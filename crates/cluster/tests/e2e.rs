@@ -103,6 +103,7 @@ async fn agent(name: &str, slots: u32, dir: PathBuf) -> Agent {
         net: NetMode::Local,
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: None,
+        microvm: None,
         corrupt_results: false,
     })
     .await
@@ -450,6 +451,7 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         net: NetMode::Local,
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: None,
+        microvm: None,
         corrupt_results: corrupt,
     })
     .await
@@ -476,6 +478,7 @@ fn test_policy(hold_secs: u64, verify_permille: u32, max_strikes: u32) -> Policy
         prices: PriceList {
             wasm_per_gfuel: 1_000_000_000,
             docker_cpu_hour: 0,
+            microvm_cpu_hour: 0,
             memory_gib_hour: 0,
         },
         hold_secs,
@@ -849,6 +852,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         net: NetMode::Local,
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: Some("docker".into()),
+        microvm: None,
         corrupt_results: false,
     })
     .await
@@ -945,5 +949,191 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
     client.close().await;
     wasm_only.kill().await;
     d.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// MicroVM executor (skipped unless PUMASI_TEST_VM_DIR points at a VM
+// directory set up with `pumasi vm setup`; CI does this on Linux with KVM)
+// ---------------------------------------------------------------------------
+
+fn microvm_config() -> Option<pumasi_agent::MicrovmConfig> {
+    let dir = std::env::var_os("PUMASI_TEST_VM_DIR")?;
+    let backend = std::env::var("PUMASI_TEST_VM_BACKEND")
+        .ok()
+        .map(|b| b.parse().expect("PUMASI_TEST_VM_BACKEND"));
+    Some(pumasi_agent::MicrovmConfig {
+        dir: dir.into(),
+        backend,
+    })
+}
+
+fn microvm_image() -> String {
+    std::env::var("PUMASI_TEST_VM_IMAGE").unwrap_or_else(|_| "busybox:1.36".into())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_jobs_run_on_an_invited_provider() {
+    let Some(vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    let mut policy = test_policy(1, 0, 3);
+    // One credit per vCPU-second, so a run costs a visible amount.
+    policy.prices.microvm_cpu_hour = 3600 * 1_000_000;
+    set_policy(&client, policy).await;
+    deposit(&client, "owner", 100_000).await;
+
+    // A plain owner machine (WASM only) and a provider that opted into
+    // microVMs but was not invited for Docker.
+    let owner_ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let wasm_only = spawn_join(agent("wasm-only", 2, tempdir("w")).await, owner_ticket);
+    let provider = Agent::new(AgentConfig {
+        data_dir: tempdir("p"),
+        name: "bobs-pc".into(),
+        slots: Some(2),
+        net: NetMode::Local,
+        bind: Some("127.0.0.1:0".parse().unwrap()),
+        docker: None,
+        microvm: Some(vm),
+        corrupt_results: false,
+    })
+    .await
+    .unwrap();
+    let provider_id = provider.id().to_string();
+    let p = spawn_join(provider, invite(&cluster, "bob"));
+    wait_online(&cluster, 2).await;
+    let node = cluster
+        .status()
+        .nodes
+        .into_iter()
+        .find(|n| n.id == provider_id)
+        .unwrap();
+    assert_eq!(node.role, Role::Provider);
+    assert_eq!(node.executors, vec![Executor::Wasm, Executor::Microvm]);
+
+    // Shared + per-task input files, an output file, stdout, a fresh
+    // writable root per task, its own kernel, and no network.
+    let script = "cat shared.txt mine.txt > /output/out.txt && mkdir -p /output/sub && echo $0 > /output/sub/arg.txt \
+        && test ! -e /var/leftover && touch /var/leftover \
+        && test \"$(uname -r)\" != \"$HOST_KERNEL\" \
+        && ! wget -q -T 2 -O /dev/null http://1.1.1.1 && echo isolated";
+    let host_kernel = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let tasks = (0..3)
+        .map(|i| TaskInput {
+            args: vec![format!("arg{i}")],
+            env: [("HOST_KERNEL".to_string(), host_kernel.clone())].into(),
+            files: vec![FileEntry {
+                path: "mine.txt".into(),
+                data: format!("task{i}").into_bytes(),
+            }],
+            ..Default::default()
+        })
+        .collect();
+    let mut sub = docker_job(&["sh", "-c", script], tasks);
+    sub.executor = Executor::Microvm;
+    sub.docker.as_mut().unwrap().image = microvm_image();
+    // Generous: the first task also pulls and unpacks the image.
+    sub.limits.timeout_ms = 120_000;
+    let id = submit(&client, sub).await;
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    for (i, t) in view.tasks.iter().enumerate() {
+        assert_eq!(t.node.as_deref(), Some(provider_id.as_str()));
+        assert_eq!(t.stdout.as_deref(), Some(&b"isolated\n"[..]), "{t:#?}");
+        assert!(t.cost > 0, "microvm runs are billed");
+        let AdminResponse::Files(files) = client
+            .call(AdminOp::TaskFiles {
+                id,
+                index: i as u32,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected files");
+        };
+        assert_eq!(
+            files,
+            vec![
+                FileEntry {
+                    path: "out.txt".into(),
+                    data: format!("shared+task{i}").into_bytes()
+                },
+                FileEntry {
+                    path: "sub/arg.txt".into(),
+                    data: format!("arg{i}\n").into_bytes()
+                },
+            ]
+        );
+    }
+    let rs = receipts(&client, id).await;
+    assert_eq!(rs.len(), 3);
+    for r in &rs {
+        r.verify().unwrap();
+        assert_eq!(r.usage.executor, Executor::Microvm);
+        assert_eq!(r.billing.provider, "bob");
+        assert!(r.billing.amount > 0);
+    }
+
+    // Timeout kills the VM; exit codes and signals come through.
+    let mut slow = docker_job(&["sleep", "60"], vec![TaskInput::default()]);
+    slow.executor = Executor::Microvm;
+    slow.docker.as_mut().unwrap().image = microvm_image();
+    slow.limits.timeout_ms = 3000;
+    let id = submit(&client, slow).await;
+    let view = wait_job(&client, id, 60).await;
+    assert!(
+        matches!(
+            view.tasks[0].state,
+            TaskState::Failed(pumasi_proto::msg::Outcome::Timeout)
+        ),
+        "{view:#?}"
+    );
+    let mut fail = docker_job(
+        &["sh", "-c", "echo oops >&2; exit 3"],
+        vec![TaskInput::default()],
+    );
+    fail.executor = Executor::Microvm;
+    fail.docker.as_mut().unwrap().image = microvm_image();
+    let id = submit(&client, fail).await;
+    let view = wait_job(&client, id, 60).await;
+    assert!(
+        matches!(
+            view.tasks[0].state,
+            TaskState::Failed(pumasi_proto::msg::Outcome::Exited(3))
+        ),
+        "{view:#?}"
+    );
+    assert_eq!(view.tasks[0].stderr.as_deref(), Some(&b"oops\n"[..]));
+
+    // A task over its memory limit is reported as out of memory.
+    let mut hog = docker_job(
+        &["sh", "-c", "x=a; while true; do x=$x$x; done"],
+        vec![TaskInput::default()],
+    );
+    hog.executor = Executor::Microvm;
+    hog.docker.as_mut().unwrap().image = microvm_image();
+    hog.limits.memory_bytes = 32 << 20;
+    let id = submit(&client, hog).await;
+    let view = wait_job(&client, id, 60).await;
+    match &view.tasks[0].state {
+        TaskState::Failed(pumasi_proto::msg::Outcome::Trap(msg)) => {
+            assert!(msg.contains("out of memory"), "{msg}")
+        }
+        other => panic!("expected out of memory, got {other:?}"),
+    }
+
+    client.close().await;
+    wasm_only.kill().await;
+    p.kill().await;
     cluster.shutdown().await.unwrap();
 }

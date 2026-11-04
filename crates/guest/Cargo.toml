@@ -1,0 +1,20 @@
+[package]
+name = "pumasi-guest"
+description = "PID 1 inside a pumasi microVM, and the format the agent uses to talk to it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pumasi-guest"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+flate2.workspace = true
+ruzstd.workspace = true

@@ -38,7 +38,7 @@ const RECEIPTS: TableDefinition<RunKey, &[u8]> = TableDefinition::new("receipts"
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
 /// Layout version written by this build.
-const SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
 
 fn run_key(t: &TaskRef) -> RunKey {
     (t.job.0, t.index, t.attempt, t.check)
@@ -122,8 +122,11 @@ impl Store {
             );
         }
         let store = Self { db };
-        if schema < SCHEMA {
+        if schema < 2 {
             store.migrate_v1()?;
+        }
+        if schema < 3 {
+            store.migrate_v2()?;
         }
         Ok(store)
     }
@@ -183,15 +186,33 @@ impl Store {
             }
         }
         tx.open_table(META)?
-            .insert(SCHEMA_META, SCHEMA.to_le_bytes().as_slice())?;
+            .insert(SCHEMA_META, 2u32.to_le_bytes().as_slice())?;
         tx.commit()?;
         info!(
             members = counts.0,
             tokens = counts.1,
             jobs = counts.2,
             tasks = counts.3,
-            "migrated state database to layout {SCHEMA}"
+            "migrated state database to layout 2"
         );
+        Ok(())
+    }
+
+    /// Layout 3 adds the microVM price to the stored policy; it starts at
+    /// the Docker price.
+    fn migrate_v2(&self) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut meta = tx.open_table(META)?;
+            let old = meta.get(POLICY_META)?.map(|v| v.value().to_vec());
+            if let Some(old) = old {
+                let p: Policy = dec::<legacy::PolicyV2>(&old)?.into();
+                meta.insert(POLICY_META, enc(&p).as_slice())?;
+            }
+            meta.insert(SCHEMA_META, SCHEMA.to_le_bytes().as_slice())?;
+        }
+        tx.commit()?;
+        info!("migrated state database to layout {SCHEMA}");
         Ok(())
     }
 
@@ -398,8 +419,40 @@ impl Store {
     }
 }
 
-/// Phase 1 record layouts, kept only to migrate old databases.
+/// Older record layouts, kept only to migrate old databases.
 mod legacy {
+    /// Layout 2 policy: no microVM price.
+    #[derive(serde::Deserialize)]
+    pub struct PolicyV2 {
+        prices: PricesV2,
+        hold_secs: u64,
+        verify_permille: u32,
+        max_strikes: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PricesV2 {
+        wasm_per_gfuel: i64,
+        docker_cpu_hour: i64,
+        memory_gib_hour: i64,
+    }
+
+    impl From<PolicyV2> for pumasi_proto::economy::Policy {
+        fn from(p: PolicyV2) -> Self {
+            Self {
+                prices: pumasi_proto::economy::PriceList {
+                    wasm_per_gfuel: p.prices.wasm_per_gfuel,
+                    docker_cpu_hour: p.prices.docker_cpu_hour,
+                    microvm_cpu_hour: p.prices.docker_cpu_hour,
+                    memory_gib_hour: p.prices.memory_gib_hour,
+                },
+                hold_secs: p.hold_secs,
+                verify_permille: p.verify_permille,
+                max_strikes: p.max_strikes,
+            }
+        }
+    }
+
     use pumasi_proto::{
         ModuleHash, Secret,
         job::{DockerSpec, Executor, FileEntry, JobId, Limits, TaskInput, Tier},
@@ -563,6 +616,61 @@ mod tests {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         output_files: Vec<pumasi_proto::job::FileEntry>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct V2Prices {
+        wasm_per_gfuel: i64,
+        docker_cpu_hour: i64,
+        memory_gib_hour: i64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct V2Policy {
+        prices: V2Prices,
+        hold_secs: u64,
+        verify_permille: u32,
+        max_strikes: u32,
+    }
+
+    #[test]
+    fn migrates_a_layout2_policy() {
+        let path =
+            std::env::temp_dir().join(format!("pumasi-store-{}.redb", rand::random::<u64>()));
+        {
+            let db = Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert(SCHEMA_META, 2u32.to_le_bytes().as_slice())
+                    .unwrap();
+                let old = V2Policy {
+                    prices: V2Prices {
+                        wasm_per_gfuel: 1,
+                        docker_cpu_hour: 7,
+                        memory_gib_hour: 3,
+                    },
+                    hold_secs: 60,
+                    verify_permille: 250,
+                    max_strikes: 2,
+                };
+                meta.insert(POLICY_META, enc(&old).as_slice()).unwrap();
+            }
+            tx.open_table(MEMBERS).unwrap();
+            tx.commit().unwrap();
+        }
+        let p = Store::open(&path).unwrap().load().unwrap().policy.unwrap();
+        assert_eq!(p.prices.docker_cpu_hour, 7);
+        assert_eq!(p.prices.microvm_cpu_hour, 7, "starts at the docker price");
+        assert_eq!(p.prices.memory_gib_hour, 3);
+        assert_eq!(
+            (p.hold_secs, p.verify_permille, p.max_strikes),
+            (60, 250, 2)
+        );
+        // Reopening does not migrate again.
+        let again = Store::open(&path).unwrap().load().unwrap().policy.unwrap();
+        assert_eq!(again, p);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

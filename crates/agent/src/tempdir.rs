@@ -8,7 +8,12 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!("pumasi-{tag}-{:016x}", rand_u64()));
+        Self::new_in(&std::env::temp_dir(), tag)
+    }
+
+    /// A scratch directory under `base` (created if missing).
+    pub fn new_in(base: &Path, tag: &str) -> Result<Self> {
+        let path = base.join(format!("pumasi-{tag}-{:016x}", rand_u64()));
         std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
         Ok(Self(path))
     }

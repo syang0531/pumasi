@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/agent", "crates/cluster", "crates/cli"]
+members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ rust-version = "1.90"
 pumasi-proto = { path = "crates/proto" }
 pumasi-agent = { path = "crates/agent" }
 pumasi-cluster = { path = "crates/cluster" }
+pumasi-guest = { path = "crates/guest" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -35,3 +36,13 @@ data-encoding = "2"
 sysinfo = "0.37"
 redb = "4"
 uuid = { version = "1", features = ["v4", "serde"] }
+# microVM executor: image layers, the guest's disks and registry pulls.
+tar = { version = "0.4.44", default-features = false }
+flate2 = "1"
+ruzstd = "0.8"
+libc = "0.2"
+sha2 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"

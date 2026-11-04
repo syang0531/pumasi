@@ -177,6 +177,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          # The binaries, not the guest init artifacts they embed.
+          pattern: pumasi-*
           merge-multiple: true
       - name: Check build markers
         run: |

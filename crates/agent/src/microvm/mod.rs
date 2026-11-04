@@ -196,7 +196,8 @@ pub struct MicrovmExecutor {
 
 /// How a VM run ended, as seen from the host.
 enum VmEnd {
-    Exited,
+    /// The VMM process ended by itself, with this status.
+    Exited(std::process::ExitStatus),
     Timeout,
     Cancelled,
 }
@@ -386,17 +387,18 @@ impl MicrovmExecutor {
             wall_ms,
             peak_memory_bytes: None,
         };
-        if !matches!(end, VmEnd::Exited) {
+        if !matches!(end, VmEnd::Exited(_)) {
             debug!(task = %task, console = %console_tail(&dir), "microvm stopped by the host");
         }
-        match end {
+        let status = match end {
             VmEnd::Timeout => return Ok(outcome_for(Outcome::Timeout)),
             VmEnd::Cancelled => return Ok(outcome_for(Outcome::Cancelled)),
-            VmEnd::Exited => {}
-        }
+            VmEnd::Exited(status) => status,
+        };
         let Some(out) = read_output_disk(&output_disk)? else {
             bail!(
-                "the microVM stopped without a result; console:\n{}",
+                "the microVM stopped without a result ({} {status}); console:\n{}",
+                self.vmm.backend,
                 console_tail(&dir)
             );
         };
@@ -448,7 +450,7 @@ impl MicrovmExecutor {
                     if !status.success() {
                         debug!(%status, "vmm exited");
                     }
-                    return Ok(VmEnd::Exited);
+                    return Ok(VmEnd::Exited(status));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
                     let end = if cancel.load(Ordering::Relaxed) {
@@ -538,17 +540,18 @@ impl MicrovmExecutor {
             mem_mib: BUILD_VM_MIB,
         };
         let deadline = Instant::now() + BUILD_TIMEOUT;
-        match self.boot(&vm, work.path(), Some(deadline), cancel).await? {
-            VmEnd::Exited => {}
+        let status = match self.boot(&vm, work.path(), Some(deadline), cancel).await? {
+            VmEnd::Exited(status) => status,
             VmEnd::Timeout => bail!("unpacking {reference} took longer than 30 minutes"),
             VmEnd::Cancelled => bail!("cancelled while unpacking {reference}"),
-        }
+        };
         let result = read_output_disk(&output)?.map(|o| o.result);
         match result.map(|r| r.outcome) {
             Some(GuestOutcome::Exited(0)) => {}
             Some(GuestOutcome::Failed(msg)) => bail!("unpack {reference}: {msg}"),
             other => bail!(
-                "unpack {reference}: the build VM ended without success ({other:?}); console:\n{}",
+                "unpack {reference}: the build VM ended without success ({other:?}, {} {status}); console:\n{}",
+                self.vmm.backend,
                 console_tail(work.path())
             ),
         }

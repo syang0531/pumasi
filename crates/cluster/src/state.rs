@@ -10,10 +10,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use pumasi_proto::{
     ModuleHash, Secret,
-    job::{JobId, JobSubmission, Limits, TaskInput, Tier},
+    job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{
         ClusterStatus, JobState, JobSummary, JobView, NodeInfo, NodeView, Outcome, TaskAssignment,
         TaskRef, TaskReport, TaskState, TaskView, ToAgent,
@@ -60,7 +60,12 @@ pub struct TokenRecord {
 pub struct JobMeta {
     pub id: JobId,
     pub name: String,
-    pub module_hash: ModuleHash,
+    pub executor: Executor,
+    /// WASM module (wasm executor).
+    pub module_hash: Option<ModuleHash>,
+    pub docker: Option<DockerSpec>,
+    /// Postcard-encoded `Vec<FileEntry>` shared by every task, if any.
+    pub files_hash: Option<ModuleHash>,
     pub limits: Limits,
     pub tier: Tier,
     pub max_attempts: u32,
@@ -81,6 +86,7 @@ pub struct TaskRecord {
     pub wall_ms: u64,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub output_files: Vec<FileEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +108,8 @@ struct NodeRuntime {
     kill: Option<oneshot::Sender<()>>,
     /// Running tasks and when they were placed.
     running: HashMap<TaskRef, Instant>,
-    /// Modules already sent over the current connection.
+    /// Content blobs (modules, file bundles) already sent over the current
+    /// connection.
     sent_modules: HashSet<ModuleHash>,
     last_seen: Instant,
     last_seen_unix: u64,
@@ -123,6 +130,7 @@ pub struct State {
     tokens: Vec<TokenRecord>,
     nodes: HashMap<String, NodeRuntime>,
     jobs: HashMap<JobId, Job>,
+    /// Content-addressed blobs: WASM modules and encoded file bundles.
     modules: HashMap<ModuleHash, Arc<Vec<u8>>>,
     /// Tasks waiting for a node, in scheduling order.
     queue: VecDeque<(JobId, u32)>,
@@ -393,10 +401,26 @@ impl State {
 
     // -- jobs -----------------------------------------------------------------
 
-    pub fn submit(&mut self, sub: JobSubmission) -> Result<JobId> {
+    pub fn submit(&mut self, mut sub: JobSubmission) -> Result<JobId> {
         sub.validate()?;
-        let hash = pumasi_proto::module_hash(&sub.module);
-        let new_module = !self.modules.contains_key(&hash);
+        let mut blobs: Vec<(ModuleHash, Vec<u8>)> = Vec::new();
+        let module_hash = match sub.executor {
+            Executor::Wasm => {
+                let h = pumasi_proto::module_hash(&sub.module);
+                blobs.push((h, std::mem::take(&mut sub.module)));
+                Some(h)
+            }
+            Executor::Docker => None,
+        };
+        let files_hash = if sub.files.is_empty() {
+            None
+        } else {
+            let bundle = postcard::to_stdvec(&sub.files)?;
+            let h = pumasi_proto::module_hash(&bundle);
+            blobs.push((h, bundle));
+            Some(h)
+        };
+        blobs.retain(|(h, _)| !self.modules.contains_key(h));
         let id = loop {
             let id = JobId::random();
             if !self.jobs.contains_key(&id) {
@@ -406,7 +430,10 @@ impl State {
         let meta = JobMeta {
             id,
             name: sub.name,
-            module_hash: hash,
+            executor: sub.executor,
+            module_hash,
+            docker: sub.docker,
+            files_hash,
             limits: sub.limits,
             tier: sub.tier,
             max_attempts: sub.max_attempts,
@@ -428,12 +455,14 @@ impl State {
                 wall_ms: 0,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
+                output_files: Vec::new(),
             })
             .collect();
-        self.store
-            .put_new_job(&meta, &tasks, new_module.then_some(sub.module.as_slice()))?;
-        if new_module {
-            self.modules.insert(hash, Arc::new(sub.module));
+        let blob_refs: Vec<(ModuleHash, &[u8])> =
+            blobs.iter().map(|(h, b)| (*h, b.as_slice())).collect();
+        self.store.put_new_job(&meta, &tasks, &blob_refs)?;
+        for (h, b) in blobs {
+            self.modules.insert(h, Arc::new(b));
         }
         for i in 0..tasks.len() {
             self.queue.push_back((id, i as u32));
@@ -511,6 +540,7 @@ impl State {
         task.wall_ms = report.wall_ms;
         task.stdout = report.stdout;
         task.stderr = report.stderr;
+        task.output_files = report.files;
         task.state = match report.outcome {
             Outcome::Exited(0) => TaskState::Succeeded,
             Outcome::Cancelled => TaskState::Cancelled,
@@ -567,11 +597,17 @@ impl State {
                 continue;
             }
             let need = job.meta.limits.memory_bytes;
+            let executor = job.meta.executor;
             // Most free slots first spreads work across nodes.
             let best = self
                 .nodes
                 .iter_mut()
-                .filter(|(_, n)| n.online && n.free_slots() > 0 && n.info.memory_bytes >= need)
+                .filter(|(_, n)| {
+                    n.online
+                        && n.free_slots() > 0
+                        && n.info.memory_bytes >= need
+                        && n.info.executors.contains(&executor)
+                })
                 .max_by_key(|(_, n)| n.free_slots());
             let Some((node_id, node)) = best else {
                 skipped.push_back((job_id, index));
@@ -586,17 +622,25 @@ impl State {
                 index,
                 attempt: task.attempts,
             };
-            let hash = job.meta.module_hash;
-            let module = if node.sent_modules.contains(&hash) {
-                None
-            } else {
-                self.modules.get(&hash).map(|m| m.as_ref().clone())
-            };
+            let module_hash = job.meta.module_hash;
+            let module = module_hash
+                .filter(|h| !node.sent_modules.contains(h))
+                .and_then(|h| self.modules.get(&h))
+                .map(|m| m.as_ref().clone());
+            let files_hash = job.meta.files_hash;
+            let files = files_hash
+                .filter(|h| !node.sent_modules.contains(h))
+                .and_then(|h| self.modules.get(&h))
+                .and_then(|b| postcard::from_bytes::<Vec<FileEntry>>(b).ok());
             let assignment = TaskAssignment {
                 task: r,
                 program: job.meta.name.clone(),
-                module_hash: hash,
+                executor: job.meta.executor,
+                module_hash,
                 module,
+                docker: job.meta.docker.clone(),
+                files_hash,
+                files,
                 input: task.input.clone(),
                 limits: job.meta.limits,
             };
@@ -610,7 +654,8 @@ impl State {
                 skipped.push_back((job_id, index));
                 continue;
             }
-            node.sent_modules.insert(hash);
+            node.sent_modules.extend(module_hash);
+            node.sent_modules.extend(files_hash);
             node.running.insert(r, Instant::now());
             task.state = TaskState::Running {
                 node: node_id.clone(),
@@ -705,6 +750,12 @@ impl State {
         }
     }
 
+    pub fn task_files(&self, id: JobId, index: u32) -> Result<Vec<FileEntry>> {
+        let job = self.jobs.get(&id).context("no such job")?;
+        let task = job.tasks.get(index as usize).context("no such task")?;
+        Ok(task.output_files.clone())
+    }
+
     pub fn job_view(&self, id: JobId, with_output: bool) -> Option<JobView> {
         let job = self.jobs.get(&id)?;
         let tasks = job
@@ -720,10 +771,17 @@ impl State {
                 wall_ms: t.wall_ms,
                 stdout: with_output.then(|| t.stdout.clone()),
                 stderr: with_output.then(|| t.stderr.clone()),
+                output_files: t
+                    .output_files
+                    .iter()
+                    .map(|f| (f.path.clone(), f.data.len() as u64))
+                    .collect(),
             })
             .collect();
         Some(JobView {
             summary: Self::summary(job),
+            executor: job.meta.executor,
+            image: job.meta.docker.as_ref().map(|d| d.image.clone()),
             limits: job.meta.limits,
             total_fuel: job.tasks.iter().map(|t| t.fuel_used).sum(),
             tasks,

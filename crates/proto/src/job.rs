@@ -23,6 +23,15 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 /// Cap on captured stdout/stderr per task.
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Cap on the total size of files a task writes to `/output`.
+pub const MAX_OUTPUT_FILES_BYTES: usize = 32 * 1024 * 1024;
+/// Cap on all input files of one job (shared plus per-task). Keeps the
+/// submission well under the wire frame limit.
+pub const MAX_INPUT_FILES_BYTES: usize = 48 * 1024 * 1024;
+/// Guest path where input files appear.
+pub const INPUT_DIR: &str = "/input";
+/// Guest path whose contents are collected after a task.
+pub const OUTPUT_DIR: &str = "/output";
 
 /// Identifies a job. Random, assigned by the control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -60,13 +69,113 @@ pub enum Tier {
     Open,
 }
 
-/// Which executor runs the task. Phase 1 ships only `Wasm`; `MicroVm`
-/// (OCI images, GPU) arrives in a later phase behind the same job format.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Which executor runs the task.
+///
+/// - `Wasm`: Wasmtime sandbox, runs on every node, no network.
+/// - `Docker`: an OCI image run by the node's Docker (or Podman). Any
+///   language, packages and optional network. Only nodes that opted in with
+///   `--allow-docker` get these tasks; meant for machines you own. A microVM
+///   executor will run the same jobs on untrusted machines later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Executor {
     #[default]
     Wasm,
+    Docker,
+}
+
+impl fmt::Display for Executor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Executor::Wasm => "wasm",
+            Executor::Docker => "docker",
+        })
+    }
+}
+
+/// A file handed to or produced by a task. `path` is relative, with `/`
+/// separators, and never escapes its directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub path: String,
+    pub data: Vec<u8>,
+}
+
+/// Checks that a relative path stays inside its directory.
+pub fn validate_rel_path(path: &str) -> Result<()> {
+    ensure!(!path.is_empty(), "empty file path");
+    ensure!(
+        !path.starts_with('/') && !path.contains('\\'),
+        "file path must be relative: {path}"
+    );
+    ensure!(
+        !path.contains(':'),
+        "file path must not contain ':': {path}"
+    );
+    for part in path.split('/') {
+        ensure!(
+            !part.is_empty() && part != "." && part != "..",
+            "invalid file path: {path}"
+        );
+    }
+    Ok(())
+}
+
+/// Writes entries under `dir`, creating parent directories.
+pub fn write_files(dir: &Path, files: &[FileEntry]) -> Result<()> {
+    for f in files {
+        validate_rel_path(&f.path)?;
+        let target = dir.join(&f.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, &f.data).with_context(|| format!("write {}", target.display()))?;
+    }
+    Ok(())
+}
+
+/// Reads every regular file under `dir` (recursively) as entries relative
+/// to it, sorted by path. Stops at `limit` total bytes and reports whether
+/// anything was left out.
+pub fn read_files(dir: &Path, limit: usize) -> Result<(Vec<FileEntry>, bool)> {
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    let mut stack = vec![dir.to_path_buf()];
+    let mut paths = Vec::new();
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries {
+            let e = e?;
+            let ft = e.file_type()?;
+            if ft.is_dir() {
+                stack.push(e.path());
+            } else if ft.is_file() {
+                paths.push(e.path());
+            }
+        }
+    }
+    paths.sort();
+    for p in paths {
+        let rel = p.strip_prefix(dir).expect("under dir");
+        let rel: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let size = std::fs::metadata(&p)?.len() as usize;
+        if total + size > limit {
+            truncated = true;
+            continue;
+        }
+        total += size;
+        out.push(FileEntry {
+            path: rel.join("/"),
+            data: std::fs::read(&p)?,
+        });
+    }
+    Ok((out, truncated))
 }
 
 /// Resource limits enforced on every task of a job.
@@ -78,6 +187,8 @@ pub struct Limits {
     pub fuel: Option<u64>,
     /// Wall-clock timeout in milliseconds.
     pub timeout_ms: u64,
+    /// CPU share in thousandths of a core (Docker only). `None` = no cap.
+    pub cpu_millis: Option<u32>,
 }
 
 impl Default for Limits {
@@ -86,6 +197,7 @@ impl Default for Limits {
             memory_bytes: DEFAULT_MEMORY_MB * 1024 * 1024,
             fuel: None,
             timeout_ms: DEFAULT_TIMEOUT_SECS * 1000,
+            cpu_millis: None,
         }
     }
 }
@@ -97,6 +209,21 @@ pub struct TaskInput {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub stdin: Vec<u8>,
+    /// Files placed in `/input` for this task only (in addition to the
+    /// job's shared files).
+    pub files: Vec<FileEntry>,
+}
+
+/// Settings specific to the Docker executor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerSpec {
+    pub image: String,
+    /// Replaces the image's default command. Task args are appended.
+    pub command: Vec<String>,
+    /// Allow outbound network access (default: none).
+    pub network: bool,
+    /// Passed to `docker run --gpus`, e.g. "all".
+    pub gpus: Option<String>,
 }
 
 /// What the CLI sends to the control plane.
@@ -104,7 +231,12 @@ pub struct TaskInput {
 pub struct JobSubmission {
     pub name: String,
     pub executor: Executor,
+    /// WASM module (wasm executor only).
     pub module: Vec<u8>,
+    /// Docker settings (docker executor only).
+    pub docker: Option<DockerSpec>,
+    /// Files placed in every task's `/input`.
+    pub files: Vec<FileEntry>,
     pub tasks: Vec<TaskInput>,
     pub limits: Limits,
     pub tier: Tier,
@@ -117,10 +249,39 @@ impl JobSubmission {
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.tasks.is_empty(), "job has no tasks");
         ensure!(self.tasks.len() <= 100_000, "too many tasks (max 100000)");
-        ensure!(!self.module.is_empty(), "module is empty");
+        match self.executor {
+            Executor::Wasm => {
+                ensure!(!self.module.is_empty(), "module is empty");
+                ensure!(
+                    self.module.starts_with(b"\0asm"),
+                    "module is not a WebAssembly binary"
+                );
+            }
+            Executor::Docker => {
+                let d = self.docker.as_ref().context("docker job needs an image")?;
+                ensure!(!d.image.trim().is_empty(), "docker job needs an image");
+                ensure!(!d.image.starts_with('-'), "invalid image name");
+            }
+        }
+        for f in self
+            .files
+            .iter()
+            .chain(self.tasks.iter().flat_map(|t| t.files.iter()))
+        {
+            validate_rel_path(&f.path)?;
+        }
+        // The whole submission travels in one frame, so cap all files together.
+        let total: usize = self
+            .files
+            .iter()
+            .chain(self.tasks.iter().flat_map(|t| t.files.iter()))
+            .map(|f| f.data.len())
+            .sum();
         ensure!(
-            self.module.starts_with(b"\0asm"),
-            "module is not a WebAssembly binary"
+            total <= MAX_INPUT_FILES_BYTES,
+            "input files total {} MiB, the limit is {} MiB",
+            total >> 20,
+            MAX_INPUT_FILES_BYTES >> 20
         );
         ensure!(self.max_attempts >= 1, "max_attempts must be at least 1");
         ensure!(self.limits.timeout_ms > 0, "timeout must be positive");
@@ -138,33 +299,55 @@ impl JobSubmission {
 
 /// The `job.toml` users write.
 ///
+/// WASM job:
+///
 /// ```toml
 /// name = "estimate-pi"
 /// module = "montecarlo.wasm"
 /// shards = 8
-/// args = ["--seed", "{shard}", "--samples", "2000000"]
-///
-/// [resources]
-/// memory_mb = 64
-/// timeout = "60s"
+/// args = ["sample", "{shard}", "2000000"]
 /// ```
 ///
-/// Either `shards` (N copies of `args`, with `{shard}` / `{shards}`
-/// substituted) or an explicit `[[task]]` list may be given. With neither,
-/// the job has a single task.
+/// Docker job:
+///
+/// ```toml
+/// image = "python:3.12-slim"
+/// command = ["python", "count.py", "{shard}", "{shards}"]
+/// files = ["count.py", "texts/"]
+/// shards = 4
+/// network = false
+/// ```
+///
+/// Either `shards` (N copies of `args`/`command`, with `{shard}` /
+/// `{shards}` substituted) or an explicit `[[task]]` list may be given. With
+/// neither, the job has a single task.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobFile {
     pub name: Option<String>,
-    pub module: PathBuf,
+    /// WASM module path (wasm executor).
+    pub module: Option<PathBuf>,
+    /// OCI image (docker executor).
+    pub image: Option<String>,
+    /// Overrides the image's default command (docker executor).
     #[serde(default)]
-    pub executor: Executor,
+    pub command: Vec<String>,
+    /// Defaults to `docker` when `image` is set, else `wasm`.
+    pub executor: Option<Executor>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Path to a file fed to every task's stdin.
     pub stdin: Option<PathBuf>,
+    /// Files and directories copied into every task's `/input`.
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+    /// Allow network access (docker executor only).
+    #[serde(default)]
+    pub network: bool,
+    /// GPUs for `docker run --gpus` (docker executor only), e.g. "all".
+    pub gpus: Option<String>,
     pub shards: Option<u32>,
     #[serde(default, rename = "task")]
     pub tasks: Vec<TaskFile>,
@@ -184,6 +367,9 @@ pub struct TaskFile {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub stdin: Option<PathBuf>,
+    /// Extra files and directories for this task's `/input`.
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -193,6 +379,58 @@ pub struct ResourcesFile {
     pub fuel: Option<u64>,
     /// Human duration such as "90s", "5m".
     pub timeout: Option<String>,
+    /// CPU cores, fractional allowed (docker executor only).
+    pub cpus: Option<f64>,
+}
+
+/// Collects files and directories (recursively) relative to `base`. A file
+/// `data/a.csv` keeps that path; a directory `data/` contributes every file
+/// under it with its path relative to `base`.
+pub fn collect_files(base: &Path, paths: &[PathBuf]) -> Result<Vec<FileEntry>> {
+    let mut out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for p in paths {
+        let full = base.join(p);
+        let meta = std::fs::metadata(&full).with_context(|| format!("read {}", full.display()))?;
+        let root_rel = rel_string(p)?;
+        if meta.is_dir() {
+            let (entries, _) = read_files(&full, usize::MAX)?;
+            for e in entries {
+                let path = if root_rel.is_empty() {
+                    e.path
+                } else {
+                    format!("{root_rel}/{}", e.path)
+                };
+                out.insert(path, e.data);
+            }
+        } else {
+            ensure!(!root_rel.is_empty(), "invalid file path {}", p.display());
+            out.insert(root_rel, std::fs::read(&full)?);
+        }
+    }
+    let files: Vec<FileEntry> = out
+        .into_iter()
+        .map(|(path, data)| FileEntry { path, data })
+        .collect();
+    for f in &files {
+        validate_rel_path(&f.path)?;
+    }
+    Ok(files)
+}
+
+/// Turns a user-given relative path into `a/b/c` form.
+fn rel_string(p: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => {}
+            _ => bail!(
+                "file paths in a job must be relative and stay inside its folder: {}",
+                p.display()
+            ),
+        }
+    }
+    Ok(parts.join("/"))
 }
 
 impl JobFile {
@@ -200,8 +438,8 @@ impl JobFile {
         toml::from_str(text).context("invalid job file")
     }
 
-    /// Loads the file, reads the module and stdin files relative to it, and
-    /// expands shards into concrete tasks.
+    /// Loads the file, reads the module, stdin and input files relative to
+    /// it, and expands shards into concrete tasks.
     pub fn load(path: &Path) -> Result<JobSubmission> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -215,12 +453,39 @@ impl JobFile {
             let full = base.join(p);
             std::fs::read(&full).with_context(|| format!("read {}", full.display()))
         };
-        let module = read(&self.module)?;
+        let executor = self.executor.unwrap_or(if self.image.is_some() {
+            Executor::Docker
+        } else {
+            Executor::Wasm
+        });
+        let (module, docker_base) = match executor {
+            Executor::Wasm => {
+                ensure!(self.image.is_none(), "`image` is only for docker jobs");
+                ensure!(
+                    self.command.is_empty(),
+                    "`command` is only for docker jobs; use `args`"
+                );
+                ensure!(
+                    !self.network,
+                    "wasm tasks cannot use the network; use a docker job"
+                );
+                ensure!(self.gpus.is_none(), "`gpus` is only for docker jobs");
+                let m = self.module.as_ref().context("wasm job needs `module`")?;
+                (read(m)?, None)
+            }
+            Executor::Docker => {
+                ensure!(self.module.is_none(), "`module` is only for wasm jobs");
+                let image = self.image.clone().context("docker job needs `image`")?;
+                (Vec::new(), Some(image))
+            }
+        };
         let shared_stdin = match &self.stdin {
             Some(p) => read(p)?,
             None => Vec::new(),
         };
+        let files = collect_files(base, &self.files)?;
 
+        let mut command = self.command.clone();
         let tasks = if !self.tasks.is_empty() {
             if self.shards.is_some() {
                 bail!("use either `shards` or `[[task]]`, not both");
@@ -241,24 +506,39 @@ impl JobFile {
                             Some(p) => read(p)?,
                             None => shared_stdin.clone(),
                         },
+                        files: collect_files(base, &t.files)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
             let n = self.shards.unwrap_or(1);
             ensure!(n >= 1, "shards must be at least 1");
+            // `{shard}` in the command is per task, so move the command into
+            // the task args when it uses placeholders.
+            let templated = command.iter().any(|c| c.contains("{shard"));
+            let cmd_template = if templated {
+                std::mem::take(&mut command)
+            } else {
+                Vec::new()
+            };
             (0..n)
                 .map(|i| TaskInput {
-                    args: self.args.iter().map(|a| expand(a, i, n)).collect(),
+                    args: cmd_template
+                        .iter()
+                        .chain(self.args.iter())
+                        .map(|a| expand(a, i, n))
+                        .collect(),
                     env: self
                         .env
                         .iter()
                         .map(|(k, v)| (k.clone(), expand(v, i, n)))
                         .collect(),
                     stdin: shared_stdin.clone(),
+                    files: Vec::new(),
                 })
                 .collect()
         };
+        // An explicit command with `[[task]]`s keeps placeholders literal.
 
         let mut limits = Limits::default();
         if let Some(mb) = self.resources.memory_mb {
@@ -268,17 +548,38 @@ impl JobFile {
         if let Some(t) = &self.resources.timeout {
             limits.timeout_ms = parse_duration_ms(t)?;
         }
+        if let Some(c) = self.resources.cpus {
+            ensure!(
+                c > 0.0 && c <= 1024.0,
+                "resources.cpus must be between 0 and 1024"
+            );
+            limits.cpu_millis = Some((c * 1000.0).round() as u32);
+        }
 
-        let name = self.name.unwrap_or_else(|| {
-            self.module
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "job".into())
+        let name = self.name.clone().unwrap_or_else(|| {
+            if let Some(m) = &self.module
+                && let Some(stem) = m.file_stem()
+            {
+                return stem.to_string_lossy().into_owned();
+            }
+            if let Some(img) = &docker_base {
+                let last = img.rsplit('/').next().unwrap_or(img);
+                return last.split([':', '@']).next().unwrap_or(last).to_string();
+            }
+            "job".into()
+        });
+        let docker = docker_base.map(|image| DockerSpec {
+            image,
+            command,
+            network: self.network,
+            gpus: self.gpus.clone(),
         });
         let sub = JobSubmission {
             name,
-            executor: self.executor,
+            executor,
             module,
+            docker,
+            files,
             tasks,
             limits,
             tier: self.tier,
@@ -383,6 +684,126 @@ mod tests {
         std::fs::write(dir.join("m.wasm"), b"not wasm").unwrap();
         let f = JobFile::parse(r#"module = "m.wasm""#).unwrap();
         assert!(f.resolve(&dir).is_err());
+    }
+
+    #[test]
+    fn docker_job_with_files() {
+        let dir = tempdir();
+        std::fs::write(dir.join("count.py"), b"print(1)").unwrap();
+        std::fs::create_dir_all(dir.join("texts/sub")).unwrap();
+        std::fs::write(dir.join("texts/a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("texts/sub/b.txt"), b"b").unwrap();
+        let f = JobFile::parse(
+            r#"
+            image = "ghcr.io/acme/py:3.12"
+            command = ["python", "count.py", "{shard}", "{shards}"]
+            files = ["count.py", "texts/"]
+            shards = 2
+            network = true
+            [resources]
+            cpus = 1.5
+            "#,
+        )
+        .unwrap();
+        let sub = f.resolve(&dir).unwrap();
+        assert_eq!(sub.executor, Executor::Docker);
+        assert_eq!(sub.name, "py");
+        let d = sub.docker.as_ref().unwrap();
+        assert!(d.network);
+        assert!(
+            d.command.is_empty(),
+            "templated command moves into task args"
+        );
+        assert_eq!(sub.tasks[1].args, vec!["python", "count.py", "1", "2"]);
+        let paths: Vec<&str> = sub.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["count.py", "texts/a.txt", "texts/sub/b.txt"]);
+        assert_eq!(sub.limits.cpu_millis, Some(1500));
+    }
+
+    #[test]
+    fn docker_command_without_placeholders_is_kept() {
+        let dir = tempdir();
+        let f = JobFile::parse(
+            r#"
+            image = "busybox"
+            command = ["sh", "-c"]
+            [[task]]
+            args = ["echo one"]
+            [[task]]
+            args = ["echo two"]
+            "#,
+        )
+        .unwrap();
+        let sub = f.resolve(&dir).unwrap();
+        assert_eq!(sub.docker.unwrap().command, vec!["sh", "-c"]);
+        assert_eq!(sub.tasks[1].args, vec!["echo two"]);
+    }
+
+    #[test]
+    fn rejects_mixed_and_escaping_specs() {
+        let dir = tempdir();
+        write_module(&dir);
+        let net = JobFile::parse("module = \"m.wasm\"\nnetwork = true").unwrap();
+        assert!(net.resolve(&dir).is_err(), "wasm cannot have network");
+        let up = JobFile::parse("image = \"busybox\"\nfiles = [\"../secret\"]").unwrap();
+        assert!(
+            up.resolve(&dir).is_err(),
+            "files must stay inside the job folder"
+        );
+        let none = JobFile::parse("name = \"x\"").unwrap();
+        assert!(none.resolve(&dir).is_err(), "needs module or image");
+    }
+
+    #[test]
+    fn rel_paths_and_file_roundtrip() {
+        assert!(validate_rel_path("a/b.txt").is_ok());
+        for bad in ["", "/etc/passwd", "../x", "a/../b", "a//b", "C:x", "a\\b"] {
+            assert!(
+                validate_rel_path(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        let dir = tempdir();
+        let files = vec![
+            FileEntry {
+                path: "x/y.txt".into(),
+                data: b"1".to_vec(),
+            },
+            FileEntry {
+                path: "z.bin".into(),
+                data: vec![0; 10],
+            },
+        ];
+        write_files(&dir, &files).unwrap();
+        let (back, truncated) = read_files(&dir, usize::MAX).unwrap();
+        assert_eq!(back, files);
+        assert!(!truncated);
+        let (some, truncated) = read_files(&dir, 5).unwrap();
+        assert_eq!(some.len(), 1);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn example_jobs_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let sub = JobFile::load(&root.join("python-wordcount/job.toml")).unwrap();
+        assert_eq!(sub.executor, Executor::Docker);
+        assert_eq!(sub.tasks.len(), 4);
+        assert!(sub.files.iter().any(|f| f.path == "count.py"));
+        assert!(sub.files.iter().any(|f| f.path.starts_with("texts/")));
+        assert_eq!(sub.limits.cpu_millis, Some(1000));
+    }
+
+    #[test]
+    fn rejects_oversized_input() {
+        let dir = tempdir();
+        let f = JobFile::parse(r#"image = "busybox""#).unwrap();
+        let mut sub = f.resolve(&dir).unwrap();
+        sub.files.push(FileEntry {
+            path: "big.bin".into(),
+            data: vec![0; MAX_INPUT_FILES_BYTES + 1],
+        });
+        assert!(sub.validate().is_err());
     }
 
     #[test]

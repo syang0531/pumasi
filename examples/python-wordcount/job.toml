@@ -1,0 +1,20 @@
+# Count words in a folder of text files with 4 Python containers.
+#
+# Every task sees the same files read-only under /input and gets its share
+# of the work from {shard}/{shards}. Whatever a task writes to /output comes
+# back to your machine (pumasi-out/<job id>/task-N/).
+#
+#   pumasi run examples/python-wordcount/job.toml
+#   python3 examples/python-wordcount/merge.py pumasi-out/<job id>
+#
+# Needs at least one agent started with `--allow-docker`.
+name = "wordcount"
+image = "python:3.12-slim"
+command = ["python", "/input/count.py", "{shard}", "{shards}"]
+files = ["count.py", "texts/"]
+shards = 4
+
+[resources]
+memory_mb = 256
+cpus = 1
+timeout = "2m"

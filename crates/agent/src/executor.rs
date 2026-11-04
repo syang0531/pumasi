@@ -1,7 +1,8 @@
 //! The WASM executor: runs one task inside a fresh Wasmtime store.
 //!
 //! Every task gets:
-//! - no filesystem (no preopened directories) and no network,
+//! - no network, and no filesystem except two directories: `/input`
+//!   (read-only, the job's files) and `/output` (collected afterwards),
 //! - only the args, env and stdin from the job spec,
 //! - a memory cap (store limiter), a fuel cap (instruction metering) and a
 //!   wall-clock cap (epoch interruption),
@@ -20,12 +21,17 @@ use std::{
 use anyhow::Result;
 use pumasi_proto::{
     ModuleHash,
-    job::{Limits, MAX_OUTPUT_BYTES, TaskInput},
+    job::{
+        FileEntry, INPUT_DIR, Limits, MAX_OUTPUT_BYTES, MAX_OUTPUT_FILES_BYTES, OUTPUT_DIR,
+        TaskInput, read_files, write_files,
+    },
     msg::Outcome,
 };
+
+use crate::tempdir::TempDir;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::{
-    I32Exit, WasiCtxBuilder,
+    FsPerms, I32Exit, WasiCtxBuilder,
     p1::{self, WasiP1Ctx},
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
 };
@@ -41,6 +47,7 @@ pub struct RunResult {
     pub outcome: Outcome,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub files: Vec<FileEntry>,
     pub fuel_used: u64,
     pub wall_ms: u64,
 }
@@ -136,6 +143,7 @@ impl WasmExecutor {
         hash: &ModuleHash,
         program: &str,
         input: &TaskInput,
+        shared_files: &[FileEntry],
         limits: &Limits,
         cancel: Arc<AtomicBool>,
     ) -> RunResult {
@@ -144,6 +152,22 @@ impl WasmExecutor {
             Some(m) => m,
             None => return RunResult::error("module not loaded", start),
         };
+
+        // Scratch space: /input holds the job's files, /output is collected.
+        let scratch = match TempDir::new("wasm") {
+            Ok(d) => d,
+            Err(e) => return RunResult::error(&format!("{e:#}"), start),
+        };
+        let in_dir = scratch.path().join("input");
+        let out_dir = scratch.path().join("output");
+        let prepared = std::fs::create_dir_all(&in_dir)
+            .and_then(|_| std::fs::create_dir_all(&out_dir))
+            .map_err(anyhow::Error::from)
+            .and_then(|_| write_files(&in_dir, shared_files))
+            .and_then(|_| write_files(&in_dir, &input.files));
+        if let Err(e) = prepared {
+            return RunResult::error(&format!("prepare input files: {e:#}"), start);
+        }
 
         let stdout = MemoryOutputPipe::new(MAX_OUTPUT_BYTES);
         let stderr = MemoryOutputPipe::new(MAX_OUTPUT_BYTES);
@@ -155,13 +179,21 @@ impl WasmExecutor {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        let wasi = WasiCtxBuilder::new()
+        let mut builder = WasiCtxBuilder::new();
+        builder
             .args(&args)
             .envs(&env)
             .stdin(MemoryInputPipe::new(input.stdin.clone()))
             .stdout(stdout.clone())
-            .stderr(stderr.clone())
-            .build_p1();
+            .stderr(stderr.clone());
+        let preopened = builder
+            .preopened_dir(&in_dir, INPUT_DIR, FsPerms::ReadOnly)
+            .and_then(|b| b.preopened_dir(&out_dir, OUTPUT_DIR, FsPerms::ReadWrite))
+            .map(|_| ());
+        if let Err(e) = preopened {
+            return RunResult::error(&format!("preopen directories: {e}"), start);
+        }
+        let wasi = builder.build_p1();
 
         let memory = usize::try_from(limits.memory_bytes).unwrap_or(usize::MAX);
         let store_limits = StoreLimitsBuilder::new()
@@ -208,10 +240,13 @@ impl WasmExecutor {
             Ok(()) => Outcome::Exited(0),
             Err(e) => classify(e),
         };
+        let mut stderr = stderr.contents().to_vec();
+        let files = collect_output(&out_dir, &mut stderr);
         RunResult {
             outcome,
             stdout: stdout.contents().to_vec(),
-            stderr: stderr.contents().to_vec(),
+            stderr,
+            files,
             fuel_used,
             wall_ms: start.elapsed().as_millis() as u64,
         }
@@ -219,6 +254,30 @@ impl WasmExecutor {
 }
 
 const CANCELLED: &str = "pumasi: task cancelled";
+
+/// Reads `/output` back, noting on stderr if the size cap cut it short.
+pub(crate) fn collect_output(out_dir: &std::path::Path, stderr: &mut Vec<u8>) -> Vec<FileEntry> {
+    match read_files(out_dir, MAX_OUTPUT_FILES_BYTES) {
+        Ok((files, truncated)) => {
+            if truncated {
+                stderr.extend_from_slice(
+                    format!(
+                        "\n[pumasi] output files exceeded {} MiB; some were dropped\n",
+                        MAX_OUTPUT_FILES_BYTES / 1024 / 1024
+                    )
+                    .as_bytes(),
+                );
+            }
+            files
+        }
+        Err(e) => {
+            stderr.extend_from_slice(
+                format!("\n[pumasi] could not read output files: {e:#}\n").as_bytes(),
+            );
+            Vec::new()
+        }
+    }
+}
 
 fn classify(e: wasmtime::Error) -> Outcome {
     if let Some(exit) = e.downcast_ref::<I32Exit>() {
@@ -250,6 +309,7 @@ impl RunResult {
             outcome: Outcome::Error(msg.to_string()),
             stdout: Vec::new(),
             stderr: Vec::new(),
+            files: Vec::new(),
             fuel_used: 0,
             wall_ms: start.elapsed().as_millis() as u64,
         }
@@ -265,7 +325,7 @@ mod tests {
         let hash = pumasi_proto::module_hash(&bytes);
         let ex = WasmExecutor::new().unwrap();
         ex.load_module(hash, &bytes).unwrap();
-        ex.run(&hash, "test", &input, &limits, Default::default())
+        ex.run(&hash, "test", &input, &[], &limits, Default::default())
     }
 
     /// Writes "hi\n" to stdout via fd_write, then exits with the code in
@@ -356,26 +416,89 @@ mod tests {
             &hash,
             "t",
             &TaskInput::default(),
+            &[],
             &Limits::default(),
             cancel,
         );
         assert_eq!(r.outcome, Outcome::Cancelled);
     }
 
+    /// Reads /input/in.txt and copies it to /output/out.txt. Checks that
+    /// no other directory exists, that `..` cannot escape /input, and that
+    /// /input is read-only. Exits with a distinct code per failed check.
+    const FILES_WAT: &str = r#"
+    (module
+      (import "wasi_snapshot_preview1" "fd_prestat_get" (func $prestat (param i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 100) "in.txt")
+      (data (i32.const 120) "out.txt")
+      (data (i32.const 140) "../x")
+      (data (i32.const 160) "new.txt")
+      (func (export "_start")
+        (if (i32.ne (call $prestat (i32.const 5) (i32.const 0)) (i32.const 8)) (then (call $exit (i32.const 10))))
+        (if (i32.eqz (call $open (i32.const 3) (i32.const 0) (i32.const 140) (i32.const 4) (i32.const 0) (i64.const 536870911) (i64.const 536870911) (i32.const 0) (i32.const 200)))
+          (then (call $exit (i32.const 11))))
+        (if (i32.eqz (call $open (i32.const 3) (i32.const 0) (i32.const 160) (i32.const 7) (i32.const 1) (i64.const 536870911) (i64.const 536870911) (i32.const 0) (i32.const 200)))
+          (then (call $exit (i32.const 12))))
+        (if (call $open (i32.const 3) (i32.const 0) (i32.const 100) (i32.const 6) (i32.const 0) (i64.const 2) (i64.const 0) (i32.const 0) (i32.const 200))
+          (then (call $exit (i32.const 13))))
+        (i32.store (i32.const 300) (i32.const 1000))
+        (i32.store (i32.const 304) (i32.const 100))
+        (drop (call $read (i32.load (i32.const 200)) (i32.const 300) (i32.const 1) (i32.const 308)))
+        (if (call $open (i32.const 4) (i32.const 0) (i32.const 120) (i32.const 7) (i32.const 1) (i64.const 536870911) (i64.const 536870911) (i32.const 0) (i32.const 200))
+          (then (call $exit (i32.const 14))))
+        (i32.store (i32.const 400) (i32.const 1000))
+        (i32.store (i32.const 404) (i32.load (i32.const 308)))
+        (drop (call $write (i32.load (i32.const 200)) (i32.const 400) (i32.const 1) (i32.const 408)))
+        (call $exit (i32.const 0))))
+    "#;
+
     #[test]
-    fn no_filesystem_access() {
-        // path_open on fd 3 (the first preopen) must fail: there is none.
-        let wat = r#"
-        (module
-          (import "wasi_snapshot_preview1" "fd_prestat_get" (func $prestat (param i32 i32) (result i32)))
-          (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
-          (memory (export "memory") 1)
-          (func (export "_start")
-            (call $exit (call $prestat (i32.const 3) (i32.const 0)))))
-        "#;
-        let r = exec_wat(wat, TaskInput::default(), Limits::default());
-        // errno 8 = EBADF: no preopened directory exists.
-        assert_eq!(r.outcome, Outcome::Exited(8));
+    fn input_and_output_files() {
+        let bytes = wat::parse_str(FILES_WAT).unwrap();
+        let hash = pumasi_proto::module_hash(&bytes);
+        let ex = WasmExecutor::new().unwrap();
+        ex.load_module(hash, &bytes).unwrap();
+        let shared = vec![FileEntry {
+            path: "in.txt".into(),
+            data: b"payload".to_vec(),
+        }];
+        let r = ex.run(
+            &hash,
+            "t",
+            &TaskInput::default(),
+            &shared,
+            &Limits::default(),
+            Default::default(),
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        assert_eq!(
+            r.files,
+            vec![FileEntry {
+                path: "out.txt".into(),
+                data: b"payload".to_vec()
+            }]
+        );
+
+        // Without the input file the open fails with a clear exit code.
+        let r = ex.run(
+            &hash,
+            "t",
+            &TaskInput::default(),
+            &[],
+            &Limits::default(),
+            Default::default(),
+        );
+        assert_eq!(r.outcome, Outcome::Exited(13));
     }
 
     #[test]

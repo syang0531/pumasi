@@ -8,11 +8,12 @@ Windows, x86_64 and ARM64.
 
 > [한국어 README](README.ko.md)
 
-Pumasi is phase 1 of a larger plan: first a private cluster tool that is
-useful on its own, later invited outside providers, metered billing and a
-marketplace that bursts into other people's idle machines with the same job
-format. See [docs/architecture.md](docs/architecture.md) and the roadmap
-below.
+Pumasi grows in phases: a private cluster tool that is useful on its own
+(phase 1), then other people's machines joining by invite, with signed
+usage receipts, a prepaid credit ledger and spot checks of their results
+(phase 2, this release), and later a marketplace that bursts into idle
+machines with the same job format. See
+[docs/architecture.md](docs/architecture.md) and the roadmap below.
 
 ## Quick start
 
@@ -85,21 +86,74 @@ shard 0/4: 3 files, 2164 words
 saved 4 output files to pumasi-out/6d916b0dc63f63ea
 ```
 
+### Other people's machines: invites, credit and checks
+
+A friend can lend their PC to your cluster. Invite it for their account:
+
+```sh
+pumasi invite bob                  # prints `pumasi agent join pumasijoin...` for bob to run
+pumasi credit add owner 100        # prepaid credit for runs on other people's machines
+pumasi run examples/montecarlo/job.toml
+```
+
+- Bob's machine joins as a **provider**: it runs WASM tasks only (Docker
+  only if you invited it with `--allow-docker` *and* bob started his agent
+  with `--allow-docker`), and only for jobs whose account has credit.
+- Your own machines are used first and cost nothing; work overflows to
+  providers. Each provider run is priced from the fixed price list
+  (`pumasi prices`) and charged to the job's account. The provider's
+  earning is **held** (default 1 hour), then becomes available.
+- Every run produces a **usage receipt** (fuel, wall time, memory,
+  executor, a hash of the result) signed by the node and countersigned by
+  the control plane. `pumasi receipts <JOB> --export r.json` exports them;
+  `pumasi verify-receipts r.json` checks the signatures offline.
+- WASM jobs run in **deterministic mode** by default (virtual clock, seeded
+  random numbers), so every honest node computes the same result. A sample
+  of provider-run tasks (10%; 50% for new providers; all of them after a
+  failed check) is **re-run on another node**, preferably one of yours. A
+  provider whose result disagrees loses that earning (you are refunded), gets
+  a strike, and after 3 strikes gets no more tasks. If a check run's result
+  wins, it replaces the provider's.
+
+```
+$ pumasi job a21f288f39011a2d
+job a21f288f39011a2d "estimate-pi": succeeded
+  executor wasm
+  account owner  cost 0.0375 credits  deterministic
+  tasks 16  succeeded 16  failed 0  fuel 6000109645
+  [0] ok node=a8020286f9 attempts=1 46ms
+  [1] ok node=46e7353324 attempts=1 66ms cost=0.00375
+  [2] ok node=46e7353324 attempts=1 42ms cost=0.00375 check=passed
+...
+$ pumasi credit list
+ACCOUNT               AVAILABLE           HELD          SPENT         EARNED
+bob                      0.0375              0              0         0.0375
+owner                   99.9625              0         0.0375              0
+```
+
+Credits are bookkeeping only: no money moves. `pumasi credit payout bob 10`
+records that you settled with bob outside Pumasi.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. |
-| `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine. |
+| `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
+| `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs. |
 | `pumasi agent start [--allow-docker]` | Reconnect to the cluster this machine joined before (no ticket needed). |
-| `pumasi run job.toml [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. |
-| `pumasi status` | Nodes (online, executors, slots, running) and recent jobs. |
-| `pumasi job <ID> [--output] [--out DIR]` | Per-task state, node, attempts, time; stdout/stderr with `--output`; downloads output files with `--out`. |
+| `pumasi run job.toml [--account A] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
+| `pumasi status` | Nodes (role, online, executors, slots, running, checks) and recent jobs with their cost. |
+| `pumasi job <ID> [--output] [--out DIR]` | Per-task state, node, attempts, time, cost and check result; stdout/stderr with `--output`; downloads output files with `--out`. |
+| `pumasi credit list \| add <ACCOUNT> <AMOUNT> \| payout <ACCOUNT> <AMOUNT> \| ledger [--account A]` | Balances (available, held, spent, earned), prepaid deposits, payouts, and the ledger. |
+| `pumasi prices [set --wasm-per-gfuel X --docker-cpu-hour X --memory-gib-hour X --hold 1h --verify-rate 10% --max-strikes 3]` | Show or change the price list and settlement policy. |
+| `pumasi receipts <ID> [--export FILE]` | A job's signed usage receipts. |
+| `pumasi verify-receipts FILE [--cluster ID]` | Check exported receipts offline. |
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
 | `pumasi remove-node <ID>` | Revoke a node. It needs a new ticket to come back. |
 | `pumasi login <ADMIN_TICKET>` | Manage a remote cluster from this machine. |
-| `pumasi exec module.wasm [--input DIR] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`). |
+| `pumasi exec module.wasm [--input DIR] [--seed S] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode). |
 
 `--home DIR` or `PUMASI_HOME` changes the state directory, which lets you run
 a cluster and several agents on one machine for testing. `PUMASI_LOG=debug`
@@ -112,7 +166,7 @@ A job runs on one of two executors with the same file format and commands:
 | | `wasm` (default) | `docker` |
 | --- | --- | --- |
 | Runs | a `wasm32-wasip1` module | any Linux OCI image |
-| Where | every node | only nodes started with `--allow-docker` |
+| Where | every node | only nodes started with `--allow-docker` (providers also need an invite with `--allow-docker`) |
 | Isolation | Wasmtime sandbox, safe for untrusted code | container, only for machines and people you trust |
 | Network | never | off by default, `network = true` to allow |
 | Files | `/input` (read-only), `/output` | `/input` (read-only), `/output` |
@@ -128,6 +182,7 @@ env = { MODE = "fast" }               # optional
 stdin = "input.txt"                   # optional, fed to every task
 files = ["data/", "lookup.csv"]       # optional, appear under /input
 max_attempts = 3                      # placements before giving up on lost nodes
+deterministic = true                  # default: virtual clock + seeded random, so results can be checked
 
 [resources]
 memory_mb = 32                        # memory cap per task (default 256)
@@ -181,6 +236,12 @@ Any language that targets `wasm32-wasip1` works for WASM jobs (Rust, C/C++,
 Zig, Go, TinyGo, ...). A per-task `files = [...]` in a `[[task]]` adds files
 only that task sees.
 
+In deterministic mode (the default for WASM jobs) the clocks start at
+2000-01-01 and advance 1 ms per read, and random numbers come from a seed
+derived from the job and task index. A task that needs real time or fresh
+randomness sets `deterministic = false`; its provider runs are then never
+checked.
+
 ## How it works
 
 ```
@@ -208,8 +269,12 @@ only that task sees.
   its tasks to other nodes (up to `max_attempts`). Agents reconnect with
   backoff. Task-level failures (trap, non-zero exit, out of fuel or memory,
   timeout) are reported, not retried.
+- **Receipts and settlement**: the agent signs each run's usage with its
+  node key; the control plane checks it against the result it received,
+  caps the wall time at what it observed itself, prices it, countersigns it
+  and stores it next to the ledger entries it caused, in one transaction.
 
-## Security model (phase 1)
+## Security model
 
 - Join tickets are bearer secrets with an expiry and optional use count.
   Once a node joins, its public key is remembered; the ticket is not needed
@@ -222,22 +287,32 @@ only that task sees.
   kernel. That is why an agent runs them only after its owner passes
   `--allow-docker`. Use it on your own machines and in clusters of people
   you trust; the microVM executor (phase 3) is the answer for strangers.
-- Tasks are **not** hidden from the machine's owner: phase 1 has only the
-  `open` confidentiality tier. Do not send secrets to machines you do not
+- Provider machines (other people's, admitted with `pumasi invite`) get WASM
+  tasks only unless the invite allowed Docker, and never settle a check:
+  only your own machines are trusted to arbitrate.
+- A provider can return made-up results; signatures prove who claimed what,
+  not that it is true. Checks catch it statistically: with the default 10%
+  rate, a provider faking 20 results is caught with 88% probability, loses
+  every held earning that a check rejects, and is suspended after 3 strikes.
+  Earnings are held for an hour so a later check can still claw them back.
+- Tasks are **not** hidden from the machine's owner: only the `open`
+  confidentiality tier exists. Do not send secrets to machines you do not
   trust.
 
 ## Roadmap
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 1 | Private cluster: agent, control plane, iroh networking, WASM and Docker executors, file input/output, CLI | this release |
-| 2 | Invited outside providers (open tier), usage receipts signed by node and cluster, fixed price list, prepaid ledger | next |
+| 1 | Private cluster: agent, control plane, iroh networking, WASM and Docker executors, file input/output, CLI | done |
+| 2 | Invited outside providers (open tier), usage receipts signed by node and cluster, fixed price list, prepaid credit ledger, sampled re-runs to check results | this release |
 | 3 | microVM executor (same OCI images as docker jobs, VM isolation, Linux GPU passthrough) behind the same job format; WebGPU experiments | planned |
 | 4 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
 
-Known gaps in phase 1: single control plane (no Raft yet), no web console,
-no per-user accounts, input and output files are size-capped (48 MiB in,
-32 MiB out per task) because they travel through the control plane.
+Known gaps: single control plane (no Raft yet), no web console, accounts
+exist only inside one cluster and only the admin can submit (with
+`--account`), credits are not connected to real payments, input and output
+files are size-capped (48 MiB in, 32 MiB out per task) because they travel
+through the control plane.
 
 ## Development
 
@@ -249,8 +324,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 The end-to-end tests in `crates/cluster/tests/e2e.rs` start a control plane
 and agents on localhost and cover sharded jobs, node failure and rescheduling,
 ticket rejection and reuse, reconnect without a ticket, cancellation, fuel
-limits, bad admin credentials, restarting the control plane, and docker jobs
-with input/output files (skipped when no Linux Docker daemon is available).
+limits, bad admin credentials, restarting the control plane, docker jobs
+with input/output files (skipped when no Linux Docker daemon is available),
+an invited provider paid from prepaid credit with verifiable receipts, and a
+dishonest provider caught by check runs, refunded and suspended.
 
 ## License
 

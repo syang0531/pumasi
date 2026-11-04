@@ -16,6 +16,7 @@ wasmtime-wasi.workspace = true
 blake3.workspace = true
 sysinfo.workspace = true
 serde_json.workspace = true
+rand010.workspace = true
 
 [dev-dependencies]
 wat.workspace = true

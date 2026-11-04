@@ -4,9 +4,11 @@
 //! specification users write, the messages agents and the control plane
 //! exchange, the admin API, and the tickets used to join a cluster.
 
+pub mod economy;
 pub mod job;
 pub mod msg;
 pub mod net;
+pub mod receipt;
 pub mod ticket;
 pub mod wire;
 
@@ -15,7 +17,7 @@ pub const AGENT_ALPN: &[u8] = b"pumasi/agent/0";
 /// ALPN for the admin (CLI) <-> control plane protocol.
 pub const ADMIN_ALPN: &[u8] = b"pumasi/admin/0";
 /// Bumped on any incompatible change to [`msg`].
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A 32-byte random secret (join tokens, admin credentials).
 pub type Secret = [u8; 32];

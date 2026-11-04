@@ -243,6 +243,13 @@ pub struct JobSubmission {
     pub max_attempts: u32,
     /// Recorded for the future marketplace; ignored in a private cluster.
     pub max_price_per_hour: Option<f64>,
+    /// Account that pays for runs on other people's machines. `None` means
+    /// the cluster owner.
+    pub account: Option<String>,
+    /// WASM only: give every task a virtual clock and seeded random numbers
+    /// so any honest node computes the same result. Needed for checking
+    /// provider results by re-running them.
+    pub deterministic: bool,
 }
 
 impl JobSubmission {
@@ -284,6 +291,13 @@ impl JobSubmission {
             MAX_INPUT_FILES_BYTES >> 20
         );
         ensure!(self.max_attempts >= 1, "max_attempts must be at least 1");
+        ensure!(
+            !self.deterministic || self.executor == Executor::Wasm,
+            "deterministic mode is only for wasm jobs"
+        );
+        if let Some(a) = &self.account {
+            crate::economy::validate_account(a)?;
+        }
         ensure!(self.limits.timeout_ms > 0, "timeout must be positive");
         ensure!(
             self.limits.memory_bytes >= 64 * 1024,
@@ -357,6 +371,9 @@ pub struct JobFile {
     pub tier: Tier,
     pub max_attempts: Option<u32>,
     pub max_price_per_hour: Option<f64>,
+    /// Deterministic mode (wasm only, default on): a virtual clock and
+    /// seeded random numbers, so results can be checked by re-running.
+    pub deterministic: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -585,6 +602,17 @@ impl JobFile {
             tier: self.tier,
             max_attempts: self.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS),
             max_price_per_hour: self.max_price_per_hour,
+            account: None,
+            deterministic: match executor {
+                Executor::Wasm => self.deterministic.unwrap_or(true),
+                Executor::Docker => {
+                    ensure!(
+                        self.deterministic != Some(true),
+                        "deterministic mode is only for wasm jobs"
+                    );
+                    false
+                }
+            },
         };
         sub.validate()?;
         Ok(sub)
@@ -596,11 +624,13 @@ fn expand(s: &str, shard: u32, shards: u32) -> String {
         .replace("{shards}", &shards.to_string())
 }
 
-/// Parses "250ms", "90s", "5m", "1h" or a bare number of seconds.
+/// Parses "250ms", "90s", "5m", "1h", "7d" or a bare number of seconds.
 pub fn parse_duration_ms(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
         (n, 1)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400_000)
     } else if let Some(n) = s.strip_suffix('s') {
         (n, 1000)
     } else if let Some(n) = s.strip_suffix('m') {
@@ -650,6 +680,11 @@ mod tests {
         assert_eq!(sub.limits.memory_bytes, 32 * 1024 * 1024);
         assert_eq!(sub.limits.timeout_ms, 90_000);
         assert_eq!(sub.limits.fuel, Some(1000));
+        assert!(sub.deterministic, "wasm jobs are deterministic by default");
+        let off = JobFile::parse("module = \"m.wasm\"\ndeterministic = false").unwrap();
+        assert!(!off.resolve(&dir).unwrap().deterministic);
+        let docker = JobFile::parse("image = \"busybox\"\ndeterministic = true").unwrap();
+        assert!(docker.resolve(&dir).is_err());
     }
 
     #[test]
@@ -811,6 +846,7 @@ mod tests {
         assert_eq!(parse_duration_ms("250ms").unwrap(), 250);
         assert_eq!(parse_duration_ms("2m").unwrap(), 120_000);
         assert_eq!(parse_duration_ms("7").unwrap(), 7000);
+        assert_eq!(parse_duration_ms("2d").unwrap(), 172_800_000);
         assert!(parse_duration_ms("abc").is_err());
     }
 

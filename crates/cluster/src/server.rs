@@ -18,7 +18,7 @@ use pumasi_proto::{
     ADMIN_ALPN, AGENT_ALPN, PROTOCOL_VERSION, Secret,
     msg::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FromAgent, HelloReply,
-        ToAgent,
+        Invite, Role, ToAgent,
     },
     net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key, write_private},
     secrets_eq,
@@ -94,6 +94,7 @@ impl Cluster {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create {}", config.data_dir.display()))?;
         let key = load_or_create_key(&config.data_dir.join(KEY_FILE))?;
+        let signing_key = key.clone();
         let store = Store::open(&config.data_dir.join(DB_FILE))?;
 
         let admin_secret: Secret = match store.get_meta(ADMIN_SECRET_META)? {
@@ -121,7 +122,7 @@ impl Cluster {
             config.bind,
         )
         .await?;
-        let state = State::load(name.clone(), endpoint.id().to_string(), store)?;
+        let state = State::load(name.clone(), endpoint.id().to_string(), store, signing_key)?;
         let addr = dialable_addr(&endpoint, config.net).await;
 
         let inner = Arc::new(Inner {
@@ -183,7 +184,18 @@ impl Cluster {
     }
 
     pub fn create_join_ticket(&self, ttl: Duration, uses: Option<u32>) -> Result<JoinTicket> {
-        let token = self.inner.state().create_token(ttl, uses)?;
+        self.create_invite(ttl, uses, None)
+    }
+
+    /// A join ticket; with `invite`, for someone else's machine joining as
+    /// a provider.
+    pub fn create_invite(
+        &self,
+        ttl: Duration,
+        uses: Option<u32>,
+        invite: Option<Invite>,
+    ) -> Result<JoinTicket> {
+        let token = self.inner.state().create_token(ttl, uses, invite)?;
         Ok(JoinTicket {
             cluster: self.addr(),
             secret: token.secret,
@@ -231,7 +243,7 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
         return Ok(());
     };
 
-    let verdict = if hello.protocol_version != PROTOCOL_VERSION {
+    let verdict: Result<(Role, String)> = if hello.protocol_version != PROTOCOL_VERSION {
         Err(anyhow::anyhow!(
             "protocol version {} not supported (cluster speaks {PROTOCOL_VERSION}); upgrade the agent",
             hello.protocol_version
@@ -241,20 +253,23 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
             .state()
             .authorize(&node_id, &hello.node, hello.join_secret.as_ref())
     };
-    if let Err(e) = verdict {
-        warn!(node = %node_id, "rejected node: {e:#}");
-        write_msg(
-            &mut send,
-            &HelloReply::Rejected {
-                reason: format!("{e:#}"),
-            },
-        )
-        .await?;
-        send.finish()?;
-        // Give the reply a moment to flush before the connection drops.
-        let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
-        return Ok(());
-    }
+    let (role, account) = match verdict {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(node = %node_id, "rejected node: {e:#}");
+            write_msg(
+                &mut send,
+                &HelloReply::Rejected {
+                    reason: format!("{e:#}"),
+                },
+            )
+            .await?;
+            send.finish()?;
+            // Give the reply a moment to flush before the connection drops.
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+            return Ok(());
+        }
+    };
 
     let cluster_name = inner.state().cluster_name.clone();
     write_msg(
@@ -262,6 +277,8 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
         &HelloReply::Welcome {
             cluster_name,
             heartbeat_ms: inner.config.heartbeat.as_millis() as u64,
+            role,
+            account: account.clone(),
         },
     )
     .await?;
@@ -271,7 +288,7 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
     let generation = inner
         .state()
         .on_connect(&node_id, hello.node.clone(), tx, kill_tx);
-    info!(node = %node_id, name = %hello.node.name, slots = hello.node.slots, "node online");
+    info!(node = %node_id, name = %hello.node.name, slots = hello.node.slots, %role, %account, "node online");
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -351,10 +368,14 @@ impl ProtocolHandler for AdminHandler {
 
 fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
     let result: Result<AdminResponse> = (|| match op {
-        AdminOp::CreateJoinToken { ttl_secs, uses } => {
+        AdminOp::CreateJoinToken {
+            ttl_secs,
+            uses,
+            invite,
+        } => {
             let token = inner
                 .state()
-                .create_token(Duration::from_secs(ttl_secs), uses)?;
+                .create_token(Duration::from_secs(ttl_secs), uses, invite)?;
             let ticket = JoinTicket {
                 cluster: inner.addr(),
                 secret: token.secret,
@@ -383,6 +404,35 @@ fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
         AdminOp::RemoveNode { id } => {
             inner.state().remove_node(&id)?;
             Ok(AdminResponse::Ok)
+        }
+        AdminOp::Receipts { id } => Ok(AdminResponse::Receipts(inner.state().receipts(id)?)),
+        AdminOp::Accounts => Ok(AdminResponse::Accounts(inner.state().accounts())),
+        AdminOp::Ledger { account, limit } => Ok(AdminResponse::Ledger(
+            inner
+                .state()
+                .ledger(account.as_deref(), limit.clamp(1, 10_000) as usize)?,
+        )),
+        AdminOp::Deposit {
+            account,
+            amount,
+            memo,
+        } => {
+            let a = inner.state().deposit(&account, amount, &memo)?;
+            Ok(AdminResponse::Accounts(vec![a]))
+        }
+        AdminOp::Payout {
+            account,
+            amount,
+            memo,
+        } => {
+            let a = inner.state().payout(&account, amount, &memo)?;
+            Ok(AdminResponse::Accounts(vec![a]))
+        }
+        AdminOp::GetPolicy => Ok(AdminResponse::Policy(inner.state().policy())),
+        AdminOp::SetPolicy(p) => {
+            let mut st = inner.state();
+            st.set_policy(p)?;
+            Ok(AdminResponse::Policy(st.policy()))
         }
     })();
     result.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))

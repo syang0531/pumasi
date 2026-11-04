@@ -2,7 +2,8 @@
 //!
 //! All mutation goes through [`State`] while holding one mutex. Methods never
 //! block on I/O other than short redb writes; messages to agents go through
-//! unbounded channels.
+//! unbounded channels. Accounts and settlement live in `ledger.rs`, result
+//! checks in `check.rs`; both extend [`State`].
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -11,13 +12,17 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use iroh::{PublicKey, SecretKey};
 use pumasi_proto::{
     ModuleHash, Secret,
+    economy::{Metered, Micros, Policy, validate_account},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{
-        ClusterStatus, JobState, JobSummary, JobView, NodeInfo, NodeView, Outcome, TaskAssignment,
-        TaskRef, TaskReport, TaskState, TaskView, ToAgent,
+        AccountView, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo, NodeView,
+        OWNER_ACCOUNT, Outcome, Role, TaskAssignment, TaskRef, TaskReport, TaskState, TaskView,
+        ToAgent, Verification,
     },
+    receipt::{Billing, Receipt, check_usage, result_digest},
     secrets_eq,
 };
 use serde::{Deserialize, Serialize};
@@ -47,6 +52,30 @@ pub struct Member {
     pub id: String,
     pub info: NodeInfo,
     pub joined_unix: u64,
+    pub role: Role,
+    /// Account the node earns for (`owner` for the owner's machines).
+    pub account: String,
+    /// Provider machines only: the invite allowed Docker jobs.
+    pub allow_docker: bool,
+    /// Checks this node's runs passed / failed.
+    pub checks_passed: u32,
+    pub strikes: u32,
+}
+
+impl Member {
+    /// Executors the cluster sends this node: what it offers, minus Docker
+    /// on provider machines whose invite did not allow it.
+    pub fn executors(&self, offered: &[Executor]) -> Vec<Executor> {
+        offered
+            .iter()
+            .copied()
+            .filter(|e| self.role == Role::Owner || *e == Executor::Wasm || self.allow_docker)
+            .collect()
+    }
+
+    pub fn trusted(&self) -> bool {
+        self.role == Role::Owner
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +83,8 @@ pub struct TokenRecord {
     pub secret: Secret,
     pub expires_unix: u64,
     pub uses_left: Option<u32>,
+    /// Set for invites of other people's machines.
+    pub invite: Option<Invite>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +105,47 @@ pub struct JobMeta {
     pub cancelled: bool,
     /// Submission order, for FIFO scheduling after a restart.
     pub seq: u64,
+    /// Account paying for runs on other accounts' machines.
+    pub account: String,
+    pub deterministic: bool,
+}
+
+/// What a run produced, kept for a check run until the check settles in
+/// case its result is the one accepted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub files: Vec<FileEntry>,
+    pub fuel_used: u64,
+    pub wall_ms: u64,
+}
+
+/// One finished run that takes part in a check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub task: TaskRef,
+    pub node: String,
+    pub account: String,
+    pub trusted: bool,
+    pub agent_version: String,
+    pub outcome: Outcome,
+    pub digest: [u8; 32],
+    pub fuel_used: u64,
+    /// `None` for the first run, whose output is in the task itself.
+    pub output: Option<RunOutput>,
+}
+
+/// A sampled task being checked by re-running it on other nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckRecord {
+    /// The first run, then each finished check run.
+    pub runs: Vec<RunRecord>,
+    /// Placements of check runs so far (their `TaskRef::attempt`).
+    pub attempts: u32,
+    /// Node a check run is on right now.
+    pub running_on: Option<String>,
+    pub status: Verification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,33 +159,51 @@ pub struct TaskRecord {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub output_files: Vec<FileEntry>,
+    pub check: Option<CheckRecord>,
+    /// Credits charged for this task's runs.
+    pub cost: Micros,
+}
+
+/// A provider earning waiting out the hold period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hold {
+    pub task: TaskRef,
+    pub consumer: String,
+    pub provider: String,
+    pub amount: Micros,
+    pub release_after_unix: u64,
 }
 
 // ---------------------------------------------------------------------------
 // Runtime-only state
 // ---------------------------------------------------------------------------
 
-struct Job {
-    meta: JobMeta,
-    tasks: Vec<TaskRecord>,
+pub(crate) struct Job {
+    pub meta: JobMeta,
+    pub tasks: Vec<TaskRecord>,
 }
 
-struct NodeRuntime {
-    info: NodeInfo,
-    online: bool,
+pub(crate) struct NodeRuntime {
+    pub info: NodeInfo,
+    pub online: bool,
     /// Bumped on every new connection so a stale session cannot clobber a
     /// fresh one.
-    generation: u64,
-    tx: Option<mpsc::UnboundedSender<ToAgent>>,
-    kill: Option<oneshot::Sender<()>>,
-    /// Running tasks and when they were placed.
-    running: HashMap<TaskRef, Instant>,
+    pub generation: u64,
+    pub tx: Option<mpsc::UnboundedSender<ToAgent>>,
+    pub kill: Option<oneshot::Sender<()>>,
+    /// Running runs and when they were placed.
+    pub running: HashMap<TaskRef, Instant>,
     /// Content blobs (modules, file bundles) already sent over the current
     /// connection.
-    sent_modules: HashSet<ModuleHash>,
-    last_seen: Instant,
-    last_seen_unix: u64,
-    completed: u64,
+    pub sent_modules: HashSet<ModuleHash>,
+    pub last_seen: Instant,
+    pub last_seen_unix: u64,
+    pub completed: u64,
+    // Copied from the member record for scheduling.
+    pub account: String,
+    pub trusted: bool,
+    pub executors: Vec<Executor>,
+    pub suspended: bool,
 }
 
 impl NodeRuntime {
@@ -122,29 +212,76 @@ impl NodeRuntime {
     }
 }
 
+/// A unit of work waiting for a node: a task's own run, or a check run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueueItem {
+    pub job: JobId,
+    pub index: u32,
+    pub check: bool,
+}
+
 pub struct State {
     pub cluster_name: String,
     pub cluster_id: String,
-    store: Store,
-    members: HashMap<String, Member>,
-    tokens: Vec<TokenRecord>,
-    nodes: HashMap<String, NodeRuntime>,
-    jobs: HashMap<JobId, Job>,
+    pub(crate) key: SecretKey,
+    pub(crate) store: Store,
+    pub(crate) policy: Policy,
+    pub(crate) members: HashMap<String, Member>,
+    pub(crate) tokens: Vec<TokenRecord>,
+    pub(crate) nodes: HashMap<String, NodeRuntime>,
+    pub(crate) jobs: HashMap<JobId, Job>,
     /// Content-addressed blobs: WASM modules and encoded file bundles.
-    modules: HashMap<ModuleHash, Arc<Vec<u8>>>,
-    /// Tasks waiting for a node, in scheduling order.
-    queue: VecDeque<(JobId, u32)>,
-    next_seq: u64,
-    next_generation: u64,
+    pub(crate) modules: HashMap<ModuleHash, Arc<Vec<u8>>>,
+    /// Work waiting for a node, in scheduling order.
+    pub(crate) queue: VecDeque<QueueItem>,
+    pub(crate) accounts: HashMap<String, AccountView>,
+    pub(crate) holds: HashMap<TaskRef, Hold>,
+    pub(crate) next_ledger_seq: u64,
+    pub(crate) next_seq: u64,
+    pub(crate) next_generation: u64,
+}
+
+/// The seed a deterministic task runs with. The same for every run of the
+/// task, so honest nodes agree.
+pub fn task_seed(job: JobId, index: u32) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"pumasi/seed/v1\0");
+    h.update(&job.0.to_le_bytes());
+    h.update(&index.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// Outcomes that a deterministic task reproduces exactly, so a check run
+/// can compare them. Timeouts and agent errors depend on the machine.
+pub(crate) fn reproducible(o: &Outcome) -> bool {
+    matches!(
+        o,
+        Outcome::Exited(_) | Outcome::OutOfFuel | Outcome::Trap(_)
+    )
+}
+
+pub(crate) fn final_state(o: &Outcome) -> TaskState {
+    match o {
+        Outcome::Exited(0) => TaskState::Succeeded,
+        Outcome::Cancelled => TaskState::Cancelled,
+        other => TaskState::Failed(other.clone()),
+    }
 }
 
 impl State {
-    pub fn load(cluster_name: String, cluster_id: String, store: Store) -> Result<Self> {
+    pub fn load(
+        cluster_name: String,
+        cluster_id: String,
+        store: Store,
+        key: SecretKey,
+    ) -> Result<Self> {
         let snap = store.load()?;
         let mut state = Self {
             cluster_name,
             cluster_id,
+            key,
             store,
+            policy: snap.policy.unwrap_or_default(),
             members: snap
                 .members
                 .into_iter()
@@ -159,26 +296,54 @@ impl State {
                 .map(|(h, b)| (h, Arc::new(b)))
                 .collect(),
             queue: VecDeque::new(),
+            accounts: snap
+                .accounts
+                .into_iter()
+                .map(|a| (a.name.clone(), a))
+                .collect(),
+            holds: snap.holds.into_iter().map(|h| (h.task, h)).collect(),
+            next_ledger_seq: snap.next_ledger_seq,
             next_seq: 0,
             next_generation: 1,
         };
+        state.ensure_account(OWNER_ACCOUNT)?;
         let mut jobs = snap.jobs;
         jobs.sort_by_key(|(m, _)| m.seq);
         for (meta, mut tasks) in jobs {
             state.next_seq = state.next_seq.max(meta.seq + 1);
             let mut changed = Vec::new();
             for (i, t) in tasks.iter_mut().enumerate() {
+                let index = i as u32;
                 // Nothing is connected yet, so anything "running" was
                 // interrupted by the restart.
                 if matches!(t.state, TaskState::Running { .. }) {
                     t.state = TaskState::Pending;
                     t.node = None;
-                    changed.push(i as u32);
+                    changed.push(index);
                 }
-                if t.state == TaskState::Pending && !meta.cancelled {
-                    state.queue.push_back((meta.id, i as u32));
+                if let Some(c) = t.check.as_mut()
+                    && c.running_on.take().is_some()
+                {
+                    changed.push(index);
+                }
+                if meta.cancelled {
+                    continue;
+                }
+                match t.state {
+                    TaskState::Pending => state.queue.push_back(QueueItem {
+                        job: meta.id,
+                        index,
+                        check: false,
+                    }),
+                    TaskState::Verifying => state.queue.push_back(QueueItem {
+                        job: meta.id,
+                        index,
+                        check: true,
+                    }),
+                    _ => {}
                 }
             }
+            changed.dedup();
             let refs: Vec<(u32, &TaskRecord)> =
                 changed.iter().map(|&i| (i, &tasks[i as usize])).collect();
             state.store.put_tasks(meta.id.0, &refs)?;
@@ -195,29 +360,65 @@ impl State {
         Ok(state)
     }
 
+    pub fn policy(&self) -> Policy {
+        self.policy
+    }
+
+    pub fn set_policy(&mut self, p: Policy) -> Result<()> {
+        p.validate()?;
+        self.store.put_policy(&p)?;
+        self.policy = p;
+        for (id, n) in self.nodes.iter_mut() {
+            if let Some(m) = self.members.get(id) {
+                n.suspended = !m.trusted() && m.strikes >= p.max_strikes;
+            }
+        }
+        self.schedule();
+        Ok(())
+    }
+
     // -- membership ---------------------------------------------------------
 
-    pub fn create_token(&mut self, ttl: Duration, uses: Option<u32>) -> Result<TokenRecord> {
+    pub fn create_token(
+        &mut self,
+        ttl: Duration,
+        uses: Option<u32>,
+        invite: Option<Invite>,
+    ) -> Result<TokenRecord> {
+        if let Some(i) = &invite {
+            validate_account(&i.account)?;
+            if i.account == OWNER_ACCOUNT {
+                bail!("`{OWNER_ACCOUNT}` is the cluster owner's account; pick the provider's name");
+            }
+        }
         let token = TokenRecord {
             secret: pumasi_proto::new_secret(),
             expires_unix: now_unix() + ttl.as_secs(),
             uses_left: uses,
+            invite,
         };
         self.store.put_token(&token)?;
         self.tokens.push(token.clone());
         Ok(token)
     }
 
-    /// Decides whether a connecting node may join. Known members are always
-    /// allowed; new nodes need a valid, unexpired join secret.
-    pub fn authorize(&mut self, id: &str, info: &NodeInfo, secret: Option<&Secret>) -> Result<()> {
+    /// Decides whether a connecting node may join, and as what. Known
+    /// members are always allowed; new nodes need a valid, unexpired join
+    /// secret, which also fixes their role and account.
+    pub fn authorize(
+        &mut self,
+        id: &str,
+        info: &NodeInfo,
+        secret: Option<&Secret>,
+    ) -> Result<(Role, String)> {
         if let Some(m) = self.members.get_mut(id) {
             if m.info != *info {
                 m.info = info.clone();
                 let m = m.clone();
                 self.store.put_member(&m)?;
             }
-            return Ok(());
+            let m = &self.members[id];
+            return Ok((m.role, m.account.clone()));
         }
         let Some(secret) = secret else {
             bail!("unknown node; join with a ticket first");
@@ -231,6 +432,7 @@ impl State {
             bail!("join ticket is invalid or expired");
         };
         let token = &mut self.tokens[pos];
+        let invite = token.invite.clone();
         if let Some(n) = token.uses_left.as_mut() {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -242,32 +444,40 @@ impl State {
                 self.store.put_token(&t)?;
             }
         }
-        let member = Member {
-            id: id.to_string(),
-            info: info.clone(),
-            joined_unix: now,
+        let member = match invite {
+            Some(i) => Member {
+                id: id.to_string(),
+                info: info.clone(),
+                joined_unix: now,
+                role: Role::Provider,
+                account: i.account,
+                allow_docker: i.allow_docker,
+                checks_passed: 0,
+                strikes: 0,
+            },
+            None => Member {
+                id: id.to_string(),
+                info: info.clone(),
+                joined_unix: now,
+                role: Role::Owner,
+                account: OWNER_ACCOUNT.into(),
+                allow_docker: true,
+                checks_passed: 0,
+                strikes: 0,
+            },
         };
+        self.ensure_account(&member.account)?;
         self.store.put_member(&member)?;
+        info!(node = %id, name = %info.name, role = %member.role, account = %member.account, "new node joined");
+        let out = (member.role, member.account.clone());
         self.members.insert(id.to_string(), member);
-        info!(node = %id, name = %info.name, "new node joined");
-        Ok(())
+        Ok(out)
     }
 
     /// Removes a member. `id` may be a unique prefix, as `pumasi status`
     /// shows only the first characters.
     pub fn remove_node(&mut self, id: &str) -> Result<()> {
-        let id = id.trim();
-        let matches: Vec<String> = self
-            .members
-            .keys()
-            .filter(|k| !id.is_empty() && k.starts_with(id))
-            .cloned()
-            .collect();
-        let id = match matches.as_slice() {
-            [one] => one.clone(),
-            [] => bail!("no such node"),
-            _ => bail!("node id prefix {id:?} is ambiguous; give more characters"),
-        };
+        let id = self.resolve_member(id)?;
         let id = id.as_str();
         self.members.remove(id);
         self.store.remove_member(id)?;
@@ -280,6 +490,20 @@ impl State {
         self.on_disconnect(id, generation);
         self.nodes.remove(id);
         Ok(())
+    }
+
+    fn resolve_member(&self, id: &str) -> Result<String> {
+        let id = id.trim();
+        let matches: Vec<&String> = self
+            .members
+            .keys()
+            .filter(|k| !id.is_empty() && k.starts_with(id))
+            .collect();
+        match matches.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => bail!("no such node"),
+            _ => bail!("node id prefix {id:?} is ambiguous; give more characters"),
+        }
     }
 
     /// Registers a live connection and returns its generation.
@@ -305,6 +529,15 @@ impl State {
         {
             let _ = kill.send(());
         }
+        let (account, trusted, executors, suspended) = match self.members.get(id) {
+            Some(m) => (
+                m.account.clone(),
+                m.trusted(),
+                m.executors(&info.executors),
+                !m.trusted() && m.strikes >= self.policy.max_strikes,
+            ),
+            None => (OWNER_ACCOUNT.into(), true, info.executors.clone(), false),
+        };
         self.nodes.insert(
             id.to_string(),
             NodeRuntime {
@@ -318,6 +551,10 @@ impl State {
                 last_seen: Instant::now(),
                 last_seen_unix: now_unix(),
                 completed: prev_completed,
+                account,
+                trusted,
+                executors,
+                suspended,
             },
         );
         self.schedule();
@@ -356,7 +593,8 @@ impl State {
         }
     }
 
-    /// Periodic housekeeping: drop silent nodes, reclaim hung tasks.
+    /// Periodic housekeeping: drop silent nodes, reclaim hung tasks,
+    /// release held earnings.
     pub fn tick(&mut self, node_timeout: Duration) {
         let now = Instant::now();
         let silent: Vec<(String, u64)> = self
@@ -394,6 +632,7 @@ impl State {
             }
             self.requeue(t, "task lease expired");
         }
+        self.release_holds(now_unix());
         if !self.queue.is_empty() {
             self.schedule();
         }
@@ -403,6 +642,8 @@ impl State {
 
     pub fn submit(&mut self, mut sub: JobSubmission) -> Result<JobId> {
         sub.validate()?;
+        let account = sub.account.take().unwrap_or_else(|| OWNER_ACCOUNT.into());
+        self.ensure_account(&account)?;
         let mut blobs: Vec<(ModuleHash, Vec<u8>)> = Vec::new();
         let module_hash = match sub.executor {
             Executor::Wasm => {
@@ -441,6 +682,8 @@ impl State {
             submitted_unix: now_unix(),
             cancelled: false,
             seq: self.next_seq,
+            account,
+            deterministic: sub.deterministic,
         };
         self.next_seq += 1;
         let tasks: Vec<TaskRecord> = sub
@@ -456,6 +699,8 @@ impl State {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 output_files: Vec::new(),
+                check: None,
+                cost: 0,
             })
             .collect();
         let blob_refs: Vec<(ModuleHash, &[u8])> =
@@ -465,9 +710,13 @@ impl State {
             self.modules.insert(h, Arc::new(b));
         }
         for i in 0..tasks.len() {
-            self.queue.push_back((id, i as u32));
+            self.queue.push_back(QueueItem {
+                job: id,
+                index: i as u32,
+                check: false,
+            });
         }
-        info!(job = %id, name = %meta.name, tasks = tasks.len(), "job submitted");
+        info!(job = %id, name = %meta.name, tasks = tasks.len(), account = %meta.account, "job submitted");
         self.jobs.insert(id, Job { meta, tasks });
         self.schedule();
         Ok(id)
@@ -493,10 +742,30 @@ impl State {
                         job: id,
                         index: i as u32,
                         attempt: t.attempts,
+                        check: false,
                     };
                     if let Some(tx) = self.nodes.get(node).and_then(|n| n.tx.as_ref()) {
                         let _ = tx.send(ToAgent::Cancel(r));
                     }
+                }
+                TaskState::Verifying => {
+                    // Keep the first result; the check is dropped.
+                    if let Some(c) = t.check.as_mut() {
+                        if let Some(node) = c.running_on.take() {
+                            let r = TaskRef {
+                                job: id,
+                                index: i as u32,
+                                attempt: c.attempts,
+                                check: true,
+                            };
+                            if let Some(tx) = self.nodes.get(&node).and_then(|n| n.tx.as_ref()) {
+                                let _ = tx.send(ToAgent::Cancel(r));
+                            }
+                        }
+                        c.status = Verification::Skipped("job cancelled".into());
+                        t.state = final_state(&c.runs[0].outcome);
+                    }
+                    changed.push(i as u32);
                 }
                 _ => {}
             }
@@ -508,12 +777,14 @@ impl State {
             .collect();
         self.store.put_tasks(id.0, &refs)?;
         self.store.put_job_meta(&meta)?;
-        self.queue.retain(|(j, _)| *j != id);
+        self.queue.retain(|q| q.job != id);
         info!(job = %id, "job cancelled");
         Ok(())
     }
 
-    /// Applies a task report from a node.
+    /// Applies a task report from a node: checks and countersigns its
+    /// usage receipt, settles the charge, records the result and decides
+    /// whether to check it.
     pub fn on_report(&mut self, node_id: &str, generation: u64, report: TaskReport) {
         let Some(node) = self.nodes.get_mut(node_id) else {
             return;
@@ -521,38 +792,256 @@ impl State {
         if node.generation != generation {
             return;
         }
-        if node.running.remove(&report.task).is_none() {
+        let Some(placed) = node.running.remove(&report.task) else {
             // Stale: the task was already rescheduled elsewhere.
             return;
-        }
+        };
         node.completed += 1;
+        let observed_ms = placed.elapsed().as_millis() as u64;
         let r = report.task;
+        let Some(job) = self.jobs.get(&r.job) else {
+            return;
+        };
+        let Some(task) = job.tasks.get(r.index as usize) else {
+            return;
+        };
+        let current = if r.check {
+            task.check.as_ref().map(|c| c.attempts) == Some(r.attempt)
+        } else {
+            task.attempts == r.attempt
+        };
+        if !current {
+            return;
+        }
+
+        // The receipt must be the node's own, for this run, and describe
+        // exactly the result it sent.
+        let digest = result_digest(&report.outcome, &report.stdout, &report.files);
+        let receipt_check = self.check_receipt(node_id, &job.meta, &report, &digest);
+        if let Err(e) = receipt_check {
+            warn!(node = %node_id, task = %r, "rejected report: {e:#}");
+            self.strike(node_id, &format!("invalid receipt: {e:#}"));
+            self.requeue_run(r, "invalid receipt");
+            self.schedule();
+            return;
+        }
+        if let Some(signed) = report.usage.clone() {
+            self.settle_run(node_id, signed, observed_ms);
+        }
+
+        if r.check {
+            self.on_check_report(node_id, report, digest);
+        } else {
+            self.on_primary_report(node_id, report, digest);
+        }
+        self.schedule();
+    }
+
+    fn check_receipt(
+        &self,
+        node_id: &str,
+        meta: &JobMeta,
+        report: &TaskReport,
+        digest: &[u8; 32],
+    ) -> Result<()> {
+        let Some(signed) = &report.usage else {
+            if matches!(report.outcome, Outcome::Error(_)) {
+                return Ok(());
+            }
+            bail!("report has no usage receipt");
+        };
+        let node: PublicKey = node_id.parse().context("bad node id")?;
+        check_usage(signed, &node, &self.key.public(), report.task, digest)?;
+        let u = &signed.usage;
+        anyhow::ensure!(
+            u.executor == meta.executor,
+            "receipt names another executor"
+        );
+        anyhow::ensure!(
+            u.fuel_used == report.fuel_used && u.wall_ms == report.wall_ms,
+            "receipt numbers differ from the report"
+        );
+        anyhow::ensure!(
+            u.memory_limit_bytes == meta.limits.memory_bytes
+                && u.cpu_millis == meta.limits.cpu_millis,
+            "receipt limits differ from the job"
+        );
+        if let Some(limit) = meta.limits.fuel {
+            anyhow::ensure!(u.fuel_used <= limit, "fuel above the job's limit");
+        }
+        Ok(())
+    }
+
+    /// Countersigns a checked receipt, stores it and moves the money.
+    fn settle_run(
+        &mut self,
+        node_id: &str,
+        signed: pumasi_proto::receipt::SignedUsage,
+        observed_ms: u64,
+    ) {
+        let r = signed.usage.task;
+        let Some(job) = self.jobs.get(&r.job) else {
+            return;
+        };
+        let provider = self
+            .nodes
+            .get(node_id)
+            .map(|n| n.account.clone())
+            .unwrap_or_else(|| OWNER_ACCOUNT.into());
+        let consumer = job.meta.account.clone();
+        let billed_wall_ms = signed.usage.wall_ms.min(observed_ms);
+        let amount = if provider == consumer {
+            0
+        } else {
+            self.policy.prices.charge(&Metered {
+                executor: signed.usage.executor,
+                fuel_used: signed.usage.fuel_used,
+                wall_ms: billed_wall_ms,
+                memory_bytes: signed.usage.memory_limit_bytes,
+                cpu_millis: signed.usage.cpu_millis,
+            })
+        };
+        let billing = Billing {
+            consumer,
+            provider,
+            billed_wall_ms,
+            amount,
+            check: r.check,
+            recorded_unix: now_unix(),
+        };
+        let receipt = Receipt::countersign(signed, billing, &self.key);
+        if let Some(task) = self
+            .jobs
+            .get_mut(&r.job)
+            .and_then(|j| j.tasks.get_mut(r.index as usize))
+        {
+            task.cost += amount;
+        }
+        self.charge(&receipt);
+    }
+
+    fn on_primary_report(&mut self, node_id: &str, report: TaskReport, digest: [u8; 32]) {
+        let r = report.task;
+        let (trusted, account, version, passes, strikes) = self.node_record(node_id);
+        let rate = self.policy.sample_permille(passes, strikes);
         let Some(job) = self.jobs.get_mut(&r.job) else {
             return;
         };
+        let sample = job.meta.deterministic
+            && job.meta.executor == Executor::Wasm
+            && !job.meta.cancelled
+            && !trusted
+            && account != job.meta.account
+            && reproducible(&report.outcome)
+            && rand::random_range(0..1000) < rate;
         let Some(task) = job.tasks.get_mut(r.index as usize) else {
             return;
         };
-        if task.attempts != r.attempt {
-            return;
-        }
         task.fuel_used = report.fuel_used;
         task.wall_ms = report.wall_ms;
         task.stdout = report.stdout;
         task.stderr = report.stderr;
         task.output_files = report.files;
-        task.state = match report.outcome {
-            Outcome::Exited(0) => TaskState::Succeeded,
-            Outcome::Cancelled => TaskState::Cancelled,
-            other => TaskState::Failed(other),
-        };
+        if sample {
+            task.state = TaskState::Verifying;
+            task.check = Some(CheckRecord {
+                runs: vec![RunRecord {
+                    task: r,
+                    node: node_id.to_string(),
+                    account,
+                    trusted,
+                    agent_version: version,
+                    outcome: report.outcome,
+                    digest,
+                    fuel_used: report.fuel_used,
+                    output: None,
+                }],
+                attempts: 0,
+                running_on: None,
+                status: Verification::Pending,
+            });
+            self.queue.push_back(QueueItem {
+                job: r.job,
+                index: r.index,
+                check: true,
+            });
+            info!(task = %r, node = %node_id, "result picked for a check run");
+        } else {
+            task.state = final_state(&report.outcome);
+        }
         if let Err(e) = self.store.put_tasks(r.job.0, &[(r.index, task)]) {
             warn!("persist task: {e:#}");
         }
-        self.schedule();
+    }
+
+    pub(crate) fn node_record(&self, node_id: &str) -> (bool, String, String, u32, u32) {
+        let version = self
+            .nodes
+            .get(node_id)
+            .map(|n| n.info.agent_version.clone())
+            .unwrap_or_default();
+        match self.members.get(node_id) {
+            Some(m) => (
+                m.trusted(),
+                m.account.clone(),
+                version,
+                m.checks_passed,
+                m.strikes,
+            ),
+            None => (true, OWNER_ACCOUNT.into(), version, 0, 0),
+        }
+    }
+
+    /// Records a failed check (or a forged receipt) against a node.
+    pub(crate) fn strike(&mut self, node_id: &str, reason: &str) {
+        let max = self.policy.max_strikes;
+        let Some(m) = self.members.get_mut(node_id) else {
+            return;
+        };
+        if m.trusted() {
+            warn!(node = %node_id, "owner machine: {reason}");
+            return;
+        }
+        m.strikes += 1;
+        let suspended = m.strikes >= max;
+        warn!(node = %node_id, strikes = m.strikes, "strike: {reason}");
+        let m = m.clone();
+        if let Err(e) = self.store.put_member(&m) {
+            warn!("persist member: {e:#}");
+        }
+        if suspended && let Some(n) = self.nodes.get_mut(node_id) {
+            if !n.suspended {
+                warn!(node = %node_id, "too many failed checks; node suspended");
+            }
+            n.suspended = true;
+        }
+    }
+
+    pub(crate) fn credit_pass(&mut self, node_id: &str) {
+        if let Some(m) = self.members.get_mut(node_id)
+            && !m.trusted()
+        {
+            m.checks_passed += 1;
+            let m = m.clone();
+            if let Err(e) = self.store.put_member(&m) {
+                warn!("persist member: {e:#}");
+            }
+        }
+    }
+
+    /// Puts a run back in the queue after its node vanished or misbehaved.
+    fn requeue_run(&mut self, r: TaskRef, reason: &str) {
+        if r.check {
+            self.requeue_check(r, reason);
+        } else {
+            self.requeue(r, reason);
+        }
     }
 
     fn requeue(&mut self, r: TaskRef, reason: &str) {
+        if r.check {
+            return self.requeue_check(r, reason);
+        }
         let Some(job) = self.jobs.get_mut(&r.job) else {
             return;
         };
@@ -575,52 +1064,97 @@ impl State {
         } else {
             task.state = TaskState::Pending;
             // Retries go first so a job is not starved by later jobs.
-            self.queue.push_front((r.job, r.index));
+            self.queue.push_front(QueueItem {
+                job: r.job,
+                index: r.index,
+                check: false,
+            });
         }
         if let Err(e) = self.store.put_tasks(r.job.0, &[(r.index, task)]) {
             warn!("persist task: {e:#}");
         }
     }
 
-    /// Places as many queued tasks as free slots allow.
+    /// Places as many queued runs as free slots allow.
     pub fn schedule(&mut self) {
         let mut skipped = VecDeque::new();
         let mut dirty: Vec<(JobId, u32)> = Vec::new();
-        while let Some((job_id, index)) = self.queue.pop_front() {
-            let Some(job) = self.jobs.get_mut(&job_id) else {
+        while let Some(item) = self.queue.pop_front() {
+            let Some(job) = self.jobs.get_mut(&item.job) else {
                 continue;
             };
-            let Some(task) = job.tasks.get_mut(index as usize) else {
+            let Some(task) = job.tasks.get_mut(item.index as usize) else {
                 continue;
             };
-            if task.state != TaskState::Pending {
+            // Nodes (and accounts) that already ran this task are out for a
+            // check run.
+            let mut exclude_nodes: Vec<&str> = Vec::new();
+            let mut exclude_accounts: Vec<&str> = Vec::new();
+            if item.check {
+                let Some(check) = task.check.as_ref() else {
+                    continue;
+                };
+                if task.state != TaskState::Verifying
+                    || check.status != Verification::Pending
+                    || check.running_on.is_some()
+                {
+                    continue;
+                }
+                for run in &check.runs {
+                    exclude_nodes.push(&run.node);
+                    exclude_accounts.push(&run.account);
+                }
+            } else if task.state != TaskState::Pending {
                 continue;
             }
             let need = job.meta.limits.memory_bytes;
             let executor = job.meta.executor;
-            // Most free slots first spreads work across nodes.
+            let consumer = job.meta.account.as_str();
+            let can_pay = self.accounts.get(consumer).is_some_and(|a| a.balance > 0);
+            // Free (same account) and trusted nodes first, then most free
+            // slots to spread work.
             let best = self
                 .nodes
                 .iter_mut()
-                .filter(|(_, n)| {
+                .filter(|(id, n)| {
                     n.online
+                        && !n.suspended
                         && n.free_slots() > 0
                         && n.info.memory_bytes >= need
-                        && n.info.executors.contains(&executor)
+                        && n.executors.contains(&executor)
+                        && (n.account == consumer || can_pay)
+                        && !exclude_nodes.contains(&id.as_str())
+                        && !exclude_accounts.contains(&n.account.as_str())
                 })
-                .max_by_key(|(_, n)| n.free_slots());
+                .max_by_key(|(_, n)| {
+                    let pref = if item.check {
+                        n.trusted
+                    } else {
+                        n.account == consumer
+                    };
+                    (pref, n.free_slots())
+                });
             let Some((node_id, node)) = best else {
-                skipped.push_back((job_id, index));
+                skipped.push_back(item);
                 if !self.nodes.values().any(|n| n.online && n.free_slots() > 0) {
                     break;
                 }
                 continue;
             };
-            task.attempts += 1;
+            let Some(tx) = &node.tx else {
+                skipped.push_back(item);
+                continue;
+            };
+            let attempt = if item.check {
+                task.check.as_ref().map(|c| c.attempts + 1).unwrap_or(1)
+            } else {
+                task.attempts + 1
+            };
             let r = TaskRef {
-                job: job_id,
-                index,
-                attempt: task.attempts,
+                job: item.job,
+                index: item.index,
+                attempt,
+                check: item.check,
             };
             let module_hash = job.meta.module_hash;
             let module = module_hash
@@ -643,25 +1177,31 @@ impl State {
                 files,
                 input: task.input.clone(),
                 limits: job.meta.limits,
-            };
-            let Some(tx) = &node.tx else {
-                task.attempts -= 1;
-                skipped.push_back((job_id, index));
-                continue;
+                seed: job
+                    .meta
+                    .deterministic
+                    .then(|| task_seed(item.job, item.index)),
             };
             if tx.send(ToAgent::Assign(Box::new(assignment))).is_err() {
-                task.attempts -= 1;
-                skipped.push_back((job_id, index));
+                skipped.push_back(item);
                 continue;
             }
             node.sent_modules.extend(module_hash);
             node.sent_modules.extend(files_hash);
             node.running.insert(r, Instant::now());
-            task.state = TaskState::Running {
-                node: node_id.clone(),
-            };
-            task.node = Some(node_id.clone());
-            dirty.push((job_id, index));
+            if item.check {
+                if let Some(c) = task.check.as_mut() {
+                    c.attempts = attempt;
+                    c.running_on = Some(node_id.clone());
+                }
+            } else {
+                task.attempts = attempt;
+                task.state = TaskState::Running {
+                    node: node_id.clone(),
+                };
+                task.node = Some(node_id.clone());
+            }
+            dirty.push((item.job, item.index));
         }
         // Whatever could not be placed keeps its order at the front.
         while let Some(item) = skipped.pop_back() {
@@ -691,13 +1231,15 @@ impl State {
             failed: 0,
             running: 0,
             submitted_unix: job.meta.submitted_unix,
+            account: job.meta.account.clone(),
+            cost: job.tasks.iter().map(|t| t.cost).sum(),
         };
         let mut cancelled = 0;
         for t in &job.tasks {
             match t.state {
                 TaskState::Succeeded => s.succeeded += 1,
                 TaskState::Failed(_) => s.failed += 1,
-                TaskState::Running { .. } => s.running += 1,
+                TaskState::Running { .. } | TaskState::Verifying => s.running += 1,
                 TaskState::Cancelled => cancelled += 1,
                 TaskState::Pending => {}
             }
@@ -725,9 +1267,16 @@ impl State {
             .values()
             .map(|m| {
                 let rt = self.nodes.get(&m.id);
+                let info = rt.map(|n| n.info.clone()).unwrap_or_else(|| m.info.clone());
                 NodeView {
                     id: m.id.clone(),
-                    info: rt.map(|n| n.info.clone()).unwrap_or_else(|| m.info.clone()),
+                    executors: m.executors(&info.executors),
+                    info,
+                    role: m.role,
+                    account: m.account.clone(),
+                    checks_passed: m.checks_passed,
+                    strikes: m.strikes,
+                    suspended: !m.trusted() && m.strikes >= self.policy.max_strikes,
                     online: rt.is_some_and(|n| n.online),
                     running: rt.map(|n| n.running.len() as u32).unwrap_or(0),
                     completed: rt.map(|n| n.completed).unwrap_or(0),
@@ -776,6 +1325,12 @@ impl State {
                     .iter()
                     .map(|f| (f.path.clone(), f.data.len() as u64))
                     .collect(),
+                verification: t
+                    .check
+                    .as_ref()
+                    .map(|c| c.status.clone())
+                    .unwrap_or(Verification::NotChecked),
+                cost: t.cost,
             })
             .collect();
         Some(JobView {
@@ -784,7 +1339,186 @@ impl State {
             image: job.meta.docker.as_ref().map(|d| d.image.clone()),
             limits: job.meta.limits,
             total_fuel: job.tasks.iter().map(|t| t.fuel_used).sum(),
+            deterministic: job.meta.deterministic,
             tasks,
         })
+    }
+
+    pub fn receipts(&self, id: JobId) -> Result<Vec<Receipt>> {
+        anyhow::ensure!(self.jobs.contains_key(&id), "no such job");
+        self.store.receipts(id.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> State {
+        let path =
+            std::env::temp_dir().join(format!("pumasi-state-{}.redb", rand::random::<u64>()));
+        let key = SecretKey::generate();
+        State::load(
+            "t".into(),
+            key.public().to_string(),
+            Store::open(&path).unwrap(),
+            key,
+        )
+        .unwrap()
+    }
+
+    fn info(name: &str, executors: Vec<Executor>) -> NodeInfo {
+        NodeInfo {
+            name: name.into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cpus: 4,
+            memory_bytes: 8 << 30,
+            slots: 2,
+            agent_version: "test".into(),
+            executors,
+        }
+    }
+
+    /// Joins a node with a fresh token and connects it.
+    fn join(
+        st: &mut State,
+        name: &str,
+        executors: Vec<Executor>,
+        invite: Option<Invite>,
+    ) -> (String, mpsc::UnboundedReceiver<ToAgent>) {
+        let id = SecretKey::generate().public().to_string();
+        let token = st
+            .create_token(Duration::from_secs(60), Some(1), invite)
+            .unwrap();
+        let info = info(name, executors);
+        st.authorize(&id, &info, Some(&token.secret)).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (kill, _) = oneshot::channel();
+        st.on_connect(&id, info, tx, kill);
+        (id, rx)
+    }
+
+    fn job(executor: Executor, tasks: usize) -> JobSubmission {
+        JobSubmission {
+            name: "j".into(),
+            executor,
+            module: match executor {
+                Executor::Wasm => b"\0asm\x01\0\0\0".to_vec(),
+                Executor::Docker => vec![],
+            },
+            docker: (executor == Executor::Docker).then(|| DockerSpec {
+                image: "busybox".into(),
+                ..Default::default()
+            }),
+            files: vec![],
+            tasks: vec![TaskInput::default(); tasks],
+            limits: Limits::default(),
+            tier: Tier::Open,
+            max_attempts: 3,
+            max_price_per_hour: None,
+            account: None,
+            deterministic: executor == Executor::Wasm,
+        }
+    }
+
+    fn assigned(rx: &mut mpsc::UnboundedReceiver<ToAgent>) -> Vec<TaskAssignment> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let ToAgent::Assign(a) = m {
+                out.push(*a);
+            }
+        }
+        out
+    }
+
+    fn bob(allow_docker: bool) -> Option<Invite> {
+        Some(Invite {
+            account: "bob".into(),
+            allow_docker,
+        })
+    }
+
+    #[test]
+    fn provider_machines_get_wasm_only_unless_invited_for_docker() {
+        let mut st = state();
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        // Bob's machine offers docker, but the invite did not allow it.
+        let (bob_id, mut bob_rx) = join(
+            &mut st,
+            "bob",
+            vec![Executor::Wasm, Executor::Docker],
+            bob(false),
+        );
+        let view = st
+            .status()
+            .nodes
+            .into_iter()
+            .find(|n| n.id == bob_id)
+            .unwrap();
+        assert_eq!(view.role, Role::Provider);
+        assert_eq!(view.executors, vec![Executor::Wasm]);
+
+        let id = st.submit(job(Executor::Docker, 1)).unwrap();
+        assert!(
+            assigned(&mut bob_rx).is_empty(),
+            "docker task sent to a provider"
+        );
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+
+        // An owner machine with docker takes it.
+        let (_, mut own_rx) = join(&mut st, "own", vec![Executor::Wasm, Executor::Docker], None);
+        let got = assigned(&mut own_rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].executor, Executor::Docker);
+        assert_eq!(got[0].seed, None, "docker tasks are not deterministic");
+
+        // Wasm tasks do go to bob, deterministic with a per-task seed.
+        st.submit(job(Executor::Wasm, 1)).unwrap();
+        let mut got = assigned(&mut bob_rx);
+        got.extend(assigned(&mut own_rx));
+        assert_eq!(got.len(), 1);
+        assert!(got[0].seed.is_some());
+
+        // An invite can allow docker explicitly.
+        let mut st = state();
+        let (_, mut rx) = join(
+            &mut st,
+            "carol",
+            vec![Executor::Wasm, Executor::Docker],
+            bob(true),
+        );
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        st.submit(job(Executor::Docker, 1)).unwrap();
+        assert_eq!(assigned(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn provider_work_needs_credit_and_own_machines_come_first() {
+        let mut st = state();
+        let (_, mut bob_rx) = join(&mut st, "bob", vec![Executor::Wasm], bob(false));
+        st.submit(job(Executor::Wasm, 3)).unwrap();
+        assert!(
+            assigned(&mut bob_rx).is_empty(),
+            "no credit, no provider work"
+        );
+
+        // Bob can run his own account's jobs for free.
+        let mut own = job(Executor::Wasm, 1);
+        own.account = Some("bob".into());
+        st.submit(own).unwrap();
+        assert_eq!(assigned(&mut bob_rx).len(), 1);
+
+        // An owner machine with free slots is preferred over paying bob.
+        let (_, mut own_rx) = join(&mut st, "own", vec![Executor::Wasm], None);
+        assert_eq!(assigned(&mut own_rx).len(), 2);
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        let to_bob = assigned(&mut bob_rx);
+        assert_eq!(
+            to_bob.len(),
+            1,
+            "the third task overflows to bob once there is credit"
+        );
+        assert!(!to_bob[0].task.check);
     }
 }

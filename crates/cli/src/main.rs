@@ -14,12 +14,17 @@ use clap::{Args, Parser, Subcommand};
 use pumasi_agent::{Agent, AgentConfig, WasmExecutor, default_node_name};
 use pumasi_cluster::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
+    economy::{Policy, format_credits, parse_credits, parse_rate_permille, validate_account},
     job::{
         Executor, JobFile, JobId, Limits, MAX_INPUT_FILES_BYTES, TaskInput, parse_duration_ms,
         read_files, write_files,
     },
-    msg::{AdminOp, AdminResponse, ClusterStatus, JobView, Outcome, TaskState},
+    msg::{
+        AccountView, AdminOp, AdminResponse, ClusterStatus, Invite, JobView, LedgerEntry,
+        LedgerKind, Outcome, Role, TaskState, Verification,
+    },
     net::NetMode,
+    receipt::Receipt,
     ticket::{AdminTicket, JoinTicket},
 };
 
@@ -56,9 +61,60 @@ enum Cmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Invite someone else's machine to join as a provider. It runs WASM
+    /// tasks only (unless --allow-docker), earns credits for ACCOUNT, and
+    /// has a sample of its results checked.
+    Invite {
+        /// Account the machine earns for, usually its owner's name
+        /// (a-z, 0-9, '-', '_').
+        account: String,
+        /// How long the invite stays valid, e.g. 24h, 7d.
+        #[arg(long, default_value = "7d")]
+        ttl: String,
+        /// Number of machines that may join with it.
+        #[arg(long, default_value_t = 1)]
+        uses: u32,
+        /// Also send Docker jobs to this machine (it must opt in with
+        /// --allow-docker too). Containers give the provider full view of
+        /// the job; use only for people you trust.
+        #[arg(long)]
+        allow_docker: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Prepaid credit: balances, deposits, payouts and the ledger.
+    #[command(subcommand)]
+    Credit(CreditCmd),
+    /// Show the price list and settlement policy, or change it.
+    Prices {
+        #[command(subcommand)]
+        cmd: Option<PricesCmd>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Show a job's signed usage receipts, or export them to a file.
+    Receipts {
+        id: String,
+        /// Write the receipts as JSON to this file.
+        #[arg(long)]
+        export: Option<PathBuf>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Check the signatures of exported receipts (works offline).
+    VerifyReceipts {
+        file: PathBuf,
+        /// Also require every receipt to come from this control plane.
+        #[arg(long)]
+        cluster: Option<String>,
+    },
     /// Submit a job described by a job.toml file.
     Run {
         job_file: PathBuf,
+        /// Account that pays for runs on other people's machines
+        /// (default: owner).
+        #[arg(long)]
+        account: Option<String>,
         /// Return right after submitting instead of waiting for the result.
         #[arg(long)]
         detach: bool,
@@ -121,6 +177,73 @@ enum Cmd {
         /// Where to save what the module writes to /output.
         #[arg(long, default_value = "pumasi-out/exec")]
         out: PathBuf,
+        /// Deterministic mode, as cluster jobs use by default: virtual clock
+        /// and random numbers seeded from this text.
+        #[arg(long)]
+        seed: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CreditCmd {
+    /// Show every account's balance.
+    List {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Add prepaid credit to an account (bookkeeping only; no money moves).
+    Add {
+        account: String,
+        /// Credits, e.g. 50 or 12.5.
+        amount: String,
+        #[arg(long, default_value = "")]
+        memo: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Record a payout from an account's available balance.
+    Payout {
+        account: String,
+        amount: String,
+        #[arg(long, default_value = "")]
+        memo: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Show ledger entries, newest first.
+    Ledger {
+        /// Only this account.
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum PricesCmd {
+    /// Change prices or policy; options left out keep their value.
+    Set {
+        /// Credits per billion fuel units of a WASM task.
+        #[arg(long)]
+        wasm_per_gfuel: Option<String>,
+        /// Credits per core-hour of a Docker task.
+        #[arg(long)]
+        docker_cpu_hour: Option<String>,
+        /// Credits per GiB-hour of reserved memory.
+        #[arg(long)]
+        memory_gib_hour: Option<String>,
+        /// How long provider earnings stay held, e.g. 1h, 1d.
+        #[arg(long)]
+        hold: Option<String>,
+        /// Share of provider-run WASM tasks to check, e.g. 0.1 or 10%.
+        #[arg(long)]
+        verify_rate: Option<String>,
+        /// Failed checks after which a provider machine gets no tasks.
+        #[arg(long)]
+        max_strikes: Option<u32>,
     },
 }
 
@@ -251,7 +374,11 @@ async fn run(cli: Cli) -> Result<i32> {
             let ttl_secs = parse_duration_ms(&ttl)? / 1000;
             let client = connect_admin(&home, &admin).await?;
             let resp = client
-                .call(AdminOp::CreateJoinToken { ttl_secs, uses })
+                .call(AdminOp::CreateJoinToken {
+                    ttl_secs,
+                    uses,
+                    invite: None,
+                })
                 .await?;
             client.close().await;
             let AdminResponse::JoinToken { ticket, .. } = resp else {
@@ -260,14 +387,80 @@ async fn run(cli: Cli) -> Result<i32> {
             println!("{ticket}");
             Ok(0)
         }
+        Cmd::Invite {
+            account,
+            ttl,
+            uses,
+            allow_docker,
+            admin,
+        } => {
+            validate_account(&account)?;
+            let ttl_secs = parse_duration_ms(&ttl)? / 1000;
+            let client = connect_admin(&home, &admin).await?;
+            let resp = client
+                .call(AdminOp::CreateJoinToken {
+                    ttl_secs,
+                    uses: Some(uses),
+                    invite: Some(Invite {
+                        account: account.clone(),
+                        allow_docker,
+                    }),
+                })
+                .await?;
+            client.close().await;
+            let AdminResponse::JoinToken { ticket, .. } = resp else {
+                bail!("unexpected response")
+            };
+            eprintln!(
+                "invite for {account} ({} machine{}, valid {ttl}, {}):",
+                uses,
+                if uses == 1 { "" } else { "s" },
+                if allow_docker {
+                    "wasm and docker"
+                } else {
+                    "wasm only"
+                }
+            );
+            eprintln!("send this command to the provider; it runs on their machine:");
+            eprintln!();
+            println!("pumasi agent join {ticket}");
+            Ok(0)
+        }
+        Cmd::Credit(cmd) => credit(&home, cmd).await,
+        Cmd::Prices { cmd, admin } => prices(&home, cmd, &admin).await,
+        Cmd::Receipts { id, export, admin } => {
+            let id: JobId = id.parse()?;
+            let client = connect_admin(&home, &admin).await?;
+            let AdminResponse::Receipts(receipts) = client.call(AdminOp::Receipts { id }).await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            match export {
+                Some(path) => {
+                    let rows: Vec<ReceiptRow> = receipts.iter().map(ReceiptRow::from).collect();
+                    std::fs::write(&path, serde_json::to_vec_pretty(&rows)?)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    eprintln!("wrote {} receipts to {}", rows.len(), path.display());
+                }
+                None => print_receipts(&receipts),
+            }
+            Ok(0)
+        }
+        Cmd::VerifyReceipts { file, cluster } => verify_receipts(&file, cluster.as_deref()),
         Cmd::Run {
             job_file,
+            account,
             detach,
             output,
             out,
             admin,
         } => {
-            let sub = JobFile::load(&job_file)?;
+            let mut sub = JobFile::load(&job_file)?;
+            if let Some(a) = &account {
+                validate_account(a)?;
+            }
+            sub.account = account;
             let tasks = sub.tasks.len();
             let client = connect_admin(&home, &admin).await?;
             let AdminResponse::Submitted { id } =
@@ -357,6 +550,7 @@ async fn run(cli: Cli) -> Result<i32> {
             memory_mb,
             input,
             out,
+            seed,
         } => {
             exec_local(
                 &module,
@@ -366,6 +560,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 memory_mb,
                 input.as_deref(),
                 &out,
+                seed.map(|s| pumasi_proto::module_hash(s.as_bytes())),
             )
             .await
         }
@@ -428,6 +623,7 @@ async fn agent(home: &Path, cmd: AgentCmd) -> Result<i32> {
         net,
         bind: opts.net.bind,
         docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
+        corrupt_results: false,
     };
     let agent = Agent::new(config).await?;
     eprintln!(
@@ -516,20 +712,52 @@ fn print_status(s: &ClusterStatus) {
     println!("cluster {} ({})", s.cluster_name, short(&s.cluster_id));
     println!();
     println!(
-        "{:<12} {:<16} {:<8} {:<14} {:<12} {:>5} {:>8} {:>10}",
-        "NODE", "NAME", "STATE", "PLATFORM", "EXECUTORS", "SLOTS", "RUNNING", "COMPLETED"
+        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:>5} {:>8} {:>10} {:>8}",
+        "NODE",
+        "NAME",
+        "STATE",
+        "ROLE",
+        "PLATFORM",
+        "EXECUTORS",
+        "SLOTS",
+        "RUNNING",
+        "COMPLETED",
+        "CHECKS"
     );
     for n in &s.nodes {
+        let role = match n.role {
+            Role::Owner => "owner".to_string(),
+            Role::Provider => format!("provider:{}", n.account),
+        };
+        let state = if n.suspended {
+            "suspended"
+        } else if n.online {
+            "online"
+        } else {
+            "offline"
+        };
+        let checks = if n.role == Role::Owner {
+            "-".to_string()
+        } else {
+            format!("{}/{}", n.checks_passed, n.strikes)
+        };
         println!(
-            "{:<12} {:<16} {:<8} {:<14} {:<12} {:>5} {:>8} {:>10}",
+            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:>5} {:>8} {:>10} {:>8}",
             short(&n.id),
             truncate(&n.info.name, 16),
-            if n.online { "online" } else { "offline" },
+            state,
+            truncate(&role, 18),
             format!("{}/{}", n.info.os, n.info.arch),
-            executor_list(&n.info.executors),
+            executor_list(&n.executors),
             n.info.slots,
             n.running,
-            n.completed
+            n.completed,
+            checks
+        );
+    }
+    if s.nodes.iter().any(|n| n.role == Role::Provider) {
+        println!(
+            "(CHECKS: passed/failed result checks; providers run WASM unless invited with --allow-docker)"
         );
     }
     if s.nodes.is_empty() {
@@ -537,18 +765,20 @@ fn print_status(s: &ClusterStatus) {
     }
     println!();
     println!(
-        "{:<17} {:<20} {:<10} {:>7} {:>7} {:>7}",
-        "JOB", "NAME", "STATE", "TASKS", "DONE", "FAILED"
+        "{:<17} {:<20} {:<10} {:>7} {:>7} {:>7} {:<10} {:>10}",
+        "JOB", "NAME", "STATE", "TASKS", "DONE", "FAILED", "ACCOUNT", "COST"
     );
     for j in s.jobs.iter().take(20) {
         println!(
-            "{:<17} {:<20} {:<10} {:>7} {:>7} {:>7}",
+            "{:<17} {:<20} {:<10} {:>7} {:>7} {:>7} {:<10} {:>10}",
             j.id.to_string(),
             truncate(&j.name, 20),
             j.state.to_string(),
             j.tasks,
             j.succeeded,
-            j.failed
+            j.failed,
+            truncate(&j.account, 10),
+            format_credits(j.cost)
         );
     }
     if s.jobs.is_empty() {
@@ -563,6 +793,16 @@ fn print_job(v: &JobView, output: bool) {
         Some(image) => println!("  executor {} ({image})", v.executor),
         None => println!("  executor {}", v.executor),
     }
+    println!(
+        "  account {}  cost {} credits{}",
+        s.account,
+        format_credits(s.cost),
+        if v.deterministic {
+            "  deterministic"
+        } else {
+            ""
+        }
+    );
     let files: usize = v.tasks.iter().map(|t| t.output_files.len()).sum();
     print!(
         "  tasks {}  succeeded {}  failed {}",
@@ -583,17 +823,36 @@ fn print_job(v: &JobView, output: bool) {
             TaskState::Succeeded => "ok".to_string(),
             TaskState::Failed(o) => format!("failed ({o})"),
             TaskState::Cancelled => "cancelled".to_string(),
+            TaskState::Verifying => "checking".to_string(),
+        };
+        let check = match &t.verification {
+            Verification::NotChecked => String::new(),
+            Verification::Pending => " check=pending".into(),
+            Verification::Passed => " check=passed".into(),
+            Verification::Mismatch { bad } => format!(
+                " check=MISMATCH (rejected {})",
+                bad.iter().map(|b| short(b)).collect::<Vec<_>>().join(",")
+            ),
+            Verification::Inconclusive => " check=inconclusive".into(),
+            Verification::Skipped(why) => format!(" check=skipped ({why})"),
+        };
+        let cost = if t.cost > 0 {
+            format!(" cost={}", format_credits(t.cost))
+        } else {
+            String::new()
         };
         let show_line = output || !matches!(t.state, TaskState::Succeeded) || v.tasks.len() <= 20;
         if show_line {
             let _ = writeln!(
                 stdout,
-                "  [{}] {} node={} attempts={} {}ms",
+                "  [{}] {} node={} attempts={} {}ms{}{}",
                 t.index,
                 state,
                 t.node.as_deref().map(short).unwrap_or("-"),
                 t.attempts,
-                t.wall_ms
+                t.wall_ms,
+                cost,
+                check
             );
         }
         if output {
@@ -652,6 +911,7 @@ async fn download_outputs(
     Ok(count)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn exec_local(
     module: &Path,
     args: Vec<String>,
@@ -660,6 +920,7 @@ async fn exec_local(
     memory_mb: u64,
     input_dir: Option<&Path>,
     out_dir: &Path,
+    seed: Option<[u8; 32]>,
 ) -> Result<i32> {
     let bytes = std::fs::read(module).with_context(|| format!("read {}", module.display()))?;
     let hash = pumasi_proto::module_hash(&bytes);
@@ -701,6 +962,7 @@ async fn exec_local(
             &input,
             &shared,
             &limits,
+            seed,
             Arc::new(AtomicBool::new(false)),
         ))
     })
@@ -735,5 +997,394 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n - 1).collect::<String>() + "…"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Credit, prices and receipts
+// ---------------------------------------------------------------------------
+
+async fn credit(home: &Path, cmd: CreditCmd) -> Result<i32> {
+    match cmd {
+        CreditCmd::List { admin } => {
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Accounts(accounts) = client.call(AdminOp::Accounts).await? else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            print_accounts(&accounts);
+        }
+        CreditCmd::Add {
+            account,
+            amount,
+            memo,
+            admin,
+        } => {
+            validate_account(&account)?;
+            let amount = parse_credits(&amount)?;
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Accounts(a) = client
+                .call(AdminOp::Deposit {
+                    account,
+                    amount,
+                    memo,
+                })
+                .await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            print_accounts(&a);
+        }
+        CreditCmd::Payout {
+            account,
+            amount,
+            memo,
+            admin,
+        } => {
+            let amount = parse_credits(&amount)?;
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Accounts(a) = client
+                .call(AdminOp::Payout {
+                    account,
+                    amount,
+                    memo,
+                })
+                .await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            print_accounts(&a);
+        }
+        CreditCmd::Ledger {
+            account,
+            limit,
+            admin,
+        } => {
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Ledger(entries) =
+                client.call(AdminOp::Ledger { account, limit }).await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            print_ledger(&entries);
+        }
+    }
+    Ok(0)
+}
+
+fn print_accounts(accounts: &[AccountView]) {
+    println!(
+        "{:<16} {:>14} {:>14} {:>14} {:>14}",
+        "ACCOUNT", "AVAILABLE", "HELD", "SPENT", "EARNED"
+    );
+    for a in accounts {
+        println!(
+            "{:<16} {:>14} {:>14} {:>14} {:>14}",
+            truncate(&a.name, 16),
+            format_credits(a.balance),
+            format_credits(a.held),
+            format_credits(a.spent),
+            format_credits(a.earned)
+        );
+    }
+}
+
+fn print_ledger(entries: &[LedgerEntry]) {
+    println!(
+        "{:>6} {:<20} {:<12} {:<9} {:>14}  DETAIL",
+        "SEQ", "TIME (UTC)", "ACCOUNT", "KIND", "AMOUNT"
+    );
+    for e in entries {
+        let amount = match e.kind {
+            // These move held money, not the spendable balance.
+            LedgerKind::Hold | LedgerKind::Forfeit => format!("({})", format_credits(e.amount)),
+            _ => format_credits(e.amount),
+        };
+        let mut detail = e.task.map(|t| t.to_string()).unwrap_or_default();
+        if !e.memo.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str("  ");
+            }
+            detail.push_str(&e.memo);
+        }
+        println!(
+            "{:>6} {:<20} {:<12} {:<9} {:>14}  {}",
+            e.seq,
+            utc(e.unix),
+            truncate(&e.account, 12),
+            e.kind.to_string(),
+            amount,
+            detail
+        );
+    }
+    if entries.is_empty() {
+        println!("(no entries)");
+    } else {
+        println!("(amounts in parentheses move held earnings, not the available balance)");
+    }
+}
+
+async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Result<i32> {
+    let client = connect_admin(home, admin).await?;
+    let AdminResponse::Policy(mut p) = client.call(AdminOp::GetPolicy).await? else {
+        bail!("unexpected response");
+    };
+    if let Some(PricesCmd::Set {
+        wasm_per_gfuel,
+        docker_cpu_hour,
+        memory_gib_hour,
+        hold,
+        verify_rate,
+        max_strikes,
+    }) = cmd
+    {
+        if let Some(v) = wasm_per_gfuel {
+            p.prices.wasm_per_gfuel = parse_credits(&v)?;
+        }
+        if let Some(v) = docker_cpu_hour {
+            p.prices.docker_cpu_hour = parse_credits(&v)?;
+        }
+        if let Some(v) = memory_gib_hour {
+            p.prices.memory_gib_hour = parse_credits(&v)?;
+        }
+        if let Some(v) = hold {
+            p.hold_secs = parse_duration_ms(&v)? / 1000;
+        }
+        if let Some(v) = verify_rate {
+            p.verify_permille = parse_rate_permille(&v)?;
+        }
+        if let Some(v) = max_strikes {
+            p.max_strikes = v;
+        }
+        let AdminResponse::Policy(saved) = client.call(AdminOp::SetPolicy(p)).await? else {
+            bail!("unexpected response");
+        };
+        p = saved;
+        eprintln!("saved");
+    }
+    client.close().await;
+    print_policy(&p);
+    Ok(0)
+}
+
+fn print_policy(p: &Policy) {
+    println!("price list (credits)");
+    println!(
+        "  wasm-per-gfuel   {:>12}  per billion fuel units",
+        format_credits(p.prices.wasm_per_gfuel)
+    );
+    println!(
+        "  docker-cpu-hour  {:>12}  per core-hour of wall time",
+        format_credits(p.prices.docker_cpu_hour)
+    );
+    println!(
+        "  memory-gib-hour  {:>12}  per GiB-hour of reserved memory",
+        format_credits(p.prices.memory_gib_hour)
+    );
+    println!("settlement");
+    println!(
+        "  hold             {:>12}  before provider earnings become available",
+        human_secs(p.hold_secs)
+    );
+    println!(
+        "  verify-rate      {:>11}%  of provider-run WASM tasks re-run elsewhere (new or flagged providers: more)",
+        p.verify_permille as f64 / 10.0
+    );
+    println!(
+        "  max-strikes      {:>12}  failed checks before a provider machine is suspended",
+        p.max_strikes
+    );
+    println!("runs on machines of the job's own account are free.");
+}
+
+fn human_secs(s: u64) -> String {
+    if s > 0 && s.is_multiple_of(86_400) {
+        format!("{}d", s / 86_400)
+    } else if s > 0 && s.is_multiple_of(3600) {
+        format!("{}h", s / 3600)
+    } else if s > 0 && s.is_multiple_of(60) {
+        format!("{}m", s / 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// One exported receipt: readable fields plus the exact signed encoding.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReceiptRow {
+    id: String,
+    job: String,
+    task: u32,
+    attempt: u32,
+    check: bool,
+    node: String,
+    cluster: String,
+    executor: String,
+    outcome: String,
+    fuel_used: u64,
+    wall_ms: u64,
+    billed_wall_ms: u64,
+    memory_limit_bytes: u64,
+    peak_memory_bytes: Option<u64>,
+    consumer: String,
+    provider: String,
+    amount: String,
+    recorded_unix: u64,
+    receipt: String,
+}
+
+impl From<&Receipt> for ReceiptRow {
+    fn from(r: &Receipt) -> Self {
+        let u = &r.usage;
+        let b = &r.billing;
+        Self {
+            id: data_hex(&r.id()),
+            job: u.task.job.to_string(),
+            task: u.task.index,
+            attempt: u.task.attempt,
+            check: u.task.check,
+            node: r.node_id(),
+            cluster: r.cluster_id(),
+            executor: u.executor.to_string(),
+            outcome: u.outcome.to_string(),
+            fuel_used: u.fuel_used,
+            wall_ms: u.wall_ms,
+            billed_wall_ms: b.billed_wall_ms,
+            memory_limit_bytes: u.memory_limit_bytes,
+            peak_memory_bytes: u.peak_memory_bytes,
+            consumer: b.consumer.clone(),
+            provider: b.provider.clone(),
+            amount: format_credits(b.amount),
+            recorded_unix: b.recorded_unix,
+            receipt: r.to_blob(),
+        }
+    }
+}
+
+fn data_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn print_receipts(receipts: &[Receipt]) {
+    println!(
+        "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12}",
+        "RECEIPT", "RUN", "NODE", "OUTCOME", "FUEL", "WALL ms", "PEAK MiB", "PROVIDER", "AMOUNT"
+    );
+    for r in receipts {
+        let u = &r.usage;
+        let run = format!(
+            "{}#{}{}",
+            u.task.index,
+            u.task.attempt,
+            if u.task.check { "c" } else { "" }
+        );
+        println!(
+            "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12}",
+            r.short_id(),
+            run,
+            short(&r.node_id()),
+            truncate(&u.outcome.to_string(), 12),
+            u.fuel_used,
+            r.billing.billed_wall_ms,
+            u.peak_memory_bytes
+                .map(|b| format!("{:.1}", b as f64 / (1 << 20) as f64))
+                .unwrap_or_else(|| "-".into()),
+            truncate(&r.billing.provider, 10),
+            format_credits(r.billing.amount)
+        );
+    }
+    if receipts.is_empty() {
+        println!("(no receipts yet)");
+    } else {
+        println!("(RUN: task#attempt, c = check run; export with --export to verify offline)");
+    }
+}
+
+fn verify_receipts(file: &Path, cluster: Option<&str>) -> Result<i32> {
+    let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let rows: Vec<ReceiptRow> = serde_json::from_str(&text).context("not a receipts export")?;
+    let mut bad = 0;
+    for row in &rows {
+        let verdict = (|| -> Result<()> {
+            let r = Receipt::from_blob(&row.receipt)?;
+            r.verify()?;
+            // The readable fields must say what the signed encoding says.
+            let expect = ReceiptRow::from(&r);
+            anyhow::ensure!(
+                serde_json::to_value(&expect)? == serde_json::to_value(row)?,
+                "readable fields were edited"
+            );
+            if let Some(c) = cluster {
+                anyhow::ensure!(
+                    r.cluster_id().starts_with(c.trim()),
+                    "signed by another control plane ({})",
+                    short(&r.cluster_id())
+                );
+            }
+            Ok(())
+        })();
+        match verdict {
+            Ok(()) => println!(
+                "ok   {} {}/{}#{}",
+                &row.id[..12.min(row.id.len())],
+                row.job,
+                row.task,
+                row.attempt
+            ),
+            Err(e) => {
+                bad += 1;
+                println!(
+                    "BAD  {} {}/{}#{}: {e:#}",
+                    &row.id[..12.min(row.id.len())],
+                    row.job,
+                    row.task,
+                    row.attempt
+                );
+            }
+        }
+    }
+    println!(
+        "{} receipts, {} valid, {} invalid",
+        rows.len(),
+        rows.len() - bad,
+        bad
+    );
+    Ok(if bad == 0 { 0 } else { 1 })
+}
+
+/// `YYYY-MM-DD HH:MM:SS` in UTC, without a date library.
+fn utc(unix: u64) -> String {
+    let days = (unix / 86_400) as i64;
+    let secs = unix % 86_400;
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_dates() {
+        assert_eq!(utc(0), "1970-01-01 00:00:00");
+        assert_eq!(utc(946_684_800), "2000-01-01 00:00:00");
+        assert_eq!(utc(1_793_793_000), "2026-11-04 11:50:00");
     }
 }

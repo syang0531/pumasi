@@ -12,8 +12,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ModuleHash, Secret,
+    economy::{Micros, Policy},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput},
+    receipt::{Receipt, SignedUsage},
 };
+
+/// What a member machine is to the cluster.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    /// One of the cluster owner's own machines. Trusted: runs every
+    /// executor it offers, and its results settle checks.
+    #[default]
+    Owner,
+    /// Someone else's machine, admitted with an invite. Runs WASM only
+    /// (unless the invite allowed Docker), gets paid in credits, and has a
+    /// sample of its results re-run elsewhere.
+    Provider,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Role::Owner => "owner",
+            Role::Provider => "provider",
+        })
+    }
+}
+
+/// The account of the cluster owner: owns every `Role::Owner` machine and
+/// is the default consumer for submitted jobs.
+pub const OWNER_ACCOUNT: &str = "owner";
 
 // ---------------------------------------------------------------------------
 // Agent protocol
@@ -48,6 +76,9 @@ pub enum HelloReply {
         cluster_name: String,
         /// How often the agent must send a heartbeat.
         heartbeat_ms: u64,
+        role: Role,
+        /// Account this node earns for.
+        account: String,
     },
     Rejected {
         reason: String,
@@ -55,17 +86,24 @@ pub enum HelloReply {
 }
 
 /// One placement of one task. `attempt` distinguishes retries so stale
-/// reports from a node that was presumed dead can be ignored.
+/// reports from a node that was presumed dead can be ignored. A check run
+/// (a replica that verifies another node's result) has its own attempt
+/// counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskRef {
     pub job: JobId,
     pub index: u32,
     pub attempt: u32,
+    pub check: bool,
 }
 
 impl std::fmt::Display for TaskRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}#{}", self.job, self.index, self.attempt)
+        write!(f, "{}/{}#{}", self.job, self.index, self.attempt)?;
+        if self.check {
+            f.write_str("(check)")?;
+        }
+        Ok(())
     }
 }
 
@@ -87,6 +125,10 @@ pub struct TaskAssignment {
     pub files: Option<Vec<FileEntry>>,
     pub input: TaskInput,
     pub limits: Limits,
+    /// Run in deterministic mode with this seed: a virtual clock and seeded
+    /// random numbers, so every honest node produces the same result (WASM
+    /// only).
+    pub seed: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +185,9 @@ pub struct TaskReport {
     /// Fuel consumed: a hardware-independent measure of work done (WASM).
     pub fuel_used: u64,
     pub wall_ms: u64,
+    /// The node's signed usage. Absent only when the agent could not start
+    /// the task at all (`Outcome::Error`).
+    pub usage: Option<SignedUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,9 +208,12 @@ pub struct AdminRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminOp {
+    /// A ticket for one of the owner's own machines, or with `invite`, for
+    /// someone else's machine joining as a provider.
     CreateJoinToken {
         ttl_secs: u64,
         uses: Option<u32>,
+        invite: Option<Invite>,
     },
     Submit(Box<JobSubmission>),
     Status,
@@ -184,6 +232,42 @@ pub enum AdminOp {
     RemoveNode {
         id: String,
     },
+    /// Countersigned usage receipts of one job.
+    Receipts {
+        id: JobId,
+    },
+    /// Account balances.
+    Accounts,
+    /// Ledger entries, newest first.
+    Ledger {
+        account: Option<String>,
+        limit: u32,
+    },
+    /// Adds prepaid credit to an account (accounting only).
+    Deposit {
+        account: String,
+        amount: Micros,
+        memo: String,
+    },
+    /// Records a payout from an account's available balance.
+    Payout {
+        account: String,
+        amount: Micros,
+        memo: String,
+    },
+    GetPolicy,
+    SetPolicy(Policy),
+}
+
+/// Terms of an invite for someone else's machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invite {
+    /// Account the machine earns for, usually its owner's name.
+    pub account: String,
+    /// Let this machine run Docker jobs too (it must also opt in with
+    /// `--allow-docker`). Off by default: containers share the provider's
+    /// kernel, and the provider can see and alter everything in them.
+    pub allow_docker: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,8 +277,70 @@ pub enum AdminResponse {
     Status(ClusterStatus),
     Job(Box<JobView>),
     Files(Vec<FileEntry>),
+    Receipts(Vec<Receipt>),
+    Accounts(Vec<AccountView>),
+    Ledger(Vec<LedgerEntry>),
+    Policy(Policy),
     Ok,
     Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountView {
+    pub name: String,
+    /// Spendable credit. Negative when charges overran the prepaid amount.
+    pub balance: Micros,
+    /// Earnings waiting out the hold period.
+    pub held: Micros,
+    /// Totals since the account was created.
+    pub spent: Micros,
+    pub earned: Micros,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LedgerKind {
+    /// Prepaid credit added by the owner.
+    Deposit,
+    /// Credit paid out.
+    Payout,
+    /// A consumer paying for a run.
+    Charge,
+    /// A provider's earning entering the hold.
+    Hold,
+    /// A held earning becoming spendable.
+    Release,
+    /// A held earning cancelled because the run failed a check.
+    Forfeit,
+    /// A consumer getting a forfeited charge back.
+    Refund,
+}
+
+impl std::fmt::Display for LedgerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LedgerKind::Deposit => "deposit",
+            LedgerKind::Payout => "payout",
+            LedgerKind::Charge => "charge",
+            LedgerKind::Hold => "hold",
+            LedgerKind::Release => "release",
+            LedgerKind::Forfeit => "forfeit",
+            LedgerKind::Refund => "refund",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub seq: u64,
+    pub unix: u64,
+    pub account: String,
+    pub kind: LedgerKind,
+    /// Change to the account's spendable balance (`Hold` and `Forfeit`
+    /// change the held amount instead).
+    pub amount: Micros,
+    /// The run this entry is about, if any.
+    pub task: Option<TaskRef>,
+    pub memo: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,16 +377,47 @@ impl std::fmt::Display for JobState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
     Pending,
-    Running { node: String },
+    Running {
+        node: String,
+    },
     Succeeded,
     Failed(Outcome),
     Cancelled,
+    /// Finished on a provider; a check run on another node is pending.
+    Verifying,
+}
+
+/// Whether a task's result was checked by running it again elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verification {
+    /// Ran on a trusted node, or was not picked for a check.
+    NotChecked,
+    /// Picked; the check run has not finished yet.
+    Pending,
+    /// The check run agreed.
+    Passed,
+    /// A run disagreed with the accepted result; `bad` lists the nodes
+    /// whose runs were rejected (their earnings are forfeited).
+    Mismatch { bad: Vec<String> },
+    /// Runs disagreed and no majority or trusted run settled it.
+    Inconclusive,
+    /// The check was dropped (job cancelled, no node to run it).
+    Skipped(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeView {
     pub id: String,
     pub info: NodeInfo,
+    pub role: Role,
+    pub account: String,
+    /// Executors the cluster will actually send this node.
+    pub executors: Vec<Executor>,
+    /// Checks this node's runs passed and failed.
+    pub checks_passed: u32,
+    pub strikes: u32,
+    /// Too many failed checks: gets no tasks.
+    pub suspended: bool,
     pub online: bool,
     pub running: u32,
     pub completed: u64,
@@ -257,6 +434,9 @@ pub struct JobSummary {
     pub failed: u32,
     pub running: u32,
     pub submitted_unix: u64,
+    pub account: String,
+    /// Credits charged so far.
+    pub cost: Micros,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +460,9 @@ pub struct TaskView {
     pub stderr: Option<Vec<u8>>,
     /// Names and sizes of the files the task wrote to `/output`.
     pub output_files: Vec<(String, u64)>,
+    pub verification: Verification,
+    /// Credits charged for this task's runs (including check runs).
+    pub cost: Micros,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,4 +473,5 @@ pub struct JobView {
     pub limits: Limits,
     pub tasks: Vec<TaskView>,
     pub total_fuel: u64,
+    pub deterministic: bool,
 }

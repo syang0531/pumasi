@@ -7,9 +7,14 @@ use anyhow::Result;
 use pumasi_agent::{Agent, AgentConfig};
 use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
+    economy::{Policy, PriceList},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
-    msg::{AdminOp, AdminResponse, JobState, JobView, TaskState},
+    msg::{
+        AccountView, AdminOp, AdminResponse, Invite, JobState, JobView, LedgerKind, Role,
+        TaskState, Verification,
+    },
     net::NetMode,
+    receipt::Receipt,
     ticket::JoinTicket,
 };
 use tokio::task::JoinHandle;
@@ -98,6 +103,7 @@ async fn agent(name: &str, slots: u32, dir: PathBuf) -> Agent {
         net: NetMode::Local,
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: None,
+        corrupt_results: false,
     })
     .await
     .unwrap()
@@ -146,6 +152,9 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         tier: Tier::Open,
         max_attempts: 3,
         max_price_per_hour: None,
+        account: None,
+        // These tests time tasks with the real clock.
+        deterministic: false,
     }
 }
 
@@ -430,6 +439,355 @@ async fn state_survives_a_control_plane_restart() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2: invited providers, receipts, credit, checks
+// ---------------------------------------------------------------------------
+
+async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent {
+    Agent::new(AgentConfig {
+        data_dir: dir,
+        name: name.into(),
+        slots: Some(slots),
+        net: NetMode::Local,
+        bind: Some("127.0.0.1:0".parse().unwrap()),
+        docker: None,
+        corrupt_results: corrupt,
+    })
+    .await
+    .unwrap()
+}
+
+fn invite(cluster: &Cluster, account: &str) -> JoinTicket {
+    cluster
+        .create_invite(
+            Duration::from_secs(60),
+            Some(1),
+            Some(Invite {
+                account: account.into(),
+                allow_docker: false,
+            }),
+        )
+        .unwrap()
+}
+
+/// Prices that make the echo task cost a visible amount: one credit per
+/// million fuel units.
+fn test_policy(hold_secs: u64, verify_permille: u32, max_strikes: u32) -> Policy {
+    Policy {
+        prices: PriceList {
+            wasm_per_gfuel: 1_000_000_000,
+            docker_cpu_hour: 0,
+            memory_gib_hour: 0,
+        },
+        hold_secs,
+        verify_permille,
+        max_strikes,
+    }
+}
+
+async fn set_policy(client: &AdminClient, p: Policy) {
+    client.call(AdminOp::SetPolicy(p)).await.unwrap();
+}
+
+async fn accounts(client: &AdminClient) -> Vec<AccountView> {
+    match client.call(AdminOp::Accounts).await.unwrap() {
+        AdminResponse::Accounts(a) => a,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+async fn account(client: &AdminClient, name: &str) -> AccountView {
+    accounts(client)
+        .await
+        .into_iter()
+        .find(|a| a.name == name)
+        .unwrap_or_else(|| panic!("no account {name}"))
+}
+
+async fn deposit(client: &AdminClient, name: &str, credits: i64) {
+    client
+        .call(AdminOp::Deposit {
+            account: name.into(),
+            amount: credits * 1_000_000,
+            memo: "test".into(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn receipts(client: &AdminClient, id: JobId) -> Vec<Receipt> {
+    match client.call(AdminOp::Receipts { id }).await.unwrap() {
+        AdminResponse::Receipts(r) => r,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+fn deterministic_echo(n: usize) -> JobSubmission {
+    let shards: Vec<String> = (0..n).map(|i| format!("shard-{i}")).collect();
+    let mut sub = submission(shards.iter().map(|s| vec![s.as_str()]).collect());
+    sub.deterministic = true;
+    sub
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invited_provider_is_paid_from_prepaid_credit() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    // No checks here (there is no second node to run them); a short hold.
+    set_policy(&client, test_policy(1, 0, 3)).await;
+
+    let p = spawn_join(
+        provider("bobs-pc", 2, tempdir("p"), false).await,
+        invite(&cluster, "bob"),
+    );
+    wait_online(&cluster, 1).await;
+    let node = cluster.status().nodes[0].clone();
+    assert_eq!(node.role, Role::Provider);
+    assert_eq!(node.account, "bob");
+    assert_eq!(node.executors, vec![Executor::Wasm]);
+
+    // Without credit the owner's job does not go to bob's machine.
+    let id = submit(&client, deterministic_echo(4)).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let AdminResponse::Job(view) = client
+        .call(AdminOp::Job {
+            id,
+            with_output: false,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(view.summary.state, JobState::Queued, "{view:#?}");
+
+    // Prepaid credit unblocks it.
+    deposit(&client, "owner", 1000).await;
+    let view = wait_job(&client, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    for (i, t) in view.tasks.iter().enumerate() {
+        assert_eq!(t.stdout.as_deref(), Some(format!("shard-{i}").as_bytes()));
+        assert!(t.cost > 0);
+    }
+    let cost = view.summary.cost;
+    assert!(cost > 0);
+    assert_eq!(cost, view.tasks.iter().map(|t| t.cost).sum::<i64>());
+
+    // One countersigned receipt per run, each verifiable on its own.
+    let rs = receipts(&client, id).await;
+    assert_eq!(rs.len(), 4);
+    for r in &rs {
+        r.verify().unwrap();
+        assert_eq!(r.billing.consumer, "owner");
+        assert_eq!(r.billing.provider, "bob");
+        assert_eq!(r.node_id(), node.id);
+        assert_eq!(r.cluster_id(), cluster.status().cluster_id);
+        assert!(r.usage.fuel_used > 0);
+        assert!(r.usage.peak_memory_bytes.unwrap() >= 65536);
+        assert!(r.billing.billed_wall_ms <= r.usage.wall_ms);
+        // One credit per million fuel.
+        assert_eq!(r.billing.amount, r.usage.fuel_used as i64);
+    }
+    assert_eq!(rs.iter().map(|r| r.billing.amount).sum::<i64>(), cost);
+
+    let owner = account(&client, "owner").await;
+    assert_eq!(owner.balance, 1000 * 1_000_000 - cost);
+    assert_eq!(owner.spent, cost);
+
+    // After the hold period bob's earnings become available.
+    let mut bob = account(&client, "bob").await;
+    for _ in 0..100 {
+        if bob.held == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        bob = account(&client, "bob").await;
+    }
+    assert_eq!((bob.balance, bob.held, bob.earned), (cost, 0, cost));
+
+    // Payouts come out of the available balance only.
+    assert!(
+        client
+            .call(AdminOp::Payout {
+                account: "bob".into(),
+                amount: cost + 1,
+                memo: String::new(),
+            })
+            .await
+            .is_err()
+    );
+    client
+        .call(AdminOp::Payout {
+            account: "bob".into(),
+            amount: cost,
+            memo: "test".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(account(&client, "bob").await.balance, 0);
+
+    let AdminResponse::Ledger(entries) = client
+        .call(AdminOp::Ledger {
+            account: Some("bob".into()),
+            limit: 100,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let kinds: Vec<LedgerKind> = entries.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds.iter().filter(|k| **k == LedgerKind::Hold).count(), 4);
+    assert_eq!(
+        kinds.iter().filter(|k| **k == LedgerKind::Release).count(),
+        4
+    );
+    assert_eq!(kinds[0], LedgerKind::Payout, "newest first");
+
+    // The owner account cannot be handed out in an invite.
+    assert!(
+        client
+            .call(AdminOp::CreateJoinToken {
+                ttl_secs: 60,
+                uses: Some(1),
+                invite: Some(Invite {
+                    account: "owner".into(),
+                    allow_docker: false,
+                }),
+            })
+            .await
+            .is_err()
+    );
+
+    client.close().await;
+    p.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checks_catch_a_dishonest_provider() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    // Check every provider result; long hold so nothing is released.
+    set_policy(&client, test_policy(3600, 1000, 2)).await;
+    deposit(&client, "owner", 1000).await;
+
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let o = spawn_join(agent("own", 1, tempdir("o")).await, ticket);
+    let h = spawn_join(
+        provider("honest", 1, tempdir("h"), false).await,
+        invite(&cluster, "alice"),
+    );
+    let m = spawn_join(
+        provider("cheat", 1, tempdir("m"), true).await,
+        invite(&cluster, "mallory"),
+    );
+    wait_online(&cluster, 3).await;
+    let id_of = |name: &str| {
+        cluster
+            .status()
+            .nodes
+            .iter()
+            .find(|n| n.info.name == name)
+            .unwrap()
+            .id
+            .clone()
+    };
+    let (honest_id, cheat_id) = (id_of("honest"), id_of("cheat"));
+
+    let id = submit(&client, deterministic_echo(6)).await;
+    let view = wait_job(&client, id, 60).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    let mut caught = 0;
+    for (i, t) in view.tasks.iter().enumerate() {
+        // Every result is correct: the cheat's were replaced by the
+        // trusted check run's.
+        assert_eq!(
+            t.stdout.as_deref(),
+            Some(format!("shard-{i}").as_bytes()),
+            "{view:#?}"
+        );
+        if let Verification::Mismatch { bad } = &t.verification {
+            assert_eq!(bad, &vec![cheat_id.clone()]);
+            caught += 1;
+        }
+    }
+    assert!(caught >= 1, "the cheat should have been caught: {view:#?}");
+
+    let status = cluster.status();
+    let cheat = status.nodes.iter().find(|n| n.id == cheat_id).unwrap();
+    let honest = status.nodes.iter().find(|n| n.id == honest_id).unwrap();
+    assert_eq!(cheat.strikes, caught);
+    assert_eq!(honest.strikes, 0);
+    let honest_ran = view
+        .tasks
+        .iter()
+        .filter(|t| t.verification == Verification::Passed)
+        .count() as u32;
+    // It may also have run check runs for other tasks.
+    assert!(honest.checks_passed >= honest_ran);
+
+    // Mallory's held earnings were forfeited and refunded; alice keeps hers
+    // on hold.
+    let mallory = account(&client, "mallory").await;
+    assert_eq!((mallory.held, mallory.earned, mallory.balance), (0, 0, 0));
+    let alice = account(&client, "alice").await;
+    let owner = account(&client, "owner").await;
+    assert_eq!(
+        owner.spent, alice.held,
+        "owner pays only for accepted provider runs"
+    );
+    assert_eq!(owner.balance, 1000 * 1_000_000 - owner.spent);
+    let AdminResponse::Ledger(entries) = client
+        .call(AdminOp::Ledger {
+            account: None,
+            limit: 1000,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let forfeits = entries
+        .iter()
+        .filter(|e| e.kind == LedgerKind::Forfeit)
+        .count() as u32;
+    let refunds = entries
+        .iter()
+        .filter(|e| e.kind == LedgerKind::Refund)
+        .count() as u32;
+    assert_eq!((forfeits, refunds), (caught, caught));
+
+    // The cheat's receipts are still valid signatures: it signed what it
+    // claimed. The check, not the signature, is what caught it.
+    for r in receipts(&client, id).await {
+        r.verify().unwrap();
+    }
+
+    // Enough strikes suspend the machine: new work avoids it.
+    if caught >= 2 {
+        assert!(cheat.suspended);
+        let id = submit(&client, deterministic_echo(4)).await;
+        let view = wait_job(&client, id, 60).await;
+        assert_eq!(view.summary.state, JobState::Succeeded);
+        assert!(
+            view.tasks
+                .iter()
+                .all(|t| t.node.as_deref() != Some(&cheat_id))
+        );
+    }
+
+    client.close().await;
+    o.kill().await;
+    h.kill().await;
+    m.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // Docker executor (skipped when no Docker daemon is available)
 // ---------------------------------------------------------------------------
 
@@ -467,6 +825,8 @@ fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
         tier: Tier::Open,
         max_attempts: 3,
         max_price_per_hour: None,
+        account: None,
+        deterministic: false,
     }
 }
 
@@ -489,6 +849,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         net: NetMode::Local,
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: Some("docker".into()),
+        corrupt_results: false,
     })
     .await
     .unwrap();

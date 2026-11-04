@@ -207,6 +207,7 @@ impl DockerExecutor {
                 files: vec![],
                 fuel_used: 0,
                 wall_ms: start.elapsed().as_millis() as u64,
+                peak_memory_bytes: None,
             },
         }
     }
@@ -338,6 +339,7 @@ impl DockerExecutor {
             files,
             fuel_used: 0,
             wall_ms: start.elapsed().as_millis() as u64,
+            peak_memory_bytes: None,
         })
     }
 

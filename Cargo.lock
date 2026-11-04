@@ -2901,6 +2901,7 @@ dependencies = [
  "blake3",
  "iroh",
  "pumasi-proto",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sysinfo",

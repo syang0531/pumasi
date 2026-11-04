@@ -29,6 +29,8 @@ wasmtime-wasi = "50"
 wat = "1"
 blake3 = "1"
 rand = "0.9"
+# Same version wasmtime-wasi uses, for seeding its random sources.
+rand010 = { package = "rand", version = "0.10" }
 data-encoding = "2"
 sysinfo = "0.37"
 redb = "4"

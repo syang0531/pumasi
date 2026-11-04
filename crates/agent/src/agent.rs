@@ -10,14 +10,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use pumasi_proto::{
     AGENT_ALPN, ModuleHash, PROTOCOL_VERSION, Secret,
     job::{Executor, FileEntry},
     msg::{
-        AgentHello, FromAgent, HelloReply, NodeInfo, TaskAssignment, TaskRef, TaskReport, ToAgent,
+        AgentHello, FromAgent, HelloReply, NodeInfo, Role, TaskAssignment, TaskRef, TaskReport,
+        ToAgent,
     },
     net::{NetMode, bind_endpoint, load_or_create_key},
+    receipt::{SignedUsage, Usage, result_digest},
     ticket::JoinTicket,
     wire::{read_msg, write_msg},
 };
@@ -42,6 +44,10 @@ pub struct AgentConfig {
     /// Docker CLI to use for docker jobs (`docker` or `podman`). `None`
     /// means this node runs WASM tasks only.
     pub docker: Option<String>,
+    /// Test hook: tamper with every successful result before reporting it,
+    /// like a provider that skips the work. Never set this in real use.
+    #[doc(hidden)]
+    pub corrupt_results: bool,
 }
 
 /// What the agent remembers about the cluster it joined.
@@ -49,12 +55,18 @@ pub struct AgentConfig {
 pub struct Membership {
     pub cluster: EndpointAddr,
     pub cluster_name: String,
+    #[serde(default)]
+    pub role: Role,
+    #[serde(default)]
+    pub account: String,
 }
 
 type FileCache = Arc<Mutex<HashMap<ModuleHash, Arc<Vec<FileEntry>>>>>;
 
 pub struct Agent {
     endpoint: Endpoint,
+    /// Signs usage receipts. The same key as the endpoint identity.
+    key: SecretKey,
     executor: WasmExecutor,
     docker: Option<DockerExecutor>,
     /// Shared job files by content hash.
@@ -76,7 +88,7 @@ enum SessionEnd {
 impl Agent {
     pub async fn new(config: AgentConfig) -> Result<Self> {
         let key = load_or_create_key(&config.data_dir.join(KEY_FILE))?;
-        let endpoint = bind_endpoint(key, config.net, vec![], config.bind).await?;
+        let endpoint = bind_endpoint(key.clone(), config.net, vec![], config.bind).await?;
         let executor = WasmExecutor::new()?;
         let docker =
             match &config.docker {
@@ -94,6 +106,7 @@ impl Agent {
         }
         Ok(Self {
             endpoint,
+            key,
             executor,
             docker,
             files: Default::default(),
@@ -185,20 +198,29 @@ impl Agent {
         if let Err(e) = write_msg(&mut send, &hello).await {
             return SessionEnd::Failed(e);
         }
-        let (cluster_name, heartbeat_ms) = match read_msg::<_, HelloReply>(&mut recv).await {
+        let (cluster_name, heartbeat_ms, role, account) = match read_msg::<_, HelloReply>(&mut recv)
+            .await
+        {
             Ok(Some(HelloReply::Welcome {
                 cluster_name,
                 heartbeat_ms,
-            })) => (cluster_name, heartbeat_ms),
+                role,
+                account,
+            })) => (cluster_name, heartbeat_ms, role, account),
             Ok(Some(HelloReply::Rejected { reason })) => return SessionEnd::Rejected(reason),
             Ok(None) => return SessionEnd::Failed(anyhow::anyhow!("cluster closed the stream")),
             Err(e) => return SessionEnd::Failed(e),
         };
-        info!(cluster = %cluster_name, node = %self.id().fmt_short(), slots = self.info.slots, "joined cluster");
+        info!(cluster = %cluster_name, node = %self.id().fmt_short(), slots = self.info.slots, %role, %account, "joined cluster");
+        if role == Role::Provider && self.docker.is_some() {
+            info!("docker jobs run here only if the cluster's invite allowed them");
+        }
         if join_secret.take().is_some() {
             let m = Membership {
                 cluster: cluster.clone(),
                 cluster_name: cluster_name.clone(),
+                role,
+                account: account.clone(),
             };
             if let Err(e) = self.save_membership(&m) {
                 warn!("could not save membership: {e:#}");
@@ -259,7 +281,7 @@ impl Agent {
                         _ => None,
                     };
                     match load_error {
-                        None => self.start_task(*a, &running, &out_tx),
+                        None => self.start_task(*a, *cluster.id.as_bytes(), &running, &out_tx),
                         Some(e) => {
                             let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
                                 a.task,
@@ -291,6 +313,7 @@ impl Agent {
     fn start_task(
         &self,
         a: TaskAssignment,
+        cluster: [u8; 32],
         running: &Arc<Mutex<HashMap<TaskRef, Arc<AtomicBool>>>>,
         out_tx: &mpsc::UnboundedSender<FromAgent>,
     ) {
@@ -314,6 +337,8 @@ impl Agent {
         };
         let running = running.clone();
         let out_tx = out_tx.clone();
+        let key = self.key.clone();
+        let corrupt = self.config.corrupt_results;
         debug!(task = %a.task, executor = %a.executor, "starting task");
         tokio::spawn(async move {
             let task = a.task;
@@ -326,8 +351,11 @@ impl Agent {
                         ))));
                         return;
                     };
+                    let a = a.clone();
                     tokio::task::spawn_blocking(move || {
-                        executor.run(&hash, &a.program, &a.input, &shared, &a.limits, cancel)
+                        executor.run(
+                            &hash, &a.program, &a.input, &shared, &a.limits, a.seed, cancel,
+                        )
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("executor panicked: {e}"))
@@ -342,15 +370,40 @@ impl Agent {
             };
             running.lock().unwrap().remove(&task);
             let report = match result {
-                Ok(r) => TaskReport {
-                    task,
-                    outcome: r.outcome,
-                    stdout: r.stdout,
-                    stderr: r.stderr,
-                    files: r.files,
-                    fuel_used: r.fuel_used,
-                    wall_ms: r.wall_ms,
-                },
+                Ok(mut r) => {
+                    if corrupt && r.outcome.is_success() {
+                        r.stdout = b"made up".to_vec();
+                    }
+                    // Nothing ran, so there is nothing to bill.
+                    let usage =
+                        (!matches!(r.outcome, pumasi_proto::msg::Outcome::Error(_))).then(|| {
+                            let usage = Usage {
+                                cluster,
+                                node: *key.public().as_bytes(),
+                                task,
+                                executor: a.executor,
+                                outcome: r.outcome.clone(),
+                                fuel_used: r.fuel_used,
+                                wall_ms: r.wall_ms,
+                                memory_limit_bytes: a.limits.memory_bytes,
+                                peak_memory_bytes: r.peak_memory_bytes,
+                                cpu_millis: a.limits.cpu_millis,
+                                result_digest: result_digest(&r.outcome, &r.stdout, &r.files),
+                                finished_unix: now_unix(),
+                            };
+                            SignedUsage::sign(usage, &key)
+                        });
+                    TaskReport {
+                        task,
+                        outcome: r.outcome,
+                        stdout: r.stdout,
+                        stderr: r.stderr,
+                        files: r.files,
+                        fuel_used: r.fuel_used,
+                        wall_ms: r.wall_ms,
+                        usage,
+                    }
+                }
                 Err(e) => error_report(task, format!("{e:#}")),
             };
             debug!(task = %task, outcome = %report.outcome, "task finished");
@@ -368,7 +421,15 @@ fn error_report(task: TaskRef, msg: String) -> TaskReport {
         files: vec![],
         fuel_used: 0,
         wall_ms: 0,
+        usage: None,
     }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn node_info(config: &AgentConfig) -> NodeInfo {

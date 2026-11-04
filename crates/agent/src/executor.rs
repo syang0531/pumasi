@@ -7,7 +7,9 @@
 //! - a memory cap (store limiter), a fuel cap (instruction metering) and a
 //!   wall-clock cap (epoch interruption),
 //! - NaN canonicalization, so float results are bit-identical across CPUs.
-//!   That makes redundant execution usable for result verification later.
+//! - optionally a deterministic mode (virtual clock, seeded random numbers)
+//!   so any honest node produces the same result and a re-run on another
+//!   node can check it.
 
 use std::{
     collections::HashMap,
@@ -29,9 +31,12 @@ use pumasi_proto::{
 };
 
 use crate::tempdir::TempDir;
-use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
+use rand010::SeedableRng;
+use wasmtime::{
+    Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, Trap,
+};
 use wasmtime_wasi::{
-    FsPerms, I32Exit, WasiCtxBuilder,
+    FsPerms, HostMonotonicClock, HostWallClock, I32Exit, WasiCtxBuilder,
     p1::{self, WasiP1Ctx},
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
 };
@@ -50,11 +55,104 @@ pub struct RunResult {
     pub files: Vec<FileEntry>,
     pub fuel_used: u64,
     pub wall_ms: u64,
+    /// Highest linear memory reached (WASM only).
+    pub peak_memory_bytes: Option<u64>,
 }
 
 struct StoreState {
     wasi: WasiP1Ctx,
-    limits: StoreLimits,
+    limits: PeakLimiter,
+}
+
+/// Enforces the store limits and remembers the largest memory granted.
+struct PeakLimiter {
+    inner: StoreLimits,
+    peak: usize,
+}
+
+impl ResourceLimiter for PeakLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let ok = self.inner.memory_growing(current, desired, maximum)?;
+        if ok {
+            self.peak = self.peak.max(desired);
+        }
+        Ok(ok)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.inner.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
+
+/// Start of the virtual wall clock in deterministic mode (2000-01-01 UTC).
+const VIRTUAL_EPOCH: Duration = Duration::from_secs(946_684_800);
+/// How far the virtual clocks move on every read.
+const VIRTUAL_TICK: Duration = Duration::from_millis(1);
+
+/// A clock that advances by a fixed step each time it is read, so a task
+/// sees the same times on every machine and a "wait until N seconds have
+/// passed" loop still ends.
+#[derive(Clone, Default)]
+struct VirtualClock(Arc<std::sync::atomic::AtomicU64>);
+
+impl VirtualClock {
+    fn tick(&self) -> Duration {
+        let n = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+        VIRTUAL_TICK * n as u32
+    }
+}
+
+impl HostWallClock for VirtualClock {
+    fn resolution(&self) -> Duration {
+        VIRTUAL_TICK
+    }
+    fn now(&self) -> Duration {
+        VIRTUAL_EPOCH + self.tick()
+    }
+}
+
+impl HostMonotonicClock for VirtualClock {
+    fn resolution(&self) -> u64 {
+        VIRTUAL_TICK.as_nanos() as u64
+    }
+    fn now(&self) -> u64 {
+        self.tick().as_nanos() as u64
+    }
+}
+
+/// Derives an independent 32-byte seed for one purpose from a task seed.
+fn derive_seed(seed: &[u8; 32], purpose: &str) -> [u8; 32] {
+    blake3::keyed_hash(seed, purpose.as_bytes()).into()
 }
 
 /// Shared, thread-safe executor. Cheap to clone.
@@ -137,7 +235,9 @@ impl WasmExecutor {
     }
 
     /// Runs a cached module to completion. Blocking: call from a blocking
-    /// thread. `cancel` can be set from another thread to abort.
+    /// thread. `seed` turns on deterministic mode. `cancel` can be set from
+    /// another thread to abort.
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         hash: &ModuleHash,
@@ -145,6 +245,7 @@ impl WasmExecutor {
         input: &TaskInput,
         shared_files: &[FileEntry],
         limits: &Limits,
+        seed: Option<[u8; 32]>,
         cancel: Arc<AtomicBool>,
     ) -> RunResult {
         let start = Instant::now();
@@ -186,6 +287,23 @@ impl WasmExecutor {
             .stdin(MemoryInputPipe::new(input.stdin.clone()))
             .stdout(stdout.clone())
             .stderr(stderr.clone());
+        if let Some(seed) = &seed {
+            let clock = VirtualClock::default();
+            builder
+                .wall_clock(clock.clone())
+                .monotonic_clock(clock)
+                .secure_random(rand010::rngs::StdRng::from_seed(derive_seed(
+                    seed, "secure",
+                )))
+                .insecure_random(rand010::rngs::StdRng::from_seed(derive_seed(
+                    seed, "insecure",
+                )))
+                .insecure_random_seed(u128::from_le_bytes(
+                    derive_seed(seed, "insecure-seed")[..16]
+                        .try_into()
+                        .expect("16 bytes"),
+                ));
+        }
         let preopened = builder
             .preopened_dir(&in_dir, INPUT_DIR, FsPerms::ReadOnly)
             .and_then(|b| b.preopened_dir(&out_dir, OUTPUT_DIR, FsPerms::ReadWrite))
@@ -205,7 +323,10 @@ impl WasmExecutor {
             &self.engine,
             StoreState {
                 wasi,
-                limits: store_limits,
+                limits: PeakLimiter {
+                    inner: store_limits,
+                    peak: 0,
+                },
             },
         );
         store.limiter(|s| &mut s.limits);
@@ -234,6 +355,7 @@ impl WasmExecutor {
         })();
 
         let fuel_used = fuel_budget.saturating_sub(store.get_fuel().unwrap_or(0));
+        let peak = store.data().limits.peak as u64;
         drop(store);
 
         let outcome = match result {
@@ -249,6 +371,7 @@ impl WasmExecutor {
             files,
             fuel_used,
             wall_ms: start.elapsed().as_millis() as u64,
+            peak_memory_bytes: Some(peak),
         }
     }
 }
@@ -312,6 +435,7 @@ impl RunResult {
             files: Vec::new(),
             fuel_used: 0,
             wall_ms: start.elapsed().as_millis() as u64,
+            peak_memory_bytes: None,
         }
     }
 }
@@ -325,7 +449,15 @@ mod tests {
         let hash = pumasi_proto::module_hash(&bytes);
         let ex = WasmExecutor::new().unwrap();
         ex.load_module(hash, &bytes).unwrap();
-        ex.run(&hash, "test", &input, &[], &limits, Default::default())
+        ex.run(
+            &hash,
+            "test",
+            &input,
+            &[],
+            &limits,
+            None,
+            Default::default(),
+        )
     }
 
     /// Writes "hi\n" to stdout via fd_write, then exits with the code in
@@ -418,6 +550,7 @@ mod tests {
             &TaskInput::default(),
             &[],
             &Limits::default(),
+            None,
             cancel,
         );
         assert_eq!(r.outcome, Outcome::Cancelled);
@@ -473,6 +606,7 @@ mod tests {
             &TaskInput::default(),
             &shared,
             &Limits::default(),
+            None,
             Default::default(),
         );
         assert_eq!(
@@ -496,9 +630,67 @@ mod tests {
             &TaskInput::default(),
             &[],
             &Limits::default(),
+            None,
             Default::default(),
         );
         assert_eq!(r.outcome, Outcome::Exited(13));
+    }
+
+    /// Writes 16 random bytes and the realtime and monotonic clocks
+    /// (8 bytes each) to stdout.
+    const ENTROPY_WAT: &str = r#"
+    (module
+      (import "wasi_snapshot_preview1" "random_get" (func $random (param i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "clock_time_get" (func $now (param i32 i64 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 2)
+      (func (export "_start")
+        (drop (call $random (i32.const 104) (i32.const 16)))
+        (drop (call $now (i32.const 0) (i64.const 1) (i32.const 120)))
+        (drop (call $now (i32.const 1) (i64.const 1) (i32.const 128)))
+        (i32.store (i32.const 0) (i32.const 104))
+        (i32.store (i32.const 4) (i32.const 32))
+        (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))
+    "#;
+
+    #[test]
+    fn deterministic_mode_and_peak_memory() {
+        let bytes = wat::parse_str(ENTROPY_WAT).unwrap();
+        let hash = pumasi_proto::module_hash(&bytes);
+        let ex = WasmExecutor::new().unwrap();
+        ex.load_module(hash, &bytes).unwrap();
+        let run = |seed: Option<[u8; 32]>| {
+            ex.run(
+                &hash,
+                "t",
+                &TaskInput::default(),
+                &[],
+                &Limits::default(),
+                seed,
+                Default::default(),
+            )
+        };
+        let a = run(Some([1; 32]));
+        let b = run(Some([1; 32]));
+        let c = run(Some([2; 32]));
+        assert_eq!(a.outcome, Outcome::Exited(0));
+        assert_eq!(a.stdout.len(), 32);
+        assert_eq!(a.stdout, b.stdout, "same seed, same output");
+        assert_eq!(a.fuel_used, b.fuel_used);
+        assert_ne!(
+            a.stdout[..16],
+            c.stdout[..16],
+            "seed changes the random bytes"
+        );
+        let realtime = u64::from_le_bytes(a.stdout[16..24].try_into().unwrap());
+        assert!(
+            (946_684_800_000_000_000..946_684_900_000_000_000).contains(&realtime),
+            "virtual clock starts in 2000: {realtime}"
+        );
+        let x = run(None);
+        let y = run(None);
+        assert_ne!(x.stdout[..16], y.stdout[..16], "real randomness by default");
+        assert_eq!(a.peak_memory_bytes, Some(2 * 65536));
     }
 
     #[test]

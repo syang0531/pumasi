@@ -106,9 +106,9 @@ jobs:
             busybox:1.36 -- uname -a < /dev/null || true
           if [ "${{ matrix.backend }}" = qemu ]; then
             initrd=$(ls "$VM_DIR"/initrd-*.cpio | head -n1)
-            for cpu in max host; do
-              echo "=== bare boot, -cpu $cpu ==="
-              timeout 60 qemu-system-x86_64 -M microvm -accel kvm -cpu $cpu -m 256 \
+            for machine in microvm microvm,pic=off microvm,pic=off,pit=off; do
+              echo "=== bare boot, -M $machine ==="
+              timeout 60 qemu-system-x86_64 -M $machine -accel kvm -cpu max -m 256 \
                 -nodefaults -no-user-config -no-reboot -display none -serial stdio \
                 -kernel "$VM_DIR/vmlinux" -initrd "$initrd" -d cpu_reset,guest_errors \
                 -append "console=ttyS0 reboot=t panic=1 earlyprintk=serial,ttyS0 loglevel=8 rdinit=/init" \

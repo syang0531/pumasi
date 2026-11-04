@@ -145,7 +145,13 @@ impl Vmm {
     fn qemu(&self, spec: &VmSpec) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.bin);
         let x86 = cfg!(target_arch = "x86_64");
-        if x86 {
+        if x86 && self.accelerated && cfg!(target_os = "linux") {
+            // KVM's in-kernel 8259 is never programmed by this kernel (no
+            // legacy PIC in its ACPI tables), so the PIT's first tick
+            // arrives as vector 0 and panics the boot as a divide error.
+            // The local APIC timer and kvm-clock are all it needs.
+            cmd.args(["-M", "microvm,pic=off,pit=off"]);
+        } else if x86 {
             cmd.args(["-M", "microvm"]);
         } else {
             cmd.args(["-M", "virt"]);

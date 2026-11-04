@@ -259,10 +259,36 @@ pub struct MicrovmExecutor {
 
 /// How a VM run ended, as seen from the host.
 enum VmEnd {
-    /// The VMM process ended by itself, with this status.
-    Exited(std::process::ExitStatus),
+    /// The guest shut down: the VMM exited by itself (with this status), or
+    /// the guest console said it was restarting and the host stopped a VMM
+    /// that did not exit.
+    Exited(String),
     Timeout,
     Cancelled,
+}
+
+/// Lines the guest kernel prints (at emergency level, so even with
+/// `quiet`) when it is done.
+const GUEST_DONE: &[&str] = &[
+    "reboot: Restarting system",
+    "reboot: Power down",
+    "Kernel panic",
+];
+/// How long a VMM may keep running after the guest said it was done.
+const AFTER_GUEST_DONE: Duration = Duration::from_secs(3);
+
+/// Whether the end of the serial log says the guest is done.
+fn guest_said_done(serial: &Path) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(serial) else {
+        return false;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(4096)));
+    let mut tail = Vec::new();
+    let _ = f.read_to_end(&mut tail);
+    let tail = String::from_utf8_lossy(&tail);
+    GUEST_DONE.iter().any(|l| tail.contains(l))
 }
 
 impl MicrovmExecutor {
@@ -511,6 +537,12 @@ impl MicrovmExecutor {
             .and_then(|job| job.assign(&child).map(|()| job))
             .map_err(|e| warn!("could not put the VMM in a job object: {e}"))
             .ok();
+        // When QEMU writes the console to a file (Windows), watch it: under
+        // WHPX a guest reset can leave QEMU stuck instead of exiting.
+        let serial = dir.join(vmm::SERIAL_LOG);
+        let watch_serial = cfg!(windows) && self.vmm.backend == Backend::Qemu;
+        let mut done_since: Option<Instant> = None;
+        let mut ticks = 0u32;
         loop {
             tokio::select! {
                 status = child.wait() => {
@@ -518,13 +550,20 @@ impl MicrovmExecutor {
                     if !status.success() {
                         debug!(%status, "vmm exited");
                     }
-                    return Ok(VmEnd::Exited(status));
+                    return Ok(VmEnd::Exited(status.to_string()));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    ticks += 1;
+                    if watch_serial && done_since.is_none() && ticks.is_multiple_of(10) && guest_said_done(&serial) {
+                        done_since = Some(Instant::now());
+                    }
                     let end = if cancel.load(Ordering::Relaxed) {
                         Some(VmEnd::Cancelled)
                     } else if deadline.is_some_and(|d| Instant::now() >= d) {
                         Some(VmEnd::Timeout)
+                    } else if done_since.is_some_and(|t| t.elapsed() >= AFTER_GUEST_DONE) {
+                        warn!("the guest restarted but the VMM did not exit; stopping it");
+                        Some(VmEnd::Exited("stopped by the host after the guest restarted".into()))
                     } else {
                         None
                     };

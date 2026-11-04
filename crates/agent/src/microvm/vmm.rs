@@ -178,7 +178,11 @@ impl Vmm {
         // Escape hatches for trying other settings on a new machine, e.g.
         // PUMASI_QEMU_ACCEL=tcg or PUMASI_QEMU_ACCEL=whpx.
         let accel = std::env::var("PUMASI_QEMU_ACCEL").ok();
-        let whpx = cfg!(windows) && self.accelerated && accel.is_none();
+        let whpx = cfg!(windows)
+            && match &accel {
+                Some(a) => a.starts_with("whpx"),
+                None => self.accelerated,
+            };
         match &accel {
             Some(a) => {
                 cmd.args(["-accel", a]);
@@ -217,7 +221,13 @@ impl Vmm {
         } else {
             "console=ttyAMA0"
         };
-        let mut args = vec![console.to_string(), "reboot=t".into(), "panic=1".into()];
+        // The guest ends the VM by rebooting, which `-no-reboot` turns into
+        // QEMU exiting. A triple fault (`reboot=t`) does that everywhere but
+        // under WHPX, which reports it as an unrecoverable exception and
+        // leaves QEMU hanging; the microvm machine's ACPI reset register
+        // (`reboot=a`) is a clean reset request there.
+        let reboot = if whpx { "reboot=a" } else { "reboot=t" };
+        let mut args = vec![console.to_string(), reboot.into(), "panic=1".into()];
         if x86 && (!self.accelerated || whpx) {
             // Without KVM there is no kvm-clock, and calibrating the TSC
             // against the emulated timers sometimes hangs the boot. Under

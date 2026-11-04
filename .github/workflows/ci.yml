@@ -135,10 +135,9 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/pumasi-guest
           if-no-files-found: error
 
-  # GitHub's Windows runners have no nested virtualization, so this runs
-  # the microVMs under TCG; WHPX is checked on real machines.
+  # QEMU on Windows: WHPX where the runner offers it, and TCG.
   microvm-windows:
-    name: microvm (windows, qemu tcg)
+    name: microvm (windows, qemu)
     needs: guest
     runs-on: windows-latest
     env:
@@ -156,6 +155,13 @@ jobs:
           path: guest
       - name: Build with the guest init built in
         run: cargo build -p pumasi-cli
+      # The QEMU installer takes ~12 minutes; reuse the installed copy.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .vm/qemu
+            .vm/vmlinux
+          key: vm-windows-qemu-20260811-kernel-6.1.102
       - name: Install the guest kernel and the pinned QEMU
         shell: bash
         run: |
@@ -163,6 +169,26 @@ jobs:
           ./target/debug/pumasi vm status --vm-dir "$VM_DIR" | tee status.txt
           grep -q "built into this binary" status.txt
           grep -q "qemu-system-x86_64.exe" status.txt
+      # Hosted Windows runners currently do have nested virtualization, so
+      # this also tries the WHPX settings one by one (diagnostics only).
+      - name: Try QEMU settings (diagnostics)
+        continue-on-error: true
+        shell: bash
+        timeout-minutes: 25
+        run: |
+          try() {
+            echo "::group::$1"
+            shift
+            env "$@" timeout 150 ./target/debug/pumasi vm run --vm-dir "$VM_DIR" busybox:1.36 -- echo vm-ok < /dev/null
+            echo "exit $?"
+            for f in $(find "$VM_DIR/run" -type f -name '*.log' 2>/dev/null); do echo "--- $f"; tail -c 3000 "$f"; echo; done
+            echo "::endgroup::"
+          }
+          try "default" PUMASI_VM_KERNEL_ARGS=loglevel=6
+          try "whpx irqchip on, Nehalem" PUMASI_QEMU_ACCEL=whpx PUMASI_VM_KERNEL_ARGS=loglevel=6
+          try "whpx irqchip off, max" PUMASI_QEMU_ACCEL=whpx,kernel-irqchip=off PUMASI_QEMU_CPU=max PUMASI_VM_KERNEL_ARGS=loglevel=6
+          try "whpx irqchip off, Nehalem, reboot=t" PUMASI_QEMU_ACCEL=whpx,kernel-irqchip=off "PUMASI_VM_KERNEL_ARGS=loglevel=6 reboot=t"
+          try "tcg" PUMASI_QEMU_ACCEL=tcg PUMASI_VM_KERNEL_ARGS=loglevel=6
       - name: Run an image in a microVM
         shell: bash
         timeout-minutes: 20
@@ -176,6 +202,10 @@ jobs:
           grep -q "^from the host" vm.txt
           grep -q "^x86_64" vm.txt
           grep -q "^done" vm-out/r.txt
+          # And in software emulation, the fallback without WHPX.
+          PUMASI_QEMU_ACCEL=tcg ./target/debug/pumasi vm run --vm-dir "$VM_DIR" \
+            busybox:1.36 -- echo tcg-ok < /dev/null | tee tcg.txt
+          grep -q "^tcg-ok" tcg.txt
       - name: End-to-end test (cluster, invited provider, microVM jobs)
         timeout-minutes: 30
         env:

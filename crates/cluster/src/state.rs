@@ -210,8 +210,6 @@ pub(crate) struct NodeRuntime {
     pub upgrade: Option<UpgradeHello>,
     /// Gets no new tasks so it can be upgraded once idle.
     pub draining: bool,
-    /// Release (by SHA-256) sent to it; gets no tasks meanwhile.
-    pub upgrading: Option<([u8; 32], Instant)>,
 }
 
 impl NodeRuntime {
@@ -252,6 +250,9 @@ pub struct State {
     /// Nodes that refused or failed to install a release: the release's
     /// SHA-256 and why. Not offered that release again.
     pub(crate) upgrade_failures: HashMap<String, ([u8; 32], String)>,
+    /// Nodes sent a release (its SHA-256) and when. They get no tasks
+    /// until they come back; kept across the restart's disconnect.
+    pub(crate) upgrading: HashMap<String, ([u8; 32], Instant)>,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -320,6 +321,7 @@ impl State {
             next_generation: 1,
             rollout: None,
             upgrade_failures: HashMap::new(),
+            upgrading: HashMap::new(),
         };
         state.rollout = state.load_rollout()?;
         state.ensure_account(OWNER_ACCOUNT)?;
@@ -538,6 +540,10 @@ impl State {
             let g = old.generation;
             self.on_disconnect(id, g);
         }
+        // Back from an upgrade's restart (with the new binary, or rolled
+        // back: then the release is offered again and the agent says why
+        // it failed).
+        self.upgrading.remove(id);
         let generation = self.next_generation;
         self.next_generation += 1;
         let prev_completed = self.nodes.get(id).map(|n| n.completed).unwrap_or(0);
@@ -574,7 +580,6 @@ impl State {
                 suspended,
                 upgrade,
                 draining: false,
-                upgrading: None,
             },
         );
         self.schedule();
@@ -1143,7 +1148,7 @@ impl State {
                     n.online
                         && !n.suspended
                         && !n.draining
-                        && n.upgrading.is_none()
+                        && !self.upgrading.contains_key(id.as_str())
                         && n.free_slots() > 0
                         && n.info.memory_bytes >= need
                         && n.executors.contains(&executor)

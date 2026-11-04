@@ -120,6 +120,7 @@ impl State {
         }
         self.rollout = Some(record);
         self.upgrade_failures.clear();
+        self.upgrading.clear();
         for n in self.nodes.values_mut() {
             n.draining = false;
         }
@@ -131,6 +132,7 @@ impl State {
         self.store.delete_meta(ROLLOUT_META)?;
         self.rollout = None;
         self.upgrade_failures.clear();
+        self.upgrading.clear();
         for n in self.nodes.values_mut() {
             n.draining = false;
         }
@@ -165,8 +167,8 @@ impl State {
             return;
         }
         warn!(node = %node, sha256 = %hex(&sha256), "upgrade failed: {reason}");
-        n.upgrading = None;
         n.draining = false;
+        self.upgrading.remove(node);
         self.upgrade_failures
             .insert(node.to_string(), (sha256, reason));
         self.schedule();
@@ -175,33 +177,32 @@ impl State {
     pub(crate) fn expire_upgrades(&mut self) {
         let now = Instant::now();
         let expired: Vec<(String, [u8; 32])> = self
-            .nodes
+            .upgrading
             .iter()
-            .filter_map(|(id, n)| match n.upgrading {
-                Some((sha, since)) if now.duration_since(since) > UPGRADE_TIMEOUT => {
-                    Some((id.clone(), sha))
-                }
-                _ => None,
-            })
+            .filter(|(_, (_, since))| now.duration_since(*since) > UPGRADE_TIMEOUT)
+            .map(|(id, (sha, _))| (id.clone(), *sha))
             .collect();
         for (id, sha) in expired {
-            if let Some(n) = self.nodes.get_mut(&id) {
-                n.upgrading = None;
-            }
+            self.upgrading.remove(&id);
             self.upgrade_failures
                 .insert(id, (sha, "did not come back with the new binary".into()));
         }
     }
 
     fn upgrade_state(&self, id: &str, n: &NodeRuntime) -> UpgradeState {
-        if !n.online {
-            return UpgradeState::Offline;
-        }
-        let Some(rollout) = &self.rollout else {
-            return UpgradeState::Current;
-        };
         let target = Target::new(&n.info.os, &n.info.arch);
-        let Some(release) = rollout.release_for(&target) else {
+        let release = self.rollout.as_ref().and_then(|r| r.release_for(&target));
+        if !n.online {
+            // Restarting into the new binary.
+            return match (release, self.upgrading.get(id)) {
+                (Some(r), Some((sha, _))) if *sha == r.file().sha256 => UpgradeState::Upgrading,
+                _ => UpgradeState::Offline,
+            };
+        }
+        if self.rollout.is_none() {
+            return UpgradeState::Current;
+        }
+        let Some(release) = release else {
             return UpgradeState::NoRelease;
         };
         let sha = release.file().sha256;
@@ -224,7 +225,7 @@ impl State {
         {
             return UpgradeState::Failed(reason.clone());
         }
-        if n.upgrading.is_some_and(|(s, _)| s == sha) {
+        if self.upgrading.get(id).is_some_and(|(s, _)| *s == sha) {
             return UpgradeState::Upgrading;
         }
         if n.draining {
@@ -268,8 +269,8 @@ impl State {
                 && tx.send(ToAgent::Upgrade(Box::new(release))).is_ok()
             {
                 info!(node = %id, sha256 = %hex(&sha), "offered upgrade");
-                n.upgrading = Some((sha, Instant::now()));
                 n.draining = false;
+                self.upgrading.insert(id, (sha, Instant::now()));
             }
         }
         if draining == 0 {

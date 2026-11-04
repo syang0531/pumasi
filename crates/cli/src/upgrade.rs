@@ -112,22 +112,27 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
             };
             print_rollout(&view);
             if !wait {
+                client.close().await;
                 return Ok(0);
             }
             let timeout = Duration::from_millis(pumasi_proto::job::parse_duration_ms(&timeout)?);
-            wait_rollout(&client, timeout).await
+            let code = wait_rollout(&client, timeout).await;
+            client.close().await;
+            code
         }
         UpgradeCmd::Status { admin } => {
             let client = connect_admin(home, &admin).await?;
             let AdminResponse::Rollout(view) = client.call(AdminOp::RolloutStatus).await? else {
                 bail!("unexpected response");
             };
+            client.close().await;
             print_rollout(&view);
             Ok(0)
         }
         UpgradeCmd::Cancel { admin } => {
             let client = connect_admin(home, &admin).await?;
             client.call(AdminOp::CancelRollout).await?;
+            client.close().await;
             println!("rollout cancelled; nodes keep the binary they run");
             Ok(0)
         }

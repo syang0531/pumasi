@@ -245,10 +245,23 @@ impl State {
         Ok(())
     }
 
+    /// Removes a member. `id` may be a unique prefix, as `pumasi status`
+    /// shows only the first characters.
     pub fn remove_node(&mut self, id: &str) -> Result<()> {
-        if self.members.remove(id).is_none() {
-            bail!("no such node");
-        }
+        let id = id.trim();
+        let matches: Vec<String> = self
+            .members
+            .keys()
+            .filter(|k| !id.is_empty() && k.starts_with(id))
+            .cloned()
+            .collect();
+        let id = match matches.as_slice() {
+            [one] => one.clone(),
+            [] => bail!("no such node"),
+            _ => bail!("node id prefix {id:?} is ambiguous; give more characters"),
+        };
+        let id = id.as_str();
+        self.members.remove(id);
         self.store.remove_member(id)?;
         if let Some(n) = self.nodes.get_mut(id)
             && let Some(kill) = n.kill.take()

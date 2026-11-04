@@ -306,7 +306,28 @@ async fn rejects_bad_ticket_and_reconnects_known_node() {
     wait_online(&cluster, 1).await;
     assert_eq!(cluster.status().nodes.len(), 1);
 
-    h.abort();
+    // Removing it by the short id `pumasi status` shows revokes it: the
+    // agent is cut off and its reconnect is rejected.
+    let short: String = cluster.status().nodes[0].id.chars().take(10).collect();
+    let client = admin(&cluster).await;
+    assert!(
+        client
+            .call(AdminOp::RemoveNode { id: "zzzz".into() })
+            .await
+            .is_err()
+    );
+    client
+        .call(AdminOp::RemoveNode { id: short })
+        .await
+        .unwrap();
+    assert!(cluster.status().nodes.is_empty());
+    let res = tokio::time::timeout(Duration::from_secs(15), h)
+        .await
+        .expect("removed agent should stop")
+        .unwrap();
+    assert!(res.is_err(), "agent must be rejected after removal");
+
+    client.close().await;
     endpoint.close().await;
     cluster.shutdown().await.unwrap();
 }

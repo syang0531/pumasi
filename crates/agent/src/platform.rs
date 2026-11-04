@@ -233,10 +233,11 @@ mod tests {
         let job = ProcessJob::new().unwrap();
         job.assign(&child).unwrap();
         drop(job);
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        // `ping -n 30` takes 29 s; ending well before that is the kill.
+        // (A process killed with its job exits with code 0.)
+        tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
             .await
             .expect("process still running after its job closed")
             .unwrap();
-        assert!(!status.success());
     }
 }

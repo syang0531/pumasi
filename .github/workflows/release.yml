@@ -22,37 +22,79 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The microVM guest init, a static Linux binary, built once per CPU
+  # architecture and embedded into every pumasi binary of that
+  # architecture, so `pumasi vm setup` needs no Linux toolchain (Windows,
+  # macOS).
+  guest:
+    name: guest init (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-guest-${{ matrix.arch }}
+      - name: Install zig
+        run: python3 -m pip install --user --break-system-packages "ziglang<0.15"
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build
+        run: |
+          cargo zigbuild --release --locked -p pumasi-guest --target ${{ matrix.arch }}-unknown-linux-musl
+          file target/${{ matrix.arch }}-unknown-linux-musl/release/pumasi-guest | tee /dev/stderr | grep -q "statically linked"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-${{ matrix.arch }}
+          path: target/${{ matrix.arch }}-unknown-linux-musl/release/pumasi-guest
+          if-no-files-found: error
+
   build:
     name: build (${{ matrix.asset }})
+    needs: guest
     strategy:
       fail-fast: false
       matrix:
         include:
           - asset: pumasi-linux-x86_64
             target: x86_64-unknown-linux-musl
+            guest: x86_64
             os: ubuntu-latest
             zig: true
             native: true
           - asset: pumasi-linux-aarch64
             target: aarch64-unknown-linux-musl
+            guest: aarch64
             os: ubuntu-latest
             zig: true
           - asset: pumasi-macos-x86_64
             target: x86_64-apple-darwin
+            guest: x86_64
             os: macos-latest
             minos: "10.15"
           - asset: pumasi-macos-aarch64
             target: aarch64-apple-darwin
+            guest: aarch64
             os: macos-latest
             native: true
             # Apple Silicon starts at macOS 11; the linker raises 10.15 to it.
             minos: "11.0"
           - asset: pumasi-windows-x86_64.exe
             target: x86_64-pc-windows-msvc
+            guest: x86_64
             os: windows-latest
             native: true
           - asset: pumasi-windows-aarch64.exe
             target: aarch64-pc-windows-msvc
+            guest: aarch64
             os: windows-latest
     runs-on: ${{ matrix.os }}
     env:
@@ -74,6 +116,13 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-${{ matrix.guest }}
+          path: guest
+      - name: Embed the guest init
+        shell: bash
+        run: echo "PUMASI_EMBED_GUEST=$GITHUB_WORKSPACE/guest/pumasi-guest" >> "$GITHUB_ENV"
       - name: Version
         shell: bash
         run: |
@@ -101,6 +150,8 @@ jobs:
           bin="dist/${{ matrix.asset }}"
           if [ "${{ matrix.native }}" = true ]; then
             "./$bin" --version
+            { "./$bin" vm status --vm-dir "$RUNNER_TEMP/vm-check" || true; } \
+              | tee /dev/stderr | grep -q "built into this binary"
           fi
           case "${{ matrix.os }}" in
             ubuntu-*) file "$bin" | tee /dev/stderr | grep -q "statically linked" ;;

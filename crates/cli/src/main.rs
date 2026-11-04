@@ -205,8 +205,9 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum VmCmd {
-    /// Download the guest kernel (and Firecracker on Linux) and install the
-    /// guest init, so `pumasi agent ... --allow-microvm` works.
+    /// Download the guest kernel (and Firecracker on Linux, QEMU on Windows)
+    /// and install the guest init, so `pumasi agent ... --allow-microvm`
+    /// works. On Windows, run it as administrator.
     Setup {
         /// Guest init to install, a static Linux build of `pumasi-guest`
         /// (default: keep the installed one, or use the one next to this
@@ -1402,16 +1403,22 @@ fn vm_status(config: &MicrovmConfig) -> Result<i32> {
     };
     println!("microVM setup in {}", config.dir.display());
     show("kernel", &a.kernel, "run `pumasi vm setup`");
-    show(
-        "guest init",
-        &a.guest,
-        "build pumasi-guest for linux-musl, then `pumasi vm setup --guest <path>`",
-    );
+    match &a.guest {
+        Some(g) => println!("  {:<12} {g}", "guest init"),
+        None => println!(
+            "  {:<12} missing (build pumasi-guest for linux-musl, then `pumasi vm setup --guest <path>`)",
+            "guest init"
+        ),
+    }
     if cfg!(target_os = "linux") {
         show("firecracker", &a.firecracker, "run `pumasi vm setup`");
     }
-    show("qemu", &a.qemu, "optional; install QEMU");
-    show("mkfs.ext4", &a.mkfs, "install e2fsprogs");
+    let qemu_hint = if cfg!(windows) {
+        "run `pumasi vm setup` as administrator"
+    } else {
+        "optional; install QEMU"
+    };
+    show("qemu", &a.qemu, qemu_hint);
     if cfg!(target_os = "linux") {
         println!(
             "  {:<12} {}",
@@ -1423,7 +1430,14 @@ fn vm_status(config: &MicrovmConfig) -> Result<i32> {
             }
         );
     }
-    let ready = a.kernel.is_some() && a.guest.is_some() && a.mkfs.is_some();
+    if let Some(whpx) = &a.whpx {
+        match whpx {
+            Ok(()) if cfg!(target_arch = "x86_64") => println!("  {:<12} usable", "whpx"),
+            Ok(()) => println!("  {:<12} on, but QEMU uses it only on x86_64", "whpx"),
+            Err(why) => println!("  {:<12} not usable: {why}", "whpx"),
+        }
+    }
+    let ready = a.kernel.is_some() && a.guest.is_some();
     match a.pick(config.backend) {
         Ok(vmm) if ready => {
             println!(

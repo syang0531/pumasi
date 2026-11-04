@@ -63,16 +63,35 @@ pub struct VmSpec {
 pub struct Vmm {
     pub backend: Backend,
     pub bin: PathBuf,
-    /// QEMU only: the host has KVM (or HVF) for it.
+    /// QEMU only: the host has KVM, HVF or WHPX for it.
     pub accelerated: bool,
+    /// The host's TSC rate, passed to accelerated guests that have no
+    /// paravirtual clock (WHPX), so they need not calibrate it.
+    pub tsc_khz: Option<u64>,
 }
+
+/// QEMU's hardware accelerator on this OS.
+pub fn qemu_accel() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "hvf"
+    } else if cfg!(windows) {
+        // The in-kernel (Hyper-V) local APIC trips up Linux guests on some
+        // Windows builds; QEMU's own interrupt controllers always work.
+        "whpx,kernel-irqchip=off"
+    } else {
+        "kvm"
+    }
+}
+
+/// Where QEMU writes the guest console when it cannot use its stdout.
+pub const SERIAL_LOG: &str = "serial.log";
 
 impl Vmm {
     /// The VMM command for `spec`. Writes any config file into `dir`.
     pub fn command(&self, spec: &VmSpec, dir: &Path) -> Result<tokio::process::Command> {
         match self.backend {
             Backend::Firecracker => self.firecracker(spec, dir),
-            Backend::Qemu => Ok(self.qemu(spec)),
+            Backend::Qemu => Ok(self.qemu(spec, dir)),
         }
     }
 
@@ -142,7 +161,7 @@ impl Vmm {
         Ok(cmd)
     }
 
-    fn qemu(&self, spec: &VmSpec) -> tokio::process::Command {
+    fn qemu(&self, spec: &VmSpec, dir: &Path) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.bin);
         let x86 = cfg!(target_arch = "x86_64");
         if x86 && self.accelerated && cfg!(target_os = "linux") {
@@ -156,20 +175,40 @@ impl Vmm {
         } else {
             cmd.args(["-M", "virt"]);
         }
-        let accel = if cfg!(target_os = "macos") {
-            "hvf"
-        } else {
-            "kvm"
-        };
-        if self.accelerated {
-            cmd.args(["-accel", accel]);
+        // Escape hatches for trying other settings on a new machine, e.g.
+        // PUMASI_QEMU_ACCEL=tcg or PUMASI_QEMU_ACCEL=whpx.
+        let accel = std::env::var("PUMASI_QEMU_ACCEL").ok();
+        let whpx = cfg!(windows) && self.accelerated && accel.is_none();
+        match &accel {
+            Some(a) => {
+                cmd.args(["-accel", a]);
+            }
+            None => {
+                if self.accelerated {
+                    cmd.args(["-accel", qemu_accel()]);
+                }
+                cmd.args(["-accel", "tcg"]);
+            }
         }
-        cmd.args(["-accel", "tcg", "-cpu", "max"])
+        // WHPX takes CPUID leaf 1 from QEMU's CPU model, and `max` there is
+        // TCG's feature list; Nehalem is the x86-64-v2 baseline every
+        // machine with WHPX has.
+        let cpu = std::env::var("PUMASI_QEMU_CPU")
+            .unwrap_or_else(|_| if whpx { "Nehalem" } else { "max" }.into());
+        cmd.args(["-cpu", &cpu])
             .args(["-m", &spec.mem_mib.to_string()])
             .args(["-smp", &spec.vcpus.to_string()])
             .args(["-nodefaults", "-no-user-config", "-no-reboot"])
-            .args(["-display", "none", "-serial", "stdio"])
-            .arg("-kernel")
+            .args(["-display", "none"]);
+        if cfg!(windows) {
+            // QEMU's stdio console polls the console's input handle, which
+            // a service or a redirected NUL stdin does not have.
+            cmd.arg("-serial")
+                .arg(format!("file:{}", dir.join(SERIAL_LOG).display()));
+        } else {
+            cmd.args(["-serial", "stdio"]);
+        }
+        cmd.arg("-kernel")
             .arg(&spec.kernel)
             .arg("-initrd")
             .arg(&spec.initrd);
@@ -178,12 +217,15 @@ impl Vmm {
         } else {
             "console=ttyAMA0"
         };
-        let mut args = vec![console, "reboot=t", "panic=1"];
-        if x86 && !self.accelerated {
+        let mut args = vec![console.to_string(), "reboot=t".into(), "panic=1".into()];
+        if x86 && (!self.accelerated || whpx) {
             // Without KVM there is no kvm-clock, and calibrating the TSC
-            // against the emulated timers sometimes hangs the boot.
-            args.push("tsc_early_khz=2000000");
+            // against the emulated timers sometimes hangs the boot. Under
+            // WHPX the guest reads the host's TSC, whose rate we measured.
+            let khz = self.tsc_khz.filter(|_| whpx).unwrap_or(2_000_000);
+            args.push(format!("tsc_early_khz={khz}"));
         }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         cmd.arg("-append").arg(cmdline(&args, spec.mode));
         for (i, d) in spec.disks.iter().enumerate() {
             // QEMU wants commas in file names doubled.
@@ -217,6 +259,8 @@ fn cmdline(base: &[&str], mode: &str) -> String {
 
 /// Looks for a program in `dir`, then on `PATH`, then in `extra` dirs.
 pub fn find_program(name: &str, dir: Option<&Path>, extra: &[&str]) -> Option<PathBuf> {
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let name = name.as_str();
     let exe = |p: PathBuf| p.is_file().then_some(p);
     if let Some(found) = dir.and_then(|d| exe(d.join(name))) {
         return Some(found);
@@ -304,6 +348,7 @@ mod tests {
             backend: Backend::Qemu,
             bin: "qemu".into(),
             accelerated: false,
+            tsc_khz: None,
         };
         let spec = VmSpec {
             kernel: "/k".into(),

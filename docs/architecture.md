@@ -2,8 +2,9 @@
 
 This document records how the cluster is built and why: the private
 cluster of phase 1, the invited providers, receipts, credit ledger and
-result checks of phase 2, the microVM executor of phase 3, and the
-releases, OS services and signed agent upgrades of phase 4. The
+result checks of phase 2, the microVM executor of phase 3, the
+releases, OS services and signed agent upgrades of phase 4, and the
+Windows support of phase 5. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -14,7 +15,7 @@ the project; this file covers the code.
 | --- | --- |
 | `pumasi-proto` | Job spec (`job.toml`), wire messages, framing, tickets, endpoint helpers, receipts (signing and verification), price list and policy. No business logic. |
 | `pumasi-guest` | `pumasi-guest`, the init process inside every microVM (a static musl binary), and the disk protocol the agent shares with it. |
-| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `MicrovmExecutor` (registry client, Firecracker/QEMU) and the `Agent` session loop, which signs usage. |
+| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `MicrovmExecutor` (registry client, ext4 formatter, Firecracker/QEMU), `platform` (sparse files, Windows Job Objects, the WHPX check) and the `Agent` session loop, which signs usage. |
 | `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
 | `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. `service.rs` installs the agent as an OS service, `upgrade.rs` drives rollouts. |
 
@@ -115,22 +116,30 @@ another node and compare the results.
 
 `DockerExecutor` drives the Docker CLI (or a compatible one such as Podman
 via `--docker-bin`). It is enabled only when the agent is started with
-`--allow-docker` and the daemon answers; the node then advertises
-`executors = [wasm, docker]`. Per task:
+`--allow-docker` and the daemon answers with Linux containers (Docker
+Desktop in Windows-containers mode is refused with a hint); the node then
+advertises `executors = [wasm, docker]`. Per task:
 
 1. Pull the image if missing (serialized per agent, retried with backoff).
 2. `docker create` with `--network none` (unless the job sets
    `network = true`), `--memory`/`--memory-swap`, `--cpus`, `--pids-limit`,
    `--security-opt no-new-privileges`, `--init`, a `pumasi.agent` label, and
    no bind mounts.
-3. `docker cp` the input tree into `/input` and an empty `/output`.
+3. `docker cp - <name>:/` streams a tar built in memory: `/input` with the
+   job's and the task's files, and an empty `/output` (mode 0777, so any
+   image user can write it).
 4. `docker start -a -i` with stdin, under the task's wall-clock limit;
    cancellation or timeout kills the container.
-5. `docker cp` `/output` back, inspect for OOM, `docker rm -f` (also on
-   drop, and stale labeled containers are removed at agent start).
+5. `docker cp <name>:/output -` streams `/output` back as a tar, read in
+   memory up to twice the output cap and parsed like the microVM output
+   disk (regular files only, `validate_rel_path`, capped); inspect for
+   OOM; `docker rm -f` (also on drop, and stale labeled containers are
+   removed at agent start).
 
-Copying instead of mounting keeps host paths out of the container and works
-the same with remote daemons and Docker Desktop. Containers share the host
+Streaming tars instead of mounting or copying directories keeps host paths
+out of the container and off the host (no Windows path translation, no
+long-path or symlink trouble on NTFS) and works the same with remote
+daemons and Docker Desktop. Containers share the host
 kernel, so this executor is for machines and people the owner trusts; the
 microVM executor runs the same images with VM isolation.
 
@@ -139,13 +148,13 @@ microVM executor runs the same images with VM isolation.
 `MicrovmExecutor` runs docker-style jobs (`executor = "microvm"`, same
 `DockerSpec`) with one VM per task. It is enabled with `--allow-microvm`
 once `pumasi vm setup` has installed a pinned Firecracker CI guest kernel
-(Linux 6.1: virtio-mmio, ext4, overlayfs, initramfs), Firecracker on Linux,
-and the guest init. Backends:
+(Linux 6.1: virtio-mmio, ext4, overlayfs, initramfs), Firecracker on Linux
+or QEMU on Windows, and the guest init (release binaries embed it). Backends:
 
 | Backend | Where | Notes |
 | --- | --- | --- |
 | Firecracker | Linux with `/dev/kvm` | default when installed; `--no-api --config-file`, its own seccomp filters |
-| QEMU | Linux, macOS | `-M microvm` on x86_64, `-M virt` on ARM64; KVM or HVF when available, else TCG (slow; adds `tsc_early_khz` so boot never stalls calibrating the TSC) |
+| QEMU | Linux, macOS, Windows | `-M microvm` on x86_64, `-M virt` on ARM64; KVM, HVF or WHPX when available, else TCG (slow; adds `tsc_early_khz` so boot never stalls calibrating the TSC) |
 
 The research doc names libkrun for macOS; QEMU came first because the same
 command line covers Linux and macOS and CI can test it. libkrun stays an
@@ -173,6 +182,16 @@ modes. The host never unpacks image tarballs. The disk is cached under
 `<vm dir>/images/<digest>/` with the image config; `refs/` maps the
 reference to the digest, so a cached image is used without contacting the
 registry (like `docker run`).
+
+Disks are sparse files. The ext4 ones come from a built-in formatter
+(`microvm/ext4.rs`) rather than `mkfs.ext4`, which Windows lacks and macOS
+has only through Homebrew: 4 KiB blocks, 32768-block groups each with its
+own bitmaps and inode table, `sparse_super` backups, `filetype`,
+`extents`, `ext_attr`, `large_file`, `dir_nlink` and `extra_isize` with
+256-byte inodes, no journal and no checksums. Only metadata is written
+(zeroed inode tables are valid without `uninit_bg`), so a 10 GiB scratch
+disk costs a few hundred KiB. Unit tests run `e2fsck -fn` on it, before
+and after `debugfs` writes files; CI boots it with every backend.
 
 Per task: the guest mounts base read-only and scratch, stacks an overlay
 (upper on scratch) as the new root, copies `/input`, makes `/output` owned
@@ -391,6 +410,83 @@ providers keep the choice with `--auto-upgrade`. The control plane itself
 is upgraded by hand: replace its binary and restart it before rolling out
 agents of a newer protocol.
 
+## Phase 5: Windows
+
+Windows was already a release target, a service host and a WASM executor.
+Phase 5 makes Docker and microVM jobs work there too.
+
+### Docker Desktop
+
+Docker Desktop runs Linux containers in a WSL 2 VM and exposes the usual
+API on `//./pipe/docker_engine`, which the Docker CLI uses as is. What
+changed in the executor is everything that touched host paths: inputs and
+outputs travel as tar streams (above), so nothing depends on how Windows
+paths, ownership, symlinks or long paths map into the VM. `detect` refuses
+a daemon in Windows-containers mode and, for a service whose `PATH` does
+not have Docker yet, also looks in `C:\Program Files\Docker\Docker\resources\bin`.
+The attached `docker start` CLI is put in a Job Object (below). Docker
+Desktop runs only in a signed-in session, so a headless machine offers
+WASM and microVM only.
+
+### QEMU with WHPX
+
+The research doc's choice: QEMU with the Windows Hypervisor Platform reuses
+the phase 3 QEMU code; Hyper-V's HCS would be faster to boot but is a much
+larger integration, deferred. The QEMU command differs from Linux in four
+places:
+
+| | Windows | Why |
+| --- | --- | --- |
+| Accelerator | `-accel whpx,kernel-irqchip=off -accel tcg` | QEMU's own PIC/IOAPIC/LAPIC; WHPX's in-kernel APIC trips up Linux guests on some builds. TCG is the fallback when WHPX cannot start. |
+| CPU model | `-cpu Nehalem` under WHPX, `max` otherwise | WHPX takes CPUID leaf 1 from QEMU's model, and `max` there is TCG's list; Nehalem is x86-64-v2, which every WHPX host has |
+| TSC | `tsc_early_khz=<host rate>` | no kvm-clock under WHPX; the agent measures the host TSC against the system clock (50 ms) and the guest reads the same TSC |
+| Console | `-serial file:<dir>/serial.log` | QEMU's stdio console polls a console input handle that services and NUL stdin lack |
+
+`PUMASI_QEMU_ACCEL` (e.g. `tcg`, `whpx`) and `PUMASI_QEMU_CPU` override the
+first two for trying a new machine. Whether WHPX is usable is checked by
+loading `WinHvPlatform.dll` from System32 at run time (it exists only with
+the feature on) and asking `WHvGetCapability(HypervisorPresent)`; `pumasi
+vm status` prints the reason when it is not.
+
+`pumasi vm setup` on Windows x86_64 downloads a pinned QEMU installer
+(Stefan Weil's build, the one qemu.org links to; it has `microvm` and
+`whpx`), checks size and SHA-256 while streaming it to disk, and runs it
+silently (`/S /D=<vm dir>\qemu`). The installer registers itself for all
+users, so this needs an administrator shell; a plain shell gets
+`ERROR_ELEVATION_REQUIRED` and a message saying so. A marker file names the
+installer, so a newer pin replaces the install. Windows on ARM gets no
+QEMU (there is no upstream build); a QEMU on `PATH` would run guests in TCG.
+
+### Job Objects, sparse files, long paths
+
+- Each VMM and each attached Docker CLI goes into its own Job Object with
+  `KILL_ON_JOB_CLOSE`. The handle lives as long as the run; if the agent
+  dies, Windows closes it and the process dies with it. (Only the
+  executor's children are in jobs, not the agent, so the upgrade path that
+  spawns the new binary is unaffected.)
+- NTFS files are not sparse unless asked: every disk is created with
+  `FSCTL_SET_SPARSE` before it is extended.
+- Rust's standard library handles paths over 260 characters; QEMU does not,
+  so the agent warns when the VM directory path is long enough for task
+  disks to cross that limit.
+
+### Firewall
+
+`pumasi service install` adds an inbound UDP rule for the binary on private
+and domain networks (`netsh advfirewall`), since a service never gets the
+firewall prompt and its direct QUIC paths would be dropped (the relay still
+works). Public networks are left closed. `service uninstall` removes it.
+
+### CI
+
+The `microvm (windows, qemu tcg)` job builds the guest init on Linux, embeds
+it (`PUMASI_EMBED_GUEST`), runs `pumasi vm setup` (kernel and the pinned
+QEMU installer), boots an image with `pumasi vm run`, and runs the microVM
+end-to-end test, all under TCG since hosted runners have no nested
+virtualization. WHPX is verified on a real PC. The release workflow builds
+the guest for x86_64 and aarch64 and embeds the matching one in all six
+binaries.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -416,10 +512,12 @@ remotely; install the phase 4 binary on them once.
 
 ## Not yet
 
-- Remaining roadmap phases (5 to 15): Windows microVMs (QEMU + WHPX), old
-  Intel Macs and availability policy, a cluster file store, GPUs, cluster
-  management, monitoring, a web dashboard, Raft, WebGPU, the confidential
-  tier, the marketplace. See the roadmap in the README.
+- Remaining roadmap phases (6 to 15): old Intel Macs and availability
+  policy, a cluster file store, GPUs, cluster management, monitoring, a web
+  dashboard, Raft, WebGPU, the confidential tier, the marketplace. See the
+  roadmap in the README.
+- Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
+  path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node
   selection yet, and the control plane does not upgrade itself.
 - High availability: one control plane; Raft (openraft) planned.

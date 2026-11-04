@@ -597,6 +597,7 @@ mod imp {
             println!("  binary: {}", spec.exe.display());
             println!("  arguments: {:?}", spec.args());
             println!("  start: automatic, restart on failure");
+            println!("  firewall: allow inbound UDP on private and domain networks");
             return Ok(0);
         }
         let mgr = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
@@ -644,8 +645,50 @@ mod imp {
         service.set_failure_actions_on_non_crash_failures(true)?;
         service.start::<&str>(&[]).context("start the service")?;
         println!("installed and started the {NAME} service");
+        allow_through_firewall(&spec.exe);
         println!("logs: {}", spec.log_file().display());
         Ok(0)
+    }
+
+    const FIREWALL_RULE: &str = "Pumasi agent (UDP in)";
+
+    /// Lets the agent receive UDP on private and domain networks, which
+    /// direct (hole-punched) QUIC connections need. A service gets no
+    /// firewall prompt, so without a rule its traffic goes through the
+    /// relay. Public networks stay closed; see the README to open them.
+    fn allow_through_firewall(exe: &Path) {
+        use std::os::windows::process::CommandExt;
+        remove_firewall_rule();
+        let out = std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "add", "rule"])
+            .raw_arg(format!("name=\"{FIREWALL_RULE}\""))
+            .args(["dir=in", "action=allow", "protocol=UDP", "enable=yes"])
+            .arg("profile=private,domain")
+            .raw_arg(format!("program=\"{}\"", exe.display()))
+            .output();
+        match out {
+            Ok(o) if o.status.success() => println!(
+                "firewall: allowed inbound UDP for {} on private and domain networks (rule {FIREWALL_RULE:?})",
+                exe.display()
+            ),
+            Ok(o) => println!(
+                "firewall: could not add a rule ({}); direct connections may fall back to the relay",
+                String::from_utf8_lossy(&o.stdout).trim()
+            ),
+            Err(e) => println!(
+                "firewall: could not run netsh ({e}); direct connections may fall back to the relay"
+            ),
+        }
+    }
+
+    /// True if a rule was there.
+    fn remove_firewall_rule() -> bool {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule"])
+            .raw_arg(format!("name=\"{FIREWALL_RULE}\""))
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     fn stop_and_wait(service: &windows_service::service::Service) {
@@ -677,6 +720,9 @@ mod imp {
         stop_and_wait(&service);
         service.delete().context("remove the service")?;
         println!("removed the {NAME} service");
+        if remove_firewall_rule() {
+            println!("removed the firewall rule {FIREWALL_RULE:?}");
+        }
         Ok(0)
     }
 

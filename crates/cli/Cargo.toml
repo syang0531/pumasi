@@ -1,0 +1,23 @@
+[package]
+name = "pumasi-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pumasi"
+path = "src/main.rs"
+
+[dependencies]
+pumasi-proto.workspace = true
+pumasi-agent.workspace = true
+pumasi-cluster.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+iroh.workspace = true
+toml.workspace = true

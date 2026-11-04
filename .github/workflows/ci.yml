@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            examples/montecarlo
+      - name: Unit and end-to-end tests
+        run: cargo test --workspace
+      - name: Build sample module
+        run: cargo build --release --target wasm32-wasip1 --manifest-path examples/montecarlo/Cargo.toml
+      - name: Run sample module in the local sandbox
+        shell: bash
+        run: |
+          cargo run --release -p pumasi-cli -- exec \
+            examples/montecarlo/target/wasm32-wasip1/release/montecarlo.wasm sample 1 100000 \
+            | tee sample.txt
+          grep -q "^1 " sample.txt

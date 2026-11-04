@@ -1,0 +1,11 @@
+# Estimate pi with 16 independent shards of 5 million samples each.
+# Build the module first:
+#   cargo build --release --target wasm32-wasip1 --manifest-path examples/montecarlo/Cargo.toml
+name = "estimate-pi"
+module = "target/wasm32-wasip1/release/montecarlo.wasm"
+shards = 16
+args = ["sample", "{shard}", "5000000"]
+
+[resources]
+memory_mb = 32
+timeout = "2m"

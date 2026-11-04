@@ -32,8 +32,8 @@ esac
 # Paths as the native binary expects them.
 nat() { if [ "$OS" = windows ]; then cygpath -w "$1"; else echo "$1"; fi; }
 sha() {
-  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
-  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+  if command -v sha256sum >/dev/null; then sha256sum <"$1" | cut -d' ' -f1
+  else shasum -a 256 <"$1" | cut -d' ' -f1; fi
 }
 as_root() { if [ "$OS" = windows ] || [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
 

@@ -15,6 +15,7 @@ use crate::{
     economy::{Micros, Policy},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput},
     receipt::{Receipt, SignedUsage},
+    release::{ReleaseFile, SignedRelease, Target},
 };
 
 /// What a member machine is to the cluster.
@@ -68,7 +69,44 @@ pub struct AgentHello {
     /// Required the first time a node joins; omitted when reconnecting.
     pub join_secret: Option<Secret>,
     pub node: NodeInfo,
+    /// Set when the agent can replace its own binary.
+    pub upgrade: Option<UpgradeHello>,
 }
+
+/// What an agent tells the cluster about upgrading itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeHello {
+    /// SHA-256 of the binary the agent runs.
+    pub exe_sha256: [u8; 32],
+    /// `Some(true)`: the node opted in (`--auto-upgrade`), needed on
+    /// provider machines. `Some(false)`: opted out. `None`: the default,
+    /// on for the owner's machines and off for providers.
+    pub auto: Option<bool>,
+}
+
+impl UpgradeHello {
+    pub fn accepts(&self, role: Role) -> bool {
+        self.auto.unwrap_or(role == Role::Owner)
+    }
+}
+
+/// A chunk request for a release binary, sent on its own stream of the
+/// agent connection. The reply is one [`FetchReply`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchRequest {
+    pub sha256: [u8; 32],
+    pub offset: u64,
+    pub len: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FetchReply {
+    Data(Vec<u8>),
+    Error(String),
+}
+
+/// Largest chunk a [`FetchRequest`] or an upload may carry.
+pub const RELEASE_CHUNK: u32 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HelloReply {
@@ -135,6 +173,9 @@ pub struct TaskAssignment {
 pub enum ToAgent {
     Assign(Box<TaskAssignment>),
     Cancel(TaskRef),
+    /// Replace the agent binary with this release, then restart. Sent only
+    /// to idle nodes that accept upgrades.
+    Upgrade(Box<SignedRelease>),
 }
 
 /// How a task ended.
@@ -192,8 +233,16 @@ pub struct TaskReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FromAgent {
-    Heartbeat { running: Vec<TaskRef> },
+    Heartbeat {
+        running: Vec<TaskRef>,
+    },
     Done(Box<TaskReport>),
+    /// The agent refused or could not install an offered release. It
+    /// keeps running its current binary.
+    UpgradeFailed {
+        sha256: [u8; 32],
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +306,24 @@ pub enum AdminOp {
     },
     GetPolicy,
     SetPolicy(Policy),
+    /// One chunk of a release binary. Chunks are appended in order; the
+    /// last one completes the upload, which the control plane checks
+    /// against `sha256`.
+    UploadRelease {
+        sha256: [u8; 32],
+        size: u64,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    /// Replace the current rollout with these uploaded binaries (one per
+    /// target). `force` allows binaries of another protocol version.
+    Rollout {
+        files: Vec<ReleaseFile>,
+        force: bool,
+    },
+    RolloutStatus,
+    /// Stop offering the current rollout.
+    CancelRollout,
 }
 
 /// Terms of an invite for someone else's machine.
@@ -272,8 +339,13 @@ pub struct Invite {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminResponse {
-    JoinToken { ticket: String, expires_unix: u64 },
-    Submitted { id: JobId },
+    JoinToken {
+        ticket: String,
+        expires_unix: u64,
+    },
+    Submitted {
+        id: JobId,
+    },
     Status(ClusterStatus),
     Job(Box<JobView>),
     Files(Vec<FileEntry>),
@@ -281,8 +353,69 @@ pub enum AdminResponse {
     Accounts(Vec<AccountView>),
     Ledger(Vec<LedgerEntry>),
     Policy(Policy),
+    /// Upload progress: bytes stored so far.
+    Uploaded {
+        have: u64,
+    },
+    Rollout(RolloutView),
     Ok,
     Error(String),
+}
+
+/// The current rollout and where each node stands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolloutView {
+    pub releases: Vec<SignedRelease>,
+    pub started_unix: u64,
+    pub nodes: Vec<NodeUpgradeView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeUpgradeView {
+    pub id: String,
+    pub name: String,
+    pub target: Target,
+    pub version: String,
+    pub exe_sha256: Option<[u8; 32]>,
+    pub state: UpgradeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpgradeState {
+    /// No rollout, or the node runs the release binary.
+    Current,
+    /// Waits for its running tasks to finish (gets no new tasks).
+    Draining,
+    /// Waits its turn: another node is draining.
+    Waiting,
+    /// Got the release and is installing it.
+    Upgrading,
+    /// Refused or failed to install the release; keeps its binary.
+    Failed(String),
+    /// The rollout has no binary for this node's platform.
+    NoRelease,
+    /// A provider machine that did not pass `--auto-upgrade`, or a node
+    /// that passed `--no-auto-upgrade`.
+    OptedOut,
+    /// The agent cannot replace its own binary.
+    Unsupported,
+    Offline,
+}
+
+impl std::fmt::Display for UpgradeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpgradeState::Current => f.write_str("current"),
+            UpgradeState::Draining => f.write_str("draining"),
+            UpgradeState::Waiting => f.write_str("waiting"),
+            UpgradeState::Upgrading => f.write_str("upgrading"),
+            UpgradeState::Failed(r) => write!(f, "failed: {r}"),
+            UpgradeState::NoRelease => f.write_str("no binary for platform"),
+            UpgradeState::OptedOut => f.write_str("opted out"),
+            UpgradeState::Unsupported => f.write_str("cannot self-upgrade"),
+            UpgradeState::Offline => f.write_str("offline"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

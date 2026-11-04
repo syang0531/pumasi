@@ -17,10 +17,11 @@ use iroh::{
 use pumasi_proto::{
     ADMIN_ALPN, AGENT_ALPN, PROTOCOL_VERSION, Secret,
     msg::{
-        AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FromAgent, HelloReply,
-        Invite, Role, ToAgent,
+        AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
+        FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, ToAgent,
     },
     net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key, write_private},
+    release::SignedRelease,
     secrets_eq,
     ticket::{AdminTicket, JoinTicket},
     wire::{read_msg, write_msg},
@@ -31,7 +32,11 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{state::State, store::Store};
+use crate::{
+    rollout::{ReleaseStore, release_dir},
+    state::State,
+    store::Store,
+};
 
 const KEY_FILE: &str = "secret.key";
 const DB_FILE: &str = "state.redb";
@@ -70,6 +75,7 @@ struct Inner {
     endpoint: Endpoint,
     config: ClusterConfig,
     addr: Mutex<EndpointAddr>,
+    releases: ReleaseStore,
 }
 
 impl Inner {
@@ -131,6 +137,7 @@ impl Cluster {
             endpoint: endpoint.clone(),
             config: config.clone(),
             addr: Mutex::new(addr),
+            releases: ReleaseStore::new(release_dir(&config.data_dir)),
         });
 
         let router = Router::builder(endpoint.clone())
@@ -204,6 +211,17 @@ impl Cluster {
 
     pub fn status(&self) -> ClusterStatus {
         self.inner.state().status()
+    }
+
+    /// Where uploaded release binaries are kept.
+    pub fn release_store(&self) -> ReleaseStore {
+        self.inner.releases.clone()
+    }
+
+    /// Sends a release to a node as is. For tests of forged releases.
+    #[doc(hidden)]
+    pub fn send_release_for_tests(&self, node: &str, release: SignedRelease) -> Result<()> {
+        self.inner.state().send_release_for_tests(node, release)
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -285,9 +303,15 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ToAgent>();
     let (kill_tx, mut kill_rx) = oneshot::channel();
-    let generation = inner
-        .state()
-        .on_connect(&node_id, hello.node.clone(), tx, kill_tx);
+    let generation = inner.state().on_connect(
+        &node_id,
+        hello.node.clone(),
+        hello.upgrade.clone(),
+        tx,
+        kill_tx,
+    );
+    // Release downloads come on their own streams of this connection.
+    let fetcher = tokio::spawn(serve_fetches(inner.clone(), conn.clone(), node_id.clone()));
     info!(node = %node_id, name = %hello.node.name, slots = hello.node.slots, %role, %account, "node online");
 
     let writer = tokio::spawn(async move {
@@ -308,6 +332,11 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
                     st.on_heartbeat(&node_id, generation);
                     st.on_report(&node_id, generation, *report);
                 }
+                Ok(Some(FromAgent::UpgradeFailed { sha256, reason })) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_upgrade_failed(&node_id, generation, sha256, reason);
+                }
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),
             },
@@ -318,8 +347,46 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
     inner.state().on_disconnect(&node_id, generation);
     info!(node = %node_id, "node offline");
     writer.abort();
+    fetcher.abort();
     conn.close(0u32.into(), b"session ended");
     result
+}
+
+/// Serves chunks of release binaries to an agent: one [`FetchRequest`] and
+/// one [`FetchReply`] per stream.
+async fn serve_fetches(inner: Arc<Inner>, conn: Connection, node_id: String) {
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let inner = inner.clone();
+        let node_id = node_id.clone();
+        tokio::spawn(async move {
+            let res: Result<()> = async {
+                let Some(req) = read_msg::<_, FetchRequest>(&mut recv).await? else {
+                    return Ok(());
+                };
+                let reply = if !inner.state().may_fetch(&node_id, &req.sha256) {
+                    FetchReply::Error("not a binary of the current rollout".into())
+                } else {
+                    let store = inner.releases.clone();
+                    let len = req.len.min(RELEASE_CHUNK);
+                    match tokio::task::spawn_blocking(move || {
+                        store.read(&req.sha256, req.offset, len)
+                    })
+                    .await?
+                    {
+                        Ok(bytes) => FetchReply::Data(bytes),
+                        Err(e) => FetchReply::Error(format!("{e:#}")),
+                    }
+                };
+                write_msg(&mut send, &reply).await?;
+                send.finish()?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = res {
+                debug!("release fetch failed: {e:#}");
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +500,27 @@ fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
             let mut st = inner.state();
             st.set_policy(p)?;
             Ok(AdminResponse::Policy(st.policy()))
+        }
+        AdminOp::UploadRelease {
+            sha256,
+            size,
+            offset,
+            bytes,
+        } => {
+            anyhow::ensure!(bytes.len() <= RELEASE_CHUNK as usize, "chunk too large");
+            let have = inner.releases.upload(&sha256, size, offset, &bytes)?;
+            Ok(AdminResponse::Uploaded { have })
+        }
+        AdminOp::Rollout { files, force } => {
+            let mut st = inner.state();
+            let view = st.start_rollout(files, force, |f| inner.releases.has(&f.sha256, f.size))?;
+            inner.releases.prune(&st.rollout_hashes());
+            Ok(AdminResponse::Rollout(view))
+        }
+        AdminOp::RolloutStatus => Ok(AdminResponse::Rollout(inner.state().rollout_view())),
+        AdminOp::CancelRollout => {
+            inner.state().cancel_rollout()?;
+            Ok(AdminResponse::Ok)
         }
     })();
     result.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))

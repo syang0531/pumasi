@@ -229,6 +229,13 @@ impl Store {
         Ok(())
     }
 
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?.remove(key)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn put_policy(&self, p: &Policy) -> Result<()> {
         self.put_meta(POLICY_META, &enc(p))
     }

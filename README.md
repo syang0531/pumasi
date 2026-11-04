@@ -13,15 +13,40 @@ Pumasi grows in phases: a private cluster tool that is useful on its own
 (phase 1), then other people's machines joining by invite, with signed
 usage receipts, a prepaid credit ledger and spot checks of their results
 (phase 2), then a microVM executor that runs container images on those
-machines with VM isolation (phase 3, this release), and later a marketplace
-that bursts into idle machines with the same job format. See
-[docs/architecture.md](docs/architecture.md) and the roadmap below.
+machines with VM isolation (phase 3), then release binaries, OS services
+and signed cluster-wide upgrades (phase 4, this release), and later
+Windows, old Macs, storage, GPUs, cluster management, monitoring, a
+dashboard and a marketplace. See [docs/architecture.md](docs/architecture.md)
+and the roadmap below.
+
+## Install
+
+Every release has a `pumasi` binary for Linux (x86_64, aarch64; static),
+macOS (x86_64 from 10.15, Apple Silicon) and Windows (x86_64, ARM64), a
+`SHA256SUMS` file, and two install scripts that download the right binary
+and check its checksum:
+
+```sh
+# Linux, macOS: installs to /usr/local/bin as root, else ~/.local/bin
+curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.sh | sh
+```
+
+```powershell
+# Windows: installs to Program Files\Pumasi (administrator) or %LOCALAPPDATA%, adds it to PATH
+irm https://github.com/syang0531/pumasi/releases/latest/download/install.ps1 | iex
+```
+
+Options: `--version v0.4.0` / `-Version`, `--dir` / `-Dir`, and a join
+ticket to also install the agent as a service (next section):
+`curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, or
+`& ([scriptblock]::Create((irm .../install.ps1))) -Ticket pumasijoin...`.
+While the repository is private, set `GITHUB_TOKEN` to a token that can
+read it (the scripts then go through the GitHub API). Or build from source:
+`cargo build --release -p pumasi-cli`.
 
 ## Quick start
 
 ```sh
-cargo build --release -p pumasi-cli          # produces target/release/pumasi
-
 # Machine 1: start the control plane. It prints a join command.
 pumasi cluster start --name homelab
 
@@ -162,6 +187,61 @@ owner                   99.9625              0         0.0375              0
 Credits are bookkeeping only: no money moves. `pumasi credit payout bob 10`
 records that you settled with bob outside Pumasi.
 
+### Run the agent as a service
+
+`pumasi agent join` runs in the foreground. To keep a machine in the
+cluster across reboots, install the agent as a service instead:
+
+```sh
+sudo pumasi service install --ticket pumasijoin... -- --allow-microvm
+pumasi service status
+```
+
+| OS | As root / administrator | Otherwise |
+| --- | --- | --- |
+| Linux | systemd unit `/etc/systemd/system/pumasi-agent.service`, starts at boot | `systemctl --user` unit; lingering is enabled so it also starts at boot |
+| macOS | LaunchDaemon `/Library/LaunchDaemons/pumasi.agent.plist`, starts at boot | LaunchAgent, starts at login |
+| Windows | Windows service `pumasi-agent` (automatic start, restarts on failure) | needs an administrator shell |
+
+`--ticket` joins on the first start; without it the machine must have
+joined before. Options after `--` are passed to `pumasi agent start`.
+Logs go to the journal on Linux and to `~/.pumasi/logs/agent.log` on macOS
+and Windows. `pumasi service uninstall` removes the service; the machine
+stays a member (`pumasi remove-node` revokes it).
+
+### Upgrading every agent at once
+
+Download the new release's binaries, then roll them out from wherever the
+admin ticket is:
+
+```sh
+pumasi upgrade rollout pumasi-linux-x86_64 pumasi-macos-aarch64 pumasi-windows-x86_64.exe --wait
+pumasi upgrade status
+```
+
+```
+PLATFORM         VERSION              SHA256
+linux/x86_64     0.4.0                3f94db2f1a61...
+
+NODE         NAME             PLATFORM         VERSION              BINARY         STATE
+1634691880   desktop          linux/x86_64     0.4.0                3f94db2f1a61   current
+8a1c0e55d2   bobs-pc          linux/x86_64     0.3.0                a82335740e93   opted out
+```
+
+The platform and version are read from each file. The control plane signs
+each binary with the cluster key; an agent installs only a binary signed by
+the cluster it joined, for its own platform, with the signed size and
+SHA-256, and only after the new binary starts (`--version`). Your machines
+accept upgrades by default (`--no-auto-upgrade` opts out); someone else's
+machine only if its owner starts the agent with `--auto-upgrade`. Idle nodes
+upgrade right away, busy ones stop taking new tasks one at a time. The agent
+restarts in place; if the cluster rejects the new binary, it cannot reach
+the cluster for 5 minutes, or it keeps crashing, the agent puts the
+previous binary back and reports the failure in `pumasi upgrade status`.
+Upgrade the control plane first (stop it, replace the binary, start it):
+a binary with a newer protocol needs `--force` and its agents would roll
+back.
+
 ## Commands
 
 | Command | What it does |
@@ -170,7 +250,9 @@ records that you settled with bob outside Pumasi.
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`). |
-| `pumasi agent start [--allow-docker] [--allow-microvm]` | Reconnect to the cluster this machine joined before (no ticket needed). |
+| `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
+| `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- AGENT OPTIONS]` | Run the agent as a service that starts at boot (systemd, launchd, Windows service). `status` and `uninstall` too. |
+| `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
 | `pumasi vm setup [--guest FILE] [--force]` | Install the guest kernel, Firecracker (Linux) and the guest init into `~/.pumasi/vm`. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
@@ -359,6 +441,13 @@ checked.
 - Tasks are **not** hidden from the machine's owner: only the `open`
   confidentiality tier exists. Do not send secrets to machines you do not
   trust.
+- Agent upgrades are signed by the control plane's key, which agents learned
+  when they joined, and checked against the signed SHA-256 before they run.
+  Whoever holds the admin ticket can roll out a binary to your machines (and
+  to providers that opted in), so the admin ticket is as sensitive as root
+  on them. Release binaries come with `SHA256SUMS`, and with GitHub build
+  provenance attestations once the repository is public
+  (`gh attestation verify pumasi-linux-x86_64 -R syang0531/pumasi`).
 
 ## Roadmap
 
@@ -366,8 +455,19 @@ checked.
 | --- | --- | --- |
 | 1 | Private cluster: agent, control plane, iroh networking, WASM and Docker executors, file input/output, CLI | done |
 | 2 | Invited outside providers (open tier), usage receipts signed by node and cluster, fixed price list, prepaid credit ledger, sampled re-runs to check results | done |
-| 3 | microVM executor: same OCI images as docker jobs in Firecracker or QEMU VMs, behind the same job format, open to providers | this release (GPU passthrough and WebGPU experiments not yet) |
-| 4 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
+| 3 | microVM executor: same OCI images as docker jobs in Firecracker or QEMU VMs, behind the same job format, open to providers | done |
+| 4 | Distribution and install: release binaries for six platforms with SHA256SUMS, install scripts, OS services, signed cluster-driven upgrades with rollback | this release |
+| 5 | Windows: Docker Desktop, microVMs with QEMU + WHPX | planned |
+| 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours) | planned |
+| 7 | Cluster file store (iroh-blobs): datasets, large inputs and outputs, resumable transfers | planned |
+| 8 | GPUs: detection, scheduling, Docker GPU jobs, VFIO passthrough for microVMs | planned |
+| 9 | Cluster management: labels and selectors, drain, priorities, quotas, role tickets, `apply` | planned |
+| 10 | Monitoring and alerts: node metrics, Prometheus endpoint, live logs, webhooks | planned |
+| 11 | Web dashboard (built into the binary) | planned |
+| 12 | Control plane high availability (Raft) | planned |
+| 13 | WebGPU executor (experimental) | planned |
+| 14 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
+| 15 | Marketplace hub and real payments | planned |
 
 Known gaps: single control plane (no Raft yet), no web console, accounts
 exist only inside one cluster and only the admin can submit (with
@@ -384,14 +484,22 @@ cargo test --workspace     # unit tests + end-to-end tests over real iroh connec
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+`scripts/ci/service-upgrade.sh OLD NEW WORKDIR` (CI runs it on Linux,
+macOS and Windows) installs the `OLD` binary as a real service with a join
+ticket, restarts the service, rolls `NEW` out with `pumasi upgrade rollout
+--wait` and checks that the node runs it; `--foreground` does the same
+without a service manager. Build two different binaries with
+`PUMASI_BUILD_ID`: `PUMASI_BUILD_ID=new cargo build -p pumasi-cli`.
+
 The end-to-end tests in `crates/cluster/tests/e2e.rs` start a control plane
 and agents on localhost and cover sharded jobs, node failure and rescheduling,
 ticket rejection and reuse, reconnect without a ticket, cancellation, fuel
 limits, bad admin credentials, restarting the control plane, docker jobs
 with input/output files (skipped when no Linux Docker daemon is available),
 an invited provider paid from prepaid credit with verifiable receipts, a
-dishonest provider caught by check runs, refunded and suspended, and microVM
-jobs on an invited provider. The microVM test runs when `PUMASI_TEST_VM_DIR`
+dishonest provider caught by check runs, refunded and suspended, microVM
+jobs on an invited provider, and an agent upgrade rollout (opt-in, forged
+signature and tampered binary refused). The microVM test runs when `PUMASI_TEST_VM_DIR`
 points at a directory prepared with `pumasi vm setup` (CI does this on Linux
 with KVM, for Firecracker and for QEMU):
 

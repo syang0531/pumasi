@@ -1,0 +1,160 @@
+name: Release
+
+# A tag like v0.4.0 builds the pumasi binary for six platforms and publishes
+# them with SHA256SUMS, build provenance attestations and the install
+# scripts as a GitHub release. Pull requests that touch the release setup
+# run the builds without publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/**
+      - Cargo.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: pumasi-linux-x86_64
+            target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+            native: true
+          - asset: pumasi-linux-aarch64
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - asset: pumasi-macos-x86_64
+            target: x86_64-apple-darwin
+            os: macos-latest
+            minos: "10.15"
+          - asset: pumasi-macos-aarch64
+            target: aarch64-apple-darwin
+            os: macos-latest
+            native: true
+            # Apple Silicon starts at macOS 11; the linker raises 10.15 to it.
+            minos: "11.0"
+          - asset: pumasi-windows-x86_64.exe
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            native: true
+          - asset: pumasi-windows-aarch64.exe
+            target: aarch64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      # Old Intel Macs (2013-2014) run macOS 10.15 at the latest.
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install zig (static musl builds)
+        if: matrix.zig
+        run: python3 -m pip install --user --break-system-packages "ziglang<0.15"
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "PUMASI_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "PUMASI_BUILD_ID=ci.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.zig }}" = true ]; then
+            cargo zigbuild --release --locked -p pumasi-cli --target ${{ matrix.target }}
+          else
+            cargo build --release --locked -p pumasi-cli --target ${{ matrix.target }}
+          fi
+          mkdir -p dist
+          src=target/${{ matrix.target }}/release/pumasi
+          [ -f "$src.exe" ] && src="$src.exe"
+          cp "$src" "dist/${{ matrix.asset }}"
+          ls -l dist
+      - name: Check the binary
+        shell: bash
+        run: |
+          bin="dist/${{ matrix.asset }}"
+          if [ "${{ matrix.native }}" = true ]; then
+            "./$bin" --version
+          fi
+          case "${{ matrix.os }}" in
+            ubuntu-*) file "$bin" | tee /dev/stderr | grep -q "statically linked" ;;
+            macos-*) vtool -show-build "$bin" | tee /dev/stderr | grep -Eq "(minos|version) ${{ matrix.minos }}( |$)" ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check build markers
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then want="v=${GITHUB_REF_NAME#v};"; else want="v=0"; fi
+          for f in dist/pumasi-*; do
+            grep -aqo "pumasi-build-info:$want" "$f" || { echo "$f: no build marker $want"; exit 1; }
+          done
+      - name: Checksums
+        run: |
+          cp scripts/install.sh scripts/install.ps1 dist/
+          chmod +x dist/pumasi-linux-* dist/pumasi-macos-*
+          (cd dist && sha256sum pumasi-* install.sh install.ps1 > SHA256SUMS && cat SHA256SUMS)
+      - name: Install script against these assets
+        run: |
+          sh scripts/install.sh --base-url "$PWD/dist" --dir "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/pumasi" --version
+      # Attestations need a public repository (or GitHub Enterprise Cloud).
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/') && !github.event.repository.private
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/pumasi-*"
+      - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        with:
+          name: release-assets
+          path: dist/
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

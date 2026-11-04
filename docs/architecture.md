@@ -2,7 +2,8 @@
 
 This document records how the cluster is built and why: the private
 cluster of phase 1, the invited providers, receipts, credit ledger and
-result checks of phase 2, and the microVM executor of phase 3. The
+result checks of phase 2, the microVM executor of phase 3, and the
+releases, OS services and signed agent upgrades of phase 4. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -15,7 +16,7 @@ the project; this file covers the code.
 | `pumasi-guest` | `pumasi-guest`, the init process inside every microVM (a static musl binary), and the disk protocol the agent shares with it. |
 | `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `MicrovmExecutor` (registry client, Firecracker/QEMU) and the `Agent` session loop, which signs usage. |
 | `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
-| `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. |
+| `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. `service.rs` installs the agent as an OS service, `upgrade.rs` drives rollouts. |
 
 The marketplace hub is not in this repository; it will be a separate,
 closed-source service. The agent and control plane stay Apache-2.0.
@@ -33,9 +34,11 @@ Two ALPNs:
 - `pumasi/agent/0`: the agent dials the control plane and opens one
   bidirectional stream. Handshake: `AgentHello` -> `HelloReply` (which tells
   the node its role and account). Then the
-  control plane sends `ToAgent::{Assign, Cancel}` and the agent sends
-  `FromAgent::{Heartbeat, Done}`. Agents always dial out, so they work from
-  behind NAT without port forwarding.
+  control plane sends `ToAgent::{Assign, Cancel, Upgrade}` and the agent
+  sends `FromAgent::{Heartbeat, Done, UpgradeFailed}`. Further streams the
+  agent opens on the same connection each carry one `FetchRequest` (a
+  chunk of a release binary) and its `FetchReply`. Agents always dial out,
+  so they work from behind NAT without port forwarding.
 - `pumasi/admin/0`: one `AdminRequest` / `AdminResponse` per stream, each
   request carrying the admin secret.
 
@@ -294,6 +297,100 @@ Cheating is caught statistically, not prevented: with rate p a provider
 that fakes n results escapes with probability (1-p)^n, and the hold period
 keeps its earnings reclaimable meanwhile.
 
+## Phase 4: distribution and upgrades
+
+### Release builds
+
+`.github/workflows/release.yml` runs on a `v*` tag. It builds `pumasi-cli`
+in release mode for six targets: `x86_64`/`aarch64-unknown-linux-musl`
+with cargo-zigbuild (static, so one binary covers every distribution),
+`x86_64`/`aarch64-apple-darwin` with `MACOSX_DEPLOYMENT_TARGET=10.15` (Apple Silicon builds start at 11.0), and
+`x86_64`/`aarch64-pc-windows-msvc`. Assets are raw binaries named
+`pumasi-<os>-<arch>[.exe]` (what `pumasi upgrade rollout` takes as is),
+`SHA256SUMS`, `install.sh` and `install.ps1`. With a public repository the
+job also attests build provenance (`actions/attest-build-provenance`);
+GitHub offers attestations for private repositories only on Enterprise
+Cloud, so the step is skipped while the repository is private. Pull
+requests that touch the release files run the six builds without
+publishing.
+
+The version comes from the tag (`PUMASI_VERSION`, read by
+`crates/proto/build.rs`); other builds use the crate version, plus
+`+<PUMASI_BUILD_ID>` when set. Every binary carries the marker
+`pumasi-build-info:v=<version>;p=<protocol>;` (`pumasi_proto::BUILD_INFO`),
+so a rollout can read the version and protocol of a binary for another OS
+without running it. The platform comes from the executable header (ELF,
+Mach-O or PE machine field).
+
+### Services
+
+`pumasi service install` writes a service that runs
+`pumasi --home <home> agent start <options>` and starts it:
+
+| OS | System (root) | User |
+| --- | --- | --- |
+| Linux | `/etc/systemd/system/pumasi-agent.service`, `WantedBy=multi-user.target` | `~/.config/systemd/user/`, plus `loginctl enable-linger` |
+| macOS | `/Library/LaunchDaemons/pumasi.agent.plist` in the `system` domain | `~/Library/LaunchAgents/`, `gui/<uid>` domain |
+| Windows | SCM service `pumasi-agent`, LocalSystem, automatic start | - |
+
+All restart the agent when it exits (`Restart=always`, `KeepAlive`, SCM
+failure actions with `failure_actions_on_non_crash_failures`). On Windows
+the service runs `pumasi ... service run -- <options>`, which hands the
+main thread to the service dispatcher (`windows-service`) and runs the
+agent on its own runtime, logging to `<home>/logs/agent.log`.
+`--ticket` stores the ticket as `<home>/agent/join.ticket` (mode 0600);
+`agent start` joins with it while there is no membership yet, and deletes
+it afterwards.
+
+### Signed rollouts
+
+1. `pumasi upgrade rollout FILE...` reads target, version and protocol of
+   each file, refuses a protocol other than its own without `--force`, and
+   uploads each binary with `AdminOp::UploadRelease` in 8 MiB chunks. The
+   control plane appends them to `<cluster dir>/releases/<sha256>.part`
+   and renames the file once its SHA-256 matches (a binary already there
+   is not sent again).
+2. `AdminOp::Rollout` makes the control plane sign, per binary,
+   `"pumasi/release/v1\0" || postcard(Release { cluster key, ReleaseFile
+   { target, version, protocol, sha256, size }, created })` with its
+   endpoint key, the key agents dialed when they joined. The record is
+   stored under `meta.rollout`; binaries of earlier rollouts are deleted.
+3. Each agent tells the control plane in its hello whether it can upgrade
+   itself: the SHA-256 of its binary and its opt-in (`UpgradeHello`).
+   Owner machines accept by default, providers only with
+   `--auto-upgrade`. A node is due when the rollout has a binary for its
+   platform with another hash, it accepts, and it has not failed with
+   that binary. Every scheduling pass sends `ToAgent::Upgrade` to due nodes
+   with no running task; of the due nodes that are busy, one at a time is
+   drained (gets no new tasks). A node sent a release gets no tasks until
+   it reconnects, reports a failure, or 15 minutes pass.
+4. The agent checks the release (signature against its cluster's key,
+   target, opt-in, not failed before) before downloading anything, then
+   fetches the binary in chunks over its own connection and checks size and
+   SHA-256. It copies it next to its binary (same filesystem), runs
+   `<new> --version` (must exit 0 and print the release version), backs the
+   running binary up to `<data dir>/upgrade/previous`, writes
+   `upgrade/pending.json` and renames the new file over the binary
+   (Windows: the running file is renamed to `<exe>.old` first, since a
+   running executable can be renamed but not overwritten). `serve` returns
+   `AgentExit::Upgraded`; the CLI `exec`s the binary again with the same
+   arguments on Unix (same PID, so systemd and launchd keep tracking it),
+   spawns it on Windows, or under the Windows service exits with code 75,
+   which the failure actions turn into a restart.
+5. The restarted agent sees `pending.json` with its own hash: it is on
+   trial. The first `Welcome` commits the upgrade (deletes the file). A
+   `Rejected` reply, 5 minutes without reaching the cluster, or a fourth
+   start without a welcome (a crash loop under a service manager) puts
+   `previous` back, records the release in `upgrade/failed.json` and
+   restarts again. Refusals and failures go to the control plane as
+   `FromAgent::UpgradeFailed` and show in `pumasi upgrade status`.
+
+The cluster key is the trust root, so the admin secret (which can start a
+rollout) is as powerful as root on every machine that accepts upgrades;
+providers keep the choice with `--auto-upgrade`. The control plane itself
+is upgraded by hand: replace its binary and restart it before rolling out
+agents of a newer protocol.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -310,11 +407,21 @@ database (no version) becomes layout 2: members become owner machines, jobs
 belong to `owner` and are not deterministic. Layout 3 (phase 3) adds
 `microvm_cpu_hour` to the stored policy, starting at the Docker price.
 `Executor::Microvm` was appended to the enum, so older records decode
-unchanged. `PROTOCOL_VERSION` is 4: agents and the control plane must both
-be phase 3 builds.
+unchanged. Phase 4 adds no new record layout: the rollout lives under the
+new `meta.rollout` key and uploaded binaries are files in
+`<cluster dir>/releases/`. `PROTOCOL_VERSION` is 5 (the hello carries
+`UpgradeHello`, and upgrade messages were added): agents and the control
+plane must both be phase 4 builds. Phase 3 agents cannot be upgraded
+remotely; install the phase 4 binary on them once.
 
 ## Not yet
 
+- Remaining roadmap phases (5 to 15): Windows microVMs (QEMU + WHPX), old
+  Intel Macs and availability policy, a cluster file store, GPUs, cluster
+  management, monitoring, a web dashboard, Raft, WebGPU, the confidential
+  tier, the marketplace. See the roadmap in the README.
+- Rollouts go to every node; there is no canary group or per-node
+  selection yet, and the control plane does not upgrade itself.
 - High availability: one control plane; Raft (openraft) planned.
 - Accounts other than `owner` exist only as ledger entries; consumer
   tickets that let other people submit (and see only their jobs) are next.

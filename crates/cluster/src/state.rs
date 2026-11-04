@@ -20,7 +20,7 @@ use pumasi_proto::{
     msg::{
         AccountView, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo, NodeView,
         OWNER_ACCOUNT, Outcome, Role, TaskAssignment, TaskRef, TaskReport, TaskState, TaskView,
-        ToAgent, Verification,
+        ToAgent, UpgradeHello, Verification,
     },
     receipt::{Billing, Receipt, check_usage, result_digest},
     secrets_eq,
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::store::Store;
+use crate::{rollout::RolloutRecord, store::Store};
 
 /// Extra time past a task's own timeout before the control plane assumes
 /// the node hung and reschedules the task elsewhere.
@@ -206,6 +206,12 @@ pub(crate) struct NodeRuntime {
     pub trusted: bool,
     pub executors: Vec<Executor>,
     pub suspended: bool,
+    /// Present when the agent can replace its own binary.
+    pub upgrade: Option<UpgradeHello>,
+    /// Gets no new tasks so it can be upgraded once idle.
+    pub draining: bool,
+    /// Release (by SHA-256) sent to it; gets no tasks meanwhile.
+    pub upgrading: Option<([u8; 32], Instant)>,
 }
 
 impl NodeRuntime {
@@ -241,6 +247,11 @@ pub struct State {
     pub(crate) next_ledger_seq: u64,
     pub(crate) next_seq: u64,
     pub(crate) next_generation: u64,
+    /// Agent binaries being rolled out, one per platform.
+    pub(crate) rollout: Option<RolloutRecord>,
+    /// Nodes that refused or failed to install a release: the release's
+    /// SHA-256 and why. Not offered that release again.
+    pub(crate) upgrade_failures: HashMap<String, ([u8; 32], String)>,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -307,7 +318,10 @@ impl State {
             next_ledger_seq: snap.next_ledger_seq,
             next_seq: 0,
             next_generation: 1,
+            rollout: None,
+            upgrade_failures: HashMap::new(),
         };
+        state.rollout = state.load_rollout()?;
         state.ensure_account(OWNER_ACCOUNT)?;
         let mut jobs = snap.jobs;
         jobs.sort_by_key(|(m, _)| m.seq);
@@ -513,6 +527,7 @@ impl State {
         &mut self,
         id: &str,
         info: NodeInfo,
+        upgrade: Option<UpgradeHello>,
         tx: mpsc::UnboundedSender<ToAgent>,
         kill: oneshot::Sender<()>,
     ) -> u64 {
@@ -557,6 +572,9 @@ impl State {
                 trusted,
                 executors,
                 suspended,
+                upgrade,
+                draining: false,
+                upgrading: None,
             },
         );
         self.schedule();
@@ -635,7 +653,8 @@ impl State {
             self.requeue(t, "task lease expired");
         }
         self.release_holds(now_unix());
-        if !self.queue.is_empty() {
+        self.expire_upgrades();
+        if !self.queue.is_empty() || self.rollout.is_some() {
             self.schedule();
         }
     }
@@ -1079,6 +1098,8 @@ impl State {
 
     /// Places as many queued runs as free slots allow.
     pub fn schedule(&mut self) {
+        // Idle nodes due for an upgrade get it before any new task.
+        self.drive_rollout();
         let mut skipped = VecDeque::new();
         let mut dirty: Vec<(JobId, u32)> = Vec::new();
         while let Some(item) = self.queue.pop_front() {
@@ -1121,6 +1142,8 @@ impl State {
                 .filter(|(id, n)| {
                     n.online
                         && !n.suspended
+                        && !n.draining
+                        && n.upgrading.is_none()
                         && n.free_slots() > 0
                         && n.info.memory_bytes >= need
                         && n.executors.contains(&executor)
@@ -1397,7 +1420,7 @@ mod tests {
         st.authorize(&id, &info, Some(&token.secret)).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let (kill, _) = oneshot::channel();
-        st.on_connect(&id, info, tx, kill);
+        st.on_connect(&id, info, None, tx, kill);
         (id, rx)
     }
 

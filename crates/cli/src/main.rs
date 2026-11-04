@@ -1,6 +1,9 @@
 //! `pumasi`: one binary for the control plane, the node agent and the
 //! admin CLI.
 
+mod service;
+mod upgrade;
+
 use std::{
     io::Write,
     net::SocketAddr,
@@ -12,7 +15,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use pumasi_agent::{
-    Agent, AgentConfig, MicrovmConfig, MicrovmExecutor, WasmExecutor, default_node_name,
+    Agent, AgentConfig, AgentExit, MicrovmConfig, MicrovmExecutor, UpgradeConfig, WasmExecutor,
+    default_node_name,
     microvm::{Assets, Backend},
 };
 use pumasi_cluster::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig};
@@ -34,7 +38,7 @@ use pumasi_proto::{
 #[derive(Parser)]
 #[command(
     name = "pumasi",
-    version,
+    version = pumasi_proto::version(),
     about = "Pool your machines into one cluster and run batch jobs (WebAssembly or containers) on it."
 )]
 struct Cli {
@@ -163,6 +167,13 @@ enum Cmd {
     },
     /// Save an admin ticket so this machine can manage a remote cluster.
     Login { ticket: String },
+    /// Run the agent as a service that starts at boot (systemd, launchd,
+    /// Windows service).
+    #[command(subcommand)]
+    Service(service::ServiceCmd),
+    /// Roll new agent binaries out to the cluster's nodes.
+    #[command(subcommand)]
+    Upgrade(upgrade::UpgradeCmd),
     /// MicroVM support: install the guest kernel, check the setup, or run
     /// an image locally in a microVM.
     #[command(subcommand)]
@@ -379,6 +390,14 @@ struct AgentOpts {
     allow_microvm: bool,
     #[command(flatten)]
     vm: VmArgs,
+    /// Accept agent upgrades the cluster rolls out (`pumasi upgrade
+    /// rollout`). Your own machines accept them by default; a provider
+    /// machine needs this flag.
+    #[arg(long, conflicts_with = "no_auto_upgrade")]
+    auto_upgrade: bool,
+    /// Never let the cluster replace this agent's binary.
+    #[arg(long)]
+    no_auto_upgrade: bool,
     #[command(flatten)]
     net: NetArgs,
 }
@@ -400,25 +419,59 @@ struct AdminArgs {
     admin: Option<String>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    pumasi_proto::build_info();
     let cli = Cli::parse();
-    let long_running = matches!(cli.cmd, Cmd::Cluster(_) | Cmd::Agent(_));
+    let long_running = matches!(
+        cli.cmd,
+        Cmd::Cluster(_) | Cmd::Agent(_) | Cmd::Service(service::ServiceCmd::Run { .. })
+    );
     let default_filter = if long_running {
         "pumasi=info,warn"
     } else {
         "warn"
     };
+    let filter = tracing_subscriber::EnvFilter::try_from_env("PUMASI_LOG")
+        .unwrap_or_else(|_| default_filter.into());
+
+    // Under the Windows service manager there is no console: log to a file
+    // and hand the main thread to the service dispatcher.
+    #[cfg(windows)]
+    if let Cmd::Service(service::ServiceCmd::Run { agent_args }) = &cli.cmd {
+        let home = match home_dir(&cli.home) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        let logs = home.join("logs");
+        let _ = std::fs::create_dir_all(&logs);
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs.join("agent.log"))
+        {
+            Ok(file) => tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init(),
+            Err(_) => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        }
+        std::process::exit(service::windows::run(home, agent_args.clone()));
+    }
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("PUMASI_LOG")
-                .unwrap_or_else(|_| default_filter.into()),
-        )
+        .with_env_filter(filter)
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
 
-    match run(cli).await {
+    let runtime = tokio::runtime::Runtime::new().expect("start the async runtime");
+    let code = runtime.block_on(run(cli));
+    match code {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -456,7 +509,9 @@ async fn run(cli: Cli) -> Result<i32> {
             net,
             no_token,
         }) => cluster_start(&home, name, net, no_token).await,
-        Cmd::Agent(cmd) => agent(&home, cmd).await,
+        Cmd::Agent(cmd) => agent(&home, cmd, ctrl_c(), false).await,
+        Cmd::Service(cmd) => service_cmd(&home, cmd),
+        Cmd::Upgrade(cmd) => upgrade::run(&home, cmd).await,
         Cmd::Token { ttl, uses, admin } => {
             let ttl_secs = parse_duration_ms(&ttl)? / 1000;
             let client = connect_admin(&home, &admin).await?;
@@ -686,12 +741,42 @@ async fn cluster_start(home: &Path, name: String, net: NetArgs, no_token: bool) 
     Ok(0)
 }
 
-async fn agent(home: &Path, cmd: AgentCmd) -> Result<i32> {
+async fn ctrl_c() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// A ticket `pumasi service install --ticket` left for the first start.
+const PENDING_TICKET_FILE: &str = "join.ticket";
+
+/// Runs the agent until `shutdown` resolves. After an upgrade or a
+/// rollback it restarts the process: in place on Unix; on Windows a new
+/// process, or under the service manager (`in_service`) it returns
+/// [`service::RESTART_EXIT_CODE`] so the service is restarted.
+async fn agent(
+    home: &Path,
+    cmd: AgentCmd,
+    shutdown: impl std::future::Future<Output = ()>,
+    in_service: bool,
+) -> Result<i32> {
+    let data_dir = home.join("agent");
+    let membership = data_dir.join("membership.json");
+    let pending_ticket = data_dir.join(PENDING_TICKET_FILE);
     let (ticket, opts) = match cmd {
         AgentCmd::Join { ticket, opts } => (Some(ticket.parse::<JoinTicket>()?), opts),
-        AgentCmd::Start { opts } => (None, opts),
+        AgentCmd::Start { opts } if !membership.exists() && pending_ticket.exists() => {
+            let text = std::fs::read_to_string(&pending_ticket)?;
+            let ticket = text
+                .parse::<JoinTicket>()
+                .with_context(|| format!("bad ticket in {}", pending_ticket.display()))?;
+            (Some(ticket), opts)
+        }
+        AgentCmd::Start { opts } => {
+            if membership.exists() {
+                let _ = std::fs::remove_file(&pending_ticket);
+            }
+            (None, opts)
+        }
     };
-    let data_dir = home.join("agent");
     let net = match &ticket {
         Some(t) => net_for(&t.cluster, opts.net.net),
         None => {
@@ -712,8 +797,20 @@ async fn agent(home: &Path, cmd: AgentCmd) -> Result<i32> {
         bind: opts.net.bind,
         docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
         microvm: opts.allow_microvm.then(|| opts.vm.config(home)),
+        upgrade: own_exe().map(|exe| UpgradeConfig {
+            exe,
+            auto: if opts.auto_upgrade {
+                Some(true)
+            } else if opts.no_auto_upgrade {
+                Some(false)
+            } else {
+                None
+            },
+            smoke_test: true,
+        }),
         corrupt_results: false,
     };
+    let exe = config.upgrade.as_ref().map(|u| u.exe.clone());
     let agent = Agent::new(config).await?;
     eprintln!(
         "agent {} ({}, {} slots, {}) connecting...",
@@ -728,11 +825,124 @@ async fn agent(home: &Path, cmd: AgentCmd) -> Result<i32> {
             None => agent.resume().await,
         }
     };
-    tokio::select! {
-        r = serve => r.map(|_| 0),
-        _ = tokio::signal::ctrl_c() => {
+    let exit = tokio::select! {
+        r = serve => r?,
+        _ = shutdown => {
             eprintln!("shutting down");
-            Ok(0)
+            return Ok(0);
+        }
+    };
+    match &exit {
+        AgentExit::Upgraded { version } => eprintln!("upgraded to {version}; restarting"),
+        AgentExit::RolledBack { reason } => {
+            eprintln!("rolled back to the previous binary ({reason}); restarting")
+        }
+    }
+    if in_service {
+        return Ok(service::RESTART_EXIT_CODE);
+    }
+    let exe = exe.context("restart: unknown binary path")?;
+    restart_self(&exe)
+}
+
+/// The running binary, if the agent can replace it.
+fn own_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.canonicalize().unwrap_or(exe))
+}
+
+/// Runs the binary at `exe` again with this process's arguments.
+fn restart_self(exe: &Path) -> Result<i32> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(exe).args(&args).exec();
+        Err(anyhow::Error::from(err).context(format!("restart {}", exe.display())))
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(exe)
+            .args(&args)
+            .spawn()
+            .with_context(|| format!("restart {}", exe.display()))?;
+        Ok(0)
+    }
+}
+
+/// What the Windows service runs: `agent start` with the given options.
+#[cfg_attr(not(windows), allow(dead_code))]
+async fn run_service_agent(
+    home: PathBuf,
+    agent_args: Vec<String>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<i32> {
+    let cmd = parse_agent_args(&agent_args)?;
+    agent(&home, cmd, shutdown, true).await
+}
+
+/// Parses options meant for `pumasi agent start`.
+fn parse_agent_args(agent_args: &[String]) -> Result<AgentCmd> {
+    let argv = ["pumasi", "agent", "start"]
+        .into_iter()
+        .map(String::from)
+        .chain(agent_args.iter().cloned());
+    match Cli::try_parse_from(argv) {
+        Ok(Cli {
+            cmd: Cmd::Agent(cmd),
+            ..
+        }) => Ok(cmd),
+        Ok(_) => bail!("not agent options"),
+        Err(e) => bail!("invalid agent options {agent_args:?}: {e}"),
+    }
+}
+
+fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
+    use service::ServiceCmd;
+    match cmd {
+        ServiceCmd::Install {
+            ticket,
+            scope,
+            dry_run,
+            agent_args,
+        } => {
+            parse_agent_args(&agent_args)?;
+            let home = service::absolute(home)?;
+            let data_dir = home.join("agent");
+            if let Some(t) = &ticket {
+                t.parse::<JoinTicket>()?;
+            }
+            if !dry_run {
+                match &ticket {
+                    Some(t) => pumasi_proto::net::write_private(
+                        &data_dir.join(PENDING_TICKET_FILE),
+                        t.trim().as_bytes(),
+                    )?,
+                    None if !data_dir.join("membership.json").exists() => bail!(
+                        "this machine has not joined a cluster yet (no {}); pass --ticket",
+                        data_dir.join("membership.json").display()
+                    ),
+                    None => {}
+                }
+            }
+            let exe = own_exe().context("cannot find this binary's path")?;
+            service::install(
+                &service::Spec {
+                    exe,
+                    home,
+                    agent_args,
+                },
+                scope,
+                dry_run,
+            )
+        }
+        ServiceCmd::Uninstall { scope } => service::uninstall(scope),
+        ServiceCmd::Status { scope } => service::status(scope),
+        ServiceCmd::Run { agent_args } => {
+            let _ = agent_args;
+            bail!(
+                "`service run` is what the Windows service manager runs; use `pumasi agent start`"
+            )
         }
     }
 }
@@ -801,12 +1011,13 @@ fn print_status(s: &ClusterStatus) {
     println!("cluster {} ({})", s.cluster_name, short(&s.cluster_id));
     println!();
     println!(
-        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:>5} {:>8} {:>10} {:>8}",
+        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8}",
         "NODE",
         "NAME",
         "STATE",
         "ROLE",
         "PLATFORM",
+        "VERSION",
         "EXECUTORS",
         "SLOTS",
         "RUNNING",
@@ -831,12 +1042,13 @@ fn print_status(s: &ClusterStatus) {
             format!("{}/{}", n.checks_passed, n.strikes)
         };
         println!(
-            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:>5} {:>8} {:>10} {:>8}",
+            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8}",
             short(&n.id),
             truncate(&n.info.name, 16),
             state,
             truncate(&role, 18),
             format!("{}/{}", n.info.os, n.info.arch),
+            truncate(&n.info.agent_version, 12),
             executor_list(&n.executors),
             n.info.slots,
             n.running,

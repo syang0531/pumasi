@@ -4,17 +4,18 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use pumasi_agent::{Agent, AgentConfig};
+use pumasi_agent::{Agent, AgentConfig, AgentExit, UpgradeConfig};
 use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
     economy::{Policy, PriceList},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{
-        AccountView, AdminOp, AdminResponse, Invite, JobState, JobView, LedgerKind, Role,
-        TaskState, Verification,
+        AccountView, AdminOp, AdminResponse, Invite, JobState, JobView, LedgerKind,
+        NodeUpgradeView, Role, RolloutView, TaskState, UpgradeState, Verification,
     },
     net::NetMode,
     receipt::Receipt,
+    release::{Release, ReleaseFile, SignedRelease, Target, hex, sha256},
     ticket::JoinTicket,
 };
 use tokio::task::JoinHandle;
@@ -84,7 +85,7 @@ async fn start_cluster(dir: PathBuf) -> Result<Cluster> {
 
 struct RunningAgent {
     endpoint: iroh::Endpoint,
-    handle: JoinHandle<Result<()>>,
+    handle: JoinHandle<Result<AgentExit>>,
 }
 
 impl RunningAgent {
@@ -104,6 +105,7 @@ async fn agent(name: &str, slots: u32, dir: PathBuf) -> Agent {
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: None,
         microvm: None,
+        upgrade: None,
         corrupt_results: false,
     })
     .await
@@ -452,6 +454,7 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: None,
         microvm: None,
+        upgrade: None,
         corrupt_results: corrupt,
     })
     .await
@@ -853,6 +856,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: Some("docker".into()),
         microvm: None,
+        upgrade: None,
         corrupt_results: false,
     })
     .await
@@ -1001,6 +1005,7 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: None,
         microvm: Some(vm),
+        upgrade: None,
         corrupt_results: false,
     })
     .await
@@ -1135,5 +1140,238 @@ async fn microvm_jobs_run_on_an_invited_provider() {
     client.close().await;
     wasm_only.kill().await;
     p.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: cluster-driven agent upgrades
+// ---------------------------------------------------------------------------
+
+/// An agent whose "binary" is `exe`, a plain file: tests skip running the
+/// new binary (`smoke_test: false`) but everything else is real.
+async fn upgradable(name: &str, dir: PathBuf, exe: PathBuf, auto: Option<bool>) -> Agent {
+    Agent::new(AgentConfig {
+        data_dir: dir,
+        name: name.into(),
+        slots: Some(1),
+        net: NetMode::Local,
+        bind: Some("127.0.0.1:0".parse().unwrap()),
+        docker: None,
+        microvm: None,
+        upgrade: Some(UpgradeConfig {
+            exe,
+            auto,
+            smoke_test: false,
+        }),
+        corrupt_results: false,
+    })
+    .await
+    .unwrap()
+}
+
+fn release_file(bytes: &[u8], version: &str) -> ReleaseFile {
+    ReleaseFile {
+        target: Target::host(),
+        version: version.into(),
+        protocol: pumasi_proto::PROTOCOL_VERSION,
+        sha256: sha256(bytes),
+        size: bytes.len() as u64,
+    }
+}
+
+async fn upload(client: &AdminClient, bytes: &[u8]) {
+    let resp = client
+        .call(AdminOp::UploadRelease {
+            sha256: sha256(bytes),
+            size: bytes.len() as u64,
+            offset: 0,
+            bytes: bytes.to_vec(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, AdminResponse::Uploaded { have } if have == bytes.len() as u64));
+}
+
+async fn rollout_view(client: &AdminClient) -> RolloutView {
+    match client.call(AdminOp::RolloutStatus).await.unwrap() {
+        AdminResponse::Rollout(v) => v,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+async fn wait_upgrade_state(
+    client: &AdminClient,
+    node: &str,
+    pred: impl Fn(&NodeUpgradeView) -> bool,
+) -> NodeUpgradeView {
+    for _ in 0..300 {
+        let view = rollout_view(client).await;
+        if let Some(n) = view.nodes.iter().find(|n| n.id == node)
+            && pred(n)
+        {
+            return n.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "node {node} never got there: {:#?}",
+        rollout_view(client).await
+    );
+}
+
+async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    for _ in 0..300 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn rollout_upgrades_opted_in_agents_and_refuses_forged_binaries() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    let bin = tempdir("bin");
+    let old = b"pumasi binary, old build".to_vec();
+    let owner_exe = bin.join("owner-pumasi");
+    let provider_exe = bin.join("provider-pumasi");
+    std::fs::write(&owner_exe, &old).unwrap();
+    std::fs::write(&provider_exe, &old).unwrap();
+
+    // One of the owner's machines (accepts upgrades by default) and a
+    // provider machine that did not opt in.
+    let owner_dir = tempdir("o");
+    let owner = upgradable("owner-pc", owner_dir.clone(), owner_exe.clone(), None).await;
+    let owner_id = owner.id().to_string();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let owner_run = spawn_join(owner, ticket);
+    let provider = upgradable("bobs-pc", tempdir("p"), provider_exe.clone(), None).await;
+    let provider_id = provider.id().to_string();
+    let provider_run = spawn_join(provider, invite(&cluster, "bob"));
+    wait_online(&cluster, 2).await;
+
+    // A rollout of a new build for this platform.
+    let new = b"pumasi binary, new build".to_vec();
+    upload(&client, &new).await;
+    let resp = client
+        .call(AdminOp::Rollout {
+            files: vec![release_file(&new, "9.9.9-test")],
+            force: false,
+        })
+        .await
+        .unwrap();
+    let AdminResponse::Rollout(view) = resp else {
+        panic!("unexpected {resp:?}");
+    };
+    // Signed with the cluster key.
+    view.releases[0]
+        .verify(cluster.addr().id.as_bytes())
+        .unwrap();
+
+    // The owner's agent installs it and returns so the process restarts.
+    let exit = tokio::time::timeout(Duration::from_secs(30), owner_run.handle)
+        .await
+        .expect("the owner's agent did not upgrade")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exit,
+        AgentExit::Upgraded {
+            version: "9.9.9-test".into()
+        }
+    );
+    assert_eq!(std::fs::read(&owner_exe).unwrap(), new);
+    owner_run.endpoint.close().await;
+
+    // The provider never got it.
+    let p = wait_upgrade_state(&client, &provider_id, |n| n.state == UpgradeState::OptedOut).await;
+    assert_eq!(p.exe_sha256, Some(sha256(&old)));
+    assert_eq!(std::fs::read(&provider_exe).unwrap(), old);
+
+    // "Restart": a new process from the same state directory runs the new
+    // binary, is welcomed, and finishes the upgrade.
+    let owner = upgradable("owner-pc", owner_dir.clone(), owner_exe.clone(), None).await;
+    let owner_endpoint = owner.endpoint().clone();
+    let owner_run = tokio::spawn(owner.resume());
+    let n = wait_upgrade_state(&client, &owner_id, |n| n.state == UpgradeState::Current).await;
+    assert_eq!(n.exe_sha256, Some(sha256(&new)));
+    let pending = owner_dir.join("upgrade").join("pending.json");
+    wait_for("the upgrade to be committed", || !pending.exists()).await;
+
+    // A release that claims to be this cluster's but is signed by another
+    // key is refused before anything is downloaded.
+    let forger = iroh::SecretKey::generate();
+    let evil = b"pumasi binary, evil build".to_vec();
+    upload(&client, &evil).await;
+    let forged = SignedRelease::sign(
+        Release {
+            cluster: *cluster.addr().id.as_bytes(),
+            file: release_file(&evil, "6.6.6"),
+            created_unix: 0,
+        },
+        &forger,
+    );
+    cluster.send_release_for_tests(&owner_id, forged).unwrap();
+    let failed = owner_dir.join("upgrade").join("failed.json");
+    wait_for("the forged release to be refused", || {
+        std::fs::read_to_string(&failed).is_ok_and(|t| t.contains(&hex(&sha256(&evil))))
+    })
+    .await;
+    assert!(
+        std::fs::read_to_string(&failed)
+            .unwrap()
+            .contains("signature")
+    );
+    assert_eq!(std::fs::read(&owner_exe).unwrap(), new);
+    assert!(!owner_run.is_finished());
+
+    // A correctly signed release whose binary was swapped on the control
+    // plane's disk: the agent checks the hash and keeps its binary.
+    let newer = b"pumasi binary, newer build".to_vec();
+    upload(&client, &newer).await;
+    let stored = cluster.release_store().path_of(&sha256(&newer));
+    let mut tampered = newer.clone();
+    tampered[0] ^= 1;
+    std::fs::write(&stored, &tampered).unwrap();
+    client
+        .call(AdminOp::Rollout {
+            files: vec![release_file(&newer, "10.0.0-test")],
+            force: false,
+        })
+        .await
+        .unwrap();
+    let n = wait_upgrade_state(&client, &owner_id, |n| {
+        matches!(n.state, UpgradeState::Failed(_))
+    })
+    .await;
+    let UpgradeState::Failed(reason) = n.state else {
+        unreachable!()
+    };
+    assert!(reason.contains("SHA-256"), "{reason}");
+    assert_eq!(std::fs::read(&owner_exe).unwrap(), new);
+    assert!(!owner_run.is_finished());
+
+    // A binary for another protocol needs --force.
+    let mut other = release_file(&newer, "11.0.0");
+    other.protocol += 1;
+    let err = client
+        .call(AdminOp::Rollout {
+            files: vec![other],
+            force: false,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("protocol"), "{err}");
+
+    client.call(AdminOp::CancelRollout).await.unwrap();
+    owner_run.abort();
+    owner_endpoint.close().await;
+    provider_run.kill().await;
+    client.close().await;
     cluster.shutdown().await.unwrap();
 }

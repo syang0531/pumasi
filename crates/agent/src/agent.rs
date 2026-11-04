@@ -6,7 +6,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex, atomic::AtomicBool},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -31,6 +31,7 @@ use crate::{
     docker::DockerExecutor,
     executor::WasmExecutor,
     microvm::{MicrovmConfig, MicrovmExecutor},
+    upgrade::{AgentExit, Startup, TRIAL_TIMEOUT, UpgradeConfig, Upgrader},
 };
 
 const MEMBERSHIP_FILE: &str = "membership.json";
@@ -50,6 +51,8 @@ pub struct AgentConfig {
     pub docker: Option<String>,
     /// Run image jobs in microVMs. `None` means no microvm jobs here.
     pub microvm: Option<MicrovmConfig>,
+    /// Let the cluster replace this agent's binary. `None`: never.
+    pub upgrade: Option<UpgradeConfig>,
     /// Test hook: tamper with every successful result before reporting it,
     /// like a provider that skips the work. Never set this in real use.
     #[doc(hidden)]
@@ -80,6 +83,7 @@ pub struct Agent {
     files: FileCache,
     config: AgentConfig,
     info: NodeInfo,
+    upgrader: Option<Arc<Upgrader>>,
 }
 
 /// Why a session ended.
@@ -90,6 +94,8 @@ enum SessionEnd {
     Lost(anyhow::Error),
     /// Could not connect or handshake.
     Failed(anyhow::Error),
+    /// Installed a new binary; the process must restart.
+    Upgraded(String),
 }
 
 impl Agent {
@@ -117,6 +123,16 @@ impl Agent {
                 }
                 None => None,
             };
+        let upgrader = match &config.upgrade {
+            Some(u) => match Upgrader::new(u.clone(), &config.data_dir) {
+                Ok(up) => Some(Arc::new(up)),
+                Err(e) => {
+                    warn!("cluster upgrades are off for this agent: {e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
         let mut info = node_info(&config);
         if docker.is_some() {
             info.executors.push(Executor::Docker);
@@ -133,6 +149,7 @@ impl Agent {
             files: Default::default(),
             config,
             info,
+            upgrader,
         })
     }
 
@@ -167,31 +184,73 @@ impl Agent {
         Ok(())
     }
 
-    /// Joins with a ticket, then serves the cluster until a fatal error.
-    pub async fn join(self, ticket: JoinTicket) -> Result<()> {
+    /// Joins with a ticket, then serves the cluster until a fatal error or
+    /// an upgrade.
+    pub async fn join(self, ticket: JoinTicket) -> Result<AgentExit> {
         self.serve(ticket.cluster, Some(ticket.secret)).await
     }
 
     /// Reconnects to the cluster this agent joined before.
-    pub async fn resume(self) -> Result<()> {
+    pub async fn resume(self) -> Result<AgentExit> {
         let Some(m) = self.membership()? else {
             bail!("this agent has not joined a cluster yet; run `pumasi agent join <TICKET>`");
         };
         self.serve(m.cluster, None).await
     }
 
-    /// Serves the cluster forever, reconnecting with backoff when the
-    /// connection drops. Returns only if the control plane rejects us.
-    pub async fn serve(self, cluster: EndpointAddr, mut join_secret: Option<Secret>) -> Result<()> {
+    /// Serves the cluster, reconnecting with backoff when the connection
+    /// drops. Returns an error if the control plane rejects us, and
+    /// [`AgentExit`] when the process must restart to run a new (or the
+    /// previous) binary.
+    pub async fn serve(
+        self,
+        cluster: EndpointAddr,
+        mut join_secret: Option<Secret>,
+    ) -> Result<AgentExit> {
+        // On trial: running a freshly installed binary not yet welcomed.
+        let mut trial: Option<Instant> = None;
+        if let Some(up) = &self.upgrader {
+            match up.startup()? {
+                Startup::Normal => {}
+                Startup::Trial => trial = Some(Instant::now()),
+                Startup::RolledBack(reason) => return Ok(AgentExit::RolledBack { reason }),
+            }
+        }
+        let rollback = |reason: String| -> Result<AgentExit> {
+            let up = self
+                .upgrader
+                .as_ref()
+                .expect("on trial only with an upgrader");
+            up.rollback(&reason)?;
+            Ok(AgentExit::RolledBack { reason })
+        };
         let mut backoff = Duration::from_millis(500);
         loop {
             match self.session(&cluster, &mut join_secret).await {
-                SessionEnd::Rejected(reason) => bail!("cluster rejected this node: {reason}"),
+                SessionEnd::Rejected(reason) => {
+                    if trial.is_some() {
+                        return rollback(format!("cluster rejected the new binary: {reason}"));
+                    }
+                    bail!("cluster rejected this node: {reason}")
+                }
+                SessionEnd::Upgraded(version) => return Ok(AgentExit::Upgraded { version }),
                 SessionEnd::Lost(e) => {
+                    // The handshake succeeded, so the trial (if any) is over.
+                    trial = None;
                     warn!("lost connection to cluster: {e:#}");
                     backoff = Duration::from_millis(500);
                 }
-                SessionEnd::Failed(e) => warn!("could not reach cluster: {e:#}"),
+                SessionEnd::Failed(e) => {
+                    warn!("could not reach cluster: {e:#}");
+                    if let Some(since) = trial
+                        && since.elapsed() > TRIAL_TIMEOUT
+                    {
+                        return rollback(format!(
+                            "the new binary could not reach the cluster for {} s: {e:#}",
+                            TRIAL_TIMEOUT.as_secs()
+                        ));
+                    }
+                }
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -215,6 +274,7 @@ impl Agent {
             protocol_version: PROTOCOL_VERSION,
             join_secret: *join_secret,
             node: self.info.clone(),
+            upgrade: self.upgrader.as_ref().map(|u| u.hello()),
         };
         if let Err(e) = write_msg(&mut send, &hello).await {
             return SessionEnd::Failed(e);
@@ -233,6 +293,9 @@ impl Agent {
             Err(e) => return SessionEnd::Failed(e),
         };
         info!(cluster = %cluster_name, node = %self.id().fmt_short(), slots = self.info.slots, %role, %account, "joined cluster");
+        if let Some(up) = &self.upgrader {
+            up.commit();
+        }
         if role == Role::Provider && self.docker.is_some() {
             info!("docker jobs run here only if the cluster's invite allowed them");
         }
@@ -280,9 +343,78 @@ impl Agent {
             })
         };
 
+        // An upgrade in progress reports here when it is done.
+        let (up_tx, mut up_rx) = mpsc::unbounded_channel::<([u8; 32], Result<String>)>();
+        let mut upgrading = false;
+
         // Reader: handle assignments and cancellations.
         let end = loop {
-            match read_msg::<_, ToAgent>(&mut recv).await {
+            let msg = tokio::select! {
+                m = read_msg::<_, ToAgent>(&mut recv) => m,
+                Some((sha, res)) = up_rx.recv() => {
+                    upgrading = false;
+                    match res {
+                        Ok(version) => {
+                            heartbeat.abort();
+                            writer.abort();
+                            conn.close(0u32.into(), b"upgrading");
+                            return SessionEnd::Upgraded(version);
+                        }
+                        Err(e) => {
+                            let reason = format!("{e:#}");
+                            warn!("upgrade failed: {reason}");
+                            if let Some(up) = &self.upgrader {
+                                up.record_failure(&sha, &reason);
+                            }
+                            let _ = out_tx.send(FromAgent::UpgradeFailed { sha256: sha, reason });
+                            continue;
+                        }
+                    }
+                }
+            };
+            match msg {
+                Ok(Some(ToAgent::Upgrade(release))) => {
+                    let sha = release.file().sha256;
+                    let refuse = match &self.upgrader {
+                        None => Some("this agent cannot replace its own binary".to_string()),
+                        Some(up) if !up.accepts(role) => Some(
+                            "upgrades are off on this node (start the agent with --auto-upgrade to accept them)"
+                                .to_string(),
+                        ),
+                        Some(up) => up
+                            .failed_before(&sha)
+                            .map(|r| format!("failed before on this node: {r}")),
+                    };
+                    if let Some(reason) = refuse {
+                        let _ = out_tx.send(FromAgent::UpgradeFailed {
+                            sha256: sha,
+                            reason,
+                        });
+                        continue;
+                    }
+                    if upgrading {
+                        continue;
+                    }
+                    upgrading = true;
+                    let up = self.upgrader.clone().expect("checked above");
+                    let conn = conn.clone();
+                    let running = running.clone();
+                    let up_tx = up_tx.clone();
+                    let cluster_key = *cluster.id.as_bytes();
+                    info!(version = %release.file().version, "cluster offered an agent upgrade");
+                    tokio::spawn(async move {
+                        let res = async {
+                            let staged = up.fetch(&conn, *release, &cluster_key, role).await?;
+                            // Tasks placed before the offer finish first.
+                            while !running.lock().unwrap().is_empty() {
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                            up.install(staged).await
+                        }
+                        .await;
+                        let _ = up_tx.send((sha, res));
+                    });
+                }
                 Ok(Some(ToAgent::Assign(mut a))) => {
                     // Cache shared files and compile modules here, in message
                     // order, so later assignments that only carry hashes
@@ -474,7 +606,7 @@ fn node_info(config: &AgentConfig) -> NodeInfo {
         cpus,
         memory_bytes: sys.total_memory(),
         slots: config.slots.unwrap_or(cpus).max(1),
-        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent_version: pumasi_proto::version().to_string(),
         executors: vec![Executor::Wasm],
     }
 }

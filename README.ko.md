@@ -2,13 +2,27 @@
 
 이미 가진 여러 대의 기기를 하나의 사설 클러스터로 묶어 배치 작업을 나눠 돌립니다. 모든 기기에서 도는 안전한 WebAssembly 작업, 허용한 기기에서 도는 일반 Docker 이미지 작업(Python, 원하는 패키지, 선택적 네트워크), 그리고 같은 이미지를 태스크마다 자기 커널을 가진 microVM 안에서 돌리는 작업(남이 빌려준 기기에도 보낼 수 있을 만큼 격리됨)을 같은 방식으로 실행합니다. Linux, macOS, Windows와 x86_64, ARM64에서 같은 Rust 단일 바이너리 하나로 동작합니다.
 
-단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 크레딧 원장, 결과 표본 검증을 더한 것, 3단계(이번 릴리스)는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기이고, 이후 같은 작업 명세로 남의 유휴 장비까지 빌려 쓰는 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
+단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 크레딧 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계(이번 릴리스)는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드입니다. 이후 Windows, 구형 Mac, 저장소, GPU, 클러스터 관리, 모니터링, 대시보드를 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
+
+## 설치
+
+릴리스마다 Linux(x86_64, aarch64, 정적 링크), macOS(x86_64는 10.15부터, Apple Silicon), Windows(x86_64, ARM64)용 `pumasi` 바이너리와 `SHA256SUMS`, 그리고 맞는 바이너리를 받아 체크섬까지 확인하는 설치 스크립트 두 개가 올라갑니다.
+
+```sh
+# Linux, macOS: root면 /usr/local/bin, 아니면 ~/.local/bin에 설치
+curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.sh | sh
+```
+
+```powershell
+# Windows: 관리자면 Program Files\Pumasi, 아니면 %LOCALAPPDATA%에 설치하고 PATH에 추가
+irm https://github.com/syang0531/pumasi/releases/latest/download/install.ps1 | iex
+```
+
+옵션: `--version v0.4.0` / `-Version`, `--dir` / `-Dir`. 참가 티켓을 주면 에이전트를 서비스로도 설치합니다: `curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, 또는 `& ([scriptblock]::Create((irm .../install.ps1))) -Ticket pumasijoin...`. 저장소가 비공개인 동안에는 읽기 권한이 있는 토큰을 `GITHUB_TOKEN`에 넣으면 GitHub API로 받습니다. 소스에서 빌드하려면 `cargo build --release -p pumasi-cli`.
 
 ## 빠른 시작
 
 ```sh
-cargo build --release -p pumasi-cli          # target/release/pumasi 생성
-
 # 1번 기기: 컨트롤 플레인 시작. 참가 명령이 출력됩니다.
 pumasi cluster start --name homelab
 
@@ -76,6 +90,34 @@ pumasi run examples/montecarlo/job.toml
 
 크레딧은 장부일 뿐 실제 돈은 오가지 않습니다. `pumasi credit payout bob 10`은 Pumasi 밖에서 bob에게 정산했다는 기록입니다.
 
+### 에이전트를 서비스로 실행
+
+`pumasi agent join`은 터미널을 차지하고 돕니다. 재부팅해도 클러스터에 다시 붙게 하려면 서비스로 설치합니다.
+
+```sh
+sudo pumasi service install --ticket pumasijoin... -- --allow-microvm
+pumasi service status
+```
+
+| OS | root·관리자로 설치 | 일반 사용자로 설치 |
+| --- | --- | --- |
+| Linux | systemd 유닛 `/etc/systemd/system/pumasi-agent.service`, 부팅 시 시작 | `systemctl --user` 유닛, lingering을 켜서 부팅 시 시작 |
+| macOS | LaunchDaemon `/Library/LaunchDaemons/pumasi.agent.plist`, 부팅 시 시작 | LaunchAgent, 로그인 시 시작 |
+| Windows | Windows 서비스 `pumasi-agent` (자동 시작, 실패 시 재시작) | 관리자 PowerShell 필요 |
+
+`--ticket`은 첫 시작 때 클러스터에 참가하고, 없으면 이미 참가한 기기여야 합니다. `--` 뒤의 옵션은 `pumasi agent start`로 넘어갑니다. 로그는 Linux는 journal, macOS와 Windows는 `~/.pumasi/logs/agent.log`입니다. `pumasi service uninstall`은 서비스만 지우고 멤버십은 남깁니다(퇴출은 `pumasi remove-node`).
+
+### 모든 에이전트를 한 번에 업그레이드
+
+새 릴리스의 바이너리를 받아 관리자 티켓이 있는 곳에서 배포합니다.
+
+```sh
+pumasi upgrade rollout pumasi-linux-x86_64 pumasi-macos-aarch64 pumasi-windows-x86_64.exe --wait
+pumasi upgrade status
+```
+
+플랫폼과 버전은 파일에서 읽습니다. 컨트롤 플레인이 바이너리마다 클러스터 키로 서명하고, 에이전트는 자기가 참가한 클러스터가 서명했고, 자기 플랫폼용이며, 서명된 크기와 SHA-256이 맞고, 새 바이너리가 실제로 뜨는(`--version`) 경우에만 설치합니다. 내 기기는 기본으로 받고(`--no-auto-upgrade`로 거부), 남의 기기는 주인이 에이전트를 `--auto-upgrade`로 띄운 경우에만 받습니다. 쉬는 노드는 바로, 바쁜 노드는 한 대씩 새 작업을 멈추고 비운 뒤 교체합니다. 에이전트는 제자리에서 재시작하고, 새 바이너리를 클러스터가 거부하거나, 5분 동안 클러스터에 못 붙거나, 계속 죽으면 이전 바이너리로 되돌리고 실패를 `pumasi upgrade status`에 보고합니다. 컨트롤 플레인을 먼저 업그레이드하세요(멈추고 바이너리 교체 후 시작). 프로토콜 버전이 다른 바이너리는 `--force`가 필요하고, 그 에이전트들은 롤백됩니다.
+
 ## 명령어
 
 | 명령 | 설명 |
@@ -84,7 +126,9 @@ pumasi run examples/montecarlo/job.toml
 | `pumasi token [--ttl 24h] [--uses N]` | 내 다른 기기용 참가 티켓 발급 |
 | `pumasi invite <계정> [--ttl 7d] [--uses 1] [--allow-docker]` | 다른 사람의 기기를 `계정` 몫으로 버는 제공자로 초대 |
 | `pumasi agent join <티켓> [--allow-docker] [--allow-microvm]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`) |
-| `pumasi agent start [--allow-docker] [--allow-microvm]` | 이전에 참가한 클러스터에 티켓 없이 재접속 |
+| `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | 이전에 참가한 클러스터에 티켓 없이 재접속 |
+| `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- 에이전트 옵션]` | 부팅 시 시작하는 서비스로 에이전트 설치 (systemd, launchd, Windows 서비스). `status`, `uninstall`도 있음 |
+| `pumasi upgrade rollout 파일... [--wait] [--force]` | 클러스터 키로 서명한 새 에이전트 바이너리를 노드에 배포. `upgrade status`로 노드별 상태, `upgrade cancel`로 중단 |
 | `pumasi vm setup [--guest FILE] [--force]` | 게스트 커널, Firecracker(Linux), 게스트 init을 `~/.pumasi/vm`에 설치 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
 | `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
@@ -184,6 +228,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 - 제공자 기기(`pumasi invite`로 받은 남의 기기)는 WASM과 microVM 작업을 받고, Docker는 초대가 허용할 때만 받으며, 검증의 판정은 내 기기만 맡습니다. microVM 결과는 결정적이지 않아 표본 검증 대상이 아닙니다.
 - 제공자는 가짜 결과를 낼 수 있습니다. 서명은 누가 무엇을 주장했는지를 증명할 뿐 참임을 증명하지는 않습니다. 표본 검증이 확률적으로 잡습니다. 기본 10%면 가짜 결과 20개를 낸 제공자는 88% 확률로 걸리고, 걸린 수익은 몰수되며, 3번이면 정지됩니다. 수익을 1시간 보류하는 이유가 이것입니다.
 - 어느 쪽이든 기기 주인에게 내용이 숨겨지지는 않습니다. 지금은 "오픈" 등급만 있습니다.
+- 에이전트 업그레이드는 에이전트가 참가할 때 알게 된 컨트롤 플레인 키로 서명되고, 실행 전에 서명된 SHA-256과 대조합니다. 관리자 티켓을 가진 사람은 내 기기(와 옵트인한 제공자 기기)에 바이너리를 배포할 수 있으므로, 관리자 티켓은 그 기기들의 root 권한만큼 중요합니다. 릴리스 바이너리에는 `SHA256SUMS`가 있고, 저장소가 공개되면 GitHub 빌드 출처 증명도 붙습니다(`gh attestation verify pumasi-linux-x86_64 -R syang0531/pumasi`).
 
 ## 로드맵
 
@@ -191,8 +236,19 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | --- | --- | --- |
 | 1 | 사설 클러스터: 에이전트, 컨트롤 플레인, iroh 연결, WASM·Docker 실행기, 파일 입출력, CLI | 완료 |
 | 2 | 초대한 외부 제공자(오픈 등급), 노드·클러스터 공동 서명 사용 영수증, 고정 요금표, 선불 크레딧 원장, 표본 재실행 검증 | 완료 |
-| 3 | microVM 실행기: Docker 작업과 같은 OCI 이미지를 Firecracker·QEMU VM에서, 같은 작업 명세로, 제공자에게도 | 이번 릴리스 (GPU 패스스루, WebGPU 실험은 아직) |
-| 4 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
+| 3 | microVM 실행기: Docker 작업과 같은 OCI 이미지를 Firecracker·QEMU VM에서, 같은 작업 명세로, 제공자에게도 | 완료 |
+| 4 | 배포·설치: 6개 플랫폼 릴리스 바이너리와 SHA256SUMS, 설치 스크립트, OS 서비스, 클러스터 서명 업그레이드와 롤백 | 이번 릴리스 |
+| 5 | Windows 정식 지원: Docker Desktop, QEMU + WHPX microVM | 예정 |
+| 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대) | 예정 |
+| 7 | 클러스터 파일 저장소(iroh-blobs): 데이터셋, 대용량 입출력, 이어받기 | 예정 |
+| 8 | GPU: 탐지, 스케줄링, Docker GPU 작업, microVM VFIO 패스스루 | 예정 |
+| 9 | 클러스터 관리: 라벨·selector, drain, 우선순위, 쿼터, 역할 티켓, `apply` | 예정 |
+| 10 | 모니터링·경보: 노드 지표, Prometheus, 실시간 로그, 웹훅 | 예정 |
+| 11 | 웹 대시보드(바이너리 내장) | 예정 |
+| 12 | 컨트롤 플레인 고가용성(Raft) | 예정 |
+| 13 | WebGPU 실행기(실험) | 예정 |
+| 14 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
+| 15 | 마켓 허브와 실결제 | 예정 |
 
 알려진 한계: microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM이 있는 Linux가 필요합니다(KVM 없는 QEMU는 동작하지만 느리고, macOS의 QEMU 경로는 아직 검증하지 않았습니다).
 

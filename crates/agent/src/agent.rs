@@ -12,7 +12,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use pumasi_proto::{
-    AGENT_ALPN, PROTOCOL_VERSION, Secret,
+    AGENT_ALPN, ModuleHash, PROTOCOL_VERSION, Secret,
+    job::{Executor, FileEntry},
     msg::{
         AgentHello, FromAgent, HelloReply, NodeInfo, TaskAssignment, TaskRef, TaskReport, ToAgent,
     },
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::executor::WasmExecutor;
+use crate::{docker::DockerExecutor, executor::WasmExecutor};
 
 const MEMBERSHIP_FILE: &str = "membership.json";
 const KEY_FILE: &str = "secret.key";
@@ -38,6 +39,9 @@ pub struct AgentConfig {
     pub slots: Option<u32>,
     pub net: NetMode,
     pub bind: Option<SocketAddr>,
+    /// Docker CLI to use for docker jobs (`docker` or `podman`). `None`
+    /// means this node runs WASM tasks only.
+    pub docker: Option<String>,
 }
 
 /// What the agent remembers about the cluster it joined.
@@ -47,9 +51,14 @@ pub struct Membership {
     pub cluster_name: String,
 }
 
+type FileCache = Arc<Mutex<HashMap<ModuleHash, Arc<Vec<FileEntry>>>>>;
+
 pub struct Agent {
     endpoint: Endpoint,
     executor: WasmExecutor,
+    docker: Option<DockerExecutor>,
+    /// Shared job files by content hash.
+    files: FileCache,
     config: AgentConfig,
     info: NodeInfo,
 }
@@ -69,10 +78,25 @@ impl Agent {
         let key = load_or_create_key(&config.data_dir.join(KEY_FILE))?;
         let endpoint = bind_endpoint(key, config.net, vec![], config.bind).await?;
         let executor = WasmExecutor::new()?;
-        let info = node_info(&config);
+        let docker =
+            match &config.docker {
+                Some(bin) => {
+                    let label = endpoint.id().fmt_short().to_string();
+                    Some(DockerExecutor::detect(bin, &label).await.context(
+                        "--allow-docker was given but Docker is not usable on this machine",
+                    )?)
+                }
+                None => None,
+            };
+        let mut info = node_info(&config);
+        if docker.is_some() {
+            info.executors.push(Executor::Docker);
+        }
         Ok(Self {
             endpoint,
             executor,
+            docker,
+            files: Default::default(),
             config,
             info,
         })
@@ -217,19 +241,22 @@ impl Agent {
         let end = loop {
             match read_msg::<_, ToAgent>(&mut recv).await {
                 Ok(Some(ToAgent::Assign(mut a))) => {
-                    // Compile here, in message order, so later assignments
-                    // that reuse this module (and carry no bytes) find it.
-                    let load_error = match a.module.take() {
-                        Some(bytes) => {
+                    // Cache shared files and compile modules here, in message
+                    // order, so later assignments that only carry hashes
+                    // find them.
+                    if let (Some(hash), Some(files)) = (a.files_hash, a.files.take()) {
+                        self.files.lock().unwrap().insert(hash, Arc::new(files));
+                    }
+                    let load_error = match (a.module.take(), a.module_hash) {
+                        (Some(bytes), Some(hash)) => {
                             let executor = self.executor.clone();
-                            let hash = a.module_hash;
                             tokio::task::spawn_blocking(move || executor.load_module(hash, &bytes))
                                 .await
                                 .map_err(anyhow::Error::from)
                                 .and_then(|r| r)
                                 .err()
                         }
-                        None => None,
+                        _ => None,
                     };
                     match load_error {
                         None => self.start_task(*a, &running, &out_tx),
@@ -270,15 +297,49 @@ impl Agent {
         let cancel = Arc::new(AtomicBool::new(false));
         running.lock().unwrap().insert(a.task, cancel.clone());
         let executor = self.executor.clone();
+        let docker = self.docker.clone();
+        let shared: Arc<Vec<FileEntry>> = match a.files_hash {
+            Some(h) => match self.files.lock().unwrap().get(&h) {
+                Some(f) => f.clone(),
+                None => {
+                    running.lock().unwrap().remove(&a.task);
+                    let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
+                        a.task,
+                        "job input files not received".into(),
+                    ))));
+                    return;
+                }
+            },
+            None => Arc::new(Vec::new()),
+        };
         let running = running.clone();
         let out_tx = out_tx.clone();
-        debug!(task = %a.task, "starting task");
+        debug!(task = %a.task, executor = %a.executor, "starting task");
         tokio::spawn(async move {
             let task = a.task;
-            let result = tokio::task::spawn_blocking(move || {
-                executor.run(&a.module_hash, &a.program, &a.input, &a.limits, cancel)
-            })
-            .await;
+            let result: Result<crate::executor::RunResult> = match a.executor {
+                Executor::Wasm => {
+                    let Some(hash) = a.module_hash else {
+                        let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
+                            task,
+                            "no module".into(),
+                        ))));
+                        return;
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        executor.run(&hash, &a.program, &a.input, &shared, &a.limits, cancel)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("executor panicked: {e}"))
+                }
+                Executor::Docker => match (docker, a.docker.as_ref()) {
+                    (Some(d), Some(spec)) => Ok(d
+                        .run(task, spec, &a.input, &shared, &a.limits, cancel)
+                        .await),
+                    (None, _) => Err(anyhow::anyhow!("docker is not enabled on this node")),
+                    (_, None) => Err(anyhow::anyhow!("docker task without an image")),
+                },
+            };
             running.lock().unwrap().remove(&task);
             let report = match result {
                 Ok(r) => TaskReport {
@@ -286,10 +347,11 @@ impl Agent {
                     outcome: r.outcome,
                     stdout: r.stdout,
                     stderr: r.stderr,
+                    files: r.files,
                     fuel_used: r.fuel_used,
                     wall_ms: r.wall_ms,
                 },
-                Err(e) => error_report(task, format!("executor panicked: {e}")),
+                Err(e) => error_report(task, format!("{e:#}")),
             };
             debug!(task = %task, outcome = %report.outcome, "task finished");
             let _ = out_tx.send(FromAgent::Done(Box::new(report)));
@@ -303,6 +365,7 @@ fn error_report(task: TaskRef, msg: String) -> TaskReport {
         outcome: pumasi_proto::msg::Outcome::Error(msg),
         stdout: vec![],
         stderr: vec![],
+        files: vec![],
         fuel_used: 0,
         wall_ms: 0,
     }
@@ -322,6 +385,7 @@ fn node_info(config: &AgentConfig) -> NodeInfo {
         memory_bytes: sys.total_memory(),
         slots: config.slots.unwrap_or(cpus).max(1),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        executors: vec![Executor::Wasm],
     }
 }
 

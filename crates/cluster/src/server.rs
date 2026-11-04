@@ -373,6 +373,9 @@ fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
             Some(v) => Ok(AdminResponse::Job(Box::new(v))),
             None => Ok(AdminResponse::Error(format!("no job {id}"))),
         },
+        AdminOp::TaskFiles { id, index } => {
+            Ok(AdminResponse::Files(inner.state().task_files(id, index)?))
+        }
         AdminOp::Cancel { id } => {
             inner.state().cancel(id)?;
             Ok(AdminResponse::Ok)

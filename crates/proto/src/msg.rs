@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ModuleHash, Secret,
-    job::{JobId, JobSubmission, Limits, TaskInput},
+    job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput},
 };
 
 // ---------------------------------------------------------------------------
@@ -30,6 +30,8 @@ pub struct NodeInfo {
     /// How many tasks the node runs at once.
     pub slots: u32,
     pub agent_version: String,
+    /// Executors this node accepts. Always includes `Wasm`.
+    pub executors: Vec<Executor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,9 +74,17 @@ pub struct TaskAssignment {
     pub task: TaskRef,
     /// argv[0] for the module.
     pub program: String,
-    pub module_hash: ModuleHash,
+    pub executor: Executor,
+    /// WASM module hash (wasm executor).
+    pub module_hash: Option<ModuleHash>,
     /// Sent only the first time this connection sees the module.
     pub module: Option<Vec<u8>>,
+    /// Docker settings (docker executor).
+    pub docker: Option<DockerSpec>,
+    /// Hash of the job's shared input files, if it has any.
+    pub files_hash: Option<ModuleHash>,
+    /// The shared files, sent only the first time this connection sees them.
+    pub files: Option<Vec<FileEntry>>,
     pub input: TaskInput,
     pub limits: Limits,
 }
@@ -128,7 +138,9 @@ pub struct TaskReport {
     pub outcome: Outcome,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    /// Fuel consumed: a hardware-independent measure of work done.
+    /// Files the task wrote to `/output`.
+    pub files: Vec<FileEntry>,
+    /// Fuel consumed: a hardware-independent measure of work done (WASM).
     pub fuel_used: u64,
     pub wall_ms: u64,
 }
@@ -151,12 +163,27 @@ pub struct AdminRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminOp {
-    CreateJoinToken { ttl_secs: u64, uses: Option<u32> },
+    CreateJoinToken {
+        ttl_secs: u64,
+        uses: Option<u32>,
+    },
     Submit(Box<JobSubmission>),
     Status,
-    Job { id: JobId, with_output: bool },
-    Cancel { id: JobId },
-    RemoveNode { id: String },
+    Job {
+        id: JobId,
+        with_output: bool,
+    },
+    /// Output files of one task.
+    TaskFiles {
+        id: JobId,
+        index: u32,
+    },
+    Cancel {
+        id: JobId,
+    },
+    RemoveNode {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +192,7 @@ pub enum AdminResponse {
     Submitted { id: JobId },
     Status(ClusterStatus),
     Job(Box<JobView>),
+    Files(Vec<FileEntry>),
     Ok,
     Error(String),
 }
@@ -250,11 +278,15 @@ pub struct TaskView {
     /// Present only when requested.
     pub stdout: Option<Vec<u8>>,
     pub stderr: Option<Vec<u8>>,
+    /// Names and sizes of the files the task wrote to `/output`.
+    pub output_files: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobView {
     pub summary: JobSummary,
+    pub executor: Executor,
+    pub image: Option<String>,
     pub limits: Limits,
     pub tasks: Vec<TaskView>,
     pub total_fuel: u64,

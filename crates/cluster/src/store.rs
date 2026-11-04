@@ -133,19 +133,21 @@ impl Store {
         Ok(())
     }
 
-    /// Writes a new job with all its tasks and its module in one transaction.
+    /// Writes a new job with all its tasks and any new content blobs
+    /// (module, shared file bundle) in one transaction.
     pub fn put_new_job(
         &self,
         meta: &JobMeta,
         tasks: &[TaskRecord],
-        module: Option<&[u8]>,
+        blobs: &[(ModuleHash, &[u8])],
     ) -> Result<()> {
         let tx = self.db.begin_write()?;
         {
-            if let Some(bytes) = module {
-                tx.open_table(MODULES)?
-                    .insert(meta.module_hash.as_slice(), bytes)?;
+            let mut t = tx.open_table(MODULES)?;
+            for (hash, bytes) in blobs {
+                t.insert(hash.as_slice(), *bytes)?;
             }
+            drop(t);
             tx.open_table(JOBS)?
                 .insert(meta.id.0, enc(meta).as_slice())?;
             let mut t = tx.open_table(TASKS)?;

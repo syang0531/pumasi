@@ -1,8 +1,10 @@
 # Pumasi
 
-Pool the machines you already own into one private cluster and run
-WebAssembly batch jobs across them. One small Rust binary, the same on
-Linux, macOS and Windows, x86_64 and ARM64.
+Pool the machines you already own into one private cluster and run batch
+jobs across them: sandboxed WebAssembly modules on every machine, or
+ordinary Docker images (Python, any packages, optional network) on the
+machines you allow. One small Rust binary, the same on Linux, macOS and
+Windows, x86_64 and ARM64.
 
 > [한국어 README](README.ko.md)
 
@@ -54,27 +56,68 @@ pumasi run examples/montecarlo/job.toml -o | grep -E '^[0-9]+ ' \
 # pi ~= 3.141691 from 80000000 samples in 16 shards
 ```
 
+### Docker jobs: Python, files and more
+
+Start the agents that may run containers with `--allow-docker` (Docker or a
+compatible CLI must be installed there):
+
+```sh
+pumasi agent join pumasijoin... --allow-docker
+```
+
+Then run the Python word count sample. It ships a script and a folder of
+text files to 4 containers and brings back each one's `/output`:
+
+```sh
+pumasi run examples/python-wordcount/job.toml --output
+python3 examples/python-wordcount/merge.py pumasi-out/<job id>
+```
+
+```
+submitted job 6d916b0dc63f63ea (4 tasks)
+succeeded: 4/4 done, 0 running, 0 failed
+job 6d916b0dc63f63ea "wordcount": succeeded
+  executor docker (python:3.12-slim)
+  tasks 4  succeeded 4  failed 0  output files 4
+  [0] ok node=a8bce3f98f attempts=1 734ms
+shard 0/4: 3 files, 2164 words
+...
+saved 4 output files to pumasi-out/6d916b0dc63f63ea
+```
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. |
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine. |
-| `pumasi agent join <TICKET> [--name N] [--slots N]` | Join a cluster and start running tasks. |
-| `pumasi agent start` | Reconnect to the cluster this machine joined before (no ticket needed). |
-| `pumasi run job.toml [--output] [--detach]` | Submit a job and wait for it. Exit code 0 on success, 2 if any task failed. |
-| `pumasi status` | Nodes (online, slots, running) and recent jobs. |
-| `pumasi job <ID> [--output]` | Per-task state, node, attempts, time; stdout/stderr with `--output`. |
+| `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs. |
+| `pumasi agent start [--allow-docker]` | Reconnect to the cluster this machine joined before (no ticket needed). |
+| `pumasi run job.toml [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. |
+| `pumasi status` | Nodes (online, executors, slots, running) and recent jobs. |
+| `pumasi job <ID> [--output] [--out DIR]` | Per-task state, node, attempts, time; stdout/stderr with `--output`; downloads output files with `--out`. |
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
 | `pumasi remove-node <ID>` | Revoke a node. It needs a new ticket to come back. |
 | `pumasi login <ADMIN_TICKET>` | Manage a remote cluster from this machine. |
-| `pumasi exec module.wasm [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through). |
+| `pumasi exec module.wasm [--input DIR] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`). |
 
 `--home DIR` or `PUMASI_HOME` changes the state directory, which lets you run
 a cluster and several agents on one machine for testing. `PUMASI_LOG=debug`
 turns on verbose logs.
 
 ## Job file
+
+A job runs on one of two executors with the same file format and commands:
+
+| | `wasm` (default) | `docker` |
+| --- | --- | --- |
+| Runs | a `wasm32-wasip1` module | any Linux OCI image |
+| Where | every node | only nodes started with `--allow-docker` |
+| Isolation | Wasmtime sandbox, safe for untrusted code | container, only for machines and people you trust |
+| Network | never | off by default, `network = true` to allow |
+| Files | `/input` (read-only), `/output` | `/input` (read-only), `/output` |
+
+WASM job:
 
 ```toml
 name = "estimate-pi"                  # optional, defaults to the module name
@@ -83,13 +126,42 @@ shards = 16                           # N tasks; {shard} and {shards} are substi
 args = ["sample", "{shard}", "5000000"]
 env = { MODE = "fast" }               # optional
 stdin = "input.txt"                   # optional, fed to every task
+files = ["data/", "lookup.csv"]       # optional, appear under /input
 max_attempts = 3                      # placements before giving up on lost nodes
 
 [resources]
-memory_mb = 32                        # linear memory cap per task (default 256)
+memory_mb = 32                        # memory cap per task (default 256)
 timeout = "2m"                        # wall-clock cap per task (default 5m)
-fuel = 10_000_000_000                 # instruction budget per task (default unlimited)
+fuel = 10_000_000_000                 # instruction budget per task (wasm only, default unlimited)
 ```
+
+Docker job:
+
+```toml
+name = "wordcount"
+image = "python:3.12-slim"            # setting `image` selects the docker executor
+command = ["python", "/input/count.py", "{shard}", "{shards}"]
+files = ["count.py", "texts/"]        # copied into /input of every task
+shards = 4
+network = false                       # default; true allows outbound network
+# gpus = "all"                        # passed to `docker run --gpus`
+
+[resources]
+memory_mb = 512
+cpus = 1.5                            # CPU cap per task (docker only)
+timeout = "10m"
+```
+
+Paths in `files` are relative to the job file; directories are copied
+recursively and keep their relative path under `/input`. All input files of a
+job may total up to 48 MiB. Whatever a task writes to `/output` (up to
+32 MiB) is stored by the control plane and downloaded by `pumasi run` into
+`pumasi-out/<job id>/task-<N>/`. stdout and stderr are captured up to 4 MiB
+each.
+
+Containers run with `--network none` unless `network = true`, with memory,
+CPU and process caps, `no-new-privileges`, and no host directories mounted
+(files are copied in and out). Images are pulled on first use.
 
 Instead of `shards`, list tasks explicitly:
 
@@ -105,9 +177,9 @@ args = ["b.png"]
 stdin = "b.png"
 ```
 
-Any language that targets `wasm32-wasip1` works (Rust, C/C++, Zig, Go,
-TinyGo, ...). Tasks read stdin and write stdout; they have no filesystem and
-no network.
+Any language that targets `wasm32-wasip1` works for WASM jobs (Rust, C/C++,
+Zig, Go, TinyGo, ...). A per-task `files = [...]` in a `[[task]]` adds files
+only that task sees.
 
 ## How it works
 
@@ -121,18 +193,21 @@ no network.
 
 - **Control plane** (`crates/cluster`): membership, join tokens, a FIFO task
   queue and a scheduler that places tasks on the node with the most free
-  slots. State (members, jobs, task results, modules) is persisted in redb, so
-  a restart resumes queued and interrupted work.
+  slots among those that offer the job's executor and enough memory. State
+  (members, jobs, task results and output files, modules and input bundles)
+  is persisted in redb, so a restart resumes queued and interrupted work.
 - **Agent** (`crates/agent`): connects out to the control plane, so it works
-  from behind NAT. It runs tasks in Wasmtime with no filesystem or network,
-  caps memory, fuel and wall-clock time, and reports stdout, stderr, exit
-  status, fuel used and wall time.
+  from behind NAT. It runs WASM tasks in Wasmtime (memory, fuel and
+  wall-clock caps, only `/input` and `/output` visible) and, when allowed,
+  docker tasks through the Docker CLI. It reports stdout, stderr, output
+  files, exit status, fuel used and wall time. Modules and shared input files
+  are sent to each node once per job, not once per task.
 - **Protocol** (`crates/proto`): postcard frames over iroh QUIC streams.
   Every node is identified by its ed25519 key; nobody can impersonate it.
 - **Failure handling**: an agent that disconnects or misses heartbeats loses
   its tasks to other nodes (up to `max_attempts`). Agents reconnect with
-  backoff. Task-level failures (trap, non-zero exit, out of fuel, timeout)
-  are reported, not retried, because WASM execution is deterministic.
+  backoff. Task-level failures (trap, non-zero exit, out of fuel or memory,
+  timeout) are reported, not retried.
 
 ## Security model (phase 1)
 
@@ -141,22 +216,28 @@ no network.
   again. `remove-node` revokes it.
 - The admin ticket in `~/.pumasi/cluster/admin.ticket` grants full control.
   Treat it like a password.
-- Tasks are sandboxed from the machine running them (no files, no network,
-  memory and CPU caps). They are **not** hidden from that machine's owner:
-  phase 1 has only the `open` confidentiality tier. Do not send secrets to
-  machines you do not trust.
+- WASM tasks are sandboxed from the machine running them (only their own
+  `/input` and `/output`, no network, memory and CPU caps).
+- Docker tasks are only as isolated as a container: they share the host
+  kernel. That is why an agent runs them only after its owner passes
+  `--allow-docker`. Use it on your own machines and in clusters of people
+  you trust; the microVM executor (phase 3) is the answer for strangers.
+- Tasks are **not** hidden from the machine's owner: phase 1 has only the
+  `open` confidentiality tier. Do not send secrets to machines you do not
+  trust.
 
 ## Roadmap
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 1 | Private cluster: agent, control plane, iroh networking, WASM executor, CLI | this release |
+| 1 | Private cluster: agent, control plane, iroh networking, WASM and Docker executors, file input/output, CLI | this release |
 | 2 | Invited outside providers (open tier), usage receipts signed by node and cluster, fixed price list, prepaid ledger | next |
-| 3 | microVM executor (OCI images, Linux GPU passthrough) behind the same job format; WebGPU experiments | planned |
+| 3 | microVM executor (same OCI images as docker jobs, VM isolation, Linux GPU passthrough) behind the same job format; WebGPU experiments | planned |
 | 4 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
 
 Known gaps in phase 1: single control plane (no Raft yet), no web console,
-no output files beyond stdout, no per-user accounts.
+no per-user accounts, input and output files are size-capped (48 MiB in,
+32 MiB out per task) because they travel through the control plane.
 
 ## Development
 
@@ -168,7 +249,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 The end-to-end tests in `crates/cluster/tests/e2e.rs` start a control plane
 and agents on localhost and cover sharded jobs, node failure and rescheduling,
 ticket rejection and reuse, reconnect without a ticket, cancellation, fuel
-limits, bad admin credentials, and restarting the control plane.
+limits, bad admin credentials, restarting the control plane, and docker jobs
+with input/output files (skipped when no Linux Docker daemon is available).
 
 ## License
 

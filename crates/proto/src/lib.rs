@@ -15,7 +15,7 @@ pub const AGENT_ALPN: &[u8] = b"pumasi/agent/0";
 /// ALPN for the admin (CLI) <-> control plane protocol.
 pub const ADMIN_ALPN: &[u8] = b"pumasi/admin/0";
 /// Bumped on any incompatible change to [`msg`].
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A 32-byte random secret (join tokens, admin credentials).
 pub type Secret = [u8; 32];

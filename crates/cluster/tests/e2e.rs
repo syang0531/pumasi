@@ -7,7 +7,7 @@ use anyhow::Result;
 use pumasi_agent::{Agent, AgentConfig};
 use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
-    job::{Executor, JobId, JobSubmission, Limits, TaskInput, Tier},
+    job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{AdminOp, AdminResponse, JobState, JobView, TaskState},
     net::NetMode,
     ticket::JoinTicket,
@@ -97,6 +97,7 @@ async fn agent(name: &str, slots: u32, dir: PathBuf) -> Agent {
         slots: Some(slots),
         net: NetMode::Local,
         bind: Some("127.0.0.1:0".parse().unwrap()),
+        docker: None,
     })
     .await
     .unwrap()
@@ -129,6 +130,8 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         name: "echo".into(),
         executor: Executor::Wasm,
         module: wat::parse_str(ECHO_WAT).unwrap(),
+        docker: None,
+        files: vec![],
         tasks: args
             .into_iter()
             .map(|a| TaskInput {
@@ -423,5 +426,163 @@ async fn state_survives_a_control_plane_restart() {
     client.close().await;
     h.abort();
     endpoint.close().await;
+    cluster.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Docker executor (skipped when no Docker daemon is available)
+// ---------------------------------------------------------------------------
+
+/// True when a Docker daemon that runs Linux containers is reachable
+/// (Windows CI runners have Docker in Windows-container mode).
+fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .args(["version", "--format", "{{.Server.Os}}"])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "linux")
+        .unwrap_or(false)
+}
+
+fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
+    JobSubmission {
+        name: "docker-test".into(),
+        executor: Executor::Docker,
+        module: vec![],
+        docker: Some(DockerSpec {
+            image: "busybox:1.36".into(),
+            command: command.iter().map(|s| s.to_string()).collect(),
+            network: false,
+            gpus: None,
+        }),
+        files: vec![FileEntry {
+            path: "shared.txt".into(),
+            data: b"shared+".to_vec(),
+        }],
+        tasks,
+        limits: Limits {
+            timeout_ms: 60_000,
+            memory_bytes: 64 << 20,
+            ..Default::default()
+        },
+        tier: Tier::Open,
+        max_attempts: 3,
+        max_price_per_hour: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
+    if !docker_available() {
+        eprintln!("skipping: docker is not available");
+        return;
+    }
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let wasm_only = spawn_join(agent("wasm-only", 4, tempdir("w")).await, ticket.clone());
+    let docker_agent = Agent::new(AgentConfig {
+        data_dir: tempdir("d"),
+        name: "docker".into(),
+        slots: Some(4),
+        net: NetMode::Local,
+        bind: Some("127.0.0.1:0".parse().unwrap()),
+        docker: Some("docker".into()),
+    })
+    .await
+    .unwrap();
+    let docker_id = docker_agent.id().to_string();
+    let d = spawn_join(docker_agent, ticket);
+    wait_online(&cluster, 2).await;
+    let client = admin(&cluster).await;
+
+    // Shared + per-task input files, an output file, stdout, and no network.
+    let script = "cat shared.txt mine.txt > /output/out.txt && mkdir -p /output/sub && echo $0 > /output/sub/arg.txt && ! wget -q -T 2 -O /dev/null http://1.1.1.1 && echo isolated";
+    let tasks = (0..3)
+        .map(|i| TaskInput {
+            args: vec![format!("arg{i}")],
+            files: vec![FileEntry {
+                path: "mine.txt".into(),
+                data: format!("task{i}").into_bytes(),
+            }],
+            ..Default::default()
+        })
+        .collect();
+    let id = submit(&client, docker_job(&["sh", "-c", script], tasks)).await;
+    let view = wait_job(&client, id, 300).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    for (i, t) in view.tasks.iter().enumerate() {
+        assert_eq!(
+            t.node.as_deref(),
+            Some(docker_id.as_str()),
+            "docker task on a wasm-only node"
+        );
+        assert_eq!(t.stdout.as_deref(), Some(&b"isolated\n"[..]));
+        let AdminResponse::Files(files) = client
+            .call(AdminOp::TaskFiles {
+                id,
+                index: i as u32,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected files");
+        };
+        assert_eq!(
+            files,
+            vec![
+                FileEntry {
+                    path: "out.txt".into(),
+                    data: format!("shared+task{i}").into_bytes()
+                },
+                FileEntry {
+                    path: "sub/arg.txt".into(),
+                    data: format!("arg{i}\n").into_bytes()
+                },
+            ]
+        );
+    }
+
+    // Timeout kills the container; a non-zero exit is reported as such.
+    let mut slow = docker_job(&["sleep", "30"], vec![TaskInput::default()]);
+    slow.limits.timeout_ms = 1500;
+    let id = submit(&client, slow).await;
+    let view = wait_job(&client, id, 60).await;
+    assert!(
+        matches!(
+            view.tasks[0].state,
+            TaskState::Failed(pumasi_proto::msg::Outcome::Timeout)
+        ),
+        "{view:#?}"
+    );
+
+    let id = submit(
+        &client,
+        docker_job(&["sh", "-c", "exit 3"], vec![TaskInput::default()]),
+    )
+    .await;
+    let view = wait_job(&client, id, 60).await;
+    assert!(
+        matches!(
+            view.tasks[0].state,
+            TaskState::Failed(pumasi_proto::msg::Outcome::Exited(3))
+        ),
+        "{view:#?}"
+    );
+
+    // No leftover containers.
+    let out = std::process::Command::new("docker")
+        .args(["ps", "-aq", "--filter", "label=pumasi=1"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "containers left behind"
+    );
+
+    client.close().await;
+    wasm_only.kill().await;
+    d.kill().await;
     cluster.shutdown().await.unwrap();
 }

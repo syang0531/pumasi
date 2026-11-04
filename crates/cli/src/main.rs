@@ -14,7 +14,10 @@ use clap::{Args, Parser, Subcommand};
 use pumasi_agent::{Agent, AgentConfig, WasmExecutor, default_node_name};
 use pumasi_cluster::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
-    job::{JobFile, JobId, Limits, TaskInput, parse_duration_ms},
+    job::{
+        Executor, JobFile, JobId, Limits, MAX_INPUT_FILES_BYTES, TaskInput, parse_duration_ms,
+        read_files, write_files,
+    },
     msg::{AdminOp, AdminResponse, ClusterStatus, JobView, Outcome, TaskState},
     net::NetMode,
     ticket::{AdminTicket, JoinTicket},
@@ -24,7 +27,7 @@ use pumasi_proto::{
 #[command(
     name = "pumasi",
     version,
-    about = "Pool your machines into one cluster and run WebAssembly batch jobs on it."
+    about = "Pool your machines into one cluster and run batch jobs (WebAssembly or containers) on it."
 )]
 struct Cli {
     /// State directory (default: $PUMASI_HOME or ~/.pumasi).
@@ -62,6 +65,10 @@ enum Cmd {
         /// Print each task's stdout when the job finishes.
         #[arg(long, short)]
         output: bool,
+        /// Where to save files tasks wrote to /output
+        /// (default: ./pumasi-out/<job id>).
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -76,6 +83,9 @@ enum Cmd {
         /// Print each task's stdout and stderr.
         #[arg(long, short)]
         output: bool,
+        /// Download files tasks wrote to /output into this directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -105,6 +115,12 @@ enum Cmd {
         timeout: String,
         #[arg(long, default_value_t = 256)]
         memory_mb: u64,
+        /// Directory whose contents appear read-only at /input.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Where to save what the module writes to /output.
+        #[arg(long, default_value = "pumasi-out/exec")]
+        out: PathBuf,
     },
 }
 
@@ -146,6 +162,13 @@ struct AgentOpts {
     /// Tasks to run at once (default: number of CPUs).
     #[arg(long)]
     slots: Option<u32>,
+    /// Also run docker jobs on this machine. Only for machines you own:
+    /// containers share this machine's kernel.
+    #[arg(long)]
+    allow_docker: bool,
+    /// Docker-compatible CLI to use for docker jobs.
+    #[arg(long, default_value = "docker")]
+    docker_bin: String,
     #[command(flatten)]
     net: NetArgs,
 }
@@ -241,6 +264,7 @@ async fn run(cli: Cli) -> Result<i32> {
             job_file,
             detach,
             output,
+            out,
             admin,
         } => {
             let sub = JobFile::load(&job_file)?;
@@ -258,8 +282,10 @@ async fn run(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             let view = wait_for_job(&client, id).await?;
-            client.close().await;
             print_job(&view, output);
+            let dir = out.unwrap_or_else(|| PathBuf::from("pumasi-out").join(id.to_string()));
+            download_outputs(&client, &view, &dir, false).await?;
+            client.close().await;
             Ok(
                 if view.summary.state == pumasi_proto::msg::JobState::Succeeded {
                     0
@@ -277,7 +303,12 @@ async fn run(cli: Cli) -> Result<i32> {
             print_status(&status);
             Ok(0)
         }
-        Cmd::Job { id, output, admin } => {
+        Cmd::Job {
+            id,
+            output,
+            out,
+            admin,
+        } => {
             let id: JobId = id.parse()?;
             let client = connect_admin(&home, &admin).await?;
             let AdminResponse::Job(view) = client
@@ -289,8 +320,11 @@ async fn run(cli: Cli) -> Result<i32> {
             else {
                 bail!("unexpected response");
             };
-            client.close().await;
             print_job(&view, output);
+            if let Some(dir) = out {
+                download_outputs(&client, &view, &dir, true).await?;
+            }
+            client.close().await;
             Ok(0)
         }
         Cmd::Cancel { id, admin } => {
@@ -321,7 +355,20 @@ async fn run(cli: Cli) -> Result<i32> {
             fuel,
             timeout,
             memory_mb,
-        } => exec_local(&module, args, fuel, &timeout, memory_mb).await,
+            input,
+            out,
+        } => {
+            exec_local(
+                &module,
+                args,
+                fuel,
+                &timeout,
+                memory_mb,
+                input.as_deref(),
+                &out,
+            )
+            .await
+        }
     }
 }
 
@@ -380,13 +427,15 @@ async fn agent(home: &Path, cmd: AgentCmd) -> Result<i32> {
         slots: opts.slots,
         net,
         bind: opts.net.bind,
+        docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
     };
     let agent = Agent::new(config).await?;
     eprintln!(
-        "agent {} ({}, {} slots) connecting...",
+        "agent {} ({}, {} slots, {}) connecting...",
         agent.info().name,
         agent.id().fmt_short(),
-        agent.info().slots
+        agent.info().slots,
+        executor_list(&agent.info().executors)
     );
     let serve = async move {
         match ticket {
@@ -467,16 +516,17 @@ fn print_status(s: &ClusterStatus) {
     println!("cluster {} ({})", s.cluster_name, short(&s.cluster_id));
     println!();
     println!(
-        "{:<12} {:<16} {:<8} {:<14} {:>5} {:>8} {:>10}",
-        "NODE", "NAME", "STATE", "PLATFORM", "SLOTS", "RUNNING", "COMPLETED"
+        "{:<12} {:<16} {:<8} {:<14} {:<12} {:>5} {:>8} {:>10}",
+        "NODE", "NAME", "STATE", "PLATFORM", "EXECUTORS", "SLOTS", "RUNNING", "COMPLETED"
     );
     for n in &s.nodes {
         println!(
-            "{:<12} {:<16} {:<8} {:<14} {:>5} {:>8} {:>10}",
+            "{:<12} {:<16} {:<8} {:<14} {:<12} {:>5} {:>8} {:>10}",
             short(&n.id),
             truncate(&n.info.name, 16),
             if n.online { "online" } else { "offline" },
             format!("{}/{}", n.info.os, n.info.arch),
+            executor_list(&n.info.executors),
             n.info.slots,
             n.running,
             n.completed
@@ -509,10 +559,22 @@ fn print_status(s: &ClusterStatus) {
 fn print_job(v: &JobView, output: bool) {
     let s = &v.summary;
     println!("job {} \"{}\": {}", s.id, s.name, s.state);
-    println!(
-        "  tasks {}  succeeded {}  failed {}  fuel {}",
-        s.tasks, s.succeeded, s.failed, v.total_fuel
+    match &v.image {
+        Some(image) => println!("  executor {} ({image})", v.executor),
+        None => println!("  executor {}", v.executor),
+    }
+    let files: usize = v.tasks.iter().map(|t| t.output_files.len()).sum();
+    print!(
+        "  tasks {}  succeeded {}  failed {}",
+        s.tasks, s.succeeded, s.failed
     );
+    if v.executor == Executor::Wasm {
+        print!("  fuel {}", v.total_fuel);
+    }
+    if files > 0 {
+        print!("  output files {files}");
+    }
+    println!();
     let mut stdout = std::io::stdout().lock();
     for t in &v.tasks {
         let state = match &t.state {
@@ -552,12 +614,52 @@ fn print_job(v: &JobView, output: bool) {
     }
 }
 
+fn executor_list(executors: &[Executor]) -> String {
+    executors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Fetches every task's `/output` files into `dir/task-<index>/`.
+/// Returns the number of files written.
+async fn download_outputs(
+    client: &AdminClient,
+    view: &JobView,
+    dir: &Path,
+    always_report: bool,
+) -> Result<usize> {
+    let mut count = 0;
+    for t in view.tasks.iter().filter(|t| !t.output_files.is_empty()) {
+        let resp = client
+            .call(AdminOp::TaskFiles {
+                id: view.summary.id,
+                index: t.index,
+            })
+            .await?;
+        let AdminResponse::Files(files) = resp else {
+            bail!("unexpected response");
+        };
+        let target = dir.join(format!("task-{}", t.index));
+        std::fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
+        write_files(&target, &files)?;
+        count += files.len();
+    }
+    if count > 0 || always_report {
+        eprintln!("saved {count} output files to {}", dir.display());
+    }
+    Ok(count)
+}
+
 async fn exec_local(
     module: &Path,
     args: Vec<String>,
     fuel: Option<u64>,
     timeout: &str,
     memory_mb: u64,
+    input_dir: Option<&Path>,
+    out_dir: &Path,
 ) -> Result<i32> {
     let bytes = std::fs::read(module).with_context(|| format!("read {}", module.display()))?;
     let hash = pumasi_proto::module_hash(&bytes);
@@ -565,6 +667,17 @@ async fn exec_local(
         memory_bytes: memory_mb * 1024 * 1024,
         fuel,
         timeout_ms: parse_duration_ms(timeout)?,
+        cpu_millis: None,
+    };
+    let shared = match input_dir {
+        Some(dir) => {
+            let (files, truncated) = read_files(dir, MAX_INPUT_FILES_BYTES)?;
+            if truncated {
+                bail!("{} is larger than the input limit", dir.display());
+            }
+            files
+        }
+        None => Vec::new(),
     };
     let program = module
         .file_stem()
@@ -586,6 +699,7 @@ async fn exec_local(
             &hash,
             &program,
             &input,
+            &shared,
             &limits,
             Arc::new(AtomicBool::new(false)),
         ))
@@ -593,6 +707,15 @@ async fn exec_local(
     .await??;
     std::io::stdout().write_all(&result.stdout)?;
     std::io::stderr().write_all(&result.stderr)?;
+    if !result.files.is_empty() {
+        std::fs::create_dir_all(out_dir)?;
+        write_files(out_dir, &result.files)?;
+        eprintln!(
+            "[pumasi] saved {} output files to {}",
+            result.files.len(),
+            out_dir.display()
+        );
+    }
     eprintln!(
         "[pumasi] {}  fuel={}  {}ms",
         result.outcome, result.fuel_used, result.wall_ms

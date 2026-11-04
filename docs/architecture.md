@@ -304,7 +304,7 @@ keeps its earnings reclaimable meanwhile.
 `.github/workflows/release.yml` runs on a `v*` tag. It builds `pumasi-cli`
 in release mode for six targets: `x86_64`/`aarch64-unknown-linux-musl`
 with cargo-zigbuild (static, so one binary covers every distribution),
-`x86_64`/`aarch64-apple-darwin` with `MACOSX_DEPLOYMENT_TARGET=10.15`, and
+`x86_64`/`aarch64-apple-darwin` with `MACOSX_DEPLOYMENT_TARGET=10.15` (Apple Silicon builds start at 11.0), and
 `x86_64`/`aarch64-pc-windows-msvc`. Assets are raw binaries named
 `pumasi-<os>-<arch>[.exe]` (what `pumasi upgrade rollout` takes as is),
 `SHA256SUMS`, `install.sh` and `install.ps1`. With a public repository the

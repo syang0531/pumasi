@@ -40,10 +40,13 @@ jobs:
           - asset: pumasi-macos-x86_64
             target: x86_64-apple-darwin
             os: macos-latest
+            minos: "10.15"
           - asset: pumasi-macos-aarch64
             target: aarch64-apple-darwin
             os: macos-latest
             native: true
+            # Apple Silicon starts at macOS 11; the linker raises 10.15 to it.
+            minos: "11.0"
           - asset: pumasi-windows-x86_64.exe
             target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -101,7 +104,7 @@ jobs:
           fi
           case "${{ matrix.os }}" in
             ubuntu-*) file "$bin" | tee /dev/stderr | grep -q "statically linked" ;;
-            macos-*) vtool -show-build "$bin" | tee /dev/stderr | grep -Eq "minos 10\.15|version 10\.15" ;;
+            macos-*) vtool -show-build "$bin" | tee /dev/stderr | grep -Eq "(minos|version) ${{ matrix.minos }}( |$)" ;;
           esac
       - uses: actions/upload-artifact@v4
         with:

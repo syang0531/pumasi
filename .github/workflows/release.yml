@@ -150,8 +150,10 @@ jobs:
           bin="dist/${{ matrix.asset }}"
           if [ "${{ matrix.native }}" = true ]; then
             "./$bin" --version
-            { "./$bin" vm status --vm-dir "$RUNNER_TEMP/vm-check" || true; } \
-              | tee /dev/stderr | grep -q "built into this binary"
+            # Not ready (no kernel) exits 1; only the guest init matters here.
+            status=$("./$bin" vm status --vm-dir "$RUNNER_TEMP/vm-check" || true)
+            echo "$status"
+            grep -q "built into this binary" <<< "$status"
           fi
           case "${{ matrix.os }}" in
             ubuntu-*) file "$bin" | tee /dev/stderr | grep -q "statically linked" ;;

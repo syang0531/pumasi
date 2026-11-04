@@ -1,0 +1,20 @@
+# The same word count as job.toml, but every task runs in its own microVM
+# with its own kernel instead of a container on the host. Safe to send to
+# other people's machines: any agent started with `--allow-microvm`
+# (including invited providers) can take these tasks.
+#
+#   pumasi run examples/python-wordcount/job-microvm.toml
+#   python3 examples/python-wordcount/merge.py pumasi-out/<job id>
+#
+# MicroVM tasks have no network: bake what the job needs into the image.
+name = "wordcount-vm"
+executor = "microvm"
+image = "python:3.12-slim"
+command = ["python", "/input/count.py", "{shard}", "{shards}"]
+files = ["count.py", "texts/"]
+shards = 4
+
+[resources]
+memory_mb = 256
+cpus = 1
+timeout = "2m"

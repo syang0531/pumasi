@@ -64,12 +64,14 @@ pub struct Member {
 
 impl Member {
     /// Executors the cluster sends this node: what it offers, minus Docker
-    /// on provider machines whose invite did not allow it.
+    /// on provider machines whose invite did not allow it. WASM and microVM
+    /// tasks are sandboxed from the provider's machine, so every node that
+    /// offers them gets them.
     pub fn executors(&self, offered: &[Executor]) -> Vec<Executor> {
         offered
             .iter()
             .copied()
-            .filter(|e| self.role == Role::Owner || *e == Executor::Wasm || self.allow_docker)
+            .filter(|e| self.role == Role::Owner || *e != Executor::Docker || self.allow_docker)
             .collect()
     }
 
@@ -651,7 +653,7 @@ impl State {
                 blobs.push((h, std::mem::take(&mut sub.module)));
                 Some(h)
             }
-            Executor::Docker => None,
+            Executor::Docker | Executor::Microvm => None,
         };
         let files_hash = if sub.files.is_empty() {
             None
@@ -1405,9 +1407,9 @@ mod tests {
             executor,
             module: match executor {
                 Executor::Wasm => b"\0asm\x01\0\0\0".to_vec(),
-                Executor::Docker => vec![],
+                Executor::Docker | Executor::Microvm => vec![],
             },
-            docker: (executor == Executor::Docker).then(|| DockerSpec {
+            docker: executor.runs_images().then(|| DockerSpec {
                 image: "busybox".into(),
                 ..Default::default()
             }),
@@ -1491,6 +1493,38 @@ mod tests {
         st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
         st.submit(job(Executor::Docker, 1)).unwrap();
         assert_eq!(assigned(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn providers_get_microvm_jobs_without_a_docker_invite() {
+        let mut st = state();
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        let (bob_id, mut bob_rx) = join(
+            &mut st,
+            "bob",
+            vec![Executor::Wasm, Executor::Docker, Executor::Microvm],
+            bob(false),
+        );
+        let view = st
+            .status()
+            .nodes
+            .into_iter()
+            .find(|n| n.id == bob_id)
+            .unwrap();
+        assert_eq!(view.executors, vec![Executor::Wasm, Executor::Microvm]);
+        st.submit(job(Executor::Docker, 1)).unwrap();
+        assert!(assigned(&mut bob_rx).is_empty(), "docker needs the invite");
+        st.submit(job(Executor::Microvm, 2)).unwrap();
+        let got = assigned(&mut bob_rx);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|a| a.executor == Executor::Microvm));
+        assert_eq!(got[0].docker.as_ref().unwrap().image, "busybox");
+        assert_eq!(got[0].seed, None, "microvm tasks are not deterministic");
+        // A machine that does not offer microVMs never gets them.
+        let mut st = state();
+        let (_, mut rx) = join(&mut st, "own", vec![Executor::Wasm, Executor::Docker], None);
+        st.submit(job(Executor::Microvm, 1)).unwrap();
+        assert!(assigned(&mut rx).is_empty());
     }
 
     #[test]

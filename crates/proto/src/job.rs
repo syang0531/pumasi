@@ -74,14 +74,25 @@ pub enum Tier {
 /// - `Wasm`: Wasmtime sandbox, runs on every node, no network.
 /// - `Docker`: an OCI image run by the node's Docker (or Podman). Any
 ///   language, packages and optional network. Only nodes that opted in with
-///   `--allow-docker` get these tasks; meant for machines you own. A microVM
-///   executor will run the same jobs on untrusted machines later.
+///   `--allow-docker` get these tasks; meant for machines you own.
+/// - `Microvm`: the same OCI images, each task in its own lightweight VM
+///   (Firecracker, or QEMU's microvm machine) with its own kernel. No
+///   network. Safe to send to other people's machines, so providers that
+///   opted in with `--allow-microvm` get these tasks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Executor {
     #[default]
     Wasm,
     Docker,
+    Microvm,
+}
+
+impl Executor {
+    /// Docker and microVM jobs run OCI images and share [`DockerSpec`].
+    pub fn runs_images(self) -> bool {
+        matches!(self, Executor::Docker | Executor::Microvm)
+    }
 }
 
 impl fmt::Display for Executor {
@@ -89,6 +100,7 @@ impl fmt::Display for Executor {
         f.write_str(match self {
             Executor::Wasm => "wasm",
             Executor::Docker => "docker",
+            Executor::Microvm => "microvm",
         })
     }
 }
@@ -214,15 +226,15 @@ pub struct TaskInput {
     pub files: Vec<FileEntry>,
 }
 
-/// Settings specific to the Docker executor.
+/// Settings of an image job (the docker and microvm executors).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerSpec {
     pub image: String,
     /// Replaces the image's default command. Task args are appended.
     pub command: Vec<String>,
-    /// Allow outbound network access (default: none).
+    /// Allow outbound network access (default: none). Docker only.
     pub network: bool,
-    /// Passed to `docker run --gpus`, e.g. "all".
+    /// Passed to `docker run --gpus`, e.g. "all". Docker only.
     pub gpus: Option<String>,
 }
 
@@ -233,7 +245,7 @@ pub struct JobSubmission {
     pub executor: Executor,
     /// WASM module (wasm executor only).
     pub module: Vec<u8>,
-    /// Docker settings (docker executor only).
+    /// Image settings (docker and microvm executors).
     pub docker: Option<DockerSpec>,
     /// Files placed in every task's `/input`.
     pub files: Vec<FileEntry>,
@@ -264,10 +276,27 @@ impl JobSubmission {
                     "module is not a WebAssembly binary"
                 );
             }
-            Executor::Docker => {
-                let d = self.docker.as_ref().context("docker job needs an image")?;
-                ensure!(!d.image.trim().is_empty(), "docker job needs an image");
-                ensure!(!d.image.starts_with('-'), "invalid image name");
+            Executor::Docker | Executor::Microvm => {
+                let kind = self.executor;
+                let d = self
+                    .docker
+                    .as_ref()
+                    .with_context(|| format!("{kind} job needs an image"))?;
+                ensure!(!d.image.trim().is_empty(), "{kind} job needs an image");
+                ensure!(
+                    !d.image.starts_with('-') && !d.image.contains(char::is_whitespace),
+                    "invalid image name"
+                );
+                if kind == Executor::Microvm {
+                    ensure!(
+                        !d.network,
+                        "microvm jobs have no network; bake what the job needs into the image, or use a docker job"
+                    );
+                    ensure!(
+                        d.gpus.is_none(),
+                        "microvm jobs cannot use GPUs yet; use a docker job"
+                    );
+                }
             }
         }
         for f in self
@@ -332,6 +361,9 @@ impl JobSubmission {
 /// network = false
 /// ```
 ///
+/// The same job in a microVM (on any node that allows microVMs, including
+/// provider machines) only adds `executor = "microvm"`.
+///
 /// Either `shards` (N copies of `args`/`command`, with `{shard}` /
 /// `{shards}` substituted) or an explicit `[[task]]` list may be given. With
 /// neither, the job has a single task.
@@ -341,12 +373,13 @@ pub struct JobFile {
     pub name: Option<String>,
     /// WASM module path (wasm executor).
     pub module: Option<PathBuf>,
-    /// OCI image (docker executor).
+    /// OCI image (docker and microvm executors).
     pub image: Option<String>,
-    /// Overrides the image's default command (docker executor).
+    /// Overrides the image's default command (docker and microvm).
     #[serde(default)]
     pub command: Vec<String>,
-    /// Defaults to `docker` when `image` is set, else `wasm`.
+    /// Defaults to `docker` when `image` is set, else `wasm`. Set
+    /// `microvm` to run the image in a VM.
     pub executor: Option<Executor>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -477,10 +510,13 @@ impl JobFile {
         });
         let (module, docker_base) = match executor {
             Executor::Wasm => {
-                ensure!(self.image.is_none(), "`image` is only for docker jobs");
+                ensure!(
+                    self.image.is_none(),
+                    "`image` is only for docker and microvm jobs"
+                );
                 ensure!(
                     self.command.is_empty(),
-                    "`command` is only for docker jobs; use `args`"
+                    "`command` is only for docker and microvm jobs; use `args`"
                 );
                 ensure!(
                     !self.network,
@@ -490,9 +526,12 @@ impl JobFile {
                 let m = self.module.as_ref().context("wasm job needs `module`")?;
                 (read(m)?, None)
             }
-            Executor::Docker => {
+            Executor::Docker | Executor::Microvm => {
                 ensure!(self.module.is_none(), "`module` is only for wasm jobs");
-                let image = self.image.clone().context("docker job needs `image`")?;
+                let image = self
+                    .image
+                    .clone()
+                    .with_context(|| format!("{executor} job needs `image`"))?;
                 (Vec::new(), Some(image))
             }
         };
@@ -605,7 +644,7 @@ impl JobFile {
             account: None,
             deterministic: match executor {
                 Executor::Wasm => self.deterministic.unwrap_or(true),
-                Executor::Docker => {
+                Executor::Docker | Executor::Microvm => {
                     ensure!(
                         self.deterministic != Some(true),
                         "deterministic mode is only for wasm jobs"
@@ -756,6 +795,33 @@ mod tests {
     }
 
     #[test]
+    fn microvm_job_uses_the_docker_fields() {
+        let dir = tempdir();
+        let f = JobFile::parse(
+            r#"
+            executor = "microvm"
+            image = "python:3.12-slim"
+            command = ["python", "-c", "print({shard})"]
+            shards = 2
+            "#,
+        )
+        .unwrap();
+        let sub = f.resolve(&dir).unwrap();
+        assert_eq!(sub.executor, Executor::Microvm);
+        assert!(!sub.deterministic);
+        assert_eq!(sub.tasks[1].args, vec!["python", "-c", "print(1)"]);
+        assert_eq!(sub.docker.unwrap().image, "python:3.12-slim");
+        let net =
+            JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\nnetwork = true").unwrap();
+        assert!(net.resolve(&dir).is_err(), "microvm jobs have no network");
+        let gpu =
+            JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\ngpus = \"all\"").unwrap();
+        assert!(gpu.resolve(&dir).is_err(), "no GPU passthrough yet");
+        let none = JobFile::parse("executor = \"microvm\"").unwrap();
+        assert!(none.resolve(&dir).is_err(), "needs an image");
+    }
+
+    #[test]
     fn docker_command_without_placeholders_is_kept() {
         let dir = tempdir();
         let f = JobFile::parse(
@@ -827,6 +893,9 @@ mod tests {
         assert!(sub.files.iter().any(|f| f.path == "count.py"));
         assert!(sub.files.iter().any(|f| f.path.starts_with("texts/")));
         assert_eq!(sub.limits.cpu_millis, Some(1000));
+        let vm = JobFile::load(&root.join("python-wordcount/job-microvm.toml")).unwrap();
+        assert_eq!(vm.executor, Executor::Microvm);
+        assert_eq!(vm.tasks, sub.tasks);
     }
 
     #[test]

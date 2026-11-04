@@ -11,7 +11,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use pumasi_agent::{Agent, AgentConfig, WasmExecutor, default_node_name};
+use pumasi_agent::{
+    Agent, AgentConfig, MicrovmConfig, MicrovmExecutor, WasmExecutor, default_node_name,
+    microvm::{Assets, Backend},
+};
 use pumasi_cluster::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
     economy::{Policy, format_credits, parse_credits, parse_rate_permille, validate_account},
@@ -62,8 +65,9 @@ enum Cmd {
         admin: AdminArgs,
     },
     /// Invite someone else's machine to join as a provider. It runs WASM
-    /// tasks only (unless --allow-docker), earns credits for ACCOUNT, and
-    /// has a sample of its results checked.
+    /// tasks and, if it opts in with --allow-microvm, image jobs in microVMs
+    /// (Docker only with --allow-docker), earns credits for ACCOUNT, and has
+    /// a sample of its WASM results checked.
     Invite {
         /// Account the machine earns for, usually its owner's name
         /// (a-z, 0-9, '-', '_').
@@ -159,6 +163,10 @@ enum Cmd {
     },
     /// Save an admin ticket so this machine can manage a remote cluster.
     Login { ticket: String },
+    /// MicroVM support: install the guest kernel, check the setup, or run
+    /// an image locally in a microVM.
+    #[command(subcommand)]
+    Vm(VmCmd),
     /// Run a module locally in the same sandbox the agent uses.
     Exec {
         module: PathBuf,
@@ -182,6 +190,75 @@ enum Cmd {
         #[arg(long)]
         seed: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum VmCmd {
+    /// Download the guest kernel (and Firecracker on Linux) and install the
+    /// guest init, so `pumasi agent ... --allow-microvm` works.
+    Setup {
+        /// Guest init to install, a static Linux build of `pumasi-guest`
+        /// (default: keep the installed one, or use the one next to this
+        /// binary).
+        #[arg(long)]
+        guest: Option<PathBuf>,
+        /// Download again even if the files exist.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        vm: VmArgs,
+    },
+    /// Show what is installed and which VM monitor would be used.
+    Status {
+        #[command(flatten)]
+        vm: VmArgs,
+    },
+    /// Run an image in a microVM on this machine, the way an agent would.
+    Run {
+        image: String,
+        /// Command and arguments (default: the image's own command).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+        /// Environment variables, KEY=VALUE.
+        #[arg(long = "env", short = 'e')]
+        env: Vec<String>,
+        #[arg(long, default_value = "300s")]
+        timeout: String,
+        #[arg(long, default_value_t = 256)]
+        memory_mb: u64,
+        /// CPU cores (rounded up to whole vCPUs).
+        #[arg(long)]
+        cpus: Option<f64>,
+        /// Directory whose contents appear at /input.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Where to save what the task writes to /output.
+        #[arg(long, default_value = "pumasi-out/vm")]
+        out: PathBuf,
+        #[command(flatten)]
+        vm: VmArgs,
+    },
+}
+
+#[derive(Args, Clone, Default)]
+struct VmArgs {
+    /// Directory with the guest kernel and init, and the image cache
+    /// (default: <home>/vm).
+    #[arg(long, env = "PUMASI_VM_DIR")]
+    vm_dir: Option<PathBuf>,
+    /// VM monitor: firecracker or qemu (default: Firecracker when installed
+    /// and KVM is usable, else QEMU).
+    #[arg(long)]
+    vm_backend: Option<Backend>,
+}
+
+impl VmArgs {
+    fn config(&self, home: &Path) -> MicrovmConfig {
+        MicrovmConfig {
+            dir: self.vm_dir.clone().unwrap_or_else(|| home.join("vm")),
+            backend: self.vm_backend,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -232,6 +309,9 @@ enum PricesCmd {
         /// Credits per core-hour of a Docker task.
         #[arg(long)]
         docker_cpu_hour: Option<String>,
+        /// Credits per vCPU-hour of a microVM task.
+        #[arg(long)]
+        microvm_cpu_hour: Option<String>,
         /// Credits per GiB-hour of reserved memory.
         #[arg(long)]
         memory_gib_hour: Option<String>,
@@ -292,6 +372,13 @@ struct AgentOpts {
     /// Docker-compatible CLI to use for docker jobs.
     #[arg(long, default_value = "docker")]
     docker_bin: String,
+    /// Also run image jobs in microVMs. Each task gets its own VM and
+    /// kernel, so this is safe on machines you share with a cluster.
+    /// Needs `pumasi vm setup` first.
+    #[arg(long)]
+    allow_microvm: bool,
+    #[command(flatten)]
+    vm: VmArgs,
     #[command(flatten)]
     net: NetArgs,
 }
@@ -416,9 +503,9 @@ async fn run(cli: Cli) -> Result<i32> {
                 uses,
                 if uses == 1 { "" } else { "s" },
                 if allow_docker {
-                    "wasm and docker"
+                    "wasm, microvm and docker"
                 } else {
-                    "wasm only"
+                    "wasm and microvm"
                 }
             );
             eprintln!("send this command to the provider; it runs on their machine:");
@@ -542,6 +629,7 @@ async fn run(cli: Cli) -> Result<i32> {
             eprintln!("saved admin ticket to {}", path.display());
             Ok(0)
         }
+        Cmd::Vm(cmd) => vm(&home, cmd).await,
         Cmd::Exec {
             module,
             args,
@@ -623,6 +711,7 @@ async fn agent(home: &Path, cmd: AgentCmd) -> Result<i32> {
         net,
         bind: opts.net.bind,
         docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
+        microvm: opts.allow_microvm.then(|| opts.vm.config(home)),
         corrupt_results: false,
     };
     let agent = Agent::new(config).await?;
@@ -757,7 +846,7 @@ fn print_status(s: &ClusterStatus) {
     }
     if s.nodes.iter().any(|n| n.role == Role::Provider) {
         println!(
-            "(CHECKS: passed/failed result checks; providers run WASM unless invited with --allow-docker)"
+            "(CHECKS: passed/failed result checks; providers run WASM and microVM jobs, Docker only if invited with --allow-docker)"
         );
     }
     if s.nodes.is_empty() {
@@ -988,6 +1077,165 @@ async fn exec_local(
     })
 }
 
+async fn vm(home: &Path, cmd: VmCmd) -> Result<i32> {
+    match cmd {
+        VmCmd::Setup { guest, force, vm } => {
+            let config = vm.config(home);
+            let report =
+                pumasi_agent::microvm::setup::setup(&config.dir, guest.as_deref(), force).await?;
+            for f in &report.installed {
+                eprintln!("installed {f}");
+            }
+            for f in &report.kept {
+                eprintln!("kept      {f}");
+            }
+            vm_status(&config)
+        }
+        VmCmd::Status { vm } => vm_status(&vm.config(home)),
+        VmCmd::Run {
+            image,
+            command,
+            env,
+            timeout,
+            memory_mb,
+            cpus,
+            input,
+            out,
+            vm,
+        } => {
+            let exec = MicrovmExecutor::detect(&vm.config(home), "local").await?;
+            let mut task_env = std::collections::BTreeMap::new();
+            for kv in env {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("--env wants KEY=VALUE, got {kv:?}"))?;
+                task_env.insert(k.to_string(), v.to_string());
+            }
+            let files = match &input {
+                Some(dir) => {
+                    let (files, truncated) = read_files(dir, MAX_INPUT_FILES_BYTES)?;
+                    if truncated {
+                        bail!("{} is larger than the input limit", dir.display());
+                    }
+                    files
+                }
+                None => Vec::new(),
+            };
+            let mut stdin = Vec::new();
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut stdin)?;
+            }
+            let spec = pumasi_proto::job::DockerSpec {
+                image,
+                command,
+                network: false,
+                gpus: None,
+            };
+            let limits = Limits {
+                memory_bytes: memory_mb << 20,
+                fuel: None,
+                timeout_ms: parse_duration_ms(&timeout)?,
+                cpu_millis: cpus.map(|c| (c * 1000.0).round() as u32),
+            };
+            let task = pumasi_proto::msg::TaskRef {
+                job: JobId(0),
+                index: 0,
+                attempt: 1,
+                check: false,
+            };
+            let input = TaskInput {
+                args: vec![],
+                env: task_env,
+                stdin,
+                files: vec![],
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = cancel.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            let r = exec.run(task, &spec, &input, &files, &limits, cancel).await;
+            std::io::stdout().write_all(&r.stdout)?;
+            std::io::stderr().write_all(&r.stderr)?;
+            if !r.files.is_empty() {
+                std::fs::create_dir_all(&out)?;
+                write_files(&out, &r.files)?;
+                eprintln!(
+                    "[pumasi] saved {} output files to {}",
+                    r.files.len(),
+                    out.display()
+                );
+            }
+            eprintln!(
+                "[pumasi] {}  {}ms ({})",
+                r.outcome,
+                r.wall_ms,
+                exec.backend()
+            );
+            Ok(match r.outcome {
+                Outcome::Exited(c) => c,
+                _ => 125,
+            })
+        }
+    }
+}
+
+fn vm_status(config: &MicrovmConfig) -> Result<i32> {
+    let a = Assets::find(&config.dir);
+    let show = |name: &str, p: &Option<PathBuf>, hint: &str| match p {
+        Some(p) => println!("  {name:<12} {}", p.display()),
+        None => println!("  {name:<12} missing ({hint})"),
+    };
+    println!("microVM setup in {}", config.dir.display());
+    show("kernel", &a.kernel, "run `pumasi vm setup`");
+    show(
+        "guest init",
+        &a.guest,
+        "build pumasi-guest for linux-musl, then `pumasi vm setup --guest <path>`",
+    );
+    if cfg!(target_os = "linux") {
+        show("firecracker", &a.firecracker, "run `pumasi vm setup`");
+    }
+    show("qemu", &a.qemu, "optional; install QEMU");
+    show("mkfs.ext4", &a.mkfs, "install e2fsprogs");
+    if cfg!(target_os = "linux") {
+        println!(
+            "  {:<12} {}",
+            "kvm",
+            if a.kvm {
+                "usable"
+            } else {
+                "not usable (enable virtualization; add this user to the `kvm` group)"
+            }
+        );
+    }
+    let ready = a.kernel.is_some() && a.guest.is_some() && a.mkfs.is_some();
+    match a.pick(config.backend) {
+        Ok(vmm) if ready => {
+            println!(
+                "ready: microVMs boot with {}{}",
+                vmm.backend,
+                if vmm.accelerated {
+                    ""
+                } else {
+                    " (software emulation: slow)"
+                }
+            );
+            Ok(0)
+        }
+        Ok(_) => {
+            println!("not ready: see the missing items above");
+            Ok(1)
+        }
+        Err(e) => {
+            println!("not ready: {e:#}");
+            Ok(1)
+        }
+    }
+}
+
 fn short(id: &str) -> &str {
     &id[..id.len().min(10)]
 }
@@ -1135,6 +1383,7 @@ async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Resul
     if let Some(PricesCmd::Set {
         wasm_per_gfuel,
         docker_cpu_hour,
+        microvm_cpu_hour,
         memory_gib_hour,
         hold,
         verify_rate,
@@ -1146,6 +1395,9 @@ async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Resul
         }
         if let Some(v) = docker_cpu_hour {
             p.prices.docker_cpu_hour = parse_credits(&v)?;
+        }
+        if let Some(v) = microvm_cpu_hour {
+            p.prices.microvm_cpu_hour = parse_credits(&v)?;
         }
         if let Some(v) = memory_gib_hour {
             p.prices.memory_gib_hour = parse_credits(&v)?;
@@ -1179,6 +1431,10 @@ fn print_policy(p: &Policy) {
     println!(
         "  docker-cpu-hour  {:>12}  per core-hour of wall time",
         format_credits(p.prices.docker_cpu_hour)
+    );
+    println!(
+        "  microvm-cpu-hour {:>12}  per vCPU-hour of wall time",
+        format_credits(p.prices.microvm_cpu_hour)
     );
     println!(
         "  memory-gib-hour  {:>12}  per GiB-hour of reserved memory",

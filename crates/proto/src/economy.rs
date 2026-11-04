@@ -114,6 +114,9 @@ pub struct PriceList {
     /// Per core-hour of a Docker task's wall time (its `cpus` limit, one
     /// core when unset).
     pub docker_cpu_hour: Micros,
+    /// Per core-hour of a microVM task's wall time (its vCPUs: the `cpus`
+    /// limit rounded up, one when unset), boot included.
+    pub microvm_cpu_hour: Micros,
     /// Per GiB-hour of reserved memory, for both executors.
     pub memory_gib_hour: Micros,
 }
@@ -123,12 +126,19 @@ impl Default for PriceList {
         Self {
             wasm_per_gfuel: 10_000,
             docker_cpu_hour: 50_000,
+            microvm_cpu_hour: 50_000,
             memory_gib_hour: 5_000,
         }
     }
 }
 
 const MS_PER_HOUR: u128 = 3_600_000;
+
+/// Whole vCPUs a microVM gets for a CPU limit in thousandths of a core:
+/// rounded up, one when unset.
+pub fn vcpus(cpu_millis: Option<u32>) -> u32 {
+    cpu_millis.map_or(1, |m| m.div_ceil(1000).max(1))
+}
 const GIB: u128 = 1 << 30;
 
 impl PriceList {
@@ -141,6 +151,10 @@ impl PriceList {
             Executor::Docker => {
                 let cpu = m.cpu_millis.unwrap_or(1000) as u128;
                 cpu * wall * price(self.docker_cpu_hour) / (1000 * MS_PER_HOUR)
+            }
+            Executor::Microvm => {
+                let vcpus = vcpus(m.cpu_millis) as u128;
+                vcpus * wall * price(self.microvm_cpu_hour) / MS_PER_HOUR
             }
         };
         let memory =
@@ -186,6 +200,7 @@ impl Policy {
         ensure!(
             self.prices.wasm_per_gfuel >= 0
                 && self.prices.docker_cpu_hour >= 0
+                && self.prices.microvm_cpu_hour >= 0
                 && self.prices.memory_gib_hour >= 0,
             "prices must not be negative"
         );
@@ -253,6 +268,7 @@ mod tests {
         let prices = PriceList {
             wasm_per_gfuel: 1_000_000,
             docker_cpu_hour: 2_000_000,
+            microvm_cpu_hour: 3_000_000,
             memory_gib_hour: 1_000_000,
         };
         // 3 billion fuel, no memory time.
@@ -273,5 +289,14 @@ mod tests {
             cpu_millis: Some(1500),
         };
         assert_eq!(prices.charge(&docker), 1_500_000 + 1_000_000);
+        // The same run in a microVM is billed for 2 whole vCPUs.
+        let vm = Metered {
+            executor: Executor::Microvm,
+            ..docker
+        };
+        assert_eq!(prices.charge(&vm), 3_000_000 + 1_000_000);
+        assert_eq!(vcpus(None), 1);
+        assert_eq!(vcpus(Some(250)), 1);
+        assert_eq!(vcpus(Some(2001)), 3);
     }
 }

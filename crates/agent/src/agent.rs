@@ -27,7 +27,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::{docker::DockerExecutor, executor::WasmExecutor};
+use crate::{
+    docker::DockerExecutor,
+    executor::WasmExecutor,
+    microvm::{MicrovmConfig, MicrovmExecutor},
+};
 
 const MEMBERSHIP_FILE: &str = "membership.json";
 const KEY_FILE: &str = "secret.key";
@@ -44,6 +48,8 @@ pub struct AgentConfig {
     /// Docker CLI to use for docker jobs (`docker` or `podman`). `None`
     /// means this node runs WASM tasks only.
     pub docker: Option<String>,
+    /// Run image jobs in microVMs. `None` means no microvm jobs here.
+    pub microvm: Option<MicrovmConfig>,
     /// Test hook: tamper with every successful result before reporting it,
     /// like a provider that skips the work. Never set this in real use.
     #[doc(hidden)]
@@ -69,6 +75,7 @@ pub struct Agent {
     key: SecretKey,
     executor: WasmExecutor,
     docker: Option<DockerExecutor>,
+    microvm: Option<MicrovmExecutor>,
     /// Shared job files by content hash.
     files: FileCache,
     config: AgentConfig,
@@ -100,15 +107,29 @@ impl Agent {
                 }
                 None => None,
             };
+        let microvm =
+            match &config.microvm {
+                Some(vm) => {
+                    let label = endpoint.id().fmt_short().to_string();
+                    Some(MicrovmExecutor::detect(vm, &label).await.context(
+                        "--allow-microvm was given but microVMs cannot run on this machine",
+                    )?)
+                }
+                None => None,
+            };
         let mut info = node_info(&config);
         if docker.is_some() {
             info.executors.push(Executor::Docker);
+        }
+        if microvm.is_some() {
+            info.executors.push(Executor::Microvm);
         }
         Ok(Self {
             endpoint,
             key,
             executor,
             docker,
+            microvm,
             files: Default::default(),
             config,
             info,
@@ -321,6 +342,7 @@ impl Agent {
         running.lock().unwrap().insert(a.task, cancel.clone());
         let executor = self.executor.clone();
         let docker = self.docker.clone();
+        let microvm = self.microvm.clone();
         let shared: Arc<Vec<FileEntry>> = match a.files_hash {
             Some(h) => match self.files.lock().unwrap().get(&h) {
                 Some(f) => f.clone(),
@@ -366,6 +388,13 @@ impl Agent {
                         .await),
                     (None, _) => Err(anyhow::anyhow!("docker is not enabled on this node")),
                     (_, None) => Err(anyhow::anyhow!("docker task without an image")),
+                },
+                Executor::Microvm => match (microvm, a.docker.as_ref()) {
+                    (Some(vm), Some(spec)) => Ok(vm
+                        .run(task, spec, &a.input, &shared, &a.limits, cancel)
+                        .await),
+                    (None, _) => Err(anyhow::anyhow!("microVMs are not enabled on this node")),
+                    (_, None) => Err(anyhow::anyhow!("microvm task without an image")),
                 },
             };
             running.lock().unwrap().remove(&task);

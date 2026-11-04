@@ -1,8 +1,8 @@
 # Architecture
 
 This document records how the cluster is built and why: the private
-cluster of phase 1 and the invited providers, receipts, credit ledger and
-result checks of phase 2. The
+cluster of phase 1, the invited providers, receipts, credit ledger and
+result checks of phase 2, and the microVM executor of phase 3. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -12,7 +12,8 @@ the project; this file covers the code.
 | Crate | Role |
 | --- | --- |
 | `pumasi-proto` | Job spec (`job.toml`), wire messages, framing, tickets, endpoint helpers, receipts (signing and verification), price list and policy. No business logic. |
-| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI) and the `Agent` session loop, which signs usage. |
+| `pumasi-guest` | `pumasi-guest`, the init process inside every microVM (a static musl binary), and the disk protocol the agent shares with it. |
+| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `MicrovmExecutor` (registry client, Firecracker/QEMU) and the `Agent` session loop, which signs usage. |
 | `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
 | `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. |
 
@@ -55,8 +56,8 @@ and reconnects need no secret.
 - `schedule()` runs after every event (submit, connect, disconnect, report,
   tick, deposit). A node is eligible for a task when it is online, not
   suspended, has a free slot, enough memory, and the job's executor among
-  the executors the cluster allows it (provider machines: WASM, plus Docker
-  only with an invite that allows it). A node of another account than the
+  the executors the cluster allows it (provider machines: WASM and microVM,
+  plus Docker only with an invite that allows it). A node of another account than the
   job's is eligible only while that account's balance is positive. Among
   eligible nodes, the job account's own machines come first (they cost
   nothing), then the most free slots. A docker job waits in the queue while
@@ -83,7 +84,7 @@ and reconnects need no secret.
 ## Executors
 
 A job names one executor; everything around it (job file, scheduling, files,
-reports, CLI) is shared. Both executors see the same file layout: the job's
+reports, CLI) is shared. All executors see the same file layout: the job's
 shared files plus the task's own files read-only at `/input`, and an empty
 writable `/output` whose contents (capped at 32 MiB) are returned in the
 report and stored with the task.
@@ -128,7 +129,67 @@ via `--docker-bin`). It is enabled only when the agent is started with
 Copying instead of mounting keeps host paths out of the container and works
 the same with remote daemons and Docker Desktop. Containers share the host
 kernel, so this executor is for machines and people the owner trusts; the
-phase 3 microVM executor will run the same images with VM isolation.
+microVM executor runs the same images with VM isolation.
+
+### MicroVM
+
+`MicrovmExecutor` runs docker-style jobs (`executor = "microvm"`, same
+`DockerSpec`) with one VM per task. It is enabled with `--allow-microvm`
+once `pumasi vm setup` has installed a pinned Firecracker CI guest kernel
+(Linux 6.1: virtio-mmio, ext4, overlayfs, initramfs), Firecracker on Linux,
+and the guest init. Backends:
+
+| Backend | Where | Notes |
+| --- | --- | --- |
+| Firecracker | Linux with `/dev/kvm` | default when installed; `--no-api --config-file`, its own seccomp filters |
+| QEMU | Linux, macOS | `-M microvm` on x86_64, `-M virt` on ARM64; KVM or HVF when available, else TCG (slow; adds `tsc_early_khz` so boot never stalls calibrating the TSC) |
+
+The research doc names libkrun for macOS; QEMU came first because the same
+command line covers Linux and macOS and CI can test it. libkrun stays an
+option once a Mac runner can exercise it.
+
+Nothing crosses the VM boundary except virtio block devices, which the
+guest identifies by content (VMMs attach them in different orders):
+
+| Disk | Contents | Mode |
+| --- | --- | --- |
+| base | the image root filesystem, ext4 labeled `pumasi-base` | read-only, shared by every task of the image |
+| scratch | empty ext4 labeled `pumasi-scratch`, 10 GiB sparse | read-write, one per task |
+| input | tar: role entry, `spec.json` (argv, env, workdir, user), `stdin`, `input/...` | read-only |
+| output | starts with a marker; the guest overwrites it with a tar: `stdout`, `stderr`, `output/...`, `result.json` | read-write |
+| layers | tar of the image's layer blobs (build mode only) | read-only |
+
+Per image, once: the agent resolves the reference with its own OCI
+distribution client (anonymous bearer tokens, manifest lists resolved to
+`linux/<arch>`, every manifest, config and layer checked against its
+SHA-256), makes an empty sparse ext4 (`mkfs.ext4`, no journal), and boots a
+*build* VM. The guest unpacks each layer (gzip, zstd or plain tar) in a
+child chrooted into the new filesystem, so absolute symlinks resolve inside
+it, honoring OCI whiteouts and opaque directories and keeping ownership and
+modes. The host never unpacks image tarballs. The disk is cached under
+`<vm dir>/images/<digest>/` with the image config; `refs/` maps the
+reference to the digest, so a cached image is used without contacting the
+registry (like `docker run`).
+
+Per task: the guest mounts base read-only and scratch, stacks an overlay
+(upper on scratch) as the new root, copies `/input`, makes `/output` owned
+by the task user, mounts `proc`, `sys` (read-only), `devtmpfs`, `devpts`,
+`/dev/shm`, writes `/etc/hosts` and `/etc/hostname`, brings up loopback,
+resolves the image's `User` against its `/etc/passwd` and `/etc/group`, and
+forks the command (entrypoint + job command and task args, or the image's
+`Cmd`) with stdout and stderr going to files on scratch, outside the
+container's view. PID 1 reaps everything, kills what is left when the
+command exits, detects the OOM killer through `/proc/vmstat`, writes the
+output disk (capped like the other executors) and reboots, which ends the
+VMM. The host kills the VMM at the deadline or on cancellation, then reads
+the output disk as data: entries are checked with `validate_rel_path` and
+only kept in memory.
+
+Outcomes map like Docker's: exit code as is, death by signal N as exit
+`128 + N`, OOM as a trap "out of memory". The VM gets the task's memory
+limit plus 96 MiB for the kernel, and `ceil(cpus)` vCPUs. There is no
+network device at all, so `network = true` and `gpus` are rejected for
+microvm jobs at submission.
 
 ### Deterministic mode
 
@@ -155,7 +216,7 @@ account and cannot be handed out.
 
 | | Owner machine | Provider machine |
 | --- | --- | --- |
-| Executors | whatever it offers | WASM; Docker only if the invite allowed it and the agent passes `--allow-docker` |
+| Executors | whatever it offers | WASM, microVM if the agent passes `--allow-microvm`; Docker only if the invite allowed it and the agent passes `--allow-docker` |
 | Results | trusted, settle checks | sampled for checks, never settle one |
 | Paid | no (same account as the owner's jobs) | yes, held then released |
 | Suspended | never | after `max_strikes` failed checks |
@@ -195,7 +256,10 @@ Amounts are integer micro-credits. The fixed price list:
   check run reproduces it, so slow machines are paid the same for the same
   work and a provider cannot pad it unnoticed.
 - Docker: `cpus × wall hours × docker_cpu_hour` (one core when unset).
-- Both: `memory limit GiB × wall hours × memory_gib_hour`.
+- MicroVM: `vCPUs × wall hours × microvm_cpu_hour`, vCPUs being `cpus`
+  rounded up (one when unset). Wall time starts at boot; the first pull of an
+  image is not billed.
+- All: `memory limit GiB × wall hours × memory_gib_hour`.
 
 Every receipt with a non-zero amount writes, in one redb transaction with
 the receipt: the consumer's `Charge` (balance down), the provider's `Hold`
@@ -241,9 +305,13 @@ keyed by sequence number, and `holds` and `receipts` keyed by run
 `(job, index, attempt, check)`.
 
 Postcard is not self-describing, so `meta.schema` versions the record
-layout. A phase 1 database (no version) is migrated in place on first open:
-members become owner machines, jobs belong to `owner` and are not
-deterministic.
+layout, and older layouts are migrated in place on first open. A phase 1
+database (no version) becomes layout 2: members become owner machines, jobs
+belong to `owner` and are not deterministic. Layout 3 (phase 3) adds
+`microvm_cpu_hour` to the stored policy, starting at the Docker price.
+`Executor::Microvm` was appended to the enum, so older records decode
+unchanged. `PROTOCOL_VERSION` is 4: agents and the control plane must both
+be phase 3 builds.
 
 ## Not yet
 
@@ -253,7 +321,10 @@ deterministic.
 - Credits are not connected to a payment provider, and there is no
   platform fee.
 - Benchmarks at join and "honeypot" tasks with known answers (needed for
-  non-deterministic and Docker work, which checks cannot cover).
+  non-deterministic Docker and microVM work, which checks cannot cover).
+- MicroVM: private registries, network (a tap device with egress rules),
+  GPU passthrough (VFIO), a snapshot pool for faster boots, and libkrun on
+  macOS.
 - WASI preview 2 components, job garbage collection.
 - Large files: inputs and outputs travel through the control plane and are
   capped (48 MiB in per job, 32 MiB out per task). Direct node-to-node

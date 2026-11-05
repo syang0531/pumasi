@@ -74,6 +74,38 @@ pub struct RunSpec {
     /// for root.
     pub user: String,
     pub hostname: String,
+    /// Bytes of `/output` files the guest may write (0: the inline limit,
+    /// [`MAX_OUTPUT_FILES_BYTES`]). Larger when the output goes to the
+    /// file store; the host sizes the output disk to match.
+    #[serde(default)]
+    pub output_limit: u64,
+    /// Most `/output` files (0: [`MAX_OUTPUT_FILES`]).
+    #[serde(default)]
+    pub output_files: u32,
+}
+
+impl RunSpec {
+    pub fn files_limit(&self) -> u64 {
+        if self.output_limit == 0 {
+            MAX_OUTPUT_FILES_BYTES
+        } else {
+            self.output_limit
+        }
+    }
+
+    pub fn count_limit(&self) -> usize {
+        if self.output_files == 0 {
+            MAX_OUTPUT_FILES
+        } else {
+            self.output_files as usize
+        }
+    }
+
+    /// The output disk this spec needs: both streams, the files and a tar
+    /// header for every file.
+    pub fn output_disk_bytes(&self) -> u64 {
+        2 * MAX_STREAM_BYTES + self.files_limit() + (self.count_limit() as u64 + 16) * 1024
+    }
 }
 
 /// How the guest's work ended.

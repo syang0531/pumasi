@@ -111,6 +111,8 @@ impl State {
         let runs = check.runs.clone();
         let mut passed = Vec::new();
         let mut rejected: Vec<RunRecord> = Vec::new();
+        // A check run whose result won (its stored output becomes the task's).
+        let mut won_attempt = None;
         match winner(&runs) {
             Some(w) => {
                 let win = &runs[w];
@@ -132,6 +134,7 @@ impl State {
                     task.fuel_used = out.fuel_used;
                     task.wall_ms = out.wall_ms;
                     task.node = Some(win.node.clone());
+                    won_attempt = Some(win.task.attempt);
                 }
                 check.status = if rejected.is_empty() {
                     Verification::Passed
@@ -163,6 +166,7 @@ impl State {
             }
         }
         let inconclusive = matches!(check.status, Verification::Inconclusive);
+        self.settle_check_stored(r.job, r.index, won_attempt);
         self.persist_task(r);
         for node in passed {
             self.credit_pass(&node);

@@ -4,13 +4,16 @@
 //! specification users write, the messages agents and the control plane
 //! exchange, the admin API, and the tickets used to join a cluster.
 
+pub mod blobs;
 pub mod economy;
 pub mod job;
 pub mod msg;
 pub mod net;
 pub mod perf;
 pub mod receipt;
+pub mod registry;
 pub mod release;
+pub mod store;
 pub mod ticket;
 pub mod wire;
 
@@ -18,11 +21,16 @@ pub mod wire;
 pub const AGENT_ALPN: &[u8] = b"pumasi/agent/0";
 /// ALPN for the admin (CLI) <-> control plane protocol.
 pub const ADMIN_ALPN: &[u8] = b"pumasi/admin/0";
+/// ALPN of the file store: iroh-blobs' own protocol, served by the control
+/// plane (and by agents, for blobs they cache).
+pub const BLOBS_ALPN: &[u8] = iroh_blobs::ALPN;
+/// The first agent protocol with the file store.
+pub const STORE_PROTOCOL: u32 = 8;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        7
+        8
     };
 }
 
@@ -33,6 +41,8 @@ pub const PROTOCOL_VERSION: u32 = protocol_version!();
 /// older releases can connect and take a rollout. Protocol 5 agents lack
 /// the availability report (6), protocol 6 agents the performance profile
 /// and benchmark challenges (7): they are billed at the reference score.
+/// Protocol 7 agents lack the file store (8): they get no jobs that mount
+/// datasets, write outputs to the store or use private images.
 pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi

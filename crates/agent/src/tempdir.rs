@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+#[derive(Debug)]
 pub struct TempDir(PathBuf);
 
 impl TempDir {

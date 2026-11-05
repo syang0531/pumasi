@@ -7,8 +7,15 @@
 //!
 //! Admin protocol (`pumasi/admin/0`): one [`AdminRequest`] and one
 //! [`AdminResponse`] per bidirectional stream.
+//!
+//! File store (iroh-blobs' ALPN, see [`crate::BLOBS_ALPN`]): agents fetch
+//! mounted datasets and push stored outputs on their own connection; the
+//! CLI pushes uploads and fetches downloads after an admin call allowed
+//! its endpoint.
 
 use serde::{Deserialize, Serialize};
+
+use iroh::EndpointAddr;
 
 use crate::{
     ModuleHash, Secret,
@@ -17,6 +24,10 @@ use crate::{
     perf::{BenchChallenge, PerfProfile, SignedPerf},
     receipt::{Receipt, SignedUsage},
     release::{ReleaseFile, SignedRelease, Target},
+    store::{
+        BlobHash, DatasetView, ImageBlob, Mount, OutputMode, StoragePolicy, StoreItem, StoreTarget,
+        StoreUsageView, StoredOutput,
+    },
 };
 
 /// What a member machine is to the cluster.
@@ -231,6 +242,19 @@ pub struct TaskAssignment {
     /// random numbers, so every honest node produces the same result (WASM
     /// only).
     pub seed: Option<[u8; 32]>,
+    // Protocol 8 from here. Older agents decode the fields above and ignore
+    // the rest (postcard leaves trailing bytes alone); jobs that need them
+    // are never sent to older agents.
+    /// Datasets placed under `/input`, fetched from the store.
+    pub mounts: Vec<Mount>,
+    /// Where `/output` goes.
+    pub output: OutputMode,
+    /// A private image the control plane pulled into the store; the node
+    /// loads it from there instead of the registry.
+    pub image: Option<ImageBlob>,
+    /// Other nodes that have the mounted collections (and the image)
+    /// cached; tried before the control plane.
+    pub peers: Vec<EndpointAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +346,22 @@ pub enum FromAgent {
         nonce: u64,
         result: u64,
     },
+    /// A task report whose output files may be in the store: the agent
+    /// pushed the collection before sending this (protocol 8).
+    Report {
+        report: Box<TaskReport>,
+        stored: Option<StoredOutput>,
+    },
+    /// What the node's store cache holds, so the control plane can point
+    /// other nodes at it, and the address they dial (protocol 8). `full`
+    /// replaces the previous list; otherwise `added` and `removed` update
+    /// it.
+    StoreState {
+        addr: Option<EndpointAddr>,
+        full: bool,
+        added: Vec<BlobHash>,
+        removed: Vec<BlobHash>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +449,56 @@ pub enum AdminOp {
     RolloutStatus,
     /// Stop offering the current rollout.
     CancelRollout,
+    /// Lets `uploader` (the CLI's endpoint) push the collection `root` to
+    /// the store for the next hour; answers with what the store is still
+    /// missing of it, so an interrupted upload resumes.
+    StoreUpload {
+        uploader: [u8; 32],
+        root: BlobHash,
+    },
+    /// Records an uploaded collection: as a new version of dataset `name`,
+    /// or, without a name, as a job input the next submission refers to.
+    StoreCommit {
+        root: BlobHash,
+        name: Option<String>,
+        account: Option<String>,
+    },
+    /// Datasets (every version of `name`, or the latest of each).
+    StoreList {
+        name: Option<String>,
+    },
+    /// Deletes one version of a dataset, or all of them. The space comes
+    /// back once nothing else refers to the files.
+    StoreRemove {
+        name: String,
+        version: Option<u32>,
+    },
+    /// Lets `reader` (the CLI's endpoint) download a dataset or a job's
+    /// stored outputs for the next hour, and says what to fetch.
+    StoreOpen {
+        reader: [u8; 32],
+        target: StoreTarget,
+    },
+    /// What each account stores, and its quota.
+    StoreUsage,
+    /// Sets (or with `None` clears) an account's storage quota in bytes.
+    StoreQuota {
+        account: String,
+        bytes: Option<u64>,
+    },
+    /// Stores a secret on the control plane. `registry/<host>` secrets
+    /// (`user:password` or a token) log in to private registries.
+    SecretSet {
+        name: String,
+        value: String,
+    },
+    /// Secret names (never their values).
+    SecretList,
+    SecretRemove {
+        name: String,
+    },
+    GetStoragePolicy,
+    SetStoragePolicy(StoragePolicy),
 }
 
 /// Terms of an invite for someone else's machine.
@@ -445,6 +535,35 @@ pub enum AdminResponse {
     Rollout(RolloutView),
     Ok,
     Error(String),
+    /// What the store lacks of an upload (an iroh-blobs request for it).
+    StoreMissing {
+        missing: iroh_blobs::protocol::ChunkRangesSeq,
+        have: bool,
+    },
+    Datasets(Vec<DatasetView>),
+    /// The collections to fetch for a download, and the account paying
+    /// for the egress.
+    StoreItems(Vec<StoreItem>),
+    StoreUsage {
+        usage: Vec<StoreUsageView>,
+        /// Bytes on the control plane's disk, after sharing between
+        /// versions.
+        disk_bytes: u64,
+    },
+    Secrets(Vec<SecretView>),
+    StoragePolicy {
+        policy: StoragePolicy,
+        /// The control plane's disk class, which picks the rate.
+        class: crate::perf::DiskClass,
+    },
+}
+
+/// A secret's name and when it was set; the value never leaves the
+/// control plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretView {
+    pub name: String,
+    pub set_unix: u64,
 }
 
 /// The current rollout and where each node stands.
@@ -535,6 +654,11 @@ pub enum LedgerKind {
     /// The opening balance after converting the phase 2 credit ledger to
     /// milli-CU.
     Convert,
+    /// Storage in the cluster file store: the account paying (negative)
+    /// and the control plane's owner receiving (positive).
+    Storage,
+    /// Data downloaded out of the store (`pumasi store get`), same sides.
+    Egress,
 }
 
 impl std::fmt::Display for LedgerKind {
@@ -548,6 +672,8 @@ impl std::fmt::Display for LedgerKind {
             LedgerKind::Forfeit => "forfeit",
             LedgerKind::Refund => "refund",
             LedgerKind::Convert => "convert",
+            LedgerKind::Storage => "storage",
+            LedgerKind::Egress => "egress",
         })
     }
 }
@@ -699,6 +825,8 @@ pub struct TaskView {
     pub verification: Verification,
     /// Milli-CU charged for this task's runs (including check runs).
     pub cost: MilliCu,
+    /// Output files kept in the store instead of inline.
+    pub stored: Option<StoredOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -710,6 +838,13 @@ pub struct JobView {
     pub tasks: Vec<TaskView>,
     pub total_fuel: u64,
     pub deterministic: bool,
+    /// Datasets the job mounts (`corpus@3`).
+    pub mounts: Vec<String>,
+    /// The dataset version holding the job's stored outputs, once made.
+    pub output_dataset: Option<String>,
+    /// What the job waits for before its tasks can run (pulling a private
+    /// image into the store), or why it failed.
+    pub preparing: Option<String>,
 }
 
 #[cfg(test)]

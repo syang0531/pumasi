@@ -32,6 +32,7 @@ use pumasi_proto::{
         validate_rel_path,
     },
     msg::{Outcome, TaskRef},
+    store::{IMAGE_CONFIG, ImageManifest, MAX_STORE_OUTPUT_BYTES, docker_tag, image_layer_name},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -39,7 +40,10 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{executor::RunResult, platform::ProcessJob};
+use crate::{
+    executor::{LocalImage, RunResult, TaskIo},
+    platform::ProcessJob,
+};
 
 const PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const CLI_TIMEOUT: Duration = Duration::from_secs(120);
@@ -153,6 +157,12 @@ impl DockerExecutor {
         Ok(out)
     }
 
+    /// Whether an image from the file store (by manifest digest) is
+    /// already loaded.
+    pub async fn has_local_image(&self, digest: &str) -> bool {
+        self.has_image(&docker_tag(digest)).await.unwrap_or(false)
+    }
+
     async fn has_image(&self, image: &str) -> Result<bool> {
         let inspect = self
             .cli(&["image", "inspect", "--format", "{{.Id}}", image])
@@ -222,6 +232,80 @@ impl DockerExecutor {
         Ok(())
     }
 
+    /// Loads an image taken from the file store into Docker (as
+    /// `docker save` would have written it) and returns its local tag.
+    async fn load_local_image(&self, image: &LocalImage) -> Result<String> {
+        let tag = docker_tag(&image.digest);
+        if self.has_image(&tag).await? {
+            return Ok(tag);
+        }
+        let _pull = self.pull_lock.lock().await;
+        if self.has_image(&tag).await? {
+            return Ok(tag);
+        }
+        info!(image = %tag, "loading a private image from the file store");
+        let manifest: ImageManifest = serde_json::from_slice(
+            &std::fs::read(image.dir.join(pumasi_proto::store::IMAGE_MANIFEST))
+                .context("read the image manifest")?,
+        )
+        .context("bad image manifest")?;
+        let mut child = Command::new(&self.bin)
+            .args(["load", "--quiet"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("docker load")?;
+        let stdin = child.stdin.take().expect("piped");
+        let dir = image.dir.clone();
+        let tag2 = tag.clone();
+        let feed = tokio::task::spawn_blocking(move || -> Result<()> {
+            let w = tokio_util::io::SyncIoBridge::new(stdin);
+            let mut b = tar::Builder::new(std::io::BufWriter::with_capacity(1 << 20, w));
+            b.mode(tar::HeaderMode::Deterministic);
+            let config_name = format!(
+                "{}.json",
+                manifest.config_digest.trim_start_matches("sha256:")
+            );
+            let layers: Vec<String> = (0..manifest.layers.len())
+                .map(|i| format!("{}.tar", image_layer_name(i)))
+                .collect();
+            let index = serde_json::json!([{
+                "Config": config_name,
+                "RepoTags": [tag2],
+                "Layers": layers,
+            }]);
+            let mut f = std::fs::File::open(dir.join(IMAGE_CONFIG))?;
+            b.append_file(&config_name, &mut f)?;
+            for (i, name) in layers.iter().enumerate() {
+                let mut f = std::fs::File::open(dir.join(image_layer_name(i)))?;
+                b.append_file(name, &mut f)?;
+            }
+            let json = serde_json::to_vec(&index)?;
+            let mut h = tar::Header::new_gnu();
+            h.set_size(json.len() as u64);
+            h.set_mode(0o644);
+            b.append_data(&mut h, "manifest.json", json.as_slice())?;
+            let mut w = b.into_inner()?;
+            std::io::Write::flush(&mut w)?;
+            drop(w);
+            Ok(())
+        });
+        let out = tokio::time::timeout(PULL_TIMEOUT, child.wait_with_output())
+            .await
+            .context("docker load timed out")??;
+        let fed = feed.await;
+        if !out.status.success() {
+            bail!(
+                "docker load: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        fed.context("docker load")??;
+        Ok(tag)
+    }
+
     /// Runs one task to completion.
     pub async fn run(
         &self,
@@ -232,9 +316,34 @@ impl DockerExecutor {
         limits: &Limits,
         cancel: Arc<AtomicBool>,
     ) -> RunResult {
+        self.run_io(
+            task,
+            spec,
+            input,
+            shared_files,
+            limits,
+            cancel,
+            &TaskIo::default(),
+        )
+        .await
+    }
+
+    /// [`Self::run`] with mounted files, outputs that may go to the file
+    /// store and private images from it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_io(
+        &self,
+        task: TaskRef,
+        spec: &DockerSpec,
+        input: &TaskInput,
+        shared_files: &[FileEntry],
+        limits: &Limits,
+        cancel: Arc<AtomicBool>,
+        io: &TaskIo,
+    ) -> RunResult {
         let start = Instant::now();
         match self
-            .run_inner(task, spec, input, shared_files, limits, &cancel, start)
+            .run_inner(task, spec, input, shared_files, limits, &cancel, start, io)
             .await
         {
             Ok(r) => r,
@@ -250,6 +359,7 @@ impl DockerExecutor {
                 fuel_used: 0,
                 wall_ms: start.elapsed().as_millis() as u64,
                 peak_memory_bytes: None,
+                out_dir: None,
             },
         }
     }
@@ -264,12 +374,24 @@ impl DockerExecutor {
         limits: &Limits,
         cancel: &AtomicBool,
         start: Instant,
+        io: &TaskIo,
     ) -> Result<RunResult> {
-        self.ensure_image(&spec.image, cancel).await?;
+        let local;
+        let spec = match &io.image {
+            Some(img) => {
+                local = DockerSpec {
+                    image: self.load_local_image(img).await?,
+                    ..spec.clone()
+                };
+                &local
+            }
+            None => {
+                self.ensure_image(&spec.image, cancel).await?;
+                spec
+            }
+        };
         // The timeout covers the run itself, not the image pull.
         let run_start = Instant::now();
-
-        let input_tar = input_tar(shared_files, &input.files)?;
 
         let name = format!(
             "pumasi-{}-{}-{}-{:08x}",
@@ -292,7 +414,8 @@ impl DockerExecutor {
             name: name.clone(),
         };
 
-        self.copy_in(&name, input_tar).await?;
+        self.copy_in(&name, shared_files, &input.files, io.staged.as_deref())
+            .await?;
 
         let mut child = Command::new(&self.bin)
             .args(["start", "--attach", "--interactive", &name])
@@ -354,7 +477,13 @@ impl DockerExecutor {
             }
         };
 
-        let files = self.copy_out(&name, &mut stderr).await;
+        let (files, out_dir) = if io.keeps_output() {
+            let dir = io.out_dir("out")?;
+            self.copy_out_dir(&name, dir.path(), &mut stderr).await;
+            (Vec::new(), Some(Arc::new(dir)))
+        } else {
+            (self.copy_out(&name, &mut stderr).await, None)
+        };
 
         Ok(RunResult {
             outcome,
@@ -364,11 +493,32 @@ impl DockerExecutor {
             fuel_used: 0,
             wall_ms: start.elapsed().as_millis() as u64,
             peak_memory_bytes: None,
+            out_dir,
         })
     }
 
-    /// Streams `tar` into the container's root (`docker cp - name:/`).
-    async fn copy_in(&self, name: &str, tar: Vec<u8>) -> Result<()> {
+    /// Streams a tar of the input files (and `staged`, the files mounted
+    /// from the store, read from disk as they go) into the container's
+    /// root (`docker cp - name:/`).
+    async fn copy_in(
+        &self,
+        name: &str,
+        shared: &[FileEntry],
+        own: &[FileEntry],
+        staged: Option<&std::path::Path>,
+    ) -> Result<()> {
+        let staged_files = match staged {
+            Some(d) => pumasi_proto::job::dir_files(d)?,
+            None => Vec::new(),
+        };
+        let bytes: u64 = staged_files.iter().map(|(_, _, n)| n).sum::<u64>()
+            + shared
+                .iter()
+                .chain(own)
+                .map(|f| f.data.len() as u64)
+                .sum::<u64>();
+        // Plenty for a slow disk: 10 MiB/s on top of the usual timeout.
+        let timeout = CLI_TIMEOUT + Duration::from_secs(bytes / (10 << 20));
         let mut child = Command::new(&self.bin)
             .args(["cp", "-", &format!("{name}:/")])
             .stdin(Stdio::piped())
@@ -377,13 +527,16 @@ impl DockerExecutor {
             .kill_on_drop(true)
             .spawn()
             .context("docker cp")?;
-        let mut stdin = child.stdin.take().expect("piped");
-        let feed = tokio::spawn(async move {
-            let r = stdin.write_all(&tar).await;
-            drop(stdin);
-            r
+        let stdin = child.stdin.take().expect("piped");
+        let (shared, own) = (shared.to_vec(), own.to_vec());
+        let feed = tokio::task::spawn_blocking(move || -> Result<()> {
+            let w = tokio_util::io::SyncIoBridge::new(stdin);
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, w);
+            write_input_tar(&mut w, &shared, &own, &staged_files)?;
+            std::io::Write::flush(&mut w)?;
+            Ok(())
         });
-        let out = tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output())
+        let out = tokio::time::timeout(timeout, child.wait_with_output())
             .await
             .context("copying input files timed out")??;
         let fed = feed.await;
@@ -396,6 +549,45 @@ impl DockerExecutor {
         fed.context("copy input files")?
             .context("copy input files")?;
         Ok(())
+    }
+
+    /// Extracts `/output` into `dir` (`docker cp name:/output -`), up to
+    /// the file store's output limit.
+    async fn copy_out_dir(&self, name: &str, dir: &std::path::Path, stderr: &mut Vec<u8>) {
+        let child = Command::new(&self.bin)
+            .args(["cp", &format!("{name}:/output"), "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn();
+        let Ok(mut child) = child else {
+            stderr.extend_from_slice(b"\n[pumasi] could not read output files\n");
+            return;
+        };
+        let out = child.stdout.take().expect("piped");
+        let dir = dir.to_path_buf();
+        let res = tokio::task::spawn_blocking(move || {
+            extract_output_tar(tokio_util::io::SyncIoBridge::new(out), &dir)
+        })
+        .await;
+        let _ = child.kill().await;
+        match res {
+            Ok(Ok(dropped)) if dropped > 0 => stderr.extend_from_slice(
+                format!(
+                    "\n[pumasi] output files exceeded {} GiB; {dropped} were dropped\n",
+                    MAX_STORE_OUTPUT_BYTES >> 30
+                )
+                .as_bytes(),
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => stderr.extend_from_slice(
+                format!("\n[pumasi] could not read output files: {e:#}\n").as_bytes(),
+            ),
+            Err(e) => stderr.extend_from_slice(
+                format!("\n[pumasi] could not read output files: {e}\n").as_bytes(),
+            ),
+        }
     }
 
     /// Reads `/output` as a tar stream (`docker cp name:/output -`) and
@@ -510,10 +702,25 @@ fn parse_server(answer: &str) -> (&str, &str) {
 /// The tar `docker cp -` unpacks at `/`: `/input` with the job's shared
 /// files and then the task's own (which win), and an empty `/output` any
 /// container user can write to.
+#[cfg(test)]
 fn input_tar(shared: &[FileEntry], own: &[FileEntry]) -> Result<Vec<u8>> {
-    let mut b = tar::Builder::new(Vec::new());
+    let mut out = Vec::new();
+    write_input_tar(&mut out, shared, own, &[])?;
+    Ok(out)
+}
+
+/// Writes the input tar: `/input` with the files mounted from the store
+/// (`staged`: path in `/input`, file on disk, size), then the job's shared
+/// files and the task's own (later ones win), and an empty `/output`.
+fn write_input_tar<W: std::io::Write>(
+    w: W,
+    shared: &[FileEntry],
+    own: &[FileEntry],
+    staged: &[(String, std::path::PathBuf, u64)],
+) -> Result<()> {
+    let mut b = tar::Builder::new(w);
     b.mode(tar::HeaderMode::Deterministic);
-    let dir = |b: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32| -> Result<()> {
+    let dir = |b: &mut tar::Builder<W>, path: &str, mode: u32| -> Result<()> {
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Directory);
         h.set_mode(mode);
@@ -524,28 +731,89 @@ fn input_tar(shared: &[FileEntry], own: &[FileEntry]) -> Result<Vec<u8>> {
     dir(&mut b, "input/", 0o755)?;
     dir(&mut b, "output/", 0o777)?;
     let mut dirs = std::collections::BTreeSet::new();
-    let mut latest = std::collections::BTreeMap::new();
-    for f in shared.iter().chain(own) {
-        validate_rel_path(&f.path)?;
-        latest.insert(f.path.as_str(), &f.data);
-    }
-    for (path, data) in latest {
+    let mut parents = |b: &mut tar::Builder<W>, path: &str| -> Result<()> {
         let mut parent = String::new();
         let parts: Vec<&str> = path.split('/').collect();
         for part in &parts[..parts.len() - 1] {
             parent.push_str(part);
             parent.push('/');
             if dirs.insert(parent.clone()) {
-                dir(&mut b, &format!("input/{parent}"), 0o755)?;
+                dir(b, &format!("input/{parent}"), 0o755)?;
             }
         }
+        Ok(())
+    };
+    let mut latest = std::collections::BTreeMap::new();
+    for f in shared.iter().chain(own) {
+        validate_rel_path(&f.path)?;
+        latest.insert(f.path.as_str(), &f.data);
+    }
+    for (path, file, size) in staged {
+        if latest.contains_key(path.as_str()) {
+            continue;
+        }
+        validate_rel_path(path)?;
+        parents(&mut b, path)?;
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(*size);
+        let f = std::fs::File::open(file).with_context(|| format!("read {}", file.display()))?;
+        b.append_data(
+            &mut h,
+            format!("input/{path}"),
+            std::io::Read::take(f, *size),
+        )?;
+    }
+    for (path, data) in latest {
+        parents(&mut b, path)?;
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Regular);
         h.set_mode(0o644);
         h.set_size(data.len() as u64);
         b.append_data(&mut h, format!("input/{path}"), data.as_slice())?;
     }
-    Ok(b.into_inner()?)
+    b.into_inner()?;
+    Ok(())
+}
+
+/// Writes the regular files under `output/` of a tar stream into `dir`,
+/// within the file store's output limits. Returns how many were left out.
+pub(crate) fn extract_output_tar<R: std::io::Read>(r: R, dir: &std::path::Path) -> Result<u32> {
+    let mut ar = tar::Archive::new(r);
+    let mut total = 0u64;
+    let mut kept = 0usize;
+    let mut dropped = 0u32;
+    for entry in ar.entries()? {
+        let mut entry = entry?;
+        if entry.header().entry_type() != tar::EntryType::Regular {
+            continue;
+        }
+        let name = entry.path()?.to_string_lossy().replace('\\', "/");
+        let Some(rel) = name.strip_prefix("output/") else {
+            continue;
+        };
+        let rel = rel.to_string();
+        if validate_rel_path(&rel).is_err() {
+            continue;
+        }
+        let size = entry.header().size()?;
+        if total + size > MAX_STORE_OUTPUT_BYTES
+            || kept >= pumasi_proto::blobs::MAX_COLLECTION_ENTRIES
+        {
+            dropped += 1;
+            continue;
+        }
+        let target = dir.join(&rel);
+        if let Some(p) = target.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        let mut f = std::fs::File::create(&target)?;
+        let n = std::io::copy(&mut std::io::Read::take(&mut entry, size), &mut f)?;
+        total += n;
+        kept += 1;
+    }
+    Ok(dropped)
 }
 
 /// The regular files under `output/` in a `docker cp` tar stream, sorted by

@@ -211,6 +211,28 @@ pub fn result_digest(outcome: &Outcome, stdout: &[u8], files: &[FileEntry]) -> [
     *h.finalize().as_bytes()
 }
 
+/// [`result_digest`] for a run whose output files may also be in the
+/// file store (protocol 8): the same digest when nothing was stored, so
+/// older agents and inline results are unchanged.
+pub fn output_digest(
+    outcome: &Outcome,
+    stdout: &[u8],
+    files: &[FileEntry],
+    stored: Option<&crate::store::StoredOutput>,
+) -> [u8; 32] {
+    let base = result_digest(outcome, stdout, files);
+    let Some(s) = stored else {
+        return base;
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(b"pumasi/result/v2\0");
+    h.update(&base);
+    h.update(&s.root);
+    h.update(&s.size.to_le_bytes());
+    h.update(&s.files.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// Checks that a node's usage describes the run it claims to.
 pub fn check_usage(
     signed: &SignedUsage,

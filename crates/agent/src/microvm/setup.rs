@@ -9,7 +9,9 @@ use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use super::{EMBEDDED_GUEST, FIRECRACKER_FILE, GUEST_FILE, KERNEL_FILE, QEMU_DIR, registry, vmm};
+use pumasi_proto::registry;
+
+use super::{EMBEDDED_GUEST, FIRECRACKER_FILE, GUEST_FILE, KERNEL_FILE, QEMU_DIR, vmm};
 
 /// QEMU for Windows (x86_64): Stefan Weil's builds, the ones qemu.org links
 /// to. The NSIS installer runs silently into `<vm dir>/qemu`. Its build has

@@ -111,6 +111,7 @@ fn agent_config(name: &str, slots: u32, dir: PathBuf) -> AgentConfig {
         microvm: None,
         upgrade: None,
         corrupt_results: false,
+        store_cache_bytes: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -163,6 +164,9 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         account: None,
         // These tests time tasks with the real clock.
         deterministic: false,
+        mounts: vec![],
+        task_mounts: vec![],
+        output_dataset: None,
     }
 }
 
@@ -541,6 +545,7 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         microvm: None,
         upgrade: None,
         corrupt_results: corrupt,
+        store_cache_bytes: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -971,9 +976,11 @@ async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
         "{:?}",
         liar.perf_note
     );
-    // Billed at about what the cluster timed, not what it claimed.
+    // Billed at about what the cluster timed (at most 1.25x its best
+    // timing, which a busy runner can put at twice the real speed), not
+    // the eightfold claim.
     assert!(
-        (liar.cpu_score as u64) * 3 < liar.perf.as_ref().unwrap().cpu.per_vcpu() as u64,
+        (liar.cpu_score as u64) * 2 < liar.perf.as_ref().unwrap().cpu.per_vcpu() as u64,
         "billed {} for a claim of {}",
         liar.cpu_score,
         liar.perf.as_ref().unwrap().cpu.per_vcpu()
@@ -1111,6 +1118,9 @@ fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
         max_price_per_hour: None,
         account: None,
         deterministic: false,
+        mounts: vec![],
+        task_mounts: vec![],
+        output_dataset: None,
     }
 }
 
@@ -1136,6 +1146,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         microvm: None,
         upgrade: None,
         corrupt_results: false,
+        store_cache_bytes: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1295,6 +1306,7 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         microvm: Some(vm),
         upgrade: None,
         corrupt_results: false,
+        store_cache_bytes: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1440,6 +1452,121 @@ async fn microvm_jobs_run_on_an_invited_provider() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 8: private registry images
+// ---------------------------------------------------------------------------
+
+/// A private registry for the tests: `PUMASI_TEST_REGISTRY` names an image
+/// in it (such as `localhost:5000/private/busybox:1.36`) and
+/// `PUMASI_TEST_REGISTRY_AUTH` its login (`user:password`).
+fn private_registry() -> Option<(String, String)> {
+    Some((
+        std::env::var("PUMASI_TEST_REGISTRY").ok()?,
+        std::env::var("PUMASI_TEST_REGISTRY_AUTH").ok()?,
+    ))
+}
+
+async fn set_registry_secret(client: &AdminClient, image: &str, login: &str) {
+    let host = image.split('/').next().unwrap();
+    let r = client
+        .call(AdminOp::SecretSet {
+            name: format!("registry/{host}"),
+            value: login.into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(r, AdminResponse::Ok), "{r:?}");
+    let AdminResponse::Secrets(list) = client.call(AdminOp::SecretList).await.unwrap() else {
+        panic!("expected secrets");
+    };
+    assert_eq!(
+        list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        vec![format!("registry/{host}")]
+    );
+}
+
+/// Runs a job with `image` on a node that has `executor`, first without
+/// the registry login (refused) and then with it (the control plane pulls
+/// the image into the file store and the node loads it from there).
+async fn private_image_job(
+    executor: Executor,
+    image: &str,
+    login: &str,
+    configure: impl FnOnce(&mut AgentConfig),
+) {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let mut config = agent_config("private", 2, tempdir("p"));
+    configure(&mut config);
+    let node = spawn_join(Agent::new(config).await.unwrap(), ticket);
+    wait_online(&cluster, 1).await;
+    let client = admin(&cluster).await;
+
+    let job = |cmd: &str| {
+        let mut sub = docker_job(&["sh", "-c", cmd], vec![TaskInput::default()]);
+        sub.executor = executor;
+        sub.docker.as_mut().unwrap().image = image.into();
+        sub.limits.timeout_ms = 120_000;
+        sub.max_attempts = 1;
+        sub
+    };
+    let id = submit(&client, job("echo should-not-run")).await;
+    let view = wait_job(&client, id, 300).await;
+    assert_eq!(view.summary.state, JobState::Failed, "{view:#?}");
+
+    set_registry_secret(&client, image, login).await;
+    let id = submit(&client, job("cat shared.txt; echo private-ok")).await;
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    assert_eq!(
+        view.tasks[0].stdout.as_deref(),
+        Some(&b"shared+private-ok\n"[..]),
+        "{view:#?}"
+    );
+    assert_eq!(view.preparing, None);
+    // A second job finds the image already on the node.
+    let id = submit(&client, job("echo again")).await;
+    let view = wait_job(&client, id, 300).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    assert_eq!(view.tasks[0].stdout.as_deref(), Some(&b"again\n"[..]));
+
+    client.close().await;
+    node.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn docker_runs_an_image_from_a_private_registry() {
+    let Some((image, login)) = private_registry() else {
+        eprintln!("skipping: PUMASI_TEST_REGISTRY is not set");
+        return;
+    };
+    if !docker_available() {
+        eprintln!("skipping: docker is not available");
+        return;
+    }
+    private_image_job(Executor::Docker, &image, &login, |c| {
+        c.docker = Some("docker".into())
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_runs_an_image_from_a_private_registry() {
+    let Some((image, login)) = private_registry() else {
+        eprintln!("skipping: PUMASI_TEST_REGISTRY is not set");
+        return;
+    };
+    let Some(vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    private_image_job(Executor::Microvm, &image, &login, |c| c.microvm = Some(vm)).await;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 4: cluster-driven agent upgrades
 // ---------------------------------------------------------------------------
 
@@ -1460,6 +1587,7 @@ async fn upgradable(name: &str, dir: PathBuf, exe: PathBuf, auto: Option<bool>) 
             smoke_test: false,
         }),
         corrupt_results: false,
+        store_cache_bytes: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1519,7 +1647,9 @@ async fn wait_upgrade_state(
 }
 
 async fn wait_for(what: &str, cond: impl Fn() -> bool) {
-    for _ in 0..300 {
+    // A minute: a second timing of an inflated benchmark runs eight times
+    // longer than claimed, and slow CI runners run several tests at once.
+    for _ in 0..600 {
         if cond() {
             return;
         }

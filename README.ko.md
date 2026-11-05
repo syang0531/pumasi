@@ -2,7 +2,7 @@
 
 이미 가진 여러 대의 기기를 하나의 사설 클러스터로 묶어 배치 작업을 나눠 돌립니다. 모든 기기에서 도는 안전한 WebAssembly 작업, 허용한 기기에서 도는 일반 Docker 이미지 작업(Python, 원하는 패키지, 선택적 네트워크), 그리고 같은 이미지를 태스크마다 자기 커널을 가진 microVM 안에서 돌리는 작업(남이 빌려준 기기에도 보낼 수 있을 만큼 격리됨)을 같은 방식으로 실행합니다. Linux, macOS, Windows와 x86_64, ARM64에서 같은 Rust 단일 바이너리 하나로 동작합니다.
 
-단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드, 5단계는 세 실행기 모두를 Windows에서 정식 지원하는 것, 6단계는 구형 Intel Mac과 가용 정책, 7단계(이번 릴리스)는 성능 벤치마크와 컴퓨팅 유닛(CU)입니다. 이후 저장소, GPU, 클러스터 관리, 모니터링, 대시보드를 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
+단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드, 5단계는 세 실행기 모두를 Windows에서 정식 지원하는 것, 6단계는 구형 Intel Mac과 가용 정책, 7단계는 성능 벤치마크와 컴퓨팅 유닛(CU), 8단계(이번 릴리스)는 클러스터 파일 저장소입니다. 이후 GPU, 클러스터 관리, 모니터링, 대시보드를 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
 
 ## 설치
 
@@ -207,6 +207,45 @@ pumasi upgrade status
 
 플랫폼과 버전은 파일에서 읽습니다. 컨트롤 플레인이 바이너리마다 클러스터 키로 서명하고, 에이전트는 자기가 참가한 클러스터가 서명했고, 자기 플랫폼용이며, 서명된 크기와 SHA-256이 맞고, 새 바이너리가 실제로 뜨는(`--version`) 경우에만 설치합니다. 내 기기는 기본으로 받고(`--no-auto-upgrade`로 거부), 남의 기기는 주인이 에이전트를 `--auto-upgrade`로 띄운 경우에만 받습니다. 쉬는 노드는 바로, 바쁜 노드는 한 대씩 새 작업을 멈추고 비운 뒤 교체합니다. 에이전트는 제자리에서 재시작하고, 새 바이너리를 클러스터가 거부하거나, 5분 동안 클러스터에 못 붙거나, 계속 죽으면 이전 바이너리로 되돌리고 실패를 `pumasi upgrade status`에 보고합니다. 컨트롤 플레인을 먼저 업그레이드하세요(멈추고 바이너리 교체 후 시작). 프로토콜 버전이 다른 바이너리는 `--force`가 필요하고, 그 에이전트들은 롤백됩니다.
 
+### 클러스터 파일 저장소
+
+컨트롤 플레인은 `~/.pumasi/cluster/blobs`에 내용 주소(iroh-blobs, BLAKE3) 저장소를 둡니다. 데이터셋은 이름과 버전이 있고, 다른 버전과 겹치는 파일은 한 번만 저장합니다.
+
+```sh
+pumasi store put corpus texts/ extra.csv --account alice   # corpus@1, 없는 부분만 보냄
+pumasi store ls                                            # 데이터셋별 최신 버전
+pumasi store get corpus@1 -o corpus/                       # 끊겨도 다시 실행하면 이어받음
+pumasi store rm corpus@1                                   # 쓰는 작업이 없어지면 공간 회수
+pumasi store usage                                         # 계정별 사용량·쿼터, 디스크 사용량
+pumasi store quota alice 100G
+```
+
+작업은 `files`의 `store:` 항목으로 데이터셋을 읽고, 출력을 데이터셋으로 남길 수 있습니다.
+
+```toml
+name = "tokenize"
+module = "tokenize.wasm"
+shards = 16
+files = ["store:corpus/part-{shard:02}.txt", "store:vocab@2"]  # /input/corpus/, /input/vocab/ 아래
+args = ["/input/corpus/part-{shard:02}.txt"]
+output = "store:tokens"            # 모든 태스크의 /output이 데이터셋 tokens@N이 됨
+```
+
+`store:이름[@버전][/경로]`는 데이터셋(또는 그 안의 파일·폴더 하나)을 `/input/이름/`에 놓습니다. `{shard}`를 쓰면 태스크마다 자기 몫만 받으므로 큰 데이터셋을 여러 노드가 나눠 읽습니다. 노드는 받은 데이터를 로컬 캐시(`--store-cache`, 기본 20 GiB, 오래 안 쓴 것부터 지움)에 두고, 이미 가진 다른 노드가 있으면 거기서, 없으면 컨트롤 플레인에서 받으며, 끊기면 받은 데서부터 이어받습니다. 모든 조각은 BLAKE3 해시로 검증합니다.
+
+입출력이 메시지 하나에 들어갈 필요가 없어졌습니다. `pumasi run`은 16 MiB가 넘는 로컬 `files`를 저장소로 보내고, 32 MiB가 넘는 `/output`은 보고 대신 저장소로 갑니다(`output = "store:..."`면 전부). 작업이 끝나면 저장된 출력은 데이터셋 `job-<id>`(또는 지정한 이름)가 되고, `pumasi run`, `pumasi job --out`, `pumasi store get --job <id>`로 받습니다.
+
+저장 용량은 데이터 주인 계정에 GiB-월당 CU로 과금하고, 단가는 컨트롤 플레인 디스크 등급을 따릅니다(`cluster start --storage-class hdd|ssd|nvme`, `prices set --storage-hdd-gib-month`, SSD는 `--storage-gib-month`, `--storage-nvme-gib-month`). `store get` 다운로드는 이그레스로 과금합니다. `prices set --default-quota 50G`는 따로 쿼터가 없는 계정의 상한입니다.
+
+**비공개 이미지.** 레지스트리 로그인을 클러스터 비밀로 넣으면 그 레지스트리의 이미지를 Docker와 microVM 작업에서 쓸 수 있습니다.
+
+```sh
+pumasi secret set registry/ghcr.io 'user:token'     # 값을 빼면 stdin에서 읽음
+pumasi secret ls                                    # 이름만, 값은 안 보여줌
+```
+
+컨트롤 플레인이 이미지를 저장소로 받고 노드는 거기서 불러오므로, 로그인 정보는 컨트롤 플레인 밖으로 나가지 않고, 이미지 레이어는 노드끼리 나눠 받습니다.
+
 ## 명령어
 
 | 명령 | 설명 |
@@ -221,13 +260,15 @@ pumasi upgrade status
 | `pumasi vm setup [--guest FILE] [--force]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
 | `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
+| `pumasi store put 이름 경로... [--account A]` / `get 이름[@버전] \| --job ID [-o DIR]` / `ls [이름]` / `rm 이름[@버전]` / `usage` / `quota 계정 크기\|none` | 클러스터 파일 저장소: 버전 있는 데이터셋, 작업 출력, 이어받기, 쿼터 |
+| `pumasi secret set 이름 [값]` / `ls` / `rm 이름` | 클러스터 비밀. `registry/<호스트>`는 비공개 레지스트리 로그인 |
 | `pumasi run job.toml [--account A] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
 | `pumasi status` | 노드(역할, 온라인 여부, 실행기, 슬롯, 실행 중, 검증 기록, 과금 CPU 점수, 디스크 종류, 지연)와 최근 작업 및 CU 비용 |
 | `pumasi node <ID> [--rebenchmark]` | 노드 하나의 벤치마크 프로필, 과금 점수, 지연, 검증 기록. `--rebenchmark`면 다시 재게 함 |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | 에이전트와 같은 방식으로 이 기기를 벤치마크해 프로필 출력 |
 | `pumasi job <ID> [--output] [--out DIR]` | 태스크별 상태, 노드, 시도 횟수, 시간, 비용, 검증 결과, 출력. `--out`이면 결과 파일 다운로드 |
 | `pumasi cu list \| add <계정> <CU> \| payout <계정> <CU> \| ledger` | CU 잔액(사용 가능, 보류, 지출, 수익), 지급, 지급 기록, 원장 (`pumasi credit`도 그대로 동작) |
-| `pumasi prices [set ...]` | CU 단가(`--memory-gib-hour`, `--storage-gib-month`, `--egress-gib`), 원장 모드(`--ledger prepaid\|mutual`, `--credit-limit`), 정산 정책(보류 시간, 검증 비율, 최대 스트라이크) 조회·변경 |
+| `pumasi prices [set ...]` | CU 단가(`--memory-gib-hour`, `--storage-gib-month`, `--storage-hdd-gib-month`, `--storage-nvme-gib-month`, `--egress-gib`), 기본 저장 쿼터(`--default-quota`), 원장 모드(`--ledger prepaid\|mutual`, `--credit-limit`), 정산 정책(보류 시간, 검증 비율, 최대 스트라이크) 조회·변경 |
 | `pumasi receipts <ID> [--export FILE]` | 작업의 서명된 사용 영수증 |
 | `pumasi verify-receipts FILE [--cluster ID]` | 내보낸 영수증을 오프라인으로 검증 |
 | `pumasi cancel <ID>` | 작업 취소 |
@@ -243,7 +284,7 @@ pumasi upgrade status
 
 | | `wasm` (기본) | `docker` | `microvm` |
 | --- | --- | --- | --- |
-| 실행 대상 | `wasm32-wasip1` 모듈 | Linux OCI 이미지 | 공개 Linux OCI 이미지 |
+| 실행 대상 | `wasm32-wasip1` 모듈 | Linux OCI 이미지 | Linux OCI 이미지 |
 | 실행 위치 | 모든 노드 | `--allow-docker`로 시작한 노드만 (제공자는 초대에도 `--allow-docker` 필요) | `--allow-microvm`으로 시작한 노드 (제공자 포함) |
 | 격리 | Wasmtime 샌드박스, 모르는 코드도 안전 | 컨테이너, 내 기기나 믿는 사람끼리만 | 태스크마다 자기 커널을 가진 VM |
 | 네트워크 | 불가 | 기본 차단, `network = true`로 허용 | 불가 |
@@ -299,7 +340,7 @@ cpus = 1                              # 정수 vCPU로 올림
 timeout = "2m"                        # 부팅과 실행 포함, 첫 이미지 받기는 제외
 ```
 
-`files`의 경로는 job.toml 기준이고, 폴더는 하위까지 그대로 `/input` 아래에 복사됩니다. 한 작업의 입력 파일은 합쳐서 48 MiB까지입니다. 태스크가 `/output`에 쓴 파일(태스크당 32 MiB까지)은 컨트롤 플레인에 저장되고, `pumasi run`이 `pumasi-out/<작업 ID>/task-<N>/`로 내려받습니다. stdout·stderr는 각각 4 MiB까지 보관합니다.
+`files`의 경로는 job.toml 기준이고, 폴더는 하위까지 그대로 `/input` 아래에 복사됩니다. 큰 입력과 32 MiB가 넘는 출력은 [파일 저장소](#클러스터-파일-저장소)를 거칩니다. 태스크가 `/output`에 쓴 파일은 `pumasi run`이 `pumasi-out/<작업 ID>/task-<N>/`로 내려받습니다. stdout·stderr는 각각 4 MiB까지 보관합니다.
 
 결정적 모드(WASM 작업 기본값)에서는 시계가 2000-01-01에서 시작해 읽을 때마다 1ms씩 가고, 난수는 작업과 태스크 번호로 만든 시드에서 나옵니다. 실제 시간이나 새 난수가 필요한 작업은 `deterministic = false`로 두고, 그러면 제공자 실행은 검증하지 않습니다.
 
@@ -333,8 +374,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 4 | 배포·설치: 6개 플랫폼 릴리스 바이너리와 SHA256SUMS, 설치 스크립트, OS 서비스, 클러스터 서명 업그레이드와 롤백 | 완료 |
 | 5 | Windows 정식 지원: Docker Desktop(WSL 2), QEMU + WHPX microVM(없으면 TCG), 고정 버전 QEMU 설치, Job Object, 내장 ext4 포맷터와 게스트 init | 완료 |
 | 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대, CPU 상한, 메모리에 맞춘 슬롯) | 완료 |
-| 7 | 성능 벤치마크와 컴퓨팅 유닛(CU): 노드가 서명한 성능 프로필(CPU, 메모리 대역폭, fio로 디스크 종류·속도, SMART 마모도, 지연), 1 CU = 기준 vCPU 1개를 1시간 쓰는 값과 자원별 CU 단가, 정수 milli-CU 원장, 돈 없이 서로 빌려 쓰는 그룹 로컬 원장 | 이번 릴리스 |
-| 8 | 클러스터 파일 저장소(iroh-blobs): 데이터셋, 대용량 입출력, 이어받기, 저장 용량 CU 과금, 비공개 레지스트리 이미지 | 예정 |
+| 7 | 성능 벤치마크와 컴퓨팅 유닛(CU): 노드가 서명한 성능 프로필(CPU, 메모리 대역폭, fio로 디스크 종류·속도, SMART 마모도, 지연), 1 CU = 기준 vCPU 1개를 1시간 쓰는 값과 자원별 CU 단가, 정수 milli-CU 원장, 돈 없이 서로 빌려 쓰는 그룹 로컬 원장 | 완료 |
+| 8 | 클러스터 파일 저장소(iroh-blobs): 버전 있는 데이터셋, `store:` 마운트와 출력 데이터셋, 크기 제한 없는 입출력, 해시 검증 이어받기, 노드끼리 나누는 캐시, 참조 GC, 쿼터, 저장·이그레스 CU 과금, 비공개 레지스트리 이미지 | 이번 릴리스 |
 | 9 | GPU·microVM 장치: 탐지, GPU 벤치마크와 CU 환산, 스케줄링, Docker GPU 작업, VFIO 패스스루, microVM 네트워크 | 예정 |
 | 10 | 클러스터 관리: 라벨·selector, drain, 우선순위, 쿼터, 역할 티켓, `apply` | 예정 |
 | 11 | 모니터링·경보: 노드 지표, Prometheus, 실시간 로그, 웹훅 | 예정 |
@@ -346,7 +387,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 17 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
 | 18 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: CU는 실제 결제와 연결되어 있지 않고, GPU 단가는 9단계, 저장소·이그레스 계량은 8단계부터입니다. 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
+알려진 한계: CU는 실제 결제와 연결되어 있지 않고, GPU 단가는 9단계부터입니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM은 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
 
 ## 라이선스
 

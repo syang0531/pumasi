@@ -13,6 +13,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -28,6 +29,7 @@ use pumasi_proto::{
         TaskInput, read_files, write_files,
     },
     msg::Outcome,
+    store::OutputMode,
 };
 
 use crate::tempdir::TempDir;
@@ -57,6 +59,47 @@ pub struct RunResult {
     pub wall_ms: u64,
     /// Highest linear memory reached (WASM only).
     pub peak_memory_bytes: Option<u64>,
+    /// The output files, left on disk when the task's output may go to the
+    /// file store ([`TaskIo::output`] other than inline); `files` is then
+    /// empty.
+    pub out_dir: Option<Arc<TempDir>>,
+}
+
+/// What a task gets beyond its inline files (protocol 8).
+#[derive(Debug, Clone, Default)]
+pub struct TaskIo {
+    /// Files from the store, already placed in a directory, for `/input`
+    /// (the job's inline files are added to it).
+    pub staged: Option<PathBuf>,
+    /// Where `/output` goes.
+    pub output: OutputMode,
+    /// Where to keep output files on disk (the file store's disk).
+    pub scratch: Option<PathBuf>,
+    /// A private image taken from the file store.
+    pub image: Option<LocalImage>,
+}
+
+impl TaskIo {
+    /// Whether output files stay on disk instead of going in the report.
+    pub fn keeps_output(&self) -> bool {
+        self.output != OutputMode::Inline
+    }
+
+    /// A directory for output files kept on disk.
+    pub fn out_dir(&self, tag: &str) -> Result<TempDir> {
+        match &self.scratch {
+            Some(base) => TempDir::new_in(base, tag),
+            None => TempDir::new(tag),
+        }
+    }
+}
+
+/// An image exported from the file store: `image.json`, `config.json` and
+/// the layers (`layer-000`, ...) in `dir`.
+#[derive(Debug, Clone)]
+pub struct LocalImage {
+    pub digest: String,
+    pub dir: PathBuf,
 }
 
 struct StoreState {
@@ -248,6 +291,32 @@ impl WasmExecutor {
         seed: Option<[u8; 32]>,
         cancel: Arc<AtomicBool>,
     ) -> RunResult {
+        self.run_io(
+            hash,
+            program,
+            input,
+            shared_files,
+            limits,
+            seed,
+            cancel,
+            &TaskIo::default(),
+        )
+    }
+
+    /// [`Self::run`] with mounted files and outputs that may go to the file
+    /// store.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_io(
+        &self,
+        hash: &ModuleHash,
+        program: &str,
+        input: &TaskInput,
+        shared_files: &[FileEntry],
+        limits: &Limits,
+        seed: Option<[u8; 32]>,
+        cancel: Arc<AtomicBool>,
+        io: &TaskIo,
+    ) -> RunResult {
         let start = Instant::now();
         let module = match self.modules.lock().unwrap().get(hash).cloned() {
             Some(m) => m,
@@ -259,8 +328,22 @@ impl WasmExecutor {
             Ok(d) => d,
             Err(e) => return RunResult::error(&format!("{e:#}"), start),
         };
-        let in_dir = scratch.path().join("input");
-        let out_dir = scratch.path().join("output");
+        let in_dir = match &io.staged {
+            Some(d) => d.clone(),
+            None => scratch.path().join("input"),
+        };
+        let kept_out = if io.keeps_output() {
+            match io.out_dir("out") {
+                Ok(d) => Some(Arc::new(d)),
+                Err(e) => return RunResult::error(&format!("{e:#}"), start),
+            }
+        } else {
+            None
+        };
+        let out_dir = match &kept_out {
+            Some(d) => d.path().to_path_buf(),
+            None => scratch.path().join("output"),
+        };
         let prepared = std::fs::create_dir_all(&in_dir)
             .and_then(|_| std::fs::create_dir_all(&out_dir))
             .map_err(anyhow::Error::from)
@@ -363,7 +446,10 @@ impl WasmExecutor {
             Err(e) => classify(e),
         };
         let mut stderr = stderr.contents().to_vec();
-        let files = collect_output(&out_dir, &mut stderr);
+        let files = match kept_out {
+            Some(_) => Vec::new(),
+            None => collect_output(&out_dir, &mut stderr),
+        };
         RunResult {
             outcome,
             stdout: stdout.contents().to_vec(),
@@ -372,6 +458,7 @@ impl WasmExecutor {
             fuel_used,
             wall_ms: start.elapsed().as_millis() as u64,
             peak_memory_bytes: Some(peak),
+            out_dir: kept_out,
         }
     }
 }
@@ -436,6 +523,7 @@ impl RunResult {
             fuel_used: 0,
             wall_ms: start.elapsed().as_millis() as u64,
             peak_memory_bytes: None,
+            out_dir: None,
         }
     }
 }

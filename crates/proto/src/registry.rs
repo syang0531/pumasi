@@ -1,8 +1,12 @@
 //! A minimal OCI distribution client: resolves an image reference to the
-//! manifest for this machine's platform, and downloads its config and
-//! layer blobs, checking every digest. Anonymous pulls only (public images
-//! on Docker Hub, GHCR, Quay and other registries that hand out anonymous
-//! bearer tokens).
+//! manifest for a platform, and downloads its config and layer blobs,
+//! checking every digest. Public images use anonymous bearer tokens (Docker
+//! Hub, GHCR, Quay, ...); private registries take a user name and password
+//! or token, sent as HTTP basic auth or exchanged for a bearer token.
+//!
+//! The agent uses it for public images in microVMs; the control plane uses
+//! it with the cluster's registry secrets to pull private images into the
+//! file store, so the credentials never leave the control plane.
 
 use std::{
     collections::HashMap,
@@ -60,10 +64,7 @@ impl ImageRef {
             }
             _ => ("docker.io".to_string(), name.to_string()),
         };
-        let registry = match registry.as_str() {
-            "docker.io" | "index.docker.io" => "registry-1.docker.io".to_string(),
-            _ => registry,
-        };
+        let registry = normalize_registry(&registry);
         let repository = if registry == "registry-1.docker.io" && !repository.contains('/') {
             format!("library/{repository}")
         } else {
@@ -97,11 +98,78 @@ impl ImageRef {
         })
     }
 
+    /// `registry/repository:tag` or `@digest`, as Docker would print it.
+    pub fn display(&self) -> String {
+        let sep = if self.reference.starts_with("sha256:") {
+            '@'
+        } else {
+            ':'
+        };
+        format!(
+            "{}/{}{sep}{}",
+            self.registry, self.repository, self.reference
+        )
+    }
+
     fn base_url(&self) -> String {
         let plain = self.registry.starts_with("localhost") || self.registry.starts_with("127.");
         let scheme = if plain { "http" } else { "https" };
         format!("{scheme}://{}/v2/{}", self.registry, self.repository)
     }
+}
+
+/// The registry host credentials are looked up by: Docker Hub's aliases
+/// become its API host, everything else is kept (lowercased).
+pub fn normalize_registry(host: &str) -> String {
+    let host = host.trim().trim_end_matches('/').to_ascii_lowercase();
+    let host = host
+        .strip_prefix("https://")
+        .or_else(|| host.strip_prefix("http://"))
+        .unwrap_or(&host)
+        .to_string();
+    match host.as_str() {
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => "registry-1.docker.io".into(),
+        _ => host,
+    }
+}
+
+/// A user name and a password (or access token) for one registry.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Credentials({}, <hidden>)", self.username)
+    }
+}
+
+impl Credentials {
+    /// Parses `user:password`. A value without a colon is a token used
+    /// with the user name `token`.
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim_end_matches(['\r', '\n']);
+        ensure!(!value.is_empty(), "empty registry credentials");
+        Ok(match value.split_once(':') {
+            Some((u, p)) => Self {
+                username: u.to_string(),
+                password: p.to_string(),
+            },
+            None => Self {
+                username: "token".into(),
+                password: value.to_string(),
+            },
+        })
+    }
+}
+
+/// What a request carries for a repository.
+#[derive(Clone)]
+enum Auth {
+    Bearer(String),
+    Basic,
 }
 
 /// The parts of an image config the executor uses (`config` in the OCI
@@ -116,14 +184,14 @@ pub struct ContainerConfig {
     pub user: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
     #[serde(default)]
     pub media_type: String,
     pub digest: String,
     pub size: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     platform: Option<Platform>,
 }
 
@@ -163,14 +231,21 @@ pub struct Resolved {
     /// Digest of the platform manifest; identifies the image contents.
     pub digest: String,
     pub config: ContainerConfig,
+    /// The raw image config and its digest (`docker load` needs both).
+    pub config_digest: String,
+    pub config_bytes: Vec<u8>,
     pub layers: Vec<Descriptor>,
 }
 
 #[derive(Clone)]
 pub struct Registry {
     http: reqwest::Client,
-    /// Bearer tokens by (registry, repository).
-    tokens: Arc<Mutex<HashMap<(String, String), String>>>,
+    /// How requests authenticate, by (registry, repository).
+    tokens: Arc<Mutex<HashMap<(String, String), Auth>>>,
+    /// Credentials by normalized registry host.
+    creds: Arc<HashMap<String, Credentials>>,
+    /// The OCI architecture to resolve image indexes for.
+    arch: String,
 }
 
 /// The OCI architecture name of this machine.
@@ -207,10 +282,33 @@ pub fn http_client() -> Result<reqwest::Client> {
 
 impl Registry {
     pub fn new() -> Result<Self> {
+        Self::with_credentials(HashMap::new())
+    }
+
+    /// A client that logs in to these registries (keys are registry hosts,
+    /// see [`normalize_registry`]).
+    pub fn with_credentials(creds: HashMap<String, Credentials>) -> Result<Self> {
         Ok(Self {
             http: http_client()?,
             tokens: Default::default(),
+            creds: Arc::new(
+                creds
+                    .into_iter()
+                    .map(|(k, v)| (normalize_registry(&k), v))
+                    .collect(),
+            ),
+            arch: oci_arch().to_string(),
         })
+    }
+
+    /// Resolves image indexes for another architecture (`amd64`, `arm64`).
+    pub fn for_arch(mut self, arch: &str) -> Self {
+        self.arch = arch.to_string();
+        self
+    }
+
+    fn creds_for(&self, image: &ImageRef) -> Option<&Credentials> {
+        self.creds.get(&image.registry)
     }
 
     /// GET `<base>/<path>`, fetching an anonymous bearer token when asked.
@@ -222,8 +320,15 @@ impl Registry {
         let mut retries = 0;
         loop {
             let mut req = self.http.get(&url).header(header::ACCEPT, accept);
-            if let Some(t) = self.tokens.lock().unwrap().get(&key) {
-                req = req.bearer_auth(t);
+            let auth = self.tokens.lock().unwrap().get(&key).cloned();
+            match auth {
+                Some(Auth::Bearer(t)) => req = req.bearer_auth(t),
+                Some(Auth::Basic) => {
+                    if let Some(c) = self.creds_for(image) {
+                        req = req.basic_auth(&c.username, Some(&c.password));
+                    }
+                }
+                None => {}
             }
             let resp = req.send().await.with_context(|| format!("GET {url}"))?;
             let status = resp.status();
@@ -244,13 +349,32 @@ impl Registry {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default()
                     .to_string();
-                let token = self.token(&challenge, image).await?;
-                self.tokens.lock().unwrap().insert(key.clone(), token);
+                let auth = if challenge.to_ascii_lowercase().starts_with("basic") {
+                    ensure!(
+                        self.creds_for(image).is_some(),
+                        "{} wants a login for {}; add it with `pumasi secret set registry/{}`",
+                        image.registry,
+                        image.repository,
+                        image.registry
+                    );
+                    Auth::Basic
+                } else {
+                    Auth::Bearer(self.token(&challenge, image).await?)
+                };
+                self.tokens.lock().unwrap().insert(key.clone(), auth);
                 continue;
             }
-            if status == StatusCode::UNAUTHORIZED {
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                let hint = if self.creds_for(image).is_some() {
+                    "check the credentials in the cluster secret".to_string()
+                } else {
+                    format!(
+                        "for a private image, add a login with `pumasi secret set registry/{}`",
+                        image.registry
+                    )
+                };
                 bail!(
-                    "{} refused access to {}; private images are not supported yet",
+                    "{} refused access to {} ({status}); {hint}",
                     image.registry,
                     image.repository
                 );
@@ -275,7 +399,7 @@ impl Registry {
     async fn token(&self, challenge: &str, image: &ImageRef) -> Result<String> {
         let Some(params) = challenge.strip_prefix("Bearer ") else {
             bail!(
-                "{} wants credentials for {}; only public images are supported",
+                "{} answered with an unsupported login scheme for {}: {challenge}",
                 image.registry,
                 image.repository
             );
@@ -302,19 +426,27 @@ impl Registry {
         );
         let mut url = reqwest::Url::parse(&realm).context("bad token endpoint")?;
         url.query_pairs_mut().extend_pairs(&query);
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("GET {realm}"))?;
-        ensure!(
-            resp.status().is_success(),
-            "{} refused an anonymous token for {} ({}); private images are not supported yet",
-            image.registry,
-            image.repository,
-            resp.status()
-        );
+        let mut req = self.http.get(url);
+        if let Some(c) = self.creds_for(image) {
+            req = req.basic_auth(&c.username, Some(&c.password));
+        }
+        let resp = req.send().await.with_context(|| format!("GET {realm}"))?;
+        if !resp.status().is_success() {
+            let hint = if self.creds_for(image).is_some() {
+                "check the credentials in the cluster secret".to_string()
+            } else {
+                format!(
+                    "for a private image, add a login with `pumasi secret set registry/{}`",
+                    image.registry
+                )
+            };
+            bail!(
+                "{} refused a token for {} ({}); {hint}",
+                image.registry,
+                image.repository,
+                resp.status()
+            );
+        }
         #[derive(Deserialize)]
         struct Token {
             token: Option<String>,
@@ -332,7 +464,7 @@ impl Registry {
         let image = ImageRef::parse(reference)?;
         let (mut digest, mut manifest) = self.manifest(&image, &image.reference).await?;
         if let Some(list) = &manifest.manifests {
-            let arch = oci_arch();
+            let arch = self.arch.as_str();
             let pick = list
                 .iter()
                 .filter(|d| {
@@ -378,17 +510,19 @@ impl Registry {
         let body = read_capped(resp, MAX_JSON_BYTES).await?;
         check_digest(&config_desc.digest, &body)?;
         let config: ConfigFile = serde_json::from_slice(&body).context("bad image config")?;
-        if !config.architecture.is_empty() && config.architecture != oci_arch() {
+        if !config.architecture.is_empty() && config.architecture != self.arch {
             bail!(
-                "{reference} is built for {}, this machine is {}",
+                "{reference} is built for {}, not {}",
                 config.architecture,
-                oci_arch()
+                self.arch
             );
         }
         Ok(Resolved {
             image,
             digest,
             config: config.config.unwrap_or_default(),
+            config_digest: config_desc.digest.clone(),
+            config_bytes: body,
             layers,
         })
     }
@@ -543,5 +677,22 @@ mod tests {
         );
         assert_eq!(c[1].1, "registry.docker.io");
         assert_eq!(c[2].1, "repository:library/busybox:pull");
+    }
+
+    #[test]
+    fn credentials_and_hosts() {
+        let c = Credentials::parse("ci:s3cret:with:colons\n").unwrap();
+        assert_eq!(
+            (c.username.as_str(), c.password.as_str()),
+            ("ci", "s3cret:with:colons")
+        );
+        let t = Credentials::parse("ghp_abc").unwrap();
+        assert_eq!(t.username, "token");
+        assert!(!format!("{c:?}").contains("s3cret"));
+        assert_eq!(normalize_registry("docker.io"), "registry-1.docker.io");
+        assert_eq!(normalize_registry("https://GHCR.io/"), "ghcr.io");
+        assert_eq!(normalize_registry("localhost:5000"), "localhost:5000");
+        let r = ImageRef::parse("localhost:5000/team/app:1").unwrap();
+        assert_eq!(r.display(), "localhost:5000/team/app:1");
     }
 }

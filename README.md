@@ -395,6 +395,67 @@ Upgrade the control plane first (stop it, replace the binary, start it):
 a binary with a newer protocol needs `--force` and its agents would roll
 back.
 
+### The cluster file store
+
+The control plane keeps a content-addressed file store (iroh-blobs, BLAKE3)
+in `~/.pumasi/cluster/blobs`. Datasets are named and versioned; a version
+that repeats files of another stores them once.
+
+```sh
+pumasi store put corpus texts/ extra.csv --account alice   # corpus@1; only missing data is sent
+pumasi store ls                                            # latest version of each dataset
+pumasi store get corpus@1 -o corpus/                       # resumes after an interruption
+pumasi store rm corpus@1                                   # space comes back once no job uses it
+pumasi store usage                                         # bytes per account, quotas, disk use
+pumasi store quota alice 100G
+```
+
+A job reads datasets with `store:` entries in `files` and can write its
+outputs to a dataset:
+
+```toml
+name = "tokenize"
+module = "tokenize.wasm"
+shards = 16
+files = ["store:corpus/part-{shard:02}.txt", "store:vocab@2"]  # under /input/corpus/, /input/vocab/
+args = ["/input/corpus/part-{shard:02}.txt"]
+output = "store:tokens"            # every task's /output becomes dataset tokens@N
+```
+
+`store:NAME[@VERSION][/PATH]` mounts a dataset (or one file or directory of
+it) at `/input/NAME/`; `{shard}` in it gives each task its own part, so a
+large dataset is read in pieces by many nodes. Nodes fetch what their tasks
+mount into a local cache (`--store-cache`, 20 GiB by default, least
+recently used first), from other nodes that already have it when they can
+and from the control plane otherwise, and pick up an interrupted download
+where it stopped. Every piece is checked against its BLAKE3 hash.
+
+Inputs and outputs no longer have to fit in a message: `pumasi run` sends
+local `files` over 16 MiB through the store, and a task's `/output` over
+32 MiB goes to the store instead of the report (all of it does with
+`output = "store:..."`). When the job ends its stored outputs become dataset
+`job-<id>` (or the named one), and `pumasi run` and `pumasi job --out`
+download them; `pumasi store get --job <id>` does too.
+
+Storage is billed in CU per GiB-month to the account that owns the data, at
+the rate of the control plane's disk class (`cluster start --storage-class
+hdd|ssd|nvme`; `prices set --storage-hdd-gib-month`,
+`--storage-gib-month` for SSD, `--storage-nvme-gib-month`), and downloads
+with `store get` as egress. `prices set --default-quota 50G` caps every
+account without its own quota.
+
+**Private images.** Store a registry login as a cluster secret and jobs can
+use images from that registry, with Docker and in microVMs:
+
+```sh
+pumasi secret set registry/ghcr.io 'user:token'     # or read from stdin
+pumasi secret ls                                    # names only, never values
+```
+
+The control plane pulls the image into the file store and nodes load it
+from there, so the login never leaves the control plane, and nodes share
+image layers with each other instead of each pulling them.
+
 ## Commands
 
 | Command | What it does |
@@ -409,13 +470,15 @@ back.
 | `pumasi vm setup [--guest FILE] [--force]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
+| `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
+| `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
 | `pumasi run job.toml [--account A] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
 | `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency) and recent jobs with their cost in CU. |
 | `pumasi node <ID> [--rebenchmark]` | One node's benchmark profile, billed score, latency and checks; `--rebenchmark` asks it to measure again. |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | Benchmark this machine the way the agent does and print the profile. |
 | `pumasi job <ID> [--output] [--out DIR]` | Per-task state, node, attempts, time, cost and check result; stdout/stderr with `--output`; downloads output files with `--out`. |
 | `pumasi cu list \| add <ACCOUNT> <CU> \| payout <ACCOUNT> <CU> \| ledger [--account A]` | Balances in CU (available, held, spent, earned), grants, payouts, and the ledger (`pumasi credit` still works). |
-| `pumasi prices [set --memory-gib-hour X --storage-gib-month X --egress-gib X --ledger prepaid\|mutual --credit-limit CU --hold 1h --verify-rate 10% --max-strikes 3]` | Show or change the CU rates, the ledger mode and the settlement policy. |
+| `pumasi prices [set --memory-gib-hour X --storage-gib-month X --storage-hdd-gib-month X --storage-nvme-gib-month X --default-quota SIZE --egress-gib X --ledger prepaid\|mutual --credit-limit CU --hold 1h --verify-rate 10% --max-strikes 3]` | Show or change the CU rates, the ledger mode and the settlement policy. |
 | `pumasi receipts <ID> [--export FILE]` | A job's signed usage receipts. |
 | `pumasi verify-receipts FILE [--cluster ID]` | Check exported receipts offline. |
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
@@ -433,7 +496,7 @@ A job runs on one of three executors with the same file format and commands:
 
 | | `wasm` (default) | `docker` | `microvm` |
 | --- | --- | --- | --- |
-| Runs | a `wasm32-wasip1` module | any Linux OCI image | any public Linux OCI image |
+| Runs | a `wasm32-wasip1` module | any Linux OCI image | any Linux OCI image |
 | Where | every node | only nodes started with `--allow-docker` (providers also need an invite with `--allow-docker`) | nodes started with `--allow-microvm`, providers included |
 | Isolation | Wasmtime sandbox, safe for untrusted code | container, only for machines and people you trust | a VM with its own kernel per task |
 | Network | never | off by default, `network = true` to allow | never |
@@ -449,7 +512,7 @@ shards = 16                           # N tasks; {shard} and {shards} are substi
 args = ["sample", "{shard}", "5000000"]
 env = { MODE = "fast" }               # optional
 stdin = "input.txt"                   # optional, fed to every task
-files = ["data/", "lookup.csv"]       # optional, appear under /input
+files = ["data/", "lookup.csv"]       # optional, appear under /input; "store:NAME" mounts a dataset
 max_attempts = 3                      # placements before giving up on lost nodes
 deterministic = true                  # default: virtual clock + seeded random, so results can be checked
 
@@ -493,15 +556,16 @@ timeout = "2m"                        # covers boot and run, not the first image
 ```
 
 Paths in `files` are relative to the job file; directories are copied
-recursively and keep their relative path under `/input`. All input files of a
-job may total up to 48 MiB. Whatever a task writes to `/output` (up to
-32 MiB) is stored by the control plane and downloaded by `pumasi run` into
-`pumasi-out/<job id>/task-<N>/`. stdout and stderr are captured up to 4 MiB
-each.
+recursively and keep their relative path under `/input`. Larger inputs go
+through the [file store](#the-cluster-file-store), as do outputs over
+32 MiB. Whatever a task writes to `/output` is downloaded by `pumasi run`
+into `pumasi-out/<job id>/task-<N>/`. stdout and stderr are captured up to
+4 MiB each.
 
 Containers run with `--network none` unless `network = true`, with memory,
 CPU and process caps, `no-new-privileges`, and no host directories mounted
-(files are copied in and out). Images are pulled on first use.
+(files are copied in and out). Images are pulled on first use; images from
+a registry with a login in `pumasi secret` come through the file store.
 
 A microVM task runs the image's entrypoint and command (or the job's
 `command`) as the image's user, with `/input` as the working directory,
@@ -623,8 +687,8 @@ with other clusters.
 | 4 | Distribution and install: release binaries for six platforms with SHA256SUMS, install scripts, OS services, signed cluster-driven upgrades with rollback | done |
 | 5 | Windows: Docker Desktop (WSL 2), microVMs with QEMU + WHPX (TCG fallback), pinned QEMU install, Job Objects, built-in ext4 formatter and guest init | done |
 | 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours, CPU cap, memory-aware slots) | done |
-| 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | this release |
-| 8 | Cluster file store (iroh-blobs): datasets, large inputs and outputs, resumable transfers, storage billed in CU, private registry images | planned |
+| 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | done |
+| 8 | Cluster file store (iroh-blobs): versioned datasets, `store:` mounts and output datasets, inputs and outputs of any size, resumable hash-checked transfers, node caches shared between nodes, reference GC, quotas, storage and egress billed in CU, private registry images | this release |
 | 9 | GPUs and microVM devices: detection, GPU benchmarks in CU, scheduling, Docker GPU jobs, VFIO passthrough, microVM networking | planned |
 | 10 | Cluster management: labels and selectors, drain, priorities, quotas, role tickets, `apply` | planned |
 | 11 | Monitoring and alerts: node metrics, Prometheus endpoint, live logs, webhooks | planned |
@@ -639,12 +703,10 @@ with other clusters.
 Known gaps: single control plane (no Raft yet), no web console, accounts
 exist only inside one cluster and only the admin can submit (with
 `--account`), CU are not connected to real payments, GPUs have no CU rate
-until phase 9 and storage and egress are not metered until phase 8,
-node-to-node latency and bandwidth are not measured yet (only each node's
-round trip to the control plane), input and output
-files are size-capped (48 MiB in, 32 MiB out per task) because they travel
-through the control plane. MicroVMs pull only public images, have no
-network and no GPUs yet, and need KVM (Linux), Virtualization.framework
+until phase 9, node-to-node latency and bandwidth are not measured yet
+(only each node's round trip to the control plane), the file store lives
+only on the control plane (no replicas on owner nodes yet, no S3-compatible
+gateway). MicroVMs have no network and no GPUs yet, and need KVM (Linux), Virtualization.framework
 (macOS 11+) or WHPX (Windows x86_64) for speed (QEMU without them works but
 is slow, and Windows on ARM has no microVMs yet). WHPX and
 Virtualization.framework guests are checked on real machines only: CI

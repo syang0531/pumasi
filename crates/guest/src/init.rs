@@ -37,10 +37,18 @@ impl<T, E: std::fmt::Display> Ctx<T> for Result<T, E> {
 }
 
 fn log(msg: &str) {
-    eprintln!("pumasi-guest: {msg}");
+    let line = format!("pumasi-guest: {msg}\n");
+    // Never panic here: this is also the panic path. When the console is
+    // not writable, the kernel log still reaches the serial console.
+    if io::stderr().write_all(line.as_bytes()).is_err()
+        && let Ok(mut k) = OpenOptions::new().write(true).open("/dev/kmsg")
+    {
+        let _ = k.write_all(format!("<2>{line}").as_bytes());
+    }
 }
 
 pub fn main() -> ! {
+    std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
     if let Err(p) = std::panic::catch_unwind(boot) {
         let msg = p
             .downcast_ref::<String>()
@@ -70,7 +78,11 @@ struct Payload {
     stdout: Option<PathBuf>,
     stderr: Option<PathBuf>,
     output_dir: Option<PathBuf>,
+    /// Output file limits (bytes, count).
+    limits: (u64, usize),
 }
+
+const DEFAULT_LIMITS: (u64, usize) = (MAX_OUTPUT_FILES_BYTES, MAX_OUTPUT_FILES);
 
 impl Payload {
     fn failed(msg: String) -> Self {
@@ -80,6 +92,7 @@ impl Payload {
             stdout: None,
             stderr: None,
             output_dir: None,
+            limits: DEFAULT_LIMITS,
         }
     }
 }
@@ -310,6 +323,7 @@ fn probe(d: &Disks) -> Payload {
             stdout: None,
             stderr: None,
             output_dir: Some(dir.to_path_buf()),
+            limits: DEFAULT_LIMITS,
         },
         Err(e) => Payload::failed(e),
     }
@@ -331,6 +345,7 @@ fn build(d: &Disks) -> Payload {
             stdout: None,
             stderr: None,
             output_dir: None,
+            limits: DEFAULT_LIMITS,
         },
         Err(e) => Payload::failed(e),
     }
@@ -623,6 +638,7 @@ fn run_inner(d: &Disks) -> R<Payload> {
         stdout: Some(stdout_path),
         stderr: Some(stderr_path),
         output_dir: Some(root.join("output")),
+        limits: (spec.files_limit(), spec.count_limit()),
     })
 }
 
@@ -893,8 +909,7 @@ fn write_output(dev: &str, mut p: Payload) -> io::Result<()> {
         let mut total = 0u64;
         let mut kept = 0usize;
         for (rel, path, size) in files {
-            if kept >= MAX_OUTPUT_FILES || total + size > MAX_OUTPUT_FILES_BYTES || rel.len() > 4096
-            {
+            if kept >= p.limits.1 || total + size > p.limits.0 || rel.len() > 4096 {
                 p.result.files_dropped += 1;
                 continue;
             }

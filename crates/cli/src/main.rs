@@ -34,8 +34,12 @@ use pumasi_proto::{
         LedgerKind, NodeView, Outcome, Role, TaskState, Verification,
     },
     net::NetMode,
-    perf::PerfProfile,
+    perf::{DiskClass, PerfProfile},
     receipt::Receipt,
+    store::{
+        DatasetView, MountRequest, MountSource, StoragePolicy, StoreRef, StoreTarget, format_size,
+        parse_size,
+    },
     ticket::{AdminTicket, JoinTicket},
 };
 
@@ -97,6 +101,15 @@ enum Cmd {
     /// Compute units (CU): balances, grants, payouts and the ledger.
     #[command(subcommand, alias = "credit")]
     Cu(CuCmd),
+    /// The cluster file store: datasets (named, versioned collections of
+    /// files) that jobs mount with `store:NAME` in job.toml, and job
+    /// outputs.
+    #[command(subcommand)]
+    Store(StoreCmd),
+    /// Cluster secrets kept on the control plane, e.g. private registry
+    /// logins (`registry/<host>`).
+    #[command(subcommand)]
+    Secret(SecretCmd),
     /// Show the CU rates and settlement policy, or change them.
     Prices {
         #[command(subcommand)]
@@ -233,6 +246,86 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum StoreCmd {
+    /// Upload files and directories as a new version of dataset NAME.
+    /// Run it again after an interruption: only what is missing is sent.
+    Put {
+        name: String,
+        /// Files and directories (directories keep their paths inside).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Account that stores the dataset and pays for it (default: owner).
+        #[arg(long)]
+        account: Option<String>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Download a dataset (NAME, NAME@VERSION) or a job's stored outputs
+    /// (--job ID). Run it again after an interruption to resume.
+    Get {
+        /// NAME or NAME@VERSION.
+        dataset: Option<String>,
+        /// Download this job's outputs instead (`task-<index>/...`).
+        #[arg(long, conflicts_with = "dataset")]
+        job: Option<String>,
+        /// Destination directory (default: ./NAME or ./pumasi-out/<job>).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// List datasets (the latest version of each, or every version of NAME).
+    Ls {
+        name: Option<String>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Delete a dataset version (NAME@VERSION) or every version (NAME).
+    /// The disk space comes back once no job uses the files.
+    Rm {
+        dataset: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// What each account stores, its quota and the control plane's disk use.
+    Usage {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Set an account's storage quota (e.g. 100G), or `none` to remove it.
+    Quota {
+        account: String,
+        size: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCmd {
+    /// Store a secret. `registry/<host>` (e.g. registry/ghcr.io) holds
+    /// `user:password` or a token for pulling private images; nodes never
+    /// see it. Without VALUE it is read from stdin.
+    Set {
+        name: String,
+        value: Option<String>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// List secret names.
+    Ls {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Delete a secret.
+    Rm {
+        name: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+}
+
+#[derive(Subcommand)]
 enum VmCmd {
     /// Download the guest kernel (and Firecracker on Linux, QEMU on Windows)
     /// and install the guest init, so `pumasi agent ... --allow-microvm`
@@ -354,6 +447,17 @@ enum PricesCmd {
         /// CU per GiB sent out of the cluster.
         #[arg(long)]
         egress_gib: Option<String>,
+        /// CU per GiB-month stored when the control plane's disk is a
+        /// hard disk (`storage-gib-month` is the SSD rate).
+        #[arg(long)]
+        storage_hdd_gib_month: Option<String>,
+        /// CU per GiB-month stored on an NVMe control plane disk.
+        #[arg(long)]
+        storage_nvme_gib_month: Option<String>,
+        /// Storage quota of accounts without their own (e.g. 50G), or
+        /// `none`.
+        #[arg(long)]
+        default_quota: Option<String>,
         /// `prepaid` (the owner grants CU) or `mutual` (품앗이: lending
         /// earns CU, using spends them, nobody grants any).
         #[arg(long)]
@@ -385,7 +489,18 @@ enum ClusterCmd {
         /// Do not print a join ticket at startup.
         #[arg(long)]
         no_token: bool,
+        /// The kind of disk the file store is on, which picks the storage
+        /// rate (`pumasi prices`).
+        #[arg(long, value_enum)]
+        storage_class: Option<StorageClassArg>,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum StorageClassArg {
+    Hdd,
+    Ssd,
+    Nvme,
 }
 
 #[derive(Subcommand)]
@@ -463,6 +578,11 @@ struct AgentOpts {
     /// How often to benchmark again (while idle), e.g. 24h or 7d.
     #[arg(long, default_value = "24h")]
     bench_interval: String,
+    /// Disk space for datasets and private images fetched from the
+    /// cluster's file store, e.g. 50G (default 20G). The least recently
+    /// used go first.
+    #[arg(long, value_name = "SIZE")]
+    store_cache: Option<String>,
     #[command(flatten)]
     net: NetArgs,
 }
@@ -593,7 +713,10 @@ async fn run(cli: Cli) -> Result<i32> {
             name,
             net,
             no_token,
-        }) => cluster_start(&home, name, net, no_token).await,
+            storage_class,
+        }) => cluster_start(&home, name, net, no_token, storage_class).await,
+        Cmd::Store(cmd) => store(&home, cmd).await,
+        Cmd::Secret(cmd) => secret(&home, cmd).await,
         Cmd::Agent(cmd) => agent(&home, cmd, ctrl_c(), false).await,
         Cmd::Service(cmd) => service_cmd(&home, cmd),
         Cmd::Upgrade(cmd) => upgrade::run(&home, cmd).await,
@@ -719,13 +842,27 @@ async fn run(cli: Cli) -> Result<i32> {
             out,
             admin,
         } => {
-            let mut sub = JobFile::load(&job_file)?;
+            let (mut sub, upload) = JobFile::load_split(&job_file, INLINE_INPUT_BYTES)?;
             if let Some(a) = &account {
                 validate_account(a)?;
             }
-            sub.account = account;
+            sub.account = account.clone();
             let tasks = sub.tasks.len();
             let client = connect_admin(&home, &admin).await?;
+            if !upload.is_empty() {
+                // Too large to send with the job: through the file store.
+                let (stored, _) = client
+                    .store_put(&upload, None, account, |m| eprintln!("input files: {m}"))
+                    .await?;
+                sub.mounts.insert(
+                    0,
+                    MountRequest {
+                        source: MountSource::Upload { root: stored.root },
+                        select: None,
+                        at: String::new(),
+                    },
+                );
+            }
             let AdminResponse::Submitted { id } =
                 client.call(AdminOp::Submit(Box::new(sub))).await?
             else {
@@ -831,9 +968,21 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-async fn cluster_start(home: &Path, name: String, net: NetArgs, no_token: bool) -> Result<i32> {
+async fn cluster_start(
+    home: &Path,
+    name: String,
+    net: NetArgs,
+    no_token: bool,
+    storage_class: Option<StorageClassArg>,
+) -> Result<i32> {
     let mut config = ClusterConfig::new(home.join("cluster"));
     config.name = name;
+    config.disk_class = match storage_class {
+        Some(StorageClassArg::Hdd) => DiskClass::Hdd,
+        Some(StorageClassArg::Ssd) => DiskClass::Ssd,
+        Some(StorageClassArg::Nvme) => DiskClass::Nvme,
+        None => DiskClass::Unknown,
+    };
     config.net = net.net.unwrap_or_default();
     // A fixed port lets agents reconnect after a restart in local mode.
     config.bind = Some(net.bind.unwrap_or_else(|| "0.0.0.0:7480".parse().unwrap()));
@@ -950,6 +1099,7 @@ async fn agent(
             smoke_test: true,
         }),
         corrupt_results: false,
+        store_cache_bytes: opts.store_cache.as_deref().map(parse_size).transpose()?,
     };
     let exe = config.upgrade.as_ref().map(|u| u.exe.clone());
     let agent = Agent::new(config).await?;
@@ -1378,10 +1528,287 @@ async fn download_outputs(
         write_files(&target, &files)?;
         count += files.len();
     }
+    if view.tasks.iter().any(|t| t.stored.is_some()) {
+        let (files, bytes) = client
+            .store_get(
+                StoreTarget::Job {
+                    id: view.summary.id,
+                },
+                dir,
+                |m| eprintln!("outputs: {m}"),
+            )
+            .await?;
+        eprintln!(
+            "saved {files} output files ({}) from the file store",
+            format_size(bytes)
+        );
+        count += files as usize;
+    }
     if count > 0 || always_report {
         eprintln!("saved {count} output files to {}", dir.display());
     }
     Ok(count)
+}
+
+/// Shared input files above this go through the file store.
+const INLINE_INPUT_BYTES: u64 = 16 << 20;
+
+async fn store(home: &Path, cmd: StoreCmd) -> Result<i32> {
+    match cmd {
+        StoreCmd::Put {
+            name,
+            paths,
+            account,
+            admin,
+        } => {
+            pumasi_proto::store::validate_dataset_name(&name)?;
+            if let Some(a) = &account {
+                validate_account(a)?;
+            }
+            let files: Vec<(String, PathBuf)> = put_files(&paths)?;
+            anyhow::ensure!(!files.is_empty(), "no files to upload");
+            let client = connect_admin(home, &admin).await?;
+            let (stored, view) = client
+                .store_put(&files, Some(name.clone()), account, |m| eprintln!("{m}"))
+                .await?;
+            client.close().await;
+            match view {
+                Some(d) => println!(
+                    "{}@{}: {} files, {}",
+                    d.name,
+                    d.version,
+                    d.files,
+                    format_size(d.size)
+                ),
+                None => println!(
+                    "{name}: {} files, {}",
+                    stored.files,
+                    format_size(stored.size)
+                ),
+            }
+            Ok(0)
+        }
+        StoreCmd::Get {
+            dataset,
+            job,
+            out,
+            admin,
+        } => {
+            let (target, default_dir) = match (dataset, job) {
+                (Some(d), None) => {
+                    let r: StoreRef = d.parse()?;
+                    anyhow::ensure!(r.path.is_none(), "give a dataset as NAME or NAME@VERSION");
+                    let dir = PathBuf::from(&r.name);
+                    (
+                        StoreTarget::Dataset {
+                            name: r.name,
+                            version: r.version,
+                        },
+                        dir,
+                    )
+                }
+                (None, Some(j)) => {
+                    let id: JobId = j.parse()?;
+                    (
+                        StoreTarget::Job { id },
+                        PathBuf::from("pumasi-out").join(id.to_string()),
+                    )
+                }
+                _ => bail!("name a dataset or give --job ID"),
+            };
+            let dir = out.unwrap_or(default_dir);
+            let client = connect_admin(home, &admin).await?;
+            let (files, bytes) = client.store_get(target, &dir, |m| eprintln!("{m}")).await?;
+            client.close().await;
+            eprintln!(
+                "saved {files} files ({}) to {}",
+                format_size(bytes),
+                dir.display()
+            );
+            Ok(0)
+        }
+        StoreCmd::Ls { name, admin } => {
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Datasets(list) = client.call(AdminOp::StoreList { name }).await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            print_datasets(&list);
+            Ok(0)
+        }
+        StoreCmd::Rm { dataset, admin } => {
+            let r: StoreRef = dataset.parse()?;
+            anyhow::ensure!(r.path.is_none(), "give a dataset as NAME or NAME@VERSION");
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Datasets(gone) = client
+                .call(AdminOp::StoreRemove {
+                    name: r.name,
+                    version: r.version,
+                })
+                .await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            for d in gone {
+                eprintln!("removed {}@{}", d.name, d.version);
+            }
+            Ok(0)
+        }
+        StoreCmd::Usage { admin } => {
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::StoreUsage { usage, disk_bytes } =
+                client.call(AdminOp::StoreUsage).await?
+            else {
+                bail!("unexpected response");
+            };
+            let AdminResponse::StoragePolicy { policy, class } =
+                client.call(AdminOp::GetStoragePolicy).await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            println!(
+                "{:<16} {:>12} {:>12} {:>9}",
+                "ACCOUNT", "STORED", "QUOTA", "DATASETS"
+            );
+            for u in &usage {
+                println!(
+                    "{:<16} {:>12} {:>12} {:>9}",
+                    u.account,
+                    format_size(u.bytes),
+                    u.quota.map(format_size).unwrap_or_else(|| "-".into()),
+                    u.datasets
+                );
+            }
+            println!(
+                "control plane disk: {} ({class}; files shared between versions count once)",
+                format_size(disk_bytes)
+            );
+            if let Some(q) = policy.default_quota {
+                println!("default quota: {}", format_size(q));
+            }
+            Ok(0)
+        }
+        StoreCmd::Quota {
+            account,
+            size,
+            admin,
+        } => {
+            validate_account(&account)?;
+            let bytes = match size.as_str() {
+                "none" | "off" => None,
+                s => Some(parse_size(s)?),
+            };
+            let client = connect_admin(home, &admin).await?;
+            client
+                .call(AdminOp::StoreQuota {
+                    account: account.clone(),
+                    bytes,
+                })
+                .await?;
+            client.close().await;
+            match bytes {
+                Some(b) => eprintln!("{account} may store {}", format_size(b)),
+                None => eprintln!("{account} has no quota of its own"),
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// The files `pumasi store put` uploads: files by name, directories with
+/// the paths inside them (`data/` gives `a.csv`, `sub/b.csv`, ...).
+fn put_files(paths: &[PathBuf]) -> Result<Vec<(String, PathBuf)>> {
+    let mut out = std::collections::BTreeMap::new();
+    for p in paths {
+        let meta = std::fs::metadata(p).with_context(|| format!("read {}", p.display()))?;
+        if meta.is_dir() {
+            for (rel, full, _) in pumasi_proto::job::dir_files(p)? {
+                out.insert(rel, full);
+            }
+        } else {
+            let name = p
+                .file_name()
+                .context("bad file name")?
+                .to_string_lossy()
+                .into_owned();
+            out.insert(name, p.clone());
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+fn print_datasets(list: &[DatasetView]) {
+    if list.is_empty() {
+        println!("no datasets");
+        return;
+    }
+    println!(
+        "{:<24} {:>7} {:>8} {:>11}  {:<10} {:<20} JOB",
+        "NAME", "VERSION", "FILES", "SIZE", "ACCOUNT", "CREATED"
+    );
+    for d in list {
+        println!(
+            "{:<24} {:>7} {:>8} {:>11}  {:<10} {:<20} {}",
+            d.name,
+            d.version,
+            d.files,
+            format_size(d.size),
+            d.account,
+            utc(d.created_unix),
+            d.job.map(|j| j.to_string()).unwrap_or_default()
+        );
+    }
+}
+
+async fn secret(home: &Path, cmd: SecretCmd) -> Result<i32> {
+    match cmd {
+        SecretCmd::Set { name, value, admin } => {
+            let value = match value {
+                Some(v) => v,
+                None => {
+                    let mut v = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut v)?;
+                    v.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            let client = connect_admin(home, &admin).await?;
+            client
+                .call(AdminOp::SecretSet {
+                    name: name.clone(),
+                    value,
+                })
+                .await?;
+            client.close().await;
+            eprintln!("saved secret {name}");
+            Ok(0)
+        }
+        SecretCmd::Ls { admin } => {
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Secrets(list) = client.call(AdminOp::SecretList).await? else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            if list.is_empty() {
+                println!("no secrets");
+            }
+            for s in list {
+                println!("{:<40} set {}", s.name, utc(s.set_unix));
+            }
+            Ok(0)
+        }
+        SecretCmd::Rm { name, admin } => {
+            let client = connect_admin(home, &admin).await?;
+            client
+                .call(AdminOp::SecretRemove { name: name.clone() })
+                .await?;
+            client.close().await;
+            eprintln!("removed secret {name}");
+            Ok(0)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1794,10 +2221,20 @@ async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Resul
     let AdminResponse::Policy(mut p) = client.call(AdminOp::GetPolicy).await? else {
         bail!("unexpected response");
     };
+    let AdminResponse::StoragePolicy {
+        policy: mut storage,
+        class,
+    } = client.call(AdminOp::GetStoragePolicy).await?
+    else {
+        bail!("unexpected response");
+    };
     if let Some(PricesCmd::Set {
         memory_gib_hour,
         storage_gib_month,
         egress_gib,
+        storage_hdd_gib_month,
+        storage_nvme_gib_month,
+        default_quota,
         ledger,
         credit_limit,
         hold,
@@ -1850,11 +2287,55 @@ async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Resul
             bail!("unexpected response");
         };
         p = saved;
+        let before = storage;
+        if let Some(v) = storage_hdd_gib_month {
+            storage.hdd_gib_month = parse_rate(&v)?;
+        }
+        if let Some(v) = storage_nvme_gib_month {
+            storage.nvme_gib_month = parse_rate(&v)?;
+        }
+        if let Some(v) = default_quota {
+            storage.default_quota = match v.as_str() {
+                "none" | "off" => None,
+                s => Some(parse_size(s)?),
+            };
+        }
+        if storage != before {
+            let AdminResponse::StoragePolicy { policy, .. } =
+                client.call(AdminOp::SetStoragePolicy(storage)).await?
+            else {
+                bail!("unexpected response");
+            };
+            storage = policy;
+        }
         eprintln!("saved");
     }
     client.close().await;
     print_policy(&p);
+    print_storage(&p, &storage, class);
     Ok(0)
+}
+
+fn print_storage(p: &Policy, s: &StoragePolicy, class: DiskClass) {
+    println!("file store (by the control plane's disk, now {class})");
+    println!(
+        "  storage-hdd-gib-month {:>4}  per GiB-month on a hard disk",
+        format_rate(s.hdd_gib_month)
+    );
+    println!(
+        "  storage-gib-month {:>8}  per GiB-month on an SSD (or an unknown disk)",
+        format_rate(p.rates.storage_gib_month)
+    );
+    println!(
+        "  storage-nvme-gib-month {:>3}  per GiB-month on NVMe",
+        format_rate(s.nvme_gib_month)
+    );
+    println!(
+        "  default-quota {:>12}  per account without its own (`pumasi store quota`)",
+        s.default_quota
+            .map(format_size)
+            .unwrap_or_else(|| "none".into())
+    );
 }
 
 fn print_policy(p: &Policy) {

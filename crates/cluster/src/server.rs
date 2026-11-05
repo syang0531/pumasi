@@ -15,15 +15,17 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use pumasi_proto::{
-    ADMIN_ALPN, AGENT_ALPN, MIN_AGENT_PROTOCOL, PROTOCOL_VERSION, Secret,
+    ADMIN_ALPN, AGENT_ALPN, BLOBS_ALPN, MIN_AGENT_PROTOCOL, PROTOCOL_VERSION, Secret, blobs,
     msg::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
         FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, ToAgent,
     },
     net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key, write_private},
+    perf::DiskClass,
     perf::kernel_native,
     release::SignedRelease,
     secrets_eq,
+    store::{MAX_STORE_OUTPUT_BYTES, StoreTarget, format_size},
     ticket::{AdminTicket, JoinTicket},
     wire::{read_frame, read_msg, write_msg},
 };
@@ -34,6 +36,8 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    datasets::StoreCmd,
+    files::FileStore,
     rollout::{ReleaseStore, release_dir},
     state::State,
     store::Store,
@@ -55,6 +59,12 @@ pub struct ClusterConfig {
     pub heartbeat: Duration,
     /// A node silent for this long is considered gone.
     pub node_timeout: Duration,
+    /// How often the file store deletes data nothing refers to.
+    pub gc_interval: Duration,
+    /// How often storage is charged.
+    pub storage_bill_every: Duration,
+    /// The control plane's disk, which picks the storage rate.
+    pub disk_class: DiskClass,
 }
 
 impl ClusterConfig {
@@ -66,6 +76,9 @@ impl ClusterConfig {
             bind: None,
             heartbeat: Duration::from_secs(2),
             node_timeout: Duration::from_secs(10),
+            gc_interval: Duration::from_secs(600),
+            storage_bill_every: Duration::from_secs(3600),
+            disk_class: DiskClass::Unknown,
         }
     }
 }
@@ -77,6 +90,7 @@ struct Inner {
     config: ClusterConfig,
     addr: Mutex<EndpointAddr>,
     releases: ReleaseStore,
+    files: FileStore,
 }
 
 impl Inner {
@@ -94,6 +108,7 @@ pub struct Cluster {
     inner: Arc<Inner>,
     router: Router,
     ticker: JoinHandle<()>,
+    worker: JoinHandle<()>,
 }
 
 impl Cluster {
@@ -122,10 +137,15 @@ impl Cluster {
             }
         };
 
+        let files = FileStore::open(&config.data_dir.join("blobs"), config.gc_interval).await?;
         let endpoint = bind_endpoint(
             key,
             config.net,
-            vec![AGENT_ALPN.to_vec(), ADMIN_ALPN.to_vec()],
+            vec![
+                AGENT_ALPN.to_vec(),
+                ADMIN_ALPN.to_vec(),
+                BLOBS_ALPN.to_vec(),
+            ],
             config.bind,
         )
         .await?;
@@ -139,11 +159,27 @@ impl Cluster {
             config: config.clone(),
             addr: Mutex::new(addr),
             releases: ReleaseStore::new(release_dir(&config.data_dir)),
+            files,
         });
+
+        let (store_tx, store_rx) = mpsc::unbounded_channel();
+        inner
+            .state()
+            .attach_store(store_tx, config.disk_class, config.storage_bill_every);
+        let worker = tokio::spawn(store_worker(inner.clone(), store_rx));
+        let blobs_protocol = {
+            let gate_inner = inner.clone();
+            let egress_inner = inner.clone();
+            inner.files.protocol(
+                Arc::new(move |id| gate_inner.state().store_peer(id)),
+                Arc::new(move |account, bytes| egress_inner.state().charge_egress(account, bytes)),
+            )
+        };
 
         let router = Router::builder(endpoint.clone())
             .accept(AGENT_ALPN, AgentHandler(inner.clone()))
             .accept(ADMIN_ALPN, AdminHandler(inner.clone()))
+            .accept(BLOBS_ALPN, blobs_protocol)
             .spawn();
 
         let ticker = {
@@ -166,6 +202,7 @@ impl Cluster {
             inner,
             router,
             ticker,
+            worker,
         };
         // The local CLI picks this up to talk to the cluster.
         write_private(
@@ -225,9 +262,16 @@ impl Cluster {
         self.inner.state().send_release_for_tests(node, release)
     }
 
+    /// Bytes the file store takes on disk.
+    pub fn store_disk_bytes(&self) -> u64 {
+        self.inner.files.disk_bytes()
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         self.ticker.abort();
+        self.worker.abort();
         self.router.shutdown().await.context("router shutdown")?;
+        self.inner.files.store.shutdown().await.ok();
         Ok(())
     }
 }
@@ -381,6 +425,37 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
                     st.on_heartbeat(&node_id, generation);
                     st.on_report(&node_id, generation, *report);
                 }
+                Ok(Some(FromAgent::Report { report, stored })) => {
+                    // A stored output must be complete in the store and be
+                    // what the report says before the result counts.
+                    let verdict: Result<(), String> = match &stored {
+                        None => Ok(()),
+                        Some(s) if s.size > MAX_STORE_OUTPUT_BYTES => Err(format!(
+                            "stored output of {} is over the {} limit",
+                            format_size(s.size),
+                            format_size(MAX_STORE_OUTPUT_BYTES)
+                        )),
+                        Some(s) => match inner.files.stored(&s.root).await {
+                            Ok(got) if got == *s => Ok(()),
+                            Ok(got) => Err(format!(
+                                "the stored output has {} files of {} bytes, not {} of {}",
+                                got.files, got.size, s.files, s.size
+                            )),
+                            Err(e) => Err(format!("stored output: {e:#}")),
+                        },
+                    };
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    match verdict {
+                        Ok(()) => st.on_report_stored(&node_id, generation, *report, stored),
+                        Err(why) => st.on_report_rejected(&node_id, generation, report.task, &why),
+                    }
+                }
+                Ok(Some(FromAgent::StoreState { addr, full, added, removed })) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_store_state(&node_id, generation, addr, full, added, removed);
+                }
                 Ok(Some(FromAgent::UpgradeFailed { sha256, reason })) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
@@ -481,7 +556,10 @@ impl ProtocolHandler for AdminHandler {
                         return Ok(());
                     };
                     let resp = if secrets_eq(&req.secret, &inner.admin_secret) {
-                        handle_admin(&inner, req.op)
+                        match handle_store_admin(&inner, req.op).await {
+                            Ok(r) => r.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}"))),
+                            Err(op) => handle_admin(&inner, op),
+                        }
                     } else {
                         AdminResponse::Error("invalid admin credentials".into())
                     };
@@ -496,6 +574,138 @@ impl ProtocolHandler for AdminHandler {
             });
         }
     }
+}
+
+/// Runs the file store worker: tags, image pulls and output datasets, in
+/// the order the state machine asked for them.
+async fn store_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<StoreCmd>) {
+    while let Some(cmd) = rx.recv().await {
+        let files = &inner.files;
+        let res = match cmd {
+            StoreCmd::Tag(name, root) => files.tag(&name, blobs::to_hash(&root)).await,
+            StoreCmd::Untag(name) => files.untag(&name).await,
+            StoreCmd::UntagPrefix(prefix) => files.untag_prefix(&prefix).await,
+            StoreCmd::Reconcile(tags) => files.reconcile(&tags).await,
+            StoreCmd::PrepareImage {
+                job,
+                arch,
+                reference,
+            } => {
+                let inner = inner.clone();
+                tokio::spawn(async move {
+                    let creds = inner.state().registry_credentials();
+                    let owner = format!("{job}/{arch}");
+                    let r = inner
+                        .files
+                        .pull_image(&reference, &arch, &owner, creds)
+                        .await;
+                    inner.state().on_image_ready(job, &arch, r);
+                });
+                Ok(())
+            }
+            StoreCmd::FinishJob { job, parts } => {
+                let inner = inner.clone();
+                tokio::spawn(async move {
+                    let r = inner.files.combine(&parts, &format!("job/{job}")).await;
+                    inner.state().on_job_output(job, r);
+                });
+                Ok(())
+            }
+        };
+        if let Err(e) = res {
+            warn!("file store: {e:#}");
+        }
+    }
+}
+
+fn endpoint_id(bytes: &[u8; 32]) -> Result<iroh::EndpointId> {
+    iroh::EndpointId::from_bytes(bytes).context("bad endpoint id")
+}
+
+/// File store admin calls, which wait on the store. Other calls come back
+/// as `Err` for [`handle_admin`].
+async fn handle_store_admin(
+    inner: &Arc<Inner>,
+    op: AdminOp,
+) -> Result<Result<AdminResponse>, AdminOp> {
+    let files = &inner.files;
+    Ok(match op {
+        AdminOp::StoreUpload { uploader, root } => {
+            async {
+                let who = endpoint_id(&uploader)?;
+                let hash = blobs::to_hash(&root);
+                files.allow_upload(who, hash);
+                let (missing, have) = blobs::missing(files.api(), hash).await?;
+                Ok(AdminResponse::StoreMissing { missing, have })
+            }
+            .await
+        }
+        AdminOp::StoreCommit {
+            root,
+            name,
+            account,
+        } => {
+            async {
+                let stored = files.stored(&root).await?;
+                let view = inner.state().commit_upload(stored, name, account)?;
+                Ok(match view {
+                    Some(v) => AdminResponse::Datasets(vec![v]),
+                    None => AdminResponse::Ok,
+                })
+            }
+            .await
+        }
+        AdminOp::StoreList { name } => Ok(AdminResponse::Datasets(
+            inner.state().list_datasets(name.as_deref()),
+        )),
+        AdminOp::StoreRemove { name, version } => inner
+            .state()
+            .remove_datasets(&name, version)
+            .map(AdminResponse::Datasets),
+        AdminOp::StoreOpen { reader, target } => (|| {
+            let who = endpoint_id(&reader)?;
+            let (account, items) = inner.state().open_target(&target)?;
+            if let StoreTarget::Job { .. } = target {
+                anyhow::ensure!(!items.is_empty(), "the job has no outputs in the store");
+            }
+            let roots: Vec<_> = items.iter().map(|i| blobs::to_hash(&i.root)).collect();
+            files.allow_read(who, &account, &roots);
+            Ok(AdminResponse::StoreItems(items))
+        })(),
+        AdminOp::StoreUsage => {
+            let usage = inner.state().store_usage();
+            let f = files.clone();
+            let disk_bytes = tokio::task::spawn_blocking(move || f.disk_bytes())
+                .await
+                .unwrap_or(0);
+            Ok(AdminResponse::StoreUsage { usage, disk_bytes })
+        }
+        AdminOp::StoreQuota { account, bytes } => inner
+            .state()
+            .set_quota(&account, bytes)
+            .map(|()| AdminResponse::Ok),
+        AdminOp::SecretSet { name, value } => inner
+            .state()
+            .set_secret(&name, &value)
+            .map(|()| AdminResponse::Ok),
+        AdminOp::SecretList => Ok(AdminResponse::Secrets(inner.state().secrets())),
+        AdminOp::SecretRemove { name } => inner
+            .state()
+            .remove_secret(&name)
+            .map(|()| AdminResponse::Ok),
+        AdminOp::GetStoragePolicy => {
+            let (policy, class) = inner.state().storage_policy();
+            Ok(AdminResponse::StoragePolicy { policy, class })
+        }
+        AdminOp::SetStoragePolicy(p) => {
+            let mut st = inner.state();
+            st.set_storage_policy(p).map(|()| {
+                let (policy, class) = st.storage_policy();
+                AdminResponse::StoragePolicy { policy, class }
+            })
+        }
+        other => return Err(other),
+    })
 }
 
 fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
@@ -591,6 +801,7 @@ fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
             inner.state().cancel_rollout()?;
             Ok(AdminResponse::Ok)
         }
+        other => anyhow::bail!("unexpected admin call {other:?}"),
     })();
     result.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))
 }
@@ -601,9 +812,10 @@ fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
 
 /// Client for the admin protocol, used by the CLI and tests.
 pub struct AdminClient {
-    endpoint: Endpoint,
+    pub(crate) endpoint: Endpoint,
     conn: Connection,
     secret: Secret,
+    pub(crate) cluster: EndpointAddr,
 }
 
 impl AdminClient {
@@ -624,6 +836,7 @@ impl AdminClient {
             endpoint,
             conn,
             secret: ticket.secret,
+            cluster: ticket.cluster.clone(),
         })
     }
 

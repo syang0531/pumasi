@@ -5,7 +5,9 @@
 //!
 //! Per image (once, cached by manifest digest):
 //!
-//! 1. resolve the reference and download the layers ([`registry`]),
+//! 1. resolve the reference and download the layers
+//!    ([`pumasi_proto::registry`]), or take them from the cluster's file
+//!    store for a private image,
 //! 2. boot a *build* VM that unpacks the layers onto an empty ext4 disk.
 //!    The untrusted tarballs are unpacked inside the VM, never on the host.
 //!
@@ -22,7 +24,6 @@
 //! process. See `pumasi_guest` for the disk protocol.
 
 pub mod ext4;
-pub mod registry;
 pub mod setup;
 pub mod vmm;
 pub mod vz;
@@ -50,14 +51,18 @@ use pumasi_proto::{
         validate_rel_path,
     },
     msg::{Outcome, TaskRef},
+    store::{IMAGE_MANIFEST, ImageManifest, MAX_STORE_OUTPUT_BYTES, image_layer_name},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-pub use registry::{ContainerConfig, Registry};
+pub use pumasi_proto::registry::{ContainerConfig, Registry};
 pub use vmm::{Backend, Disk, VmSpec, Vmm};
 
-use crate::{executor::RunResult, tempdir::TempDir};
+use crate::{
+    executor::{LocalImage, RunResult, TaskIo},
+    tempdir::TempDir,
+};
 
 /// Guest kernel file name in the VM directory. macOS needs another kernel
 /// (virtio-pci for Virtualization.framework, a bzImage on Intel), so it has
@@ -368,7 +373,15 @@ impl MicrovmExecutor {
             &blake3::hash(&cpio).to_hex()[..16]
         ));
         if !initrd.exists() {
-            let tmp = initrd.with_extension(format!("tmp{}", std::process::id()));
+            // Unique per executor: several can start at once in a process.
+            let tmp = initrd.with_extension(format!(
+                "tmp{}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
             std::fs::write(&tmp, &cpio)?;
             std::fs::rename(&tmp, &initrd)?;
         }
@@ -456,8 +469,9 @@ impl MicrovmExecutor {
             b"",
             &[],
             std::slice::from_ref(&file),
+            &[],
         )?;
-        make_output_disk(&output)?;
+        make_output_disk(&output, OUTPUT_DISK_BYTES)?;
         let vm = VmSpec {
             kernel: self.kernel.clone(),
             initrd: self.initrd.clone(),
@@ -487,7 +501,7 @@ impl MicrovmExecutor {
                 console_tail(&dir)
             ),
         };
-        let out = read_output_disk(&output)?.with_context(|| {
+        let out = read_output_disk(&output, None)?.with_context(|| {
             format!(
                 "no result ({} {status}); console:\n{}",
                 self.vmm.backend,
@@ -520,9 +534,39 @@ impl MicrovmExecutor {
         limits: &Limits,
         cancel: Arc<AtomicBool>,
     ) -> RunResult {
+        self.run_io(
+            task,
+            spec,
+            input,
+            shared_files,
+            limits,
+            cancel,
+            &TaskIo::default(),
+        )
+        .await
+    }
+
+    /// Whether an image (by manifest digest) is built and cached here.
+    pub fn has_image(&self, digest: &str) -> bool {
+        self.load_image(digest).is_some()
+    }
+
+    /// [`Self::run`] with mounted files, outputs that may go to the file
+    /// store and private images from it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_io(
+        &self,
+        task: TaskRef,
+        spec: &DockerSpec,
+        input: &TaskInput,
+        shared_files: &[FileEntry],
+        limits: &Limits,
+        cancel: Arc<AtomicBool>,
+        io: &TaskIo,
+    ) -> RunResult {
         let start = Instant::now();
         match self
-            .run_inner(task, spec, input, shared_files, limits, &cancel)
+            .run_inner(task, spec, input, shared_files, limits, &cancel, io)
             .await
         {
             Ok(r) => r,
@@ -538,6 +582,7 @@ impl MicrovmExecutor {
                 fuel_used: 0,
                 wall_ms: start.elapsed().as_millis() as u64,
                 peak_memory_bytes: None,
+                out_dir: None,
             },
         }
     }
@@ -551,29 +596,58 @@ impl MicrovmExecutor {
         shared_files: &[FileEntry],
         limits: &Limits,
         cancel: &AtomicBool,
+        io: &TaskIo,
     ) -> Result<RunResult> {
         ensure!(
             !spec.network,
             "microvm tasks have no network; use a docker job"
         );
         ensure!(spec.gpus.is_none(), "microvm tasks cannot use GPUs yet");
-        let image = self.ensure_image(&spec.image, cancel).await?;
+        let image = match &io.image {
+            Some(img) => self.ensure_local_image(img, cancel).await?,
+            None => self.ensure_image(&spec.image, cancel).await?,
+        };
         // The timeout covers the run itself, not the image pull.
         let run_start = Instant::now();
         let scratch = TempDir::new_in(&self.run_dir, &format!("{}-{}", task.job, task.index))?;
         let dir = scratch.path().to_path_buf();
-        let run_spec = run_spec(&image.config, spec, input);
+        let mut run_spec = run_spec(&image.config, spec, input);
+        if io.keeps_output() {
+            run_spec.output_limit = MAX_STORE_OUTPUT_BYTES;
+            run_spec.output_files = 1_000_000;
+        }
+        let staged = match &io.staged {
+            Some(d) => pumasi_proto::job::dir_files(d)?,
+            None => Vec::new(),
+        };
+        // The scratch disk holds the input files and what the task writes
+        // (its output too); the file is sparse.
+        let scratch_bytes = SCRATCH_BYTES
+            + staged.iter().map(|(_, _, n)| n).sum::<u64>()
+            + if io.keeps_output() {
+                run_spec.files_limit()
+            } else {
+                0
+            };
         let disks = {
             let dir = dir.clone();
             let input = input.clone();
             let shared = shared_files.to_vec();
+            let run_spec = run_spec.clone();
             tokio::task::spawn_blocking(move || -> Result<[PathBuf; 3]> {
                 let scratch = dir.join("scratch.ext4");
-                ext4::mkfs(&scratch, SCRATCH_BYTES, SCRATCH_LABEL)?;
+                ext4::mkfs(&scratch, scratch_bytes, SCRATCH_LABEL)?;
                 let input_disk = dir.join("input.tar");
-                write_input_disk(&input_disk, &run_spec, &input.stdin, &shared, &input.files)?;
+                write_input_disk(
+                    &input_disk,
+                    &run_spec,
+                    &input.stdin,
+                    &shared,
+                    &input.files,
+                    &staged,
+                )?;
                 let output = dir.join("output.img");
-                make_output_disk(&output)?;
+                make_output_disk(&output, run_spec.output_disk_bytes())?;
                 Ok([scratch, input_disk, output])
             })
             .await??
@@ -617,6 +691,7 @@ impl MicrovmExecutor {
             fuel_used: 0,
             wall_ms,
             peak_memory_bytes: None,
+            out_dir: None,
         };
         if !matches!(end, VmEnd::Exited(_)) {
             debug!(task = %task, console = %console_tail(&dir), "microvm stopped by the host");
@@ -626,7 +701,20 @@ impl MicrovmExecutor {
             VmEnd::Cancelled => return Ok(outcome_for(Outcome::Cancelled)),
             VmEnd::Exited(status) => status,
         };
-        let Some(out) = read_output_disk(&output_disk)? else {
+        let kept = if io.keeps_output() {
+            Some(Arc::new(io.out_dir("out")?))
+        } else {
+            None
+        };
+        let out = {
+            let (output_disk, kept_dir) = (
+                output_disk.clone(),
+                kept.as_ref().map(|d| d.path().to_path_buf()),
+            );
+            tokio::task::spawn_blocking(move || read_output_disk(&output_disk, kept_dir.as_deref()))
+                .await??
+        };
+        let Some(out) = out else {
             bail!(
                 "the microVM stopped without a result ({} {status}); console:\n{}",
                 self.vmm.backend,
@@ -653,6 +741,7 @@ impl MicrovmExecutor {
             fuel_used: 0,
             wall_ms,
             peak_memory_bytes: None,
+            out_dir: kept,
         })
     }
 
@@ -749,8 +838,77 @@ impl MicrovmExecutor {
                 .with_context(|| format!("pull {reference}"))?;
             blobs.push(path);
         }
-        info!(image = %reference, "unpacking image in a build VM");
         let compressed: u64 = resolved.layers.iter().map(|l| l.size).sum();
+        self.build_image(
+            reference,
+            &resolved.digest,
+            &resolved.config,
+            blobs,
+            compressed,
+            work,
+            cancel,
+        )
+        .await
+    }
+
+    /// A private image taken from the file store: built from its layers
+    /// once, then cached by digest like a pulled one.
+    async fn ensure_local_image(
+        &self,
+        img: &LocalImage,
+        cancel: &AtomicBool,
+    ) -> Result<ImageEntry> {
+        if let Some(e) = self.load_image(&img.digest) {
+            return Ok(e);
+        }
+        let _pull = self.pull_lock.lock().await;
+        if let Some(e) = self.load_image(&img.digest) {
+            return Ok(e);
+        }
+        let manifest: ImageManifest = serde_json::from_slice(
+            &std::fs::read(img.dir.join(IMAGE_MANIFEST)).context("read the image manifest")?,
+        )
+        .context("bad image manifest")?;
+        ensure!(
+            manifest.digest == img.digest,
+            "image manifest does not match"
+        );
+        let work = TempDir::new_in(&self.run_dir, "pull")?;
+        let mut blobs = Vec::new();
+        for i in 0..manifest.layers.len() {
+            let path = work.path().join(image_layer_name(i));
+            std::fs::rename(img.dir.join(image_layer_name(i)), &path)
+                .or_else(|_| std::fs::copy(img.dir.join(image_layer_name(i)), &path).map(|_| ()))
+                .context("take a layer of the private image")?;
+            blobs.push(path);
+        }
+        let compressed: u64 = manifest.layers.iter().map(|l| l.size).sum();
+        self.build_image(
+            &manifest.reference,
+            &manifest.digest,
+            &manifest.config,
+            blobs,
+            compressed,
+            work,
+            cancel,
+        )
+        .await
+    }
+
+    /// Unpacks downloaded layers into a root filesystem in a build VM and
+    /// caches it.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_image(
+        &self,
+        reference: &str,
+        digest: &str,
+        config: &ContainerConfig,
+        blobs: Vec<PathBuf>,
+        compressed: u64,
+        work: TempDir,
+        cancel: &AtomicBool,
+    ) -> Result<ImageEntry> {
+        info!(image = %reference, "unpacking image in a build VM");
         // Layers expand a few times when unpacked; the file is sparse.
         let size = (compressed * 6 + (1 << 30)).max(2 << 30);
         let base = work.path().join("rootfs.ext4");
@@ -764,7 +922,7 @@ impl MicrovmExecutor {
                 for b in &blobs {
                     let _ = std::fs::remove_file(b);
                 }
-                make_output_disk(&output)
+                make_output_disk(&output, OUTPUT_DISK_BYTES)
             })
             .await??;
         }
@@ -795,7 +953,7 @@ impl MicrovmExecutor {
             VmEnd::Timeout => bail!("unpacking {reference} took longer than 30 minutes"),
             VmEnd::Cancelled => bail!("cancelled while unpacking {reference}"),
         };
-        let result = read_output_disk(&output)?.map(|o| o.result);
+        let result = read_output_disk(&output, None)?.map(|o| o.result);
         match result.map(|r| r.outcome) {
             Some(GuestOutcome::Exited(0)) => {}
             Some(GuestOutcome::Failed(msg)) => bail!("unpack {reference}: {msg}"),
@@ -806,10 +964,10 @@ impl MicrovmExecutor {
             ),
         }
         let _ = std::fs::remove_file(&layers_disk);
-        let dest = self.image_dir(&resolved.digest);
+        let dest = self.image_dir(digest);
         let entry = ImageEntry {
-            digest: resolved.digest.clone(),
-            config: resolved.config.clone(),
+            digest: digest.to_string(),
+            config: config.clone(),
             rootfs: dest.join("rootfs.ext4"),
         };
         let staged = work.path().join("image");
@@ -818,13 +976,13 @@ impl MicrovmExecutor {
         std::fs::write(staged.join("image.json"), serde_json::to_vec(&entry)?)?;
         if let Err(e) = std::fs::rename(&staged, &dest) {
             // Another agent sharing this directory finished first.
-            if self.load_image(&resolved.digest).is_none() {
+            if self.load_image(digest).is_none() {
                 return Err(e).context("store image");
             }
         }
-        self.save_ref(reference, &resolved.digest)?;
+        self.save_ref(reference, digest)?;
         info!(image = %reference, "image ready");
-        self.load_image(&resolved.digest)
+        self.load_image(digest)
             .context("image vanished after building it")
     }
 
@@ -891,6 +1049,7 @@ fn run_spec(config: &ContainerConfig, spec: &DockerSpec, input: &TaskInput) -> R
         workdir: pumasi_proto::job::INPUT_DIR.into(),
         user: config.user.clone().unwrap_or_default(),
         hostname: "pumasi".into(),
+        ..Default::default()
     }
 }
 
@@ -933,6 +1092,7 @@ fn write_input_disk(
     stdin: &[u8],
     shared: &[FileEntry],
     own: &[FileEntry],
+    staged: &[(String, PathBuf, u64)],
 ) -> Result<()> {
     let f = std::fs::File::create(path)?;
     let mut b = tar::Builder::new(std::io::BufWriter::with_capacity(1 << 20, f));
@@ -940,7 +1100,17 @@ fn write_input_disk(
     tar_entry(&mut b, DISK_ROLE_ENTRY, ROLE_INPUT.as_bytes())?;
     tar_entry(&mut b, SPEC_ENTRY, &serde_json::to_vec(spec)?)?;
     tar_entry(&mut b, STDIN_ENTRY, stdin)?;
-    // The task's own files come last and win over shared ones.
+    // Files from the file store first; the job's inline files after them
+    // win, and the task's own files win over shared ones.
+    for (rel, file, size) in staged {
+        validate_rel_path(rel)?;
+        let mut h = tar::Header::new_gnu();
+        h.set_size(*size);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        let f = std::fs::File::open(file).with_context(|| format!("read {}", file.display()))?;
+        b.append_data(&mut h, format!("{INPUT_PREFIX}{rel}"), f.take(*size))?;
+    }
     for f in shared.iter().chain(own) {
         validate_rel_path(&f.path)?;
         tar_entry(&mut b, &format!("{INPUT_PREFIX}{}", f.path), &f.data)?;
@@ -949,8 +1119,8 @@ fn write_input_disk(
     pad_to_sector(path)
 }
 
-fn make_output_disk(path: &Path) -> Result<()> {
-    let mut f = create_sparse(path, OUTPUT_DISK_BYTES.div_ceil(4096) * 4096)?;
+fn make_output_disk(path: &Path, size: u64) -> Result<()> {
+    let mut f = create_sparse(path, size.max(OUTPUT_DISK_BYTES).div_ceil(4096) * 4096)?;
     f.write_all(OUTPUT_MARK)?;
     Ok(())
 }
@@ -963,8 +1133,10 @@ struct GuestOutput {
 }
 
 /// Parses the output disk. `None` if the guest never wrote it. The guest
-/// is untrusted: entries are only read into memory, within the caps.
-fn read_output_disk(path: &Path) -> Result<Option<GuestOutput>> {
+/// is untrusted: entries are only read into memory, within the caps, or
+/// with `kept` written as plain files under that directory (within the
+/// file store's caps).
+fn read_output_disk(path: &Path, kept: Option<&Path>) -> Result<Option<GuestOutput>> {
     let mut f = std::fs::File::open(path)?;
     let mut head = vec![0u8; OUTPUT_MARK.len()];
     f.read_exact(&mut head)?;
@@ -998,6 +1170,19 @@ fn read_output_disk(path: &Path) -> Result<Option<GuestOutput>> {
             stderr = read(&mut entry, MAX_OUTPUT_BYTES)?;
         } else if let Some(rel) = name.strip_prefix(OUTPUT_PREFIX) {
             if validate_rel_path(rel).is_err() {
+                continue;
+            }
+            if let Some(dir) = kept {
+                let size = entry.header().size()?;
+                if total as u64 + size > MAX_STORE_OUTPUT_BYTES {
+                    continue;
+                }
+                let target = dir.join(rel);
+                if let Some(p) = target.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                let mut f = std::fs::File::create(&target)?;
+                total += std::io::copy(&mut Read::take(&mut entry, size), &mut f)? as usize;
                 continue;
             }
             let size = entry.header().size()? as usize;
@@ -1149,8 +1334,11 @@ mod tests {
     fn output_disk_roundtrip() {
         let dir = TempDir::new("microvm-test").unwrap();
         let path = dir.path().join("out.img");
-        make_output_disk(&path).unwrap();
-        assert!(read_output_disk(&path).unwrap().is_none(), "empty disk");
+        make_output_disk(&path, OUTPUT_DISK_BYTES).unwrap();
+        assert!(
+            read_output_disk(&path, None).unwrap().is_none(),
+            "empty disk"
+        );
         // Write what a guest would, including entries the host must ignore.
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let mut b = tar::Builder::new(f);
@@ -1173,7 +1361,7 @@ mod tests {
         };
         tar_entry(&mut b, RESULT_ENTRY, &serde_json::to_vec(&result).unwrap()).unwrap();
         b.into_inner().unwrap();
-        let out = read_output_disk(&path).unwrap().unwrap();
+        let out = read_output_disk(&path, None).unwrap().unwrap();
         assert_eq!(out.result, result);
         assert_eq!(out.stdout, b"hello\n");
         let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
@@ -1192,7 +1380,7 @@ mod tests {
             path: "a.txt".into(),
             data: b"shared".to_vec(),
         }];
-        write_input_disk(&path, &spec, b"in", &shared, &[]).unwrap();
+        write_input_disk(&path, &spec, b"in", &shared, &[], &[]).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len() % 4096, 0);
         let mut ar = tar::Archive::new(std::fs::File::open(&path).unwrap());
         let names: Vec<String> = ar
@@ -1208,6 +1396,6 @@ mod tests {
             path: "../x".into(),
             data: vec![],
         }];
-        assert!(write_input_disk(&path, &spec, b"", &bad, &[]).is_err());
+        assert!(write_input_disk(&path, &spec, b"", &bad, &[], &[]).is_err());
     }
 }

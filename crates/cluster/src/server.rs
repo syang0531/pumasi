@@ -1080,6 +1080,41 @@ impl AdminClient {
         })
     }
 
+    /// The same connection, making calls with another ticket's secret (the
+    /// dashboard's browser sessions). The control plane checks each call
+    /// against that secret's role. Closing it closes the shared connection.
+    pub fn with_secret(&self, secret: Secret) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            conn: self.conn.clone(),
+            secret,
+            cluster: self.cluster.clone(),
+        }
+    }
+
+    /// The connection is gone (the control plane restarted, the network
+    /// dropped); calls fail until [`Self::reconnect`].
+    pub fn is_closed(&self) -> bool {
+        self.conn.close_reason().is_some()
+    }
+
+    /// A new connection from the same endpoint, with the same secret.
+    pub async fn reconnect(&self) -> Result<Self> {
+        Self::connect_with(
+            self.endpoint.clone(),
+            &AdminTicket {
+                cluster: self.cluster.clone(),
+                secret: self.secret,
+            },
+        )
+        .await
+    }
+
+    /// The control plane's endpoint id.
+    pub fn cluster_id(&self) -> iroh::EndpointId {
+        self.cluster.id
+    }
+
     pub async fn call(&self, op: AdminOp) -> Result<AdminResponse> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         write_msg(

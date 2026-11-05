@@ -1,0 +1,4 @@
+node_modules/
+.state.json
+test-results/
+playwright-report/

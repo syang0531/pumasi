@@ -12,7 +12,7 @@ use iroh::{PublicKey, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    economy::{MicroCu, MilliCu},
+    economy::{MicroCu, MilliCu, format_cu, format_rate},
     job::{Executor, FileEntry},
     msg::{Outcome, TaskRef},
 };
@@ -334,6 +334,87 @@ pub fn check_usage(
         "receipt does not match the result"
     );
     Ok(())
+}
+
+/// One exported receipt (`pumasi receipts --export`, the dashboard's
+/// receipts download): readable fields plus the exact signed encoding,
+/// which `pumasi verify-receipts` checks the fields against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReceiptRow {
+    pub id: String,
+    pub job: String,
+    pub task: u32,
+    pub attempt: u32,
+    pub check: bool,
+    pub node: String,
+    pub cluster: String,
+    pub executor: String,
+    pub outcome: String,
+    pub fuel_used: u64,
+    pub wall_ms: u64,
+    pub billed_wall_ms: u64,
+    pub memory_limit_bytes: u64,
+    pub peak_memory_bytes: Option<u64>,
+    pub consumer: String,
+    pub provider: String,
+    pub cpu_score: u32,
+    /// The exact price in CU, and the CU moved (see `Billing::amount`).
+    pub exact_cu: String,
+    pub cu: String,
+    pub recorded_unix: u64,
+    /// GPUs the run held (receipts from before GPUs have none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuRow>,
+    pub receipt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuRow {
+    pub names: Vec<String>,
+    pub gflops: u64,
+    pub vram_mib: u64,
+    /// The GPU part of `exact_cu`.
+    pub exact_cu: String,
+}
+
+impl From<&Receipt> for ReceiptRow {
+    fn from(r: &Receipt) -> Self {
+        let u = &r.usage;
+        let b = &r.billing;
+        Self {
+            id: data_hex(&r.id()),
+            job: u.task.job.to_string(),
+            task: u.task.index,
+            attempt: u.task.attempt,
+            check: u.task.check,
+            node: r.node_id(),
+            cluster: r.cluster_id(),
+            executor: u.executor.to_string(),
+            outcome: u.outcome.to_string(),
+            fuel_used: u.fuel_used,
+            wall_ms: u.wall_ms,
+            billed_wall_ms: b.billed_wall_ms,
+            memory_limit_bytes: u.memory_limit_bytes,
+            peak_memory_bytes: u.peak_memory_bytes,
+            consumer: b.consumer.clone(),
+            provider: b.provider.clone(),
+            cpu_score: b.cpu_score,
+            exact_cu: format_rate(b.exact_ucu),
+            cu: format_cu(b.amount),
+            recorded_unix: b.recorded_unix,
+            gpu: r.gpu.as_ref().map(|g| GpuRow {
+                names: g.names.clone(),
+                gflops: g.gflops,
+                vram_mib: g.vram_mib,
+                exact_cu: format_rate(g.exact_ucu),
+            }),
+            receipt: r.to_blob(),
+        }
+    }
+}
+
+pub fn data_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]

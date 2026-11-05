@@ -40,8 +40,33 @@ pub const INPUT_DIR: &str = "/input";
 pub const OUTPUT_DIR: &str = "/output";
 
 /// Identifies a job. Random, assigned by the control plane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// On the wire and on disk (postcard) it is a number; in human-readable
+/// formats such as the dashboard's JSON it is the hex string the CLI
+/// shows, since JSON numbers lose precision beyond 2^53.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JobId(pub u128);
+
+impl Serialize for JobId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.collect_str(self)
+        } else {
+            s.serialize_u128(self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JobId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        if d.is_human_readable() {
+            let s = String::deserialize(d)?;
+            s.parse().map_err(serde::de::Error::custom)
+        } else {
+            u128::deserialize(d).map(JobId)
+        }
+    }
+}
 
 impl JobId {
     pub fn random() -> Self {
@@ -979,6 +1004,22 @@ mod tests {
 
     fn write_module(dir: &Path) {
         std::fs::write(dir.join("m.wasm"), WASM_HEADER).unwrap();
+    }
+
+    #[test]
+    fn job_ids_are_numbers_in_postcard_and_hex_in_json() {
+        let id = JobId(0x00ab_cdef_0123_4567);
+        // Same bytes as the plain u128 older builds wrote.
+        assert_eq!(
+            postcard::to_stdvec(&id).unwrap(),
+            postcard::to_stdvec(&id.0).unwrap()
+        );
+        let back: JobId = postcard::from_bytes(&postcard::to_stdvec(&id).unwrap()).unwrap();
+        assert_eq!(back, id);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"00abcdef01234567\"");
+        assert_eq!(serde_json::from_str::<JobId>(&json).unwrap(), id);
+        assert!(serde_json::from_str::<JobId>("\"xyz\"").is_err());
     }
 
     #[test]

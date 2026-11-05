@@ -664,6 +664,54 @@ pumasi alert ls
 Both can also live in `cluster.toml` (`[alerts]` and `[webhooks.NAME]`,
 with `url_env` to keep the URL out of the file).
 
+### Web dashboard
+
+```sh
+pumasi ui            # opens http://127.0.0.1:7400/login?token=... in your browser
+```
+
+`pumasi ui` runs the dashboard on your own machine and talks to the
+cluster over the same connection as the CLI, so the control plane opens no
+port and it works from anywhere your ticket works (`pumasi login`). It is
+part of the binary: no Node, no separate install. The pages:
+
+- **Overview**: nodes online, running and queued tasks, active jobs, GPUs
+  in use, firing alerts, recent jobs and events, refreshed every few
+  seconds.
+- **Nodes**: each node's state, CPU, memory, disk, temperature and GPUs;
+  one node's charts over an hour, a day or a week, its benchmark and
+  GPUs, its labels and taints, and buttons to cordon, drain, benchmark
+  again or remove it.
+- **Jobs**: submit a job (paste a job.toml, attach its files or a
+  folder), follow each task's stdout and stderr live, cancel, download one
+  output file or all of them as a zip, and the signed receipts (the
+  `pumasi verify-receipts` format).
+- **Storage**: datasets and their versions, usage against quotas, upload a
+  folder as a new version, download one as a zip.
+- **CU**: balances and the ledger; admins grant and pay out.
+- **Invites**: join tickets with the install commands, provider invites,
+  and access tickets for people.
+- **Prices** and **Events** (with alert rules and webhooks).
+
+Korean and English (the browser's language, or the switch in the header).
+
+The URL `pumasi ui` prints signs the browser in with your ticket. Anyone
+else signs in on the same page with an access ticket (`pumasi access
+create`), and sees and may do what its role allows: the control plane
+checks every call, as for the CLI. `--login-only` turns the link off;
+`--listen 0.0.0.0:7400` serves other machines too (always sign-in only,
+over plain HTTP, so put a TLS reverse proxy in front).
+
+The same server has a JSON API under `/api/v1` (status, metrics, events,
+jobs with submit, cancel, logs, outputs and receipts, node drain and
+cordon, accounts, ledger, datasets, prices, invites, and `POST /api/v1/op`
+for any admin call), described by `/api/openapi.json`:
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.pumasi/admin.ticket)" http://127.0.0.1:7400/api/v1/status
+curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm http://127.0.0.1:7400/api/v1/jobs
+```
+
 ## Commands
 
 | Command | What it does |
@@ -706,6 +754,7 @@ with `url_env` to keep the URL out of the file).
 | `pumasi events [-f] [--since 1h] [-n 50] [-o json]` | Cluster events: nodes, jobs, checks, preemptions, alerts. |
 | `pumasi alert ls` / `alert set [--node-offline 1m] [--failure-rate 50%] [--disk 90%] [--temperature 90] [--perf-drop 25%] [--smart on] [--check-mismatch on] [--defaults]` | Alert rules and what fires now; `off` turns a rule off. |
 | `pumasi webhook add NAME URL [--format slack\|discord\|json]` / `ls` / `rm NAME` / `test NAME` | Where alerts go. |
+| `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB]` | The web dashboard and its JSON API, served from this machine (default 127.0.0.1:7400). |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode). |
 
 `--home DIR` or `PUMASI_HOME` changes the state directory, which lets you run
@@ -936,8 +985,8 @@ with other clusters.
 | 8 | Cluster file store (iroh-blobs): versioned datasets, `store:` mounts and output datasets, inputs and outputs of any size, resumable hash-checked transfers, node caches shared between nodes, reference GC, quotas, storage and egress billed in CU, private registry images | done |
 | 9 | GPUs and microVM devices: NVIDIA (NVML, CUDA benchmark) and AMD detection, signed device profiles, GPU time billed in CU, per-GPU scheduling, Docker GPU jobs, GPU checks for providers, VFIO passthrough (experimental), filtered microVM networking | done |
 | 10 | Cluster management: node labels and taints, job selectors and tolerations, cordon and drain, priorities with preemption, per-account quotas (slots, GPUs, CU per day, priority, storage), role tickets (admin, submitter, viewer), declarative `apply` with `get` and `describe`, cron schedules, job dependencies | done |
-| 11 | Monitoring and alerts: node metrics (CPU, memory, disk, network, temperature, GPUs) kept 7 days with downsampling, `top`, live `logs -f`, `events`, opt-in Prometheus endpoint with a Grafana dashboard, alert rules (node offline, failure rate, disk, temperature, benchmark drop, SMART, check mismatch) sent to Slack, Discord or JSON webhooks | this release |
-| 12 | Web dashboard (built into the binary) | planned |
+| 11 | Monitoring and alerts: node metrics (CPU, memory, disk, network, temperature, GPUs) kept 7 days with downsampling, `top`, live `logs -f`, `events`, opt-in Prometheus endpoint with a Grafana dashboard, alert rules (node offline, failure rate, disk, temperature, benchmark drop, SMART, check mismatch) sent to Slack, Discord or JSON webhooks | done |
+| 12 | Web dashboard built into the binary (`pumasi ui`): overview, nodes with charts, cordon and drain, jobs with submit, live output, cancel and output downloads, storage with uploads and downloads, CU and ledger, invites and access tickets, prices, events and alerts; sign-in with access tickets and their roles, Korean and English, JSON API with OpenAPI, Playwright tests in CI | this release |
 | 13 | Control plane high availability (Raft) | planned |
 | 14 | WebGPU executor (experimental) | planned |
 | 15 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
@@ -945,7 +994,7 @@ with other clusters.
 | 17 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
 | 18 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
-Known gaps: single control plane (no Raft yet), no web console, accounts
+Known gaps: single control plane (no Raft yet), accounts
 exist only inside one cluster (no SSO yet: access tickets are handed out
 by the admin), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
 (only each node's round trip to the control plane), the file store lives
@@ -964,7 +1013,9 @@ macOS 10.15 and 11 themselves have no CI runners either.
 MicroVM task output reaches `pumasi logs` only when the task ends (the
 guest writes it to its output disk), Intel and Apple GPUs report no
 metrics, Windows nodes report no temperature, and the 10-second metric steps of the last hour are not kept
-across a control plane restart.
+across a control plane restart. The dashboard shows prices and alert rules
+but does not change them (the CLI and `apply` do), and keeps its sign-ins
+in memory (restarting `pumasi ui` signs everyone out).
 
 ## Development
 
@@ -1002,6 +1053,17 @@ emulation, using a binary built with the guest init embedded through
 cargo build --release -p pumasi-guest --target x86_64-unknown-linux-musl
 cargo run -p pumasi-cli -- vm setup --vm-dir /tmp/vm --guest target/x86_64-unknown-linux-musl/release/pumasi-guest
 PUMASI_TEST_VM_DIR=/tmp/vm cargo test -p pumasi-cluster --test e2e microvm
+```
+
+The dashboard's browser tests (`crates/dashboard/e2e`, Playwright) start a
+control plane, two agents and `pumasi ui` from the debug build, then sign
+in, submit a job, follow its output, download its outputs, drain the node
+running a task, try a viewer ticket, upload and download a dataset, and
+call the JSON API:
+
+```sh
+cargo build -p pumasi-cli
+cd crates/dashboard/e2e && npm ci && npx playwright install chromium && npx playwright test
 ```
 
 ## License

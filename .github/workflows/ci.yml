@@ -62,6 +62,42 @@ jobs:
             | tee sample.txt
           grep -q "^1 " sample.txt
 
+  # The web dashboard in a real browser against a real local cluster
+  # (control plane, two WASM agents, `pumasi ui`). Node is only for the
+  # tests; the dashboard itself is built into the binary.
+  dashboard:
+    name: dashboard (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dashboard
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/dashboard/e2e/package-lock.json
+      - run: cargo build -p pumasi-cli
+      - name: Install Playwright and Chromium
+        working-directory: crates/dashboard/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Submit, follow, download and drain from the browser
+        working-directory: crates/dashboard/e2e
+        run: npx playwright test
+      - name: Keep the traces and cluster logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-e2e
+          path: |
+            crates/dashboard/e2e/test-results
+            crates/dashboard/e2e/playwright-report
+          if-no-files-found: ignore
+
   microvm:
     name: microvm (${{ matrix.backend }})
     runs-on: ubuntu-latest

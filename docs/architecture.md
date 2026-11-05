@@ -6,8 +6,9 @@ result checks of phase 2, the microVM executor of phase 3, the
 releases, OS services and signed agent upgrades of phase 4, the
 Windows support of phase 5, the Mac support and availability policy of
 phase 6, the benchmarks and compute units of phase 7, the cluster
-file store of phase 8, the GPUs and microVM devices of phase 9, and the
-cluster management of phase 10. The
+file store of phase 8, the GPUs and microVM devices of phase 9, the
+cluster management of phase 10, the monitoring of phase 11 and the web
+dashboard of phase 12. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -20,6 +21,7 @@ the project; this file covers the code.
 | `pumasi-guest` | `pumasi-guest`, the init process inside every microVM (a static musl binary), and the disk protocol the agent shares with it. |
 | `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `NodeStore` (the node's file store cache), `MicrovmExecutor` (ext4 formatter, Firecracker/QEMU/Virtualization.framework), `availability` (power, idle and hours policy), `platform` (sparse files, Windows Job Objects, the WHPX check) and the `Agent` session loop, which signs usage. |
 | `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `datasets.rs` (datasets, quotas, secrets, storage billing), `files.rs` (the blob store, its access rules and tags), `transfer.rs` (the CLI's uploads and downloads), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
+| `pumasi-dashboard` | The web dashboard and JSON API behind `pumasi ui` (axum, maud templates, vendored htmx): one admin connection to the control plane, browser sessions holding a ticket each, pages, downloads as zip, live task output as server-sent events. |
 | `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. `service.rs` installs the agent as an OS service, `upgrade.rs` drives rollouts. |
 
 The marketplace hub, Madang (마당), is not in this repository; it is a
@@ -1132,6 +1134,102 @@ read metrics and alerts, read `Logs` of their own account's jobs only, and
 see only events with no account or their own. Changing the policy and
 webhooks needs an admin.
 
+## Phase 12: the web dashboard
+
+### Where it runs
+
+`pumasi ui` (`crates/dashboard`, started by `cli/src/ui.rs`) is an HTTP
+server on the admin's own machine, 127.0.0.1:7400 by default. Browsers
+cannot speak iroh QUIC, so the server is the bridge: it keeps one
+`AdminClient` connection to the control plane (reopened when it closes,
+`backend.rs`) and turns every page, button and API call into admin calls.
+The control plane serves nothing new and opens no port; the dashboard
+reaches any cluster the CLI can. The Prometheus server of phase 11 stays
+in the control plane, because scrapers want a stable address there.
+
+### Sign-in and roles
+
+There are no dashboard accounts. A session holds the secret of a Pumasi
+ticket, and `AdminClient::with_secret` makes each call over the shared
+connection with that session's secret, so `access::admit` and
+`access::scope` apply unchanged: a submitter sees and changes only its
+account's jobs and datasets, a viewer only reads, refused calls come back
+as the control plane's message. The pages hide what the role cannot do
+(from `WhoAmI` at sign-in), but nothing depends on that.
+
+- The URL `pumasi ui` prints has a random 160-bit token; opening it starts
+  a session with the ticket `pumasi ui` runs with (`--admin`, or the saved
+  one). `--login-only` drops the token, and listening on anything but
+  loopback implies it.
+- `/login` takes any ticket of the same cluster (the ticket's cluster id
+  must match), checked with `WhoAmI`.
+- The JSON API also takes `Authorization: Bearer <ticket>` per request.
+
+Sessions live in memory (12 hours idle) behind an `HttpOnly`,
+`SameSite=Strict` cookie. Requests other than GET need the session's CSRF
+token in `X-Pumasi-CSRF` (htmx sends it from `hx-headers` on `<body>`); the
+sign-in form checks `Origin`. On loopback the server refuses Host headers
+other than its own address (DNS rebinding). Every response carries a
+strict Content-Security-Policy (scripts, styles and connections from the
+server only; no inline script or style, htmx's eval off), `X-Frame-Options:
+DENY`, `nosniff`, `Referrer-Policy: same-origin` (the token never leaves
+in a referrer) and `Cache-Control: no-store`. Downloads are always
+`attachment` and `application/octet-stream`, so task output never renders
+as a page of the dashboard's origin.
+
+### Pages
+
+Server-rendered HTML (maud, compiled into the binary), Korean or English
+from the `pumasi_lang` cookie or `Accept-Language`; strings sit side by
+side where they are used (`l.t("Nodes", "노드")`). Each page has an
+`#live` region that reloads itself with htmx every few seconds and after
+a button worked (`HX-Trigger: refresh`); buttons post with htmx and show
+the result or the control plane's error in a flash area. Charts are SVG
+drawn on the server from `MetricsView` series (`charts.rs`); times are
+UTC in `<time>` elements that `app.js` shows in the browser's zone.
+
+- Submitting: the form's job.toml and files (with their relative paths, so
+  a folder upload keeps its layout) are written to a temporary directory
+  and go through `JobFile::load_split` and `AdminClient::submit`, the same
+  path as `pumasi run`, including large inputs through the file store.
+  Dataset uploads go through `store_put` the same way.
+- Live output: `/jobs/{id}/tasks/{i}/stream` is a server-sent event stream.
+  The server polls `AdminOp::Logs` every 250 ms like `pumasi logs -f` and
+  sends what is new as JSON (attempt changes reset the view; a UTF-8
+  character cut between two chunks waits for the rest).
+- Downloads: one inline output file straight from `TaskFiles`; all of a
+  job's outputs (inline and stored) or a dataset as a zip (`zip.rs`, stored
+  entries, no ZIP64) built in a temporary directory and streamed, the
+  directory removed when the response ends. Receipts download in the
+  `pumasi receipts --export` format (`ReceiptRow`, now in `pumasi-proto`).
+
+### JSON API
+
+`/api/v1` returns the protocol's own views as JSON, the response enum's
+tag dropped. `JobId` now serializes as its hex string in human-readable
+formats (and as the same u128 in postcard, so nothing stored or on the
+wire changes), because JSON numbers lose precision past 2^53. `POST
+/api/v1/op` takes any `AdminOp` in its serde JSON form. The routes are
+listed in `assets/openapi.json` (OpenAPI 3.1), and a unit test checks that
+the document and the router agree.
+
+### Tests
+
+Unit tests cover the session store, cookies, the language choice, the
+zip writer, UTF-8 splitting, chart axes and the OpenAPI listing.
+`crates/dashboard/e2e` holds the Playwright tests the `dashboard
+(playwright)` CI job runs: a global setup starts a control plane, two
+WASM agents and `pumasi ui --url-file` from the debug build, and the tests
+sign in with the printed link, refuse a bad token, a bad ticket, a POST
+without the CSRF token and a foreign Host header, submit a job of
+`fixtures/ticker.wasm` (a WAT module that prints once a second and writes
+an output file; a unit test checks it matches `ticker.wat`), follow its
+output live, download one file and the zip, drain the node running a
+25-second task and see it finish on the other node, create a viewer
+ticket and check it cannot drain (in the page or the API), upload and
+download a dataset, call the JSON API with a bearer ticket, and switch to
+Korean.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -1235,7 +1333,12 @@ remotely; install a current binary on them once.
   plane restart; alert rules are cluster-wide (no per-node or per-label
   thresholds, no silences or repeat notices); node-to-node latency is not
   measured.
-- Remaining roadmap phases (12 to 18): a web dashboard, Raft, WebGPU, the confidential
+- Dashboard: prices, alert rules, webhooks, quotas, schedules and
+  rollouts are shown (or left to the CLI) but not edited in the browser;
+  sessions are in memory only; there is no TLS of its own (use a reverse
+  proxy when serving other machines); charts are server-drawn snapshots
+  that refresh every 10 seconds rather than streaming.
+- Remaining roadmap phases (13 to 18): Raft, WebGPU, the confidential
   tier, self-hosting 1.0 (SSO, audit log, external security review), the
   hub, buying CU. See the roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker

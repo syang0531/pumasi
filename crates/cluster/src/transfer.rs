@@ -12,8 +12,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use pumasi_proto::{
     BLOBS_ALPN, blobs,
+    job::{JobId, JobSubmission},
     msg::{AdminOp, AdminResponse},
-    store::{DatasetView, StoreItem, StoreTarget, StoredOutput, format_size},
+    store::{
+        DatasetView, MountRequest, MountSource, StoreItem, StoreTarget, StoredOutput, format_size,
+    },
 };
 
 use crate::server::AdminClient;
@@ -107,6 +110,37 @@ impl AdminClient {
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
         res
+    }
+
+    /// Submits a job. `upload` (path in `/input`, file) holds the shared
+    /// input files that were too large to send with it
+    /// ([`pumasi_proto::job::JobFile::load_split`]): they go through the
+    /// file store first and are mounted at `/input`.
+    pub async fn submit(
+        &self,
+        mut sub: JobSubmission,
+        upload: &[(String, PathBuf)],
+        progress: impl Fn(String),
+    ) -> Result<JobId> {
+        if !upload.is_empty() {
+            let (stored, _) = self
+                .store_put(upload, None, sub.account.clone(), |m| {
+                    progress(format!("input files: {m}"))
+                })
+                .await?;
+            sub.mounts.insert(
+                0,
+                MountRequest {
+                    source: MountSource::Upload { root: stored.root },
+                    select: None,
+                    at: String::new(),
+                },
+            );
+        }
+        match self.call(AdminOp::Submit(Box::new(sub))).await? {
+            AdminResponse::Submitted { id } => Ok(id),
+            _ => bail!("unexpected response"),
+        }
     }
 
     /// Downloads a dataset version or a job's stored outputs into `dest`.

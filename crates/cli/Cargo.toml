@@ -12,6 +12,7 @@ path = "src/main.rs"
 pumasi-proto.workspace = true
 pumasi-agent.workspace = true
 pumasi-cluster.workspace = true
+pumasi-dashboard.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

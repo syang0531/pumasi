@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "crates/cli"]
+members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "crates/dashboard", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ pumasi-proto = { path = "crates/proto" }
 pumasi-agent = { path = "crates/agent" }
 pumasi-cluster = { path = "crates/cluster" }
 pumasi-guest = { path = "crates/guest" }
+pumasi-dashboard = { path = "crates/dashboard" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

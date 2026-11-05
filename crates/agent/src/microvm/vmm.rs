@@ -62,6 +62,12 @@ pub struct VmSpec {
     pub disks: Vec<Disk>,
     pub vcpus: u32,
     pub mem_mib: u64,
+    /// A network card whose frames go to this gateway (QEMU only; see
+    /// [`super::net`]).
+    pub net: Option<std::net::SocketAddr>,
+    /// PCI devices bound to `vfio-pci` to pass through (QEMU on Linux
+    /// only). The VM then gets a PCI machine (q35) instead of `microvm`.
+    pub pci: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +100,12 @@ pub const SERIAL_LOG: &str = "serial.log";
 impl Vmm {
     /// The VMM command for `spec`. Writes any config file into `dir`.
     pub fn command(&self, spec: &VmSpec, dir: &Path) -> Result<tokio::process::Command> {
+        if self.backend != Backend::Qemu && (spec.net.is_some() || !spec.pci.is_empty()) {
+            bail!(
+                "{} cannot give a VM a network card or GPUs; QEMU can",
+                self.backend
+            );
+        }
         match self.backend {
             Backend::Firecracker => self.firecracker(spec, dir),
             Backend::Qemu => Ok(self.qemu(spec, dir)),
@@ -193,7 +205,13 @@ impl Vmm {
     fn qemu(&self, spec: &VmSpec, dir: &Path) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.bin);
         let x86 = cfg!(target_arch = "x86_64");
-        if x86 && self.accelerated && cfg!(target_os = "linux") {
+        // Passed-through GPUs need a PCI bus; the other devices then sit on
+        // it too.
+        let pci = !spec.pci.is_empty();
+        let transport = if pci { "pci" } else { "device" };
+        if pci {
+            cmd.args(["-M", if x86 { "q35" } else { "virt" }]);
+        } else if x86 && self.accelerated && cfg!(target_os = "linux") {
             // KVM's in-kernel 8259 is never programmed by this kernel (no
             // legacy PIC in its ACPI tables), so the PIT's first tick
             // arrives as vector 0 and panics the boot as a divide error.
@@ -275,7 +293,19 @@ impl Vmm {
                     "id=d{i},file={file},format=raw,if=none,readonly={ro}"
                 ))
                 .arg("-device")
-                .arg(format!("virtio-blk-device,drive=d{i}"));
+                .arg(format!("virtio-blk-{transport},drive=d{i}"));
+        }
+        if let Some(gw) = spec.net {
+            cmd.arg("-netdev")
+                .arg(format!("socket,id=n0,connect={gw}"))
+                .arg("-device")
+                .arg(format!(
+                    "virtio-net-{transport},netdev=n0,mac={}",
+                    super::net::GUEST_MAC
+                ));
+        }
+        for addr in &spec.pci {
+            cmd.arg("-device").arg(format!("vfio-pci,host={addr}"));
         }
         // More QEMU arguments, for trying settings on a new machine.
         if let Ok(extra) = std::env::var("PUMASI_QEMU_ARGS") {
@@ -403,19 +433,50 @@ mod tests {
             }],
             vcpus: 2,
             mem_mib: 300,
+            net: None,
+            pci: vec![],
         };
-        let cmd = vmm.command(&spec, Path::new("/tmp")).unwrap();
-        let args: Vec<String> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let joined = args.join(" ");
+        let args = |spec: &VmSpec| -> String {
+            let cmd = vmm.command(spec, Path::new("/tmp")).unwrap();
+            cmd.as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let joined = args(&spec);
         assert!(joined.contains("-no-reboot"));
         assert!(joined.contains("file=/a,,b.img,format=raw,if=none,readonly=on"));
+        assert!(joined.contains("virtio-blk-device,drive=d0"));
         assert!(joined.contains("pumasi.mode=run"));
         assert!(joined.contains("-smp 2"));
         assert!(!joined.contains("-accel kvm"));
+        assert!(!joined.contains("-netdev"), "no network by default");
+
+        let net = VmSpec {
+            net: Some("127.0.0.1:4567".parse().unwrap()),
+            ..spec.clone()
+        };
+        let joined = args(&net);
+        assert!(joined.contains("-netdev socket,id=n0,connect=127.0.0.1:4567"));
+        assert!(joined.contains("virtio-net-device,netdev=n0,mac=52:54:00:12:34:56"));
+
+        let gpu = VmSpec {
+            pci: vec!["0000:01:00.0".into()],
+            ..spec.clone()
+        };
+        let joined = args(&gpu);
+        assert!(joined.contains("vfio-pci,host=0000:01:00.0"));
+        assert!(joined.contains("virtio-blk-pci,drive=d0"), "{joined}");
+        if cfg!(target_arch = "x86_64") {
+            assert!(joined.contains("-M q35"));
+        }
+
+        let fc = Vmm {
+            backend: Backend::Firecracker,
+            ..vmm.clone()
+        };
+        assert!(fc.command(&net, Path::new("/tmp")).is_err());
     }
 
     #[test]
@@ -437,6 +498,8 @@ mod tests {
             }],
             vcpus: 2,
             mem_mib: 300,
+            net: None,
+            pci: vec![],
         };
         let cmd = vmm.command(&spec, dir.path()).unwrap();
         let args: Vec<String> = cmd

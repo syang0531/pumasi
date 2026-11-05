@@ -6,6 +6,7 @@
 
 pub mod blobs;
 pub mod economy;
+pub mod gpu;
 pub mod job;
 pub mod msg;
 pub mod net;
@@ -26,11 +27,14 @@ pub const ADMIN_ALPN: &[u8] = b"pumasi/admin/0";
 pub const BLOBS_ALPN: &[u8] = iroh_blobs::ALPN;
 /// The first agent protocol with the file store.
 pub const STORE_PROTOCOL: u32 = 8;
+/// The first agent protocol with devices: GPUs, GPU challenges and microVM
+/// networking.
+pub const DEVICES_PROTOCOL: u32 = 9;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        8
+        9
     };
 }
 
@@ -42,7 +46,9 @@ pub const PROTOCOL_VERSION: u32 = protocol_version!();
 /// the availability report (6), protocol 6 agents the performance profile
 /// and benchmark challenges (7): they are billed at the reference score.
 /// Protocol 7 agents lack the file store (8): they get no jobs that mount
-/// datasets, write outputs to the store or use private images.
+/// datasets, write outputs to the store or use private images. Protocol 8
+/// agents lack devices (9): they get no GPU jobs and no microVM jobs with
+/// a network.
 pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi

@@ -115,6 +115,53 @@ pub struct SetupReport {
 
 /// Installs the kernel, Firecracker (Linux only) and the guest init into
 /// `dir`. Files already present are kept unless `force`.
+/// Installs a GPU guest bundle (built by `scripts/kernel/build-gpu.sh`):
+/// the GPU guest kernel (`vmlinux`) and the driver disk (`drivers.ext4`,
+/// ext4 labeled `pumasi-gpu`), into the VM directory's `gpu/`. Returns the
+/// installed paths.
+pub fn install_gpu_bundle(dir: &Path, bundle: &Path) -> Result<Vec<String>> {
+    let kernel = bundle.join(super::GPU_KERNEL_FILE);
+    let drivers = bundle.join(super::GPU_DRIVER_FILE);
+    let mut head = [0u8; 4];
+    std::fs::File::open(&kernel)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .with_context(|| format!("read {}", kernel.display()))?;
+    ensure!(
+        &head == b"\x7fELF",
+        "{} is not an uncompressed kernel (vmlinux)",
+        kernel.display()
+    );
+    let mut sb = vec![0u8; 2048];
+    std::fs::File::open(&drivers)
+        .and_then(|mut f| f.read_exact(&mut sb))
+        .with_context(|| format!("read {}", drivers.display()))?;
+    let label = (sb[1080..1082] == [0x53, 0xEF]).then(|| {
+        let raw = &sb[1144..1160];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        String::from_utf8_lossy(&raw[..end]).into_owned()
+    });
+    ensure!(
+        label.as_deref() == Some(pumasi_guest::GPU_LABEL),
+        "{} is not a GPU driver disk (an ext4 filesystem labeled {})",
+        drivers.display(),
+        pumasi_guest::GPU_LABEL
+    );
+    let dest = dir.join(super::GPU_DIR);
+    std::fs::create_dir_all(&dest)?;
+    let mut installed = Vec::new();
+    for (from, name) in [
+        (&kernel, super::GPU_KERNEL_FILE),
+        (&drivers, super::GPU_DRIVER_FILE),
+    ] {
+        let to = dest.join(name);
+        let tmp = to.with_extension("tmp");
+        std::fs::copy(from, &tmp).with_context(|| format!("copy {}", from.display()))?;
+        std::fs::rename(&tmp, &to)?;
+        installed.push(to.display().to_string());
+    }
+    Ok(installed)
+}
+
 pub async fn setup(dir: &Path, guest: Option<&Path>, force: bool) -> Result<SetupReport> {
     let arch = std::env::consts::ARCH;
     let (kernel_url, kernel_sha256, kernel_label) = kernel_source(std::env::consts::OS, arch)

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use pumasi_proto::{
     ModuleHash, Secret,
     economy::Policy,
+    gpu::GpuRequest,
     msg::{AccountView, LedgerEntry, LedgerKind, TaskRef},
     receipt::Receipt,
 };
@@ -57,6 +58,11 @@ const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 /// Key: collection root. Committed job inputs not yet used by a job:
 /// (account, size, files, committed unix).
 const UPLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("uploads");
+/// A node's latest signed device profile and the cluster's GPU checks
+/// (phase 9), by node id.
+const MEMBER_DEVICES: TableDefinition<&str, &[u8]> = TableDefinition::new("member_devices");
+/// The GPUs a job's tasks need (phase 9), by job id.
+const JOB_GPU: TableDefinition<u128, &[u8]> = TableDefinition::new("job_gpu");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -65,7 +71,7 @@ const CREDIT_RATE_META: &str = "credit_cpu_hour";
 /// Set once the credit receipts were countersigned again in CU.
 const CREDIT_RECEIPTS_DONE_META: &str = "credit_receipts_converted";
 /// Layout version written by this build.
-const SCHEMA: u32 = 4;
+const SCHEMA: u32 = 5;
 
 fn run_key(t: &TaskRef) -> RunKey {
     (t.job.0, t.index, t.attempt, t.check)
@@ -84,6 +90,8 @@ pub struct Snapshot {
     pub quotas: Vec<(String, u64)>,
     pub secrets: Vec<(String, u64, String)>,
     pub uploads: Vec<([u8; 32], crate::state::UploadRecord)>,
+    pub devices: Vec<(String, crate::gpu::DeviceRecord)>,
+    pub job_gpu: Vec<(u128, GpuRequest)>,
     pub members: Vec<Member>,
     pub tokens: Vec<TokenRecord>,
     pub jobs: Vec<(JobMeta, Vec<TaskRecord>)>,
@@ -141,6 +149,8 @@ impl Store {
         tx.open_table(QUOTAS)?;
         tx.open_table(SECRETS)?;
         tx.open_table(UPLOADS)?;
+        tx.open_table(MEMBER_DEVICES)?;
+        tx.open_table(JOB_GPU)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -172,6 +182,9 @@ impl Store {
         }
         if schema < 4 {
             store.migrate_v3()?;
+        }
+        if schema < 5 {
+            store.migrate_v4()?;
         }
         Ok(store)
     }
@@ -258,6 +271,24 @@ impl Store {
         }
         tx.commit()?;
         info!("migrated state database to layout 3");
+        Ok(())
+    }
+
+    /// Layout 5 adds GPU rates to the stored policy (at their defaults).
+    /// GPUs of nodes and jobs live in tables of their own.
+    fn migrate_v4(&self) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut meta = tx.open_table(META)?;
+            let old = meta.get(POLICY_META)?.map(|v| v.value().to_vec());
+            if let Some(old) = old {
+                let p: Policy = dec::<legacy::PolicyV4>(&old)?.into();
+                meta.insert(POLICY_META, enc(&p).as_slice())?;
+            }
+            meta.insert(SCHEMA_META, 5u32.to_le_bytes().as_slice())?;
+        }
+        tx.commit()?;
+        info!("migrated state database to layout 5");
         Ok(())
     }
 
@@ -522,6 +553,14 @@ impl Store {
             let root: [u8; 32] = k.value().try_into().context("bad upload key")?;
             snap.uploads.push((root, dec(v.value())?));
         }
+        for row in tx.open_table(MEMBER_DEVICES)?.iter()? {
+            let (k, v) = row?;
+            snap.devices.push((k.value().to_string(), dec(v.value())?));
+        }
+        for row in tx.open_table(JOB_GPU)?.iter()? {
+            let (k, v) = row?;
+            snap.job_gpu.push((k.value(), dec(v.value())?));
+        }
         snap.next_ledger_seq = tx
             .open_table(LEDGER)?
             .last()?
@@ -545,6 +584,15 @@ impl Store {
     pub fn remove_member(&self, id: &str) -> Result<()> {
         let tx = self.db.begin_write()?;
         tx.open_table(MEMBERS)?.remove(id)?;
+        tx.open_table(MEMBER_DEVICES)?.remove(id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_devices(&self, id: &str, d: &crate::gpu::DeviceRecord) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(MEMBER_DEVICES)?
+            .insert(id, enc(d).as_slice())?;
         tx.commit()?;
         Ok(())
     }
@@ -586,6 +634,10 @@ impl Store {
             if !meta.ext.is_empty() {
                 tx.open_table(JOB_EXT)?
                     .insert(meta.id.0, enc(&meta.ext).as_slice())?;
+            }
+            if let Some(g) = &meta.gpu {
+                tx.open_table(JOB_GPU)?
+                    .insert(meta.id.0, enc(g).as_slice())?;
             }
             let mut t = tx.open_table(TASKS)?;
             let mut ext = tx.open_table(TASK_EXT)?;
@@ -773,7 +825,7 @@ impl Store {
         let mut out = Vec::new();
         for row in t.range((job, 0, 0, false)..=(job, u32::MAX, u32::MAX, true))? {
             let (_, v) = row?;
-            out.push(dec(v.value())?);
+            out.push(Receipt::decode(v.value()).context("corrupt receipt in state database")?);
         }
         Ok(out)
     }
@@ -841,6 +893,40 @@ pub(crate) mod legacy {
         pub memory_gib_hour: i64,
     }
 
+    /// Layout 4 policy: CU rates without GPU rates.
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    pub struct PolicyV4 {
+        pub rates: RatesV4,
+        pub hold_secs: u64,
+        pub verify_permille: u32,
+        pub max_strikes: u32,
+        pub ledger: LedgerMode,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    pub struct RatesV4 {
+        pub memory_gib_hour: i64,
+        pub storage_gib_month: i64,
+        pub egress_gib: i64,
+    }
+
+    impl From<PolicyV4> for Policy {
+        fn from(p: PolicyV4) -> Self {
+            Policy {
+                rates: CuRates {
+                    memory_gib_hour: p.rates.memory_gib_hour,
+                    storage_gib_month: p.rates.storage_gib_month,
+                    egress_gib: p.rates.egress_gib,
+                    ..CuRates::default()
+                },
+                hold_secs: p.hold_secs,
+                verify_permille: p.verify_permille,
+                max_strikes: p.max_strikes,
+                ledger: p.ledger,
+            }
+        }
+    }
+
     /// The old default price of a core-hour (0.05 credits).
     pub const OLD_CPU_HOUR: i64 = 50_000;
     const OLD_DEFAULT: PricesV3 = PricesV3 {
@@ -854,23 +940,25 @@ pub(crate) mod legacy {
         /// The CU policy, and the price of a core-hour that becomes one CU.
         /// The old default prices give the new default rates; custom ones
         /// keep their memory-to-CPU ratio.
-        pub fn convert(self) -> (Policy, i64) {
+        pub fn convert(self) -> (PolicyV4, i64) {
             let p = &self.prices;
             let cpu_hour = [p.docker_cpu_hour, p.microvm_cpu_hour]
                 .into_iter()
                 .find(|&v| v > 0)
                 .unwrap_or(OLD_CPU_HOUR);
-            let rates = if self.prices == OLD_DEFAULT {
-                CuRates::default()
-            } else {
-                CuRates {
-                    memory_gib_hour: (p.memory_gib_hour.max(0) as i128 * MICRO_PER_CU as i128
-                        / cpu_hour as i128) as i64,
-                    ..CuRates::default()
-                }
+            let defaults = CuRates::default();
+            let rates = RatesV4 {
+                memory_gib_hour: if self.prices == OLD_DEFAULT {
+                    defaults.memory_gib_hour
+                } else {
+                    (p.memory_gib_hour.max(0) as i128 * MICRO_PER_CU as i128 / cpu_hour as i128)
+                        as i64
+                },
+                storage_gib_month: defaults.storage_gib_month,
+                egress_gib: defaults.egress_gib,
             };
             (
-                Policy {
+                PolicyV4 {
                     rates,
                     hold_secs: self.hold_secs,
                     verify_permille: self.verify_permille,
@@ -1074,6 +1162,7 @@ pub(crate) mod legacy {
                 account: OWNER_ACCOUNT.into(),
                 deterministic: false,
                 ext: Default::default(),
+                gpu: None,
             }
         }
     }

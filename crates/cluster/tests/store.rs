@@ -153,6 +153,8 @@ async fn spawn_agent(name: &str, ticket: JoinTicket) -> RunningAgent {
         upgrade: None,
         corrupt_results: false,
         store_cache_bytes: Some(256 * MIB as u64),
+        gpus: false,
+        fake_gpus: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,

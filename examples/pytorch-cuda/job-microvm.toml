@@ -1,0 +1,20 @@
+# The same training in microVMs with the GPU passed through (experimental).
+#
+# The provider's GPU must be bound to vfio-pci and the GPU guest bundle
+# installed (`pumasi vm setup --gpu-bundle DIR`, see
+# scripts/kernel/build-gpu.sh); `pumasi gpu check` shows both. The VM loads
+# its own NVIDIA driver, so the host needs none.
+#
+#   pumasi run examples/pytorch-cuda/job-microvm.toml
+name = "pytorch-cuda-vm"
+executor = "microvm"
+image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+command = ["python", "/input/train.py", "{shard}", "{shards}"]
+files = ["train.py"]
+shards = 2
+gpus = 1
+
+[resources]
+memory_mb = 6144
+cpus = 2
+timeout = "20m"

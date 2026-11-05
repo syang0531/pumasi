@@ -19,6 +19,10 @@ use crate::{
 
 const NODE_DOMAIN: &[u8] = b"pumasi/receipt/node/v1\0";
 const CLUSTER_DOMAIN: &[u8] = b"pumasi/receipt/cluster/v2\0";
+/// Receipts of runs with GPUs: the cluster signature also covers the GPU
+/// part. Receipts without GPUs keep the v2 message, so they verify the
+/// same in older versions.
+const CLUSTER_GPU_DOMAIN: &[u8] = b"pumasi/receipt/cluster/v3\0";
 const BLOB_PREFIX: &str = "pumasicureceipt";
 /// Receipts from before compute units (pumasi 0.6 and older).
 const OLD_BLOB_PREFIX: &str = "pumasireceipt";
@@ -96,6 +100,21 @@ pub struct Billing {
     pub recorded_unix: u64,
 }
 
+/// The GPUs a run had and what they cost (phase 9). The control plane
+/// assigned them, so it records them; [`Billing::exact_ucu`] includes
+/// `exact_ucu`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuBilling {
+    /// Each GPU's name, as the node reported it.
+    pub names: Vec<String>,
+    /// FP32 GFLOPS of all the GPUs together, as billed.
+    pub gflops: u64,
+    /// Memory of all the GPUs together.
+    pub vram_mib: u64,
+    /// The GPU part of the price, in micro-CU.
+    pub exact_ucu: MicroCu,
+}
+
 /// A countersigned usage receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
@@ -103,24 +122,80 @@ pub struct Receipt {
     pub node_sig: Signature,
     pub billing: Billing,
     pub cluster_sig: Signature,
+    /// Present for runs with GPUs. Last, so receipts from before phase 9
+    /// decode with [`Receipt::decode`].
+    pub gpu: Option<GpuBilling>,
 }
 
-fn cluster_message(usage: &Usage, node_sig: &Signature, billing: &Billing) -> Vec<u8> {
-    let mut m = CLUSTER_DOMAIN.to_vec();
-    m.extend(postcard::to_stdvec(&(usage, node_sig, billing)).expect("receipt encodes"));
-    m
+/// A receipt from before phase 9.
+#[derive(Deserialize)]
+struct ReceiptV2 {
+    usage: Usage,
+    node_sig: Signature,
+    billing: Billing,
+    cluster_sig: Signature,
+}
+
+fn cluster_message(
+    usage: &Usage,
+    node_sig: &Signature,
+    billing: &Billing,
+    gpu: Option<&GpuBilling>,
+) -> Vec<u8> {
+    match gpu {
+        None => {
+            let mut m = CLUSTER_DOMAIN.to_vec();
+            m.extend(postcard::to_stdvec(&(usage, node_sig, billing)).expect("receipt encodes"));
+            m
+        }
+        Some(g) => {
+            let mut m = CLUSTER_GPU_DOMAIN.to_vec();
+            m.extend(postcard::to_stdvec(&(usage, node_sig, billing, g)).expect("receipt encodes"));
+            m
+        }
+    }
 }
 
 impl Receipt {
     /// Countersigns a node's usage. The caller must have checked it.
     pub fn countersign(signed: SignedUsage, billing: Billing, key: &SecretKey) -> Self {
-        let cluster_sig = key.sign(&cluster_message(&signed.usage, &signed.node_sig, &billing));
+        Self::countersign_gpu(signed, billing, None, key)
+    }
+
+    /// [`Self::countersign`] for a run that may have had GPUs.
+    pub fn countersign_gpu(
+        signed: SignedUsage,
+        billing: Billing,
+        gpu: Option<GpuBilling>,
+        key: &SecretKey,
+    ) -> Self {
+        let cluster_sig = key.sign(&cluster_message(
+            &signed.usage,
+            &signed.node_sig,
+            &billing,
+            gpu.as_ref(),
+        ));
         Self {
             usage: signed.usage,
             node_sig: signed.node_sig,
             billing,
             cluster_sig,
+            gpu,
         }
+    }
+
+    /// Decodes a receipt of this layout or of the one before phase 9.
+    pub fn decode(bytes: &[u8]) -> postcard::Result<Self> {
+        postcard::from_bytes::<Self>(bytes).or_else(|e| {
+            let old: ReceiptV2 = postcard::from_bytes(bytes).map_err(|_| e)?;
+            Ok(Self {
+                usage: old.usage,
+                node_sig: old.node_sig,
+                billing: old.billing,
+                cluster_sig: old.cluster_sig,
+                gpu: None,
+            })
+        })
     }
 
     /// Checks both signatures.
@@ -132,7 +207,12 @@ impl Receipt {
         .verify()?;
         let key = PublicKey::from_bytes(&self.usage.cluster).context("bad cluster key")?;
         key.verify(
-            &cluster_message(&self.usage, &self.node_sig, &self.billing),
+            &cluster_message(
+                &self.usage,
+                &self.node_sig,
+                &self.billing,
+                self.gpu.as_ref(),
+            ),
             &self.cluster_sig,
         )
         .map_err(|_| anyhow::anyhow!("control plane signature does not match"))
@@ -184,7 +264,7 @@ impl Receipt {
         let bytes = data_encoding::BASE32_NOPAD
             .decode(body.to_ascii_uppercase().as_bytes())
             .context("receipt is not valid base32")?;
-        postcard::from_bytes(&bytes).context("receipt is corrupt")
+        Self::decode(&bytes).context("receipt is corrupt")
     }
 }
 
@@ -333,6 +413,39 @@ mod tests {
         let mut forged = receipt.clone();
         forged.usage.fuel_used += 1;
         assert!(forged.verify().is_err());
+
+        // A receipt from before phase 9 (no GPU part) still decodes and
+        // verifies: its signature is over the same message.
+        #[derive(Serialize)]
+        struct V2<'a>(&'a Usage, &'a Signature, &'a Billing, &'a Signature);
+        let old = postcard::to_stdvec(&V2(
+            &receipt.usage,
+            &receipt.node_sig,
+            &receipt.billing,
+            &receipt.cluster_sig,
+        ))
+        .unwrap();
+        let back = Receipt::decode(&old).unwrap();
+        assert_eq!(back, receipt);
+        back.verify().unwrap();
+
+        // With GPUs, the GPU part is signed too.
+        let signed = SignedUsage::sign(usage(&node, &cluster), &node);
+        let gpu = GpuBilling {
+            names: vec!["NVIDIA GeForce RTX 3060".into()],
+            gflops: 12_700,
+            vram_mib: 12 << 10,
+            exact_ucu: 4_870_000,
+        };
+        let r = Receipt::countersign_gpu(signed, receipt.billing.clone(), Some(gpu), &cluster);
+        r.verify().unwrap();
+        assert_eq!(Receipt::from_blob(&r.to_blob()).unwrap(), r);
+        let mut forged = r.clone();
+        forged.gpu.as_mut().unwrap().gflops = 1;
+        assert!(forged.verify().is_err());
+        let mut stripped = r.clone();
+        stripped.gpu = None;
+        assert!(stripped.verify().is_err());
     }
 
     #[test]

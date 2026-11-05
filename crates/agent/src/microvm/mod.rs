@@ -20,10 +20,14 @@
 //!    stderr, `/output` and the exit status to the output disk,
 //! 3. read the output disk back (as data: nothing from it is unpacked).
 //!
-//! The VM has no network device. Timeouts and cancellation kill the VMM
-//! process. See `pumasi_guest` for the disk protocol.
+//! The VM has no network device unless the job asks for one
+//! (`network = true`): then QEMU gives it a virtio-net card whose other end
+//! is the agent's filtering gateway ([`net`]), which lets it reach public
+//! addresses only. Timeouts and cancellation kill the VMM process. See
+//! `pumasi_guest` for the disk protocol.
 
 pub mod ext4;
+pub mod net;
 pub mod setup;
 pub mod vmm;
 pub mod vz;
@@ -74,6 +78,13 @@ pub const KERNEL_FILE: &str = if cfg!(target_os = "macos") {
 };
 /// Guest init file name (in the VM directory or next to the agent).
 pub const GUEST_FILE: &str = "pumasi-guest";
+/// The GPU guest kernel and driver disk (`pumasi vm setup --gpu-bundle`),
+/// in this subdirectory of the VM directory.
+pub const GPU_DIR: &str = "gpu";
+pub const GPU_KERNEL_FILE: &str = "vmlinux";
+pub const GPU_DRIVER_FILE: &str = "drivers.ext4";
+/// Memory a GPU VM needs on top of the task's limit (the driver).
+const GPU_VM_OVERHEAD_MIB: u64 = 512;
 /// Firecracker binary name (in the VM directory or on `PATH`).
 pub const FIRECRACKER_FILE: &str = "firecracker";
 
@@ -278,6 +289,36 @@ impl Assets {
     }
 }
 
+/// The GPU guest kernel, its driver disk, and QEMU with KVM to boot them.
+#[derive(Debug, Clone)]
+struct GpuAssets {
+    kernel: PathBuf,
+    drivers: PathBuf,
+    vmm: Vmm,
+}
+
+impl GpuAssets {
+    fn find(dir: &Path, assets: &Assets) -> Option<Self> {
+        if !cfg!(target_os = "linux") || !assets.kvm {
+            return None;
+        }
+        let gpu = dir.join(GPU_DIR);
+        let kernel = Some(gpu.join(GPU_KERNEL_FILE)).filter(|p| p.is_file())?;
+        let drivers = Some(gpu.join(GPU_DRIVER_FILE)).filter(|p| p.is_file())?;
+        let vmm = Vmm {
+            backend: Backend::Qemu,
+            bin: assets.qemu.clone()?,
+            accelerated: true,
+            tsc_khz: None,
+        };
+        Some(Self {
+            kernel,
+            drivers,
+            vmm,
+        })
+    }
+}
+
 /// A pulled image, ready to boot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImageEntry {
@@ -290,6 +331,11 @@ struct ImageEntry {
 #[derive(Clone)]
 pub struct MicrovmExecutor {
     vmm: Vmm,
+    /// The VMM for VMs with a network card (QEMU: the main one, or the
+    /// one next to Firecracker), if any.
+    net_vmm: Option<Vmm>,
+    /// What GPU passthrough needs, when it is all there.
+    gpu: Option<GpuAssets>,
     kernel: PathBuf,
     initrd: PathBuf,
     images: PathBuf,
@@ -392,8 +438,22 @@ impl MicrovmExecutor {
             let _ = std::fs::remove_dir_all(&run_dir);
         }
         std::fs::create_dir_all(&run_dir)?;
+        // Firecracker's network cards need TAP devices (root); QEMU's can
+        // talk to the gateway, so network tasks use QEMU when it is there.
+        let net_vmm = match vmm.backend {
+            Backend::Firecracker => assets.qemu.clone().map(|bin| Vmm {
+                backend: Backend::Qemu,
+                bin,
+                accelerated: assets.kvm,
+                tsc_khz: None,
+            }),
+            _ => None,
+        };
+        let gpu = GpuAssets::find(&config.dir, &assets);
         let mut exec = Self {
             vmm,
+            net_vmm,
+            gpu,
             kernel,
             initrd,
             images,
@@ -432,11 +492,16 @@ impl MicrovmExecutor {
                 }
             }
         }
+        if exec.vmm.backend == Backend::Qemu {
+            exec.net_vmm = Some(exec.vmm.clone());
+        }
         let vmm = &exec.vmm;
         info!(
             backend = %vmm.backend,
             vmm = %vmm.bin.display(),
             accelerated = vmm.accelerated,
+            network = exec.net_vmm.is_some(),
+            gpu_passthrough = exec.gpu.is_some(),
             "microvm executor enabled"
         );
         if !vmm.accelerated && !whpx && accel_override.is_none() {
@@ -488,6 +553,8 @@ impl MicrovmExecutor {
             ],
             vcpus: 1,
             mem_mib: MIN_VM_MIB,
+            net: None,
+            pci: vec![],
         };
         let deadline = Instant::now() + PROBE_TIMEOUT;
         let status = match self
@@ -522,6 +589,16 @@ impl MicrovmExecutor {
 
     pub fn backend(&self) -> Backend {
         self.vmm.backend
+    }
+
+    /// Whether microVMs here can have a network device (`network = true`).
+    pub fn network_capable(&self) -> bool {
+        self.net_vmm.is_some()
+    }
+
+    /// Whether GPUs can be passed through to microVMs here.
+    pub fn gpu_passthrough(&self) -> bool {
+        self.gpu.is_some()
     }
 
     /// Runs one task to completion.
@@ -598,11 +675,34 @@ impl MicrovmExecutor {
         cancel: &AtomicBool,
         io: &TaskIo,
     ) -> Result<RunResult> {
-        ensure!(
-            !spec.network,
-            "microvm tasks have no network; use a docker job"
-        );
-        ensure!(spec.gpus.is_none(), "microvm tasks cannot use GPUs yet");
+        ensure!(spec.gpus.is_none(), "ask for GPUs with a GPU request");
+        let gpu = if io.gpus.is_empty() {
+            None
+        } else {
+            let assets = self.gpu.as_ref().context(
+                "GPU passthrough is not set up here (QEMU with KVM and `pumasi vm setup --gpu-bundle`)",
+            )?;
+            let mut pci = Vec::new();
+            for g in &io.gpus {
+                crate::gpu::vfio::ready(&g.pci).map_err(|why| {
+                    anyhow::anyhow!("GPU {} cannot be passed through: {why}", g.pci)
+                })?;
+                for d in crate::gpu::vfio::passthrough_set(&g.pci) {
+                    if !pci.contains(&d) {
+                        pci.push(d);
+                    }
+                }
+            }
+            Some((assets, pci))
+        };
+        let net_vmm =
+            if spec.network {
+                Some(self.net_vmm.as_ref().context(
+                    "microVMs on this machine cannot have a network card (that needs QEMU)",
+                )?)
+            } else {
+                None
+            };
         let image = match &io.image {
             Some(img) => self.ensure_local_image(img, cancel).await?,
             None => self.ensure_image(&spec.image, cancel).await?,
@@ -612,6 +712,18 @@ impl MicrovmExecutor {
         let scratch = TempDir::new_in(&self.run_dir, &format!("{}-{}", task.job, task.index))?;
         let dir = scratch.path().to_path_buf();
         let mut run_spec = run_spec(&image.config, spec, input);
+        let gateway = match net_vmm {
+            Some(_) => {
+                run_spec.network = Some(pumasi_guest::GuestNet {
+                    address: net::GUEST.octets(),
+                    prefix: net::PREFIX,
+                    gateway: net::GATEWAY.octets(),
+                    dns: net::GATEWAY.octets(),
+                });
+                Some(net::Gateway::start().await?)
+            }
+            None => None,
+        };
         if io.keeps_output() {
             run_spec.output_limit = MAX_STORE_OUTPUT_BYTES;
             run_spec.output_files = 1_000_000;
@@ -677,10 +789,27 @@ impl MicrovmExecutor {
             ],
             vcpus: vcpus(limits.cpu_millis).min(MAX_VCPUS),
             mem_mib: (limits.memory_bytes.div_ceil(1 << 20) + VM_OVERHEAD_MIB).max(MIN_VM_MIB),
+            net: gateway.as_ref().map(|g| g.addr),
+            pci: vec![],
         };
+        let mut vm = vm;
+        if let Some((assets, pci)) = &gpu {
+            vm.kernel = assets.kernel.clone();
+            vm.disks.push(Disk {
+                path: assets.drivers.clone(),
+                read_only: true,
+            });
+            vm.pci = pci.clone();
+            vm.mem_mib += GPU_VM_OVERHEAD_MIB;
+        }
         let deadline = run_start + Duration::from_millis(limits.timeout_ms);
-        debug!(task = %task, image = %spec.image, "booting microvm");
-        let end = self.boot(&vm, &dir, Some(deadline), cancel).await?;
+        debug!(task = %task, image = %spec.image, network = spec.network, "booting microvm");
+        let vmm = match &gpu {
+            Some((assets, _)) => &assets.vmm,
+            None => net_vmm.unwrap_or(&self.vmm),
+        };
+        let end = self.boot_on(vmm, &vm, &dir, Some(deadline), cancel).await?;
+        drop(gateway);
         // Billed time starts at boot: pulling an image is not the job's run.
         let wall_ms = run_start.elapsed().as_millis() as u64;
         let outcome_for = |o: Outcome| RunResult {
@@ -754,15 +883,26 @@ impl MicrovmExecutor {
         deadline: Option<Instant>,
         cancel: &AtomicBool,
     ) -> Result<VmEnd> {
+        self.boot_on(&self.vmm, vm, dir, deadline, cancel).await
+    }
+
+    async fn boot_on(
+        &self,
+        vmm: &Vmm,
+        vm: &VmSpec,
+        dir: &Path,
+        deadline: Option<Instant>,
+        cancel: &AtomicBool,
+    ) -> Result<VmEnd> {
         let console = std::fs::File::create(dir.join("console.log"))?;
-        let mut cmd = self.vmm.command(vm, dir)?;
+        let mut cmd = vmm.command(vm, dir)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(console.try_clone()?)
             .stderr(console)
             .kill_on_drop(true);
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("start {}", self.vmm.bin.display()))?;
+            .with_context(|| format!("start {}", vmm.bin.display()))?;
         // Windows: the VMM dies with its job, so not even a crashed agent
         // leaves VMs running.
         let _job = crate::platform::ProcessJob::new()
@@ -773,7 +913,7 @@ impl MicrovmExecutor {
         // WHPX a guest reset can leave QEMU stuck instead of exiting. The
         // vz helper writes the console to its stdout; should a guest reboot
         // not stop the VM, the same watch ends it.
-        let (serial, watch_serial) = match self.vmm.backend {
+        let (serial, watch_serial) = match vmm.backend {
             Backend::Qemu if cfg!(windows) => (dir.join(vmm::SERIAL_LOG), true),
             Backend::Vz => (dir.join("console.log"), true),
             _ => (PathBuf::new(), false),
@@ -946,6 +1086,8 @@ impl MicrovmExecutor {
             ],
             vcpus: 1,
             mem_mib: BUILD_VM_MIB,
+            net: None,
+            pci: vec![],
         };
         let deadline = Instant::now() + BUILD_TIMEOUT;
         let status = match self.boot(&vm, work.path(), Some(deadline), cancel).await? {

@@ -1,7 +1,9 @@
 //! What the agent and the guest init (`pumasi-guest`, PID 1 inside every
 //! microVM) agree on.
 //!
-//! The guest has no network and no shared folders. Everything crosses the
+//! The guest has no shared folders, and no network unless the job asks for
+//! it ([`RunSpec::network`]: a virtio-net card whose other end is the
+//! agent's filtering gateway). Everything crosses the
 //! VM boundary as virtio block devices, and the guest finds each one by
 //! what is on it rather than by its device name (VMMs attach them in
 //! different orders):
@@ -13,6 +15,7 @@
 //! | layers | tar of the image's layer blobs (build mode) | tar whose first entry is [`DISK_ROLE_ENTRY`] = `layers` |
 //! | input | tar of the run spec, stdin and `/input` files (run mode) | same, `input` |
 //! | output | written by the guest: a tar of the result | starts with [`OUTPUT_MARK`] until the guest overwrites it |
+//! | gpu | the GPU driver for the GPU guest kernel, ext4, read-only (GPU tasks only) | ext4 label [`GPU_LABEL`] |
 //!
 //! The mode comes from the kernel command line (`pumasi.mode=build|run|probe`).
 //! In build mode the guest unpacks the layers onto the empty base disk, so
@@ -28,6 +31,11 @@ use serde::{Deserialize, Serialize};
 pub const BASE_LABEL: &str = "pumasi-base";
 /// Label of a task's empty writable disk.
 pub const SCRATCH_LABEL: &str = "pumasi-scratch";
+/// Label of the GPU driver disk: `modules.order` lists the kernel modules
+/// under `modules/` in load order, `lib/` holds the driver's user-space
+/// libraries (mounted at `/usr/local/nvidia/lib64` in the task's root, where
+/// CUDA images look) and `bin/` its tools (`/usr/local/nvidia/bin`).
+pub const GPU_LABEL: &str = "pumasi-gpu";
 /// First entry of the layers and input tars; its contents name the role.
 pub const DISK_ROLE_ENTRY: &str = ".pumasi-disk";
 pub const ROLE_LAYERS: &str = "layers";
@@ -82,6 +90,19 @@ pub struct RunSpec {
     /// Most `/output` files (0: [`MAX_OUTPUT_FILES`]).
     #[serde(default)]
     pub output_files: u32,
+    /// Bring up the network card with these settings (`network = true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<GuestNet>,
+}
+
+/// The guest's network settings: one card (`eth0`), a default route
+/// through the gateway, which is also the DNS server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestNet {
+    pub address: [u8; 4],
+    pub prefix: u8,
+    pub gateway: [u8; 4],
+    pub dns: [u8; 4],
 }
 
 impl RunSpec {

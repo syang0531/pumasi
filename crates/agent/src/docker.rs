@@ -64,6 +64,11 @@ pub struct DockerExecutor {
 }
 
 impl DockerExecutor {
+    /// The Docker CLI this executor runs.
+    pub fn bin(&self) -> &str {
+        &self.bin
+    }
+
     /// Limits containers of jobs without a CPU limit to `cpus` (the node's
     /// CPU cap; jobs with a limit are placed only within it).
     pub fn with_cpu_cap(mut self, cpus: Option<u32>) -> Self {
@@ -400,7 +405,10 @@ impl DockerExecutor {
             task.attempt,
             rand_u32()
         );
-        let args = create_args(&name, &self.label, spec, input, limits, self.cpu_cap);
+        let mut args = create_args(&name, &self.label, spec, input, limits, self.cpu_cap);
+        let image_at = args.len() - 1 - spec.command.len() - input.args.len();
+        let gpu_args = gpu_args(&io.gpus);
+        args.splice(image_at..image_at, gpu_args);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let created = self.cli(&arg_refs).await?;
         if !created.status.success() {
@@ -688,6 +696,63 @@ fn create_args(
     a.extend(spec.command.iter().cloned());
     a.extend(input.args.iter().cloned());
     a
+}
+
+/// Options that give a container its GPUs: `--gpus` with the NVIDIA
+/// GPUs' UUIDs (NVIDIA Container Toolkit, or Docker Desktop), AMD GPUs as
+/// `/dev/kfd` plus their render nodes, and `PUMASI_GPUS` with the node's
+/// numbers for them either way.
+fn gpu_args(gpus: &[pumasi_proto::gpu::GpuInfo]) -> Vec<String> {
+    use pumasi_proto::gpu::GpuVendor;
+    if gpus.is_empty() {
+        return Vec::new();
+    }
+    let mut a = Vec::new();
+    let nvidia: Vec<&str> = gpus
+        .iter()
+        .filter(|g| g.vendor == GpuVendor::Nvidia)
+        .map(|g| g.uuid.as_str())
+        .collect();
+    if !nvidia.is_empty() {
+        a.push("--gpus".into());
+        if nvidia.iter().any(|u| u.is_empty()) {
+            a.push("all".into());
+        } else {
+            // Docker's CSV syntax: the quotes keep the commas in one value.
+            a.push(format!("\"device={}\"", nvidia.join(",")));
+        }
+    }
+    let amd: Vec<&str> = gpus
+        .iter()
+        .filter(|g| g.vendor == GpuVendor::Amd && !g.render_node.is_empty())
+        .map(|g| g.render_node.as_str())
+        .collect();
+    if !amd.is_empty() {
+        a.extend(["--device".into(), "/dev/kfd".into()]);
+        for r in amd {
+            a.extend(["--device".into(), r.to_string()]);
+        }
+        // ROCm needs the render and video groups' access to the nodes.
+        for node in ["/dev/kfd", gpus[0].render_node.as_str()] {
+            if let Some(gid) = group_of(node) {
+                a.extend(["--group-add".into(), gid.to_string()]);
+            }
+        }
+    }
+    let list: Vec<String> = gpus.iter().map(|g| g.index.to_string()).collect();
+    a.extend(["--env".into(), format!("PUMASI_GPUS={}", list.join(","))]);
+    a
+}
+
+#[cfg(unix)]
+fn group_of(path: &str) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.gid())
+}
+
+#[cfg(not(unix))]
+fn group_of(_: &str) -> Option<u32> {
+    None
 }
 
 /// Splits `docker version`'s "<version> <os>" answer. Old daemons that
@@ -1033,5 +1098,46 @@ mod tests {
         assert!(joined.contains("--network bridge"));
         assert!(joined.contains("--gpus all"));
         assert!(joined.contains("--cpus 2.000"));
+    }
+
+    #[test]
+    fn gpus_become_device_options() {
+        use pumasi_proto::gpu::{GpuInfo, GpuVendor};
+        let g = |index, vendor, uuid: &str, render: &str| GpuInfo {
+            index,
+            vendor,
+            name: "g".into(),
+            uuid: uuid.into(),
+            pci: String::new(),
+            vram_mib: 0,
+            driver: String::new(),
+            compute: String::new(),
+            display: false,
+            fp32_gflops: 0,
+            measured: false,
+            mem_bw_gb_s: 0,
+            hash_rate: 0,
+            docker: true,
+            vfio: false,
+            render_node: render.into(),
+        };
+        assert!(gpu_args(&[]).is_empty());
+        let a = gpu_args(&[
+            g(0, GpuVendor::Nvidia, "GPU-a", ""),
+            g(2, GpuVendor::Nvidia, "GPU-b", ""),
+        ])
+        .join(" ");
+        assert_eq!(a, "--gpus \"device=GPU-a,GPU-b\" --env PUMASI_GPUS=0,2");
+        let a = gpu_args(&[g(1, GpuVendor::Amd, "", "/dev/dri/renderD129")]).join(" ");
+        assert!(
+            a.starts_with("--device /dev/kfd --device /dev/dri/renderD129"),
+            "{a}"
+        );
+        assert!(a.ends_with("--env PUMASI_GPUS=1"));
+        // Test GPUs (vendor Other) only get the variable.
+        assert_eq!(
+            gpu_args(&[g(0, GpuVendor::Other, "", "")]).join(" "),
+            "--env PUMASI_GPUS=0"
+        );
     }
 }

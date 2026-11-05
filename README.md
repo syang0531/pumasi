@@ -508,7 +508,7 @@ checked.
 | 13 | Control plane high availability (Raft) | planned |
 | 14 | WebGPU executor (experimental) | planned |
 | 15 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
-| 16 | Hub (separate private service): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
+| 16 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
 | 17 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
 Known gaps: single control plane (no Raft yet), no web console, accounts

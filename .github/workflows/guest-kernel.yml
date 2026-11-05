@@ -5,7 +5,8 @@ name: Guest kernel
 # artifact. On main, the first build whose SHA-256 matches the pin in
 # crates/agent/src/microvm/setup.rs is published as the prerelease named in
 # KERNEL_TAG, which `pumasi vm setup` downloads; later builds are compared
-# with it to show the build is reproducible.
+# with it to show the build is reproducible. A branch build that matches
+# the pin shows the published one will too.
 
 on:
   push:

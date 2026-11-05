@@ -120,13 +120,14 @@ saved 4 output files to pumasi-out/6d916b0dc63f63ea
 A container shares the host's kernel, so Docker jobs are for your own
 machines. The microVM executor runs the same OCI images, but boots every
 task in its own lightweight VM ([Firecracker](https://firecracker-microvm.github.io/)
-on Linux with KVM, QEMU with WHPX on Windows, or QEMU elsewhere) with its
+on Linux with KVM, Apple's Virtualization.framework on macOS 11+, QEMU with
+WHPX on Windows, or QEMU elsewhere) with its
 own Linux kernel and no network. The job file only adds
 `executor = "microvm"`:
 
 ```sh
-# Once per machine (Linux with KVM, Windows 10/11 x86_64; on Windows run it
-# from an administrator terminal, since it installs QEMU).
+# Once per machine (Linux with KVM, macOS 11+, Windows 10/11 x86_64; on
+# Windows run it from an administrator terminal, since it installs QEMU).
 pumasi vm setup
 pumasi vm run python:3.12-slim -- python -c 'import platform; print(platform.release())'
 # 6.1.102   <- the guest kernel, not the host's
@@ -177,6 +178,51 @@ pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
   `netsh advfirewall firewall set rule name="Pumasi agent (UDP in)" new profile=any`.
 - The VMs and Docker CLIs an agent starts are kept in Windows Job Objects,
   so they end with the agent even if it crashes.
+
+### Macs, old Intel ones too
+
+Any Mac from macOS 10.15 runs the agent, including the 2013-2014 Intel
+models whose last macOS is 10.15, 11 or 12:
+
+| Mac | Last macOS | WASM | microVM | Docker |
+| --- | --- | --- | --- | --- |
+| Mac mini (Late 2014), Mac Pro (Late 2013) | 12 Monterey | yes | yes | no |
+| MacBook Air (Mid 2013, Early 2014), MacBook Pro (Late 2013, Mid 2014), iMac (Mid 2014, 5K Late 2014) | 11 Big Sur | yes | yes | no |
+| iMac (Late 2013), MacBook Pro (Early 2013) | 10.15 Catalina | yes | no | no |
+| Apple Silicon | current | yes | yes | with Docker Desktop |
+
+From macOS 11, microVMs run on Apple's Virtualization.framework, built
+into macOS: nothing to install, and `pumasi vm setup` only downloads the
+guest kernel and signs a helper copy of the binary (the framework only
+serves signed programs). Docker Desktop and Homebrew's QEMU support only
+recent macOS releases, so old Macs take WASM and microVM jobs.
+
+```sh
+curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.sh | sudo sh
+pumasi vm setup        # macOS 11+: guest kernel + signed VM helper
+pumasi vm status       # "vz usable" means microVMs work
+sudo pumasi service install --ticket pumasijoin... -- --allow-microvm --only-on-ac --idle-minutes 10
+```
+
+### When a machine takes work
+
+Machines people use can lend themselves only when nobody notices. Agent
+options (also after `--` in `pumasi service install`):
+
+| Option | Effect |
+| --- | --- |
+| `--only-on-ac` | No new tasks while on battery |
+| `--idle-minutes 10` | No new tasks until keyboard and mouse have been idle 10 minutes |
+| `--hours 22:00-07:00` | No new tasks outside these local times (several: `00:00-08:00,12:00-13:00`) |
+| `--max-cpu-percent 50` | Offer half the CPUs: image jobs that need more go elsewhere, slots follow |
+| `--slots N` | Tasks at once (default: one per CPU offered, but at most one per GiB of memory beyond the first two) |
+
+A paused machine gets no new tasks and finishes the ones it is running;
+`pumasi status` shows it as `paused` with the reason (e.g. "on battery
+power"). Idle time comes from the whole machine on macOS (so a
+LaunchDaemon sees it) and from terminals and desktop sessions on Linux; on
+Windows the agent must run in the user's session to see input (as a
+service it reports that it cannot tell, and stays paused).
 
 ### Other people's machines: invites, credit and checks
 
@@ -497,8 +543,8 @@ checked.
 | 2 | Invited outside providers (open tier), usage receipts signed by node and cluster, fixed price list, prepaid credit ledger, sampled re-runs to check results | done |
 | 3 | microVM executor: same OCI images as docker jobs in Firecracker or QEMU VMs, behind the same job format, open to providers | done |
 | 4 | Distribution and install: release binaries for six platforms with SHA256SUMS, install scripts, OS services, signed cluster-driven upgrades with rollback | done |
-| 5 | Windows: Docker Desktop (WSL 2), microVMs with QEMU + WHPX (TCG fallback), pinned QEMU install, Job Objects, built-in ext4 formatter and guest init | this release |
-| 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours) | planned |
+| 5 | Windows: Docker Desktop (WSL 2), microVMs with QEMU + WHPX (TCG fallback), pinned QEMU install, Job Objects, built-in ext4 formatter and guest init | done |
+| 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours, CPU cap, memory-aware slots) | this release |
 | 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | planned |
 | 8 | Cluster file store (iroh-blobs): datasets, large inputs and outputs, resumable transfers, storage billed in CU, private registry images | planned |
 | 9 | GPUs and microVM devices: detection, GPU benchmarks in CU, scheduling, Docker GPU jobs, VFIO passthrough, microVM networking | planned |
@@ -516,11 +562,13 @@ exist only inside one cluster and only the admin can submit (with
 `--account`), credits are not connected to real payments, input and output
 files are size-capped (48 MiB in, 32 MiB out per task) because they travel
 through the control plane. MicroVMs pull only public images, have no
-network and no GPUs yet, and need KVM (Linux) or WHPX (Windows x86_64) for
-speed (QEMU without them works but is slow; the macOS path through QEMU is
-untested, and Windows on ARM has no microVMs yet). WHPX itself is checked
-on real machines only: CI runners have it only nested, where it breaks
-QEMU's disks and the agent falls back to emulation.
+network and no GPUs yet, and need KVM (Linux), Virtualization.framework
+(macOS 11+) or WHPX (Windows x86_64) for speed (QEMU without them works but
+is slow, and Windows on ARM has no microVMs yet). WHPX and
+Virtualization.framework guests are checked on real machines only: CI
+runners have WHPX only nested, where it breaks QEMU's disks and the agent
+falls back to emulation, and hosted Mac runners cannot virtualize at all.
+macOS 10.15 and 11 themselves have no CI runners either.
 
 ## Development
 

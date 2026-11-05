@@ -1346,7 +1346,6 @@ async fn microvm_jobs_run_on_an_invited_provider() {
     for (i, t) in view.tasks.iter().enumerate() {
         assert_eq!(t.node.as_deref(), Some(provider_id.as_str()));
         assert_eq!(t.stdout.as_deref(), Some(&b"isolated\n"[..]), "{t:#?}");
-        assert!(t.cost > 0, "microvm runs are billed");
         let AdminResponse::Files(files) = client
             .call(AdminOp::TaskFiles {
                 id,
@@ -1377,8 +1376,14 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         r.verify().unwrap();
         assert_eq!(r.usage.executor, Executor::Microvm);
         assert_eq!(r.billing.provider, "bob");
-        assert!(r.billing.exact_ucu > 0);
+        // A half-second run is a fraction of a milli-CU: priced exactly on
+        // the receipt, carried over in the ledger until it adds up.
+        assert!(r.billing.exact_ucu > 0, "microvm runs are billed");
     }
+    assert_eq!(
+        rs.iter().map(|r| r.billing.amount).sum::<i64>(),
+        view.summary.cost
+    );
 
     // Timeout kills the VM; exit codes and signals come through.
     let mut slow = docker_job(&["sleep", "60"], vec![TaskInput::default()]);

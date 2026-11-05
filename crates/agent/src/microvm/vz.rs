@@ -204,8 +204,8 @@ mod imp {
 
     pub fn status() -> std::result::Result<(), String> {
         load()?;
-        let cls = class(c"VZVirtualMachineConfiguration").map_err(|e| e.to_string())?;
-        // SAFETY: a class property available since macOS 11.
+        let cls = class(c"VZVirtualMachine").map_err(|e| e.to_string())?;
+        // SAFETY: `+[VZVirtualMachine isSupported]`, macOS 11.
         let ok: Bool = unsafe { msg_send![cls, isSupported] };
         if ok.as_bool() {
             Ok(())
@@ -271,7 +271,9 @@ mod imp {
 
     pub fn run(c: &VzConfig) -> Result<()> {
         load().map_err(anyhow::Error::msg)?;
-        status().map_err(anyhow::Error::msg)?;
+        // The configuration is built and validated before asking whether
+        // the hardware can run it, so every call up to the start runs even
+        // on Macs (and CI runners) that cannot virtualize.
         let config_cls = class(c"VZVirtualMachineConfiguration")?;
 
         // Boot loader: kernel, initramfs, command line.
@@ -362,6 +364,8 @@ mod imp {
                 bail!("invalid VM configuration: {}", describe(err));
             }
         }
+
+        status().map_err(anyhow::Error::msg)?;
 
         // The VM lives on the main queue, which the run loop below drains.
         let vm: Retained<AnyObject> = unsafe {

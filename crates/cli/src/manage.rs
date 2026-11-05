@@ -162,7 +162,7 @@ pub async fn edit_node(home: &Path, admin: &AdminArgs, node: &str, edit: NodeEdi
         admin,
         AdminOp::EditNode {
             node: node.to_string(),
-            edit,
+            edit: Box::new(edit),
         },
     )
     .await?;

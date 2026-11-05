@@ -232,7 +232,7 @@ async fn edit(client: &AdminClient, node: &str, edit: NodeEdit) {
     client
         .call(AdminOp::EditNode {
             node: node.into(),
-            edit,
+            edit: Box::new(edit),
         })
         .await
         .unwrap();

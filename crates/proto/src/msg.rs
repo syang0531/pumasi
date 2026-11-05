@@ -524,7 +524,7 @@ pub enum AdminOp {
     /// prefix).
     EditNode {
         node: String,
-        edit: NodeEdit,
+        edit: Box<NodeEdit>,
     },
     /// Cordons a node and moves its running tasks to other nodes.
     Drain {
@@ -971,6 +971,17 @@ pub struct JobView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clippy (`result_large_err`) refuses results whose error is an
+    /// `AdminOp` of 128 bytes or more: box large variant fields instead.
+    #[test]
+    fn admin_op_stays_small() {
+        assert!(
+            std::mem::size_of::<AdminOp>() < 128,
+            "AdminOp is {} bytes",
+            std::mem::size_of::<AdminOp>()
+        );
+    }
 
     fn node() -> NodeInfo {
         NodeInfo {

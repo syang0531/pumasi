@@ -136,6 +136,10 @@ pub struct Metered {
     pub cpu_millis: Option<u32>,
     /// CPU score of the node's vCPUs (1000 = the reference vCPU).
     pub cpu_score: u32,
+    /// GPUs the run had: their FP32 GFLOPS added up (as billed), and
+    /// their memory added up. Zero for runs without GPUs.
+    pub gpu_gflops: u64,
+    pub gpu_vram_mib: u64,
 }
 
 /// The CU rate table: what each resource costs in micro-CU. CPU time is
@@ -148,15 +152,23 @@ pub struct CuRates {
     pub storage_gib_month: MicroCu,
     /// Per GiB sent out of the cluster (phase 8 onwards).
     pub egress_gib: MicroCu,
+    /// Per hour of a GPU, for each TFLOPS of its FP32 throughput (phase 9).
+    pub gpu_tflops_hour: MicroCu,
+    /// Per hour of a GPU, for each GiB of its memory (phase 9).
+    pub gpu_vram_gib_hour: MicroCu,
 }
 
 impl Default for CuRates {
-    /// One vCPU with 4 GiB for an hour is 2 CU, with 2 GiB 1.5 CU.
+    /// One vCPU with 4 GiB for an hour is 2 CU, with 2 GiB 1.5 CU. A GPU
+    /// hour is 0.1 CU per FP32 TFLOPS plus 0.3 CU per GiB of its memory:
+    /// about 5 CU for a 12 GiB RTX 3060, 15 CU for a 24 GiB RTX 4090.
     fn default() -> Self {
         Self {
             memory_gib_hour: 250_000,
             storage_gib_month: 500_000,
             egress_gib: 100_000,
+            gpu_tflops_hour: 100_000,
+            gpu_vram_gib_hour: 300_000,
         }
     }
 }
@@ -192,6 +204,39 @@ impl CuRates {
 
     /// The exact price of one run in micro-CU (rounded down).
     pub fn charge(&self, m: &Metered) -> MicroCu {
+        self.charge_cpu(m).saturating_add(self.charge_gpu(m))
+    }
+
+    /// The GPU part of a run's price: the GPUs' rate for the run's wall
+    /// time (a GPU is reserved for the whole run, whatever the CPU score).
+    pub fn charge_gpu(&self, m: &Metered) -> MicroCu {
+        if m.gpu_gflops == 0 && m.gpu_vram_mib == 0 {
+            return 0;
+        }
+        let rate = |p: MicroCu| p.max(0) as u128;
+        let ns = m.wall_ms as u128 * 1_000_000;
+        // Rates are per TFLOPS-hour and per GiB-hour.
+        let per_hour = m.gpu_gflops as u128 * rate(self.gpu_tflops_hour) / 1000
+            + m.gpu_vram_mib as u128 * rate(self.gpu_vram_gib_hour) / 1024;
+        (per_hour * ns / NS_PER_HOUR).min(i64::MAX as u128) as MicroCu
+    }
+
+    /// CU per hour of GPUs with these totals, in micro-CU.
+    pub fn gpu_per_hour(&self, gflops: u64, vram_mib: u64) -> MicroCu {
+        self.charge_gpu(&Metered {
+            executor: Executor::Docker,
+            fuel_used: 0,
+            wall_ms: 3_600_000,
+            memory_bytes: 0,
+            cpu_millis: None,
+            cpu_score: REFERENCE_SCORE,
+            gpu_gflops: gflops,
+            gpu_vram_mib: vram_mib,
+        })
+    }
+
+    /// The CPU and memory part of a run's price.
+    pub fn charge_cpu(&self, m: &Metered) -> MicroCu {
         let rate = |p: MicroCu| p.max(0) as u128;
         let t = Self::reference_ns(m);
         // vCPU-thousandths: a WASM task uses one core.
@@ -277,7 +322,9 @@ impl Policy {
         ensure!(
             self.rates.memory_gib_hour >= 0
                 && self.rates.storage_gib_month >= 0
-                && self.rates.egress_gib >= 0,
+                && self.rates.egress_gib >= 0
+                && self.rates.gpu_tflops_hour >= 0
+                && self.rates.gpu_vram_gib_hour >= 0,
             "rates must not be negative"
         );
         ensure!(
@@ -364,6 +411,8 @@ mod tests {
             memory_bytes: memory_gib << 30,
             cpu_millis,
             cpu_score: score,
+            gpu_gflops: 0,
+            gpu_vram_mib: 0,
         }
     }
 
@@ -420,6 +469,8 @@ mod tests {
             memory_bytes: 0,
             cpu_millis: None,
             cpu_score: 3000,
+            gpu_gflops: 0,
+            gpu_vram_mib: 0,
         };
         assert_eq!(r.charge(&wasm), 1_000_000);
         assert_eq!(
@@ -430,6 +481,25 @@ mod tests {
             }),
             1_000_000
         );
+    }
+
+    #[test]
+    fn gpus_are_billed_for_wall_time_by_throughput_and_memory() {
+        let r = CuRates::default();
+        // An RTX 3060: 12.7 TFLOPS, 12 GiB.
+        assert_eq!(r.gpu_per_hour(12_700, 12 << 10), 1_270_000 + 3_600_000);
+        // An RTX 4090: 82.6 TFLOPS, 24 GiB.
+        assert_eq!(r.gpu_per_hour(82_600, 24 << 10), 8_260_000 + 7_200_000);
+        let run = Metered {
+            gpu_gflops: 12_700,
+            gpu_vram_mib: 12 << 10,
+            ..docker(1_800_000, 4, None, 2000)
+        };
+        // Half an hour: the GPU at its hourly rate, the CPU by its score.
+        assert_eq!(r.charge_gpu(&run), (1_270_000 + 3_600_000) / 2);
+        assert_eq!(r.charge_cpu(&run), 2_000_000);
+        assert_eq!(r.charge(&run), r.charge_cpu(&run) + r.charge_gpu(&run));
+        assert_eq!(r.charge_gpu(&docker(1_800_000, 4, None, 2000)), 0);
     }
 
     #[test]

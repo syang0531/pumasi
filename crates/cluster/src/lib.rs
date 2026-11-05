@@ -3,6 +3,7 @@
 mod check;
 mod datasets;
 pub mod files;
+pub mod gpu;
 mod ledger;
 pub mod perf;
 pub mod rollout;

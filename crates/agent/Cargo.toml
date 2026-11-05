@@ -29,6 +29,10 @@ rustls.workspace = true
 rustls-native-certs.workspace = true
 webpki-roots.workspace = true
 chrono.workspace = true
+# GPUs: NVML and the CUDA driver are loaded at run time, when present.
+libloading = "0.8"
+# MicroVM networking: a user-space TCP/IP stack the guest NIC talks to.
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 
 [dev-dependencies]
 wat.workspace = true

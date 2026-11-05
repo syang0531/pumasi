@@ -461,6 +461,18 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
                     st.on_heartbeat(&node_id, generation);
                     st.on_upgrade_failed(&node_id, generation, sha256, reason);
                 }
+                Ok(Some(FromAgent::Devices(d))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    if let Err(e) = st.on_devices(&node_id, generation, *d) {
+                        warn!(node = %node_id, "rejected device profile: {e:#}");
+                    }
+                }
+                Ok(Some(FromAgent::GpuResult { nonce, solutions })) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_gpu_result(&node_id, generation, nonce, solutions);
+                }
                 Ok(Some(FromAgent::Availability(a))) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);

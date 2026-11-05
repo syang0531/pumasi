@@ -77,6 +77,13 @@ pub struct AgentConfig {
     /// Size of the file store cache (datasets and private images this
     /// node fetched). `None`: [`DEFAULT_CACHE_BYTES`].
     pub store_cache_bytes: Option<u64>,
+    /// Offer this machine's GPUs to GPU jobs.
+    pub gpus: bool,
+    /// Test hook: report these GPUs instead of detecting any. Docker gets
+    /// no device options for them (their vendor is `Other`), only
+    /// `PUMASI_GPUS`. Never set this in real use.
+    #[doc(hidden)]
+    pub fake_gpus: Option<Vec<pumasi_proto::gpu::GpuInfo>>,
 }
 
 /// What the agent remembers about the cluster it joined.
@@ -115,6 +122,8 @@ pub struct Agent {
     rebench: Arc<Notify>,
     /// The file store cache, which other nodes may fetch from.
     node_store: NodeStore,
+    /// GPUs and microVM networking, signed; sent after the welcome.
+    devices: Option<pumasi_proto::gpu::SignedDevices>,
     _router: Router,
 }
 
@@ -229,6 +238,43 @@ impl Agent {
             }
             None => None,
         };
+        let devices = {
+            let env = crate::gpu::GpuEnv {
+                docker_nvidia: match &docker {
+                    Some(d) if config.gpus => crate::gpu::docker_nvidia(d.bin()).await,
+                    _ => false,
+                },
+                docker_amd: config.gpus && docker.is_some() && cfg!(target_os = "linux"),
+                vfio: config.gpus && microvm.as_ref().is_some_and(|m| m.gpu_passthrough()),
+                bench: config.gpus && config.bench.is_some(),
+            };
+            let fake = config.fake_gpus.clone();
+            let detect = config.gpus || fake.is_some();
+            let (gpus, notes) = if let Some(f) = fake {
+                (f, Vec::new())
+            } else if detect {
+                tokio::task::spawn_blocking(move || {
+                    let mut notes = Vec::new();
+                    let g = crate::gpu::detect(&env, &mut notes);
+                    (g, notes)
+                })
+                .await?
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            for g in &gpus {
+                info!(
+                    gpu = g.index,
+                    name = %g.describe(),
+                    docker = g.docker,
+                    microvm = g.vfio,
+                    "GPU found"
+                );
+            }
+            let network = microvm.as_ref().is_some_and(|m| m.network_capable());
+            let profile = crate::gpu::profile(*key.public().as_bytes(), gpus, network, notes);
+            Some(pumasi_proto::gpu::SignedDevices::sign(profile, &key))
+        };
         if docker.is_some() {
             info.executors.push(Executor::Docker);
         }
@@ -250,8 +296,14 @@ impl Agent {
             perf: Arc::new(Mutex::new(perf)),
             rebench: Arc::new(Notify::new()),
             node_store,
+            devices,
             _router: router,
         })
+    }
+
+    /// The signed device profile (GPUs, microVM networking).
+    pub fn devices(&self) -> Option<&pumasi_proto::gpu::SignedDevices> {
+        self.devices.as_ref()
     }
 
     /// The latest signed performance profile, if the machine was measured.
@@ -470,6 +522,9 @@ impl Agent {
         if let Some(p) = self.perf() {
             let _ = out_tx.send(FromAgent::Perf(Box::new(p)));
         }
+        if let Some(d) = &self.devices {
+            let _ = out_tx.send(FromAgent::Devices(Box::new(d.clone())));
+        }
         let benchmarks = self.config.bench.clone().map(|config| {
             let out_tx = out_tx.clone();
             let running = running.clone();
@@ -654,6 +709,28 @@ impl Agent {
                         }
                     });
                 }
+                Ok(Some(ToAgent::GpuChallenge(ch))) => {
+                    let pci = self
+                        .devices
+                        .as_ref()
+                        .and_then(|d| d.profile.gpus.iter().find(|g| g.index == ch.device))
+                        .map(|g| g.pci.clone())
+                        .unwrap_or_default();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let solutions = if pci.is_empty() {
+                            Vec::new()
+                        } else {
+                            tokio::task::spawn_blocking(move || crate::gpu::solve(&pci, &ch))
+                                .await
+                                .unwrap_or_default()
+                        };
+                        let _ = out_tx.send(FromAgent::GpuResult {
+                            nonce: ch.nonce,
+                            solutions,
+                        });
+                    });
+                }
                 Ok(Some(ToAgent::Rebenchmark)) => {
                     if self.config.bench.is_some() {
                         info!("the cluster asked for a new benchmark");
@@ -714,6 +791,26 @@ impl Agent {
         let out_tx = out_tx.clone();
         let key = self.key.clone();
         let corrupt = self.config.corrupt_results;
+        let gpus: Vec<pumasi_proto::gpu::GpuInfo> = self
+            .devices
+            .as_ref()
+            .map(|d| {
+                d.profile
+                    .gpus
+                    .iter()
+                    .filter(|g| a.gpus.contains(&g.index))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if gpus.len() != a.gpus.len() {
+            running.lock().unwrap().remove(&a.task);
+            let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
+                a.task,
+                format!("this node has no GPU {:?}", a.gpus),
+            ))));
+            return;
+        }
         let node_store = self.node_store.clone();
         let cluster_addr = cluster_addr.clone();
         let cluster = *cluster_addr.id.as_bytes();
@@ -724,7 +821,7 @@ impl Agent {
             // first; the run's timeout starts after.
             let prepared =
                 prepare_io(&node_store, &a, &cluster_addr, &docker, &microvm, &cancel).await;
-            let (io, _held, _dirs) = match prepared {
+            let (mut io, _held, _dirs) = match prepared {
                 Ok(p) => p,
                 Err(e) => {
                     running.lock().unwrap().remove(&task);
@@ -735,6 +832,7 @@ impl Agent {
                     return;
                 }
             };
+            io.gpus = gpus;
             let result: Result<RunResult> = match a.executor {
                 Executor::Wasm => {
                     let Some(hash) = a.module_hash else {

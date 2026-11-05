@@ -6,6 +6,7 @@ pub mod availability;
 pub mod bench;
 pub mod docker;
 pub mod executor;
+pub mod gpu;
 pub mod microvm;
 pub mod platform;
 pub mod store;

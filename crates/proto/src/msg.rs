@@ -20,6 +20,7 @@ use iroh::EndpointAddr;
 use crate::{
     ModuleHash, Secret,
     economy::{MilliCu, Policy},
+    gpu::{GpuChallenge, GpuInfo, GpuRequest, SignedDevices},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput},
     perf::{BenchChallenge, PerfProfile, SignedPerf},
     receipt::{Receipt, SignedUsage},
@@ -255,6 +256,9 @@ pub struct TaskAssignment {
     /// Other nodes that have the mounted collections (and the image)
     /// cached; tried before the control plane.
     pub peers: Vec<EndpointAddr>,
+    // Protocol 9 from here; only protocol 9 agents get GPU jobs.
+    /// The node's GPUs (by [`GpuInfo::index`]) this task may use.
+    pub gpus: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +273,9 @@ pub enum ToAgent {
     Benchmark(BenchChallenge),
     /// Measure this machine again and send a new profile (protocol 7).
     Rebenchmark,
+    /// Solve this GPU challenge now and answer with
+    /// [`FromAgent::GpuResult`]; the control plane times it (protocol 9).
+    GpuChallenge(GpuChallenge),
 }
 
 /// How a task ended.
@@ -361,6 +368,15 @@ pub enum FromAgent {
         full: bool,
         added: Vec<BlobHash>,
         removed: Vec<BlobHash>,
+    },
+    /// The node's signed device profile (GPUs, microVM networking), sent
+    /// after the welcome and whenever it changes (protocol 9).
+    Devices(Box<SignedDevices>),
+    /// The answer to a [`ToAgent::GpuChallenge`]: the solutions found, or
+    /// none if the GPU could not run it (protocol 9).
+    GpuResult {
+        nonce: u64,
+        solutions: Vec<u64>,
     },
 }
 
@@ -784,6 +800,22 @@ pub struct NodeView {
     /// it on the connection, and whether it goes through a relay.
     pub rtt_us: Option<u32>,
     pub relayed: bool,
+    /// The node's GPUs (protocol 9 agents), and which are busy.
+    pub gpus: Vec<GpuView>,
+    /// MicroVMs on this node can have a network.
+    pub microvm_network: bool,
+}
+
+/// A GPU in the cluster status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuView {
+    pub info: GpuInfo,
+    /// FP32 GFLOPS its runs are billed at.
+    pub billed_gflops: u32,
+    /// Why the billed figure differs from the profile's.
+    pub note: Option<String>,
+    /// The task using it right now.
+    pub busy: Option<TaskRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -845,6 +877,10 @@ pub struct JobView {
     /// What the job waits for before its tasks can run (pulling a private
     /// image into the store), or why it failed.
     pub preparing: Option<String>,
+    /// The GPUs each task needs.
+    pub gpu: Option<GpuRequest>,
+    /// Image jobs: the tasks may reach the internet.
+    pub network: bool,
 }
 
 #[cfg(test)]

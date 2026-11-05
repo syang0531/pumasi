@@ -18,10 +18,10 @@ use std::{
 };
 
 use pumasi_guest::{
-    BASE_LABEL, DISK_ROLE_ENTRY, GuestOutcome, GuestResult, INPUT_PREFIX, MAX_OUTPUT_FILES,
-    MAX_OUTPUT_FILES_BYTES, MAX_STREAM_BYTES, MODE_PARAM, OUTPUT_MARK, OUTPUT_PREFIX, RESULT_ENTRY,
-    ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL, SPEC_ENTRY, STDERR_ENTRY, STDIN_ENTRY,
-    STDOUT_ENTRY,
+    BASE_LABEL, DISK_ROLE_ENTRY, GPU_LABEL, GuestOutcome, GuestResult, INPUT_PREFIX,
+    MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES, MAX_STREAM_BYTES, MODE_PARAM, OUTPUT_MARK,
+    OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL, SPEC_ENTRY,
+    STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY,
 };
 
 type R<T> = Result<T, String>;
@@ -150,6 +150,7 @@ struct Disks {
     layers: Option<String>,
     input: Option<String>,
     output: Option<String>,
+    gpu: Option<String>,
 }
 
 fn find_disks() -> io::Result<Disks> {
@@ -177,6 +178,7 @@ fn find_disks() -> io::Result<Disks> {
             match label.as_str() {
                 BASE_LABEL => d.base = Some(dev),
                 SCRATCH_LABEL => d.scratch = Some(dev),
+                GPU_LABEL => d.gpu = Some(dev),
                 other => log(&format!("{dev}: unknown filesystem label {other:?}")),
             }
         } else if let Some(role) = tar_role(head) {
@@ -561,10 +563,17 @@ fn run_inner(d: &Disks) -> R<Payload> {
     }
     let (uid, gid, home) = resolve_user(root, &spec.user)?;
     prepare_root(root, &spec, uid, gid)?;
+    if let Some(gpu) = d.gpu.as_deref() {
+        gpu_setup(gpu, root)?;
+    }
 
     let mut env = spec.env.clone();
     if !env.iter().any(|e| e.starts_with("PATH=")) {
         env.push(format!("PATH={DEFAULT_PATH}"));
+    }
+    if d.gpu.is_some() {
+        add_to_list(&mut env, "PATH", NVIDIA_BIN, false);
+        add_to_list(&mut env, "LD_LIBRARY_PATH", NVIDIA_LIB, true);
     }
     if !env.iter().any(|e| e.starts_with("HOME=")) {
         env.push(format!("HOME={home}"));
@@ -640,6 +649,102 @@ fn run_inner(d: &Disks) -> R<Payload> {
         output_dir: Some(root.join("output")),
         limits: (spec.files_limit(), spec.count_limit()),
     })
+}
+
+/// Where the GPU driver's libraries and tools appear in the task's root
+/// (the paths NVIDIA's CUDA images already search).
+const NVIDIA_LIB: &str = "/usr/local/nvidia/lib64";
+const NVIDIA_BIN: &str = "/usr/local/nvidia/bin";
+
+/// Adds `dir` to a `:`-separated variable unless it is there.
+fn add_to_list(env: &mut Vec<String>, var: &str, dir: &str, front: bool) {
+    let prefix = format!("{var}=");
+    match env.iter_mut().find(|e| e.starts_with(&prefix)) {
+        Some(e) => {
+            let cur = e[prefix.len()..].to_string();
+            if !cur.split(':').any(|d| d == dir) {
+                *e = if cur.is_empty() {
+                    format!("{prefix}{dir}")
+                } else if front {
+                    format!("{prefix}{dir}:{cur}")
+                } else {
+                    format!("{prefix}{cur}:{dir}")
+                };
+            }
+        }
+        None => env.push(format!("{prefix}{dir}")),
+    }
+}
+
+/// Loads the GPU driver from its disk, makes its device nodes and mounts
+/// its libraries and tools into the task's root.
+fn gpu_setup(dev: &str, root: &Path) -> R<()> {
+    fs::create_dir_all("/gpu").ctx("/gpu")?;
+    mount(dev, "/gpu", "ext4", libc::MS_RDONLY, "")?;
+    let order =
+        fs::read_to_string("/gpu/modules.order").ctx("read the GPU driver's module list")?;
+    for m in order
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        if m.split('/').any(|c| c == "..") {
+            return Err(format!("bad module path {m:?}"));
+        }
+        let f = File::open(Path::new("/gpu/modules").join(m)).ctx(m)?;
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_finit_module,
+                f.as_raw_fd(),
+                c"".as_ptr(),
+                0 as libc::c_int,
+            )
+        };
+        if r != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EEXIST) {
+                return Err(format!("load the GPU driver ({m}): {e}"));
+            }
+        }
+    }
+    // The device nodes NVIDIA's libraries open (no udev here).
+    let devices = fs::read_to_string("/proc/devices").unwrap_or_default();
+    let major = |name: &str| {
+        devices.lines().find_map(|l| {
+            let (n, d) = l.trim().split_once(' ')?;
+            (d.trim() == name).then(|| n.parse::<u32>().ok()).flatten()
+        })
+    };
+    let gpus = fs::read_dir("/proc/driver/nvidia/gpus")
+        .map(|d| d.count() as u32)
+        .unwrap_or(0);
+    if gpus == 0 {
+        return Err("the GPU driver loaded but found no GPU".into());
+    }
+    let mut nodes = vec![("nvidiactl".to_string(), 195, 255)];
+    for i in 0..gpus {
+        nodes.push((format!("nvidia{i}"), 195, i));
+    }
+    if let Some(uvm) = major("nvidia-uvm") {
+        nodes.push(("nvidia-uvm".into(), uvm, 0));
+        nodes.push(("nvidia-uvm-tools".into(), uvm, 1));
+    }
+    for (name, maj, min) in nodes {
+        let p = cstr(root.join("dev").join(&name));
+        unsafe {
+            libc::mknod(p.as_ptr(), libc::S_IFCHR | 0o666, libc::makedev(maj, min));
+            libc::chmod(p.as_ptr(), 0o666);
+        }
+    }
+    for (from, to) in [("/gpu/lib", NVIDIA_LIB), ("/gpu/bin", NVIDIA_BIN)] {
+        if !Path::new(from).is_dir() {
+            continue;
+        }
+        let target = root.join(to.trim_start_matches('/'));
+        fs::create_dir_all(&target).ctx(to)?;
+        mount(from, &target.to_string_lossy(), "", libc::MS_BIND, "")?;
+    }
+    Ok(())
 }
 
 /// The task process, between `fork` and `execve`. Never returns.
@@ -823,7 +928,95 @@ fn prepare_root(root: &Path, spec: &RunSpec, uid: u32, gid: u32) -> R<()> {
         let _ = fs::write(root.join("etc/hostname"), format!("{hostname}\n"));
     }
     loopback_up();
+    if let Some(net) = &spec.network {
+        network_up(net)?;
+        if root.join("etc").is_dir() {
+            let resolv = root.join("etc/resolv.conf");
+            // Images often ship it as a symlink into /run; replace it.
+            let _ = fs::remove_file(&resolv);
+            let [a, b, c, d] = net.dns;
+            let _ = fs::write(&resolv, format!("nameserver {a}.{b}.{c}.{d}\n"));
+        }
+    }
     Ok(())
+}
+
+fn sockaddr_in(ip: [u8; 4]) -> libc::sockaddr {
+    let sin = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(ip),
+        },
+        sin_zero: [0; 8],
+    };
+    unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sin) }
+}
+
+/// Configures `eth0` and the default route, the way `ip addr add` and
+/// `ip route add default` would.
+fn network_up(net: &pumasi_guest::GuestNet) -> R<()> {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(format!("socket: {}", io::Error::last_os_error()));
+        }
+        let ifreq = || {
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            for (i, b) in b"eth0".iter().enumerate() {
+                ifr.ifr_name[i] = *b as libc::c_char;
+            }
+            ifr
+        };
+        let check = |r: libc::c_int, what: &str| -> R<()> {
+            if r < 0 {
+                Err(format!("{what}: {}", io::Error::last_os_error()))
+            } else {
+                Ok(())
+            }
+        };
+        let res = (|| -> R<()> {
+            let mut ifr = ifreq();
+            ifr.ifr_ifru.ifru_addr = sockaddr_in(net.address);
+            check(
+                libc::ioctl(fd, libc::SIOCSIFADDR as _, &ifr),
+                "set the address of eth0 (is there a network card?)",
+            )?;
+            let mask = if net.prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - net.prefix.min(32) as u32)
+            };
+            let mut ifr = ifreq();
+            ifr.ifr_ifru.ifru_netmask = sockaddr_in(mask.to_be_bytes());
+            check(
+                libc::ioctl(fd, libc::SIOCSIFNETMASK as _, &ifr),
+                "set the netmask of eth0",
+            )?;
+            let mut ifr = ifreq();
+            check(
+                libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut ifr),
+                "read eth0 flags",
+            )?;
+            ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+            check(
+                libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &ifr),
+                "bring eth0 up",
+            )?;
+            let mut rt: libc::rtentry = std::mem::zeroed();
+            rt.rt_dst = sockaddr_in([0; 4]);
+            rt.rt_genmask = sockaddr_in([0; 4]);
+            rt.rt_gateway = sockaddr_in(net.gateway);
+            rt.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
+            check(
+                libc::ioctl(fd, libc::SIOCADDRT as _, &rt),
+                "add the default route",
+            )?;
+            Ok(())
+        })();
+        libc::close(fd);
+        res
+    }
 }
 
 fn loopback_up() {

@@ -1,6 +1,7 @@
 //! `pumasi`: one binary for the control plane, the node agent and the
 //! admin CLI.
 
+mod gpu_cmd;
 mod service;
 mod upgrade;
 
@@ -133,6 +134,10 @@ enum Cmd {
         #[arg(long)]
         cpus: Option<u32>,
     },
+    /// This machine's GPUs: list them, or check what jobs could do with
+    /// them (Docker, microVM passthrough, the cluster's GPU check).
+    #[command(subcommand)]
+    Gpu(gpu_cmd::GpuCmd),
     /// Show one node: its benchmark profile, billed CPU score, latency and
     /// checks. With --rebenchmark, ask it to measure itself again.
     Node {
@@ -339,6 +344,12 @@ enum VmCmd {
         /// Download again even if the files exist.
         #[arg(long)]
         force: bool,
+        /// Also install a GPU guest bundle (a directory with `vmlinux` and
+        /// `drivers.ext4`, built by scripts/kernel/build-gpu.sh), so GPUs
+        /// bound to vfio-pci can be passed through to microVMs. Linux with
+        /// KVM and QEMU only; experimental.
+        #[arg(long, value_name = "DIR")]
+        gpu_bundle: Option<PathBuf>,
         #[command(flatten)]
         vm: VmArgs,
     },
@@ -369,6 +380,10 @@ enum VmCmd {
         /// Where to save what the task writes to /output.
         #[arg(long, default_value = "pumasi-out/vm")]
         out: PathBuf,
+        /// Give the VM a network card that reaches public addresses only
+        /// (needs QEMU).
+        #[arg(long)]
+        network: bool,
         #[command(flatten)]
         vm: VmArgs,
     },
@@ -447,6 +462,12 @@ enum PricesCmd {
         /// CU per GiB sent out of the cluster.
         #[arg(long)]
         egress_gib: Option<String>,
+        /// CU per hour of GPU time per FP32 TFLOPS, e.g. 0.1.
+        #[arg(long)]
+        gpu_tflops_hour: Option<String>,
+        /// CU per hour per GiB of GPU memory, e.g. 0.3.
+        #[arg(long)]
+        gpu_vram_gib_hour: Option<String>,
         /// CU per GiB-month stored when the control plane's disk is a
         /// hard disk (`storage-gib-month` is the SSD rate).
         #[arg(long)]
@@ -575,6 +596,10 @@ struct AgentOpts {
     /// reference CPU score (1000).
     #[arg(long)]
     no_benchmark: bool,
+    /// Do not offer this machine's GPUs to the cluster (they are still
+    /// listed in the device profile, but no job gets them).
+    #[arg(long)]
+    no_gpus: bool,
     /// How often to benchmark again (while idle), e.g. 24h or 7d.
     #[arg(long, default_value = "24h")]
     bench_interval: String,
@@ -784,6 +809,7 @@ async fn run(cli: Cli) -> Result<i32> {
             json,
             cpus,
         } => bench(&home, dir, quick, json, cpus).await,
+        Cmd::Gpu(cmd) => gpu_cmd::run(cmd).await,
         Cmd::Node {
             id,
             rebenchmark,
@@ -1099,6 +1125,8 @@ async fn agent(
             smoke_test: true,
         }),
         corrupt_results: false,
+        gpus: !opts.no_gpus,
+        fake_gpus: None,
         store_cache_bytes: opts.store_cache.as_deref().map(parse_size).transpose()?,
     };
     let exe = config.upgrade.as_ref().map(|u| u.exe.clone());
@@ -1373,6 +1401,11 @@ fn print_status(s: &ClusterStatus) {
     if s.nodes.iter().any(|n| n.perf_note.is_some()) {
         println!("(SCORE: billed CPU score, 1000 = reference vCPU; * see `pumasi node <id>`)");
     }
+    for n in s.nodes.iter().filter(|n| !n.gpus.is_empty()) {
+        for g in &n.gpus {
+            println!("{:<16} {}", truncate(&n.info.name, 16), gpu_line(g));
+        }
+    }
     for n in s.nodes.iter().filter(|n| n.online) {
         if let Some(reason) = &n.paused {
             println!("{} is paused: {reason}", truncate(&n.info.name, 16));
@@ -1415,6 +1448,12 @@ fn print_job(v: &JobView, output: bool) {
     match &v.image {
         Some(image) => println!("  executor {} ({image})", v.executor),
         None => println!("  executor {}", v.executor),
+    }
+    if let Some(g) = &v.gpu {
+        println!("  gpus: {g}");
+    }
+    if v.network {
+        println!("  network: on");
     }
     println!(
         "  account {}  cost {} CU{}",
@@ -1494,6 +1533,38 @@ fn print_job(v: &JobView, output: bool) {
             }
         }
     }
+}
+
+/// `GPU 0 NVIDIA GeForce RTX 3060 (12 GiB, 12.7 TFLOPS) docker [busy 3f2a…/0]`.
+fn gpu_line(g: &pumasi_proto::msg::GpuView) -> String {
+    let i = &g.info;
+    let mut uses = Vec::new();
+    if i.docker {
+        uses.push("docker");
+    }
+    if i.vfio {
+        uses.push("microvm");
+    }
+    let mut s = format!(
+        "GPU {} {} {}",
+        i.index,
+        i.describe(),
+        if uses.is_empty() {
+            "(not usable here)".to_string()
+        } else {
+            uses.join(",")
+        }
+    );
+    if g.billed_gflops != i.fp32_gflops {
+        s.push_str(&format!(
+            " billed {} TFLOPS",
+            pumasi_proto::gpu::format_tflops(g.billed_gflops)
+        ));
+    }
+    if let Some(t) = &g.busy {
+        s.push_str(&format!(" [running {t}]"));
+    }
+    s
 }
 
 fn executor_list(executors: &[Executor]) -> String {
@@ -1890,12 +1961,22 @@ async fn exec_local(
 
 async fn vm(home: &Path, cmd: VmCmd) -> Result<i32> {
     match cmd {
-        VmCmd::Setup { guest, force, vm } => {
+        VmCmd::Setup {
+            guest,
+            force,
+            gpu_bundle,
+            vm,
+        } => {
             let config = vm.config(home);
             let report =
                 pumasi_agent::microvm::setup::setup(&config.dir, guest.as_deref(), force).await?;
             for f in &report.installed {
                 eprintln!("installed {f}");
+            }
+            if let Some(b) = &gpu_bundle {
+                for f in pumasi_agent::microvm::setup::install_gpu_bundle(&config.dir, b)? {
+                    eprintln!("installed {f}");
+                }
             }
             for f in &report.kept {
                 eprintln!("kept      {f}");
@@ -1912,6 +1993,7 @@ async fn vm(home: &Path, cmd: VmCmd) -> Result<i32> {
             cpus,
             input,
             out,
+            network,
             vm,
         } => {
             let exec = MicrovmExecutor::detect(&vm.config(home), "local").await?;
@@ -1939,7 +2021,7 @@ async fn vm(home: &Path, cmd: VmCmd) -> Result<i32> {
             let spec = pumasi_proto::job::DockerSpec {
                 image,
                 command,
-                network: false,
+                network,
                 gpus: None,
             };
             let limits = Limits {
@@ -2053,6 +2135,29 @@ fn vm_status(config: &MicrovmConfig) -> Result<i32> {
                     ""
                 } else {
                     " (software emulation: slow)"
+                }
+            );
+            let gpu = config.dir.join(pumasi_agent::microvm::GPU_DIR);
+            println!(
+                "gpu passthrough: {}",
+                if !cfg!(target_os = "linux") {
+                    "Linux only"
+                } else if !gpu.join(pumasi_agent::microvm::GPU_DRIVER_FILE).is_file() {
+                    "not set up (`pumasi vm setup --gpu-bundle DIR`; experimental)"
+                } else if !a.kvm || a.qemu.is_none() {
+                    "needs QEMU with KVM"
+                } else {
+                    "ready for GPUs bound to vfio-pci (`pumasi gpu check`)"
+                }
+            );
+            println!(
+                "network: {}",
+                if vmm.backend == Backend::Qemu
+                    || (vmm.backend == Backend::Firecracker && a.qemu.is_some())
+                {
+                    "jobs with network = true get a filtered network card (QEMU)"
+                } else {
+                    "not available (jobs with network = true need QEMU)"
                 }
             );
             Ok(0)
@@ -2232,6 +2337,8 @@ async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Resul
         memory_gib_hour,
         storage_gib_month,
         egress_gib,
+        gpu_tflops_hour,
+        gpu_vram_gib_hour,
         storage_hdd_gib_month,
         storage_nvme_gib_month,
         default_quota,
@@ -2250,6 +2357,12 @@ async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Resul
         }
         if let Some(v) = egress_gib {
             p.rates.egress_gib = parse_rate(&v)?;
+        }
+        if let Some(v) = gpu_tflops_hour {
+            p.rates.gpu_tflops_hour = parse_rate(&v)?;
+        }
+        if let Some(v) = gpu_vram_gib_hour {
+            p.rates.gpu_vram_gib_hour = parse_rate(&v)?;
         }
         let limit = credit_limit.as_deref().map(parse_cu).transpose()?;
         p.ledger = match (ledger, p.ledger) {
@@ -2364,6 +2477,18 @@ fn print_policy(p: &Policy) {
         "  e.g. 1 vCPU + 2 GiB for an hour = {} CU, 1 vCPU + 4 GiB = {} CU",
         format_rate(r.per_hour(1, 2)),
         format_rate(r.per_hour(1, 4))
+    );
+    println!(
+        "  gpu-tflops-hour {:>10}  per hour per FP32 TFLOPS of the GPUs a run holds",
+        format_rate(r.gpu_tflops_hour)
+    );
+    println!(
+        "  gpu-vram-gib-hour {:>8}  per hour per GiB of their memory",
+        format_rate(r.gpu_vram_gib_hour)
+    );
+    println!(
+        "  e.g. a 12 GiB, 12.7 TFLOPS GPU for an hour = {} CU on top of CPU and memory",
+        format_rate(r.gpu_per_hour(12_700, 12 * 1024))
     );
     println!("ledger");
     match p.ledger {
@@ -2533,6 +2658,48 @@ fn print_node(n: &NodeView) {
     if n.role == Role::Provider {
         println!("  checks passed {}, strikes {}", n.checks_passed, n.strikes);
     }
+    if n.executors.contains(&Executor::Microvm) {
+        println!(
+            "  microVM network {}",
+            if n.microvm_network {
+                "available (jobs with network = true)"
+            } else {
+                "not available"
+            }
+        );
+    }
+    if n.gpus.is_empty() {
+        println!("  no GPUs");
+    }
+    for g in &n.gpus {
+        println!("  {}", gpu_line(g));
+        if let Some(note) = &g.note {
+            println!("    {note}");
+        }
+        let i = &g.info;
+        let mut facts = Vec::new();
+        if !i.pci.is_empty() {
+            facts.push(format!("pci {}", i.pci));
+        }
+        if !i.driver.is_empty() {
+            facts.push(format!("driver {}", i.driver));
+        }
+        if !i.compute.is_empty() {
+            facts.push(format!("compute {}", i.compute));
+        }
+        if i.mem_bw_gb_s > 0 {
+            facts.push(format!("{} GB/s", i.mem_bw_gb_s));
+        }
+        if i.hash_rate > 0 {
+            facts.push(format!("{:.1} Ghash/s", i.hash_rate as f64 / 1e9));
+        }
+        if i.display {
+            facts.push("drives a display".into());
+        }
+        if !facts.is_empty() {
+            println!("    {}", facts.join(", "));
+        }
+    }
     match &n.perf {
         Some(p) => {
             println!("benchmark of {} UTC", utc(p.measured_unix));
@@ -2578,7 +2745,19 @@ struct ReceiptRow {
     exact_cu: String,
     cu: String,
     recorded_unix: u64,
+    /// GPUs the run held (receipts from before GPUs have none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu: Option<GpuRow>,
     receipt: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GpuRow {
+    names: Vec<String>,
+    gflops: u64,
+    vram_mib: u64,
+    /// The GPU part of `exact_cu`.
+    exact_cu: String,
 }
 
 impl From<&Receipt> for ReceiptRow {
@@ -2606,6 +2785,12 @@ impl From<&Receipt> for ReceiptRow {
             exact_cu: format_rate(b.exact_ucu),
             cu: format_cu(b.amount),
             recorded_unix: b.recorded_unix,
+            gpu: r.gpu.as_ref().map(|g| GpuRow {
+                names: g.names.clone(),
+                gflops: g.gflops,
+                vram_mib: g.vram_mib,
+                exact_cu: format_rate(g.exact_ucu),
+            }),
             receipt: r.to_blob(),
         }
     }
@@ -2617,8 +2802,17 @@ fn data_hex(b: &[u8]) -> String {
 
 fn print_receipts(receipts: &[Receipt]) {
     println!(
-        "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12}",
-        "RECEIPT", "RUN", "NODE", "OUTCOME", "FUEL", "WALL ms", "PEAK MiB", "PROVIDER", "CU"
+        "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10}",
+        "RECEIPT",
+        "RUN",
+        "NODE",
+        "OUTCOME",
+        "FUEL",
+        "WALL ms",
+        "PEAK MiB",
+        "PROVIDER",
+        "CU",
+        "GPU CU"
     );
     for r in receipts {
         let u = &r.usage;
@@ -2629,7 +2823,7 @@ fn print_receipts(receipts: &[Receipt]) {
             if u.task.check { "c" } else { "" }
         );
         println!(
-            "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12}",
+            "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10}",
             r.short_id(),
             run,
             short(&r.node_id()),
@@ -2640,13 +2834,19 @@ fn print_receipts(receipts: &[Receipt]) {
                 .map(|b| format!("{:.1}", b as f64 / (1 << 20) as f64))
                 .unwrap_or_else(|| "-".into()),
             truncate(&r.billing.provider, 10),
-            format_cu(r.billing.amount)
+            format_cu(r.billing.amount),
+            r.gpu
+                .as_ref()
+                .map(|g| format_rate(g.exact_ucu))
+                .unwrap_or_else(|| "-".into())
         );
     }
     if receipts.is_empty() {
         println!("(no receipts yet)");
     } else {
-        println!("(RUN: task#attempt, c = check run; export with --export to verify offline)");
+        println!(
+            "(RUN: task#attempt, c = check run; GPU CU: the GPU part of the exact price; export with --export to verify offline)"
+        );
     }
 }
 

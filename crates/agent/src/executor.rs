@@ -77,6 +77,8 @@ pub struct TaskIo {
     pub scratch: Option<PathBuf>,
     /// A private image taken from the file store.
     pub image: Option<LocalImage>,
+    /// The GPUs the cluster gave this task.
+    pub gpus: Vec<pumasi_proto::gpu::GpuInfo>,
 }
 
 impl TaskIo {

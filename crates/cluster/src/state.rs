@@ -14,8 +14,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{PublicKey, SecretKey};
 use pumasi_proto::{
-    ModuleHash, STORE_PROTOCOL, Secret,
+    DEVICES_PROTOCOL, ModuleHash, STORE_PROTOCOL, Secret,
     economy::{Metered, MilliCu, Policy, validate_account, vcpus},
+    gpu::{GpuRequest, GpuVendor},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{
         AccountView, Availability, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo,
@@ -34,6 +35,7 @@ use tracing::{info, warn};
 pub use crate::datasets::{DatasetRecord, ImageState, JobExt, TaskExt, UploadRecord};
 use crate::{
     datasets::{FileState, oci_arch_of},
+    gpu::{DeviceRecord, GpuRuntime},
     perf::{PerfCheck, PerfRuntime, cpu_score},
     rollout::RolloutRecord,
     store::Store,
@@ -129,6 +131,9 @@ pub struct JobMeta {
     /// File store details, persisted in their own table.
     #[serde(skip)]
     pub ext: JobExt,
+    /// The GPUs each task needs, persisted in their own table.
+    #[serde(skip)]
+    pub gpu: Option<GpuRequest>,
 }
 
 /// What a run produced, kept for a check run until the check settles in
@@ -237,6 +242,8 @@ pub(crate) struct NodeRuntime {
     pub paused: Option<String>,
     /// Protocol, round-trip time and benchmark checks.
     pub perf: PerfRuntime,
+    /// GPUs in use and GPU checks.
+    pub gpu: GpuRuntime,
 }
 
 impl NodeRuntime {
@@ -285,6 +292,8 @@ pub struct State {
     pub(crate) upgrading: HashMap<String, ([u8; 32], Instant)>,
     /// Datasets, quotas, secrets and the rest of the file store.
     pub(crate) files: FileState,
+    /// Nodes' device profiles (GPUs) and the cluster's GPU checks.
+    pub(crate) devices: HashMap<String, DeviceRecord>,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -356,7 +365,9 @@ impl State {
             upgrade_failures: HashMap::new(),
             upgrading: HashMap::new(),
             files: FileState::default(),
+            devices: snap.devices.into_iter().collect(),
         };
+        let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
         let mut job_ext: HashMap<u128, JobExt> = snap.job_ext.into_iter().collect();
         let mut task_ext: HashMap<(u128, u32), TaskExt> = snap.task_ext.into_iter().collect();
         state.rollout = state.load_rollout()?;
@@ -367,6 +378,21 @@ impl State {
         for (mut meta, mut tasks) in jobs {
             state.next_seq = state.next_seq.max(meta.seq + 1);
             meta.ext = job_ext.remove(&meta.id.0).unwrap_or_default();
+            meta.gpu = job_gpu.remove(&meta.id.0).or_else(|| {
+                // Jobs from before phase 9 passed `--gpus` to docker: that
+                // was every NVIDIA GPU of the node.
+                meta.docker
+                    .as_ref()
+                    .and_then(|d| d.gpus.as_ref())
+                    .map(|_| GpuRequest {
+                        count: 0,
+                        vendor: Some(GpuVendor::Nvidia),
+                        min_vram_mib: 0,
+                    })
+            });
+            if let Some(d) = meta.docker.as_mut() {
+                d.gpus = None;
+            }
             for (i, t) in tasks.iter_mut().enumerate() {
                 t.ext = task_ext.remove(&(meta.id.0, i as u32)).unwrap_or_default();
             }
@@ -544,6 +570,7 @@ impl State {
         let id = self.resolve_member(id)?;
         let id = id.as_str();
         self.members.remove(id);
+        self.devices.remove(id);
         self.store.remove_member(id)?;
         if let Some(n) = self.nodes.get_mut(id)
             && let Some(kill) = n.kill.take()
@@ -634,6 +661,7 @@ impl State {
                     protocol,
                     ..Default::default()
                 },
+                gpu: GpuRuntime::default(),
             },
         );
         self.schedule();
@@ -673,6 +701,7 @@ impl State {
         node.tx = None;
         self.files.caches.remove(id);
         node.perf.challenge = None;
+        node.gpu = GpuRuntime::default();
         if let Some(kill) = node.kill.take() {
             let _ = kill.send(());
         }
@@ -750,6 +779,7 @@ impl State {
             warn!(node = %id, task = %t, "task exceeded its lease; rescheduling");
             if let Some(n) = self.nodes.get_mut(&id) {
                 n.running.remove(&t);
+                n.gpu.busy.remove(&t);
                 if let Some(tx) = &n.tx {
                     let _ = tx.send(ToAgent::Cancel(t));
                 }
@@ -760,12 +790,14 @@ impl State {
         self.tick_files();
         self.expire_upgrades();
         self.expire_challenges();
+        self.expire_gpu_challenges();
         if !self.queue.is_empty() || self.rollout.is_some() {
             self.schedule();
         } else {
             // A re-timing asked for within the gap between two challenges
             // waits for a tick, not for the next job.
             self.drive_challenges();
+            self.drive_gpu_challenges();
         }
     }
 
@@ -817,6 +849,7 @@ impl State {
             account,
             deterministic: sub.deterministic,
             ext,
+            gpu: sub.gpu,
         };
         self.next_seq += 1;
         let tasks: Vec<TaskRecord> = sub
@@ -944,6 +977,7 @@ impl State {
             // Stale: the task was already rescheduled elsewhere.
             return;
         };
+        let gpus = node.gpu.busy.remove(&report.task).unwrap_or_default();
         node.completed += 1;
         let observed_ms = placed.elapsed().as_millis() as u64;
         let r = report.task;
@@ -979,7 +1013,8 @@ impl State {
             return;
         }
         if let Some(signed) = report.usage.clone() {
-            self.settle_run(node_id, signed, observed_ms);
+            self.settle_run(node_id, signed, observed_ms, &gpus);
+            self.sample_gpus(node_id, &gpus);
         }
 
         if r.check {
@@ -1003,6 +1038,7 @@ impl State {
         if node.generation != generation || node.running.remove(&task).is_none() {
             return;
         }
+        node.gpu.busy.remove(&task);
         warn!(node = %node_id, task = %task, "report rejected: {why}");
         self.requeue_run(task, why);
         self.schedule();
@@ -1049,6 +1085,7 @@ impl State {
         node_id: &str,
         signed: pumasi_proto::receipt::SignedUsage,
         observed_ms: u64,
+        gpus: &[u32],
     ) {
         let r = signed.usage.task;
         let Some(job) = self.jobs.get(&r.job) else {
@@ -1062,18 +1099,27 @@ impl State {
         let consumer = job.meta.account.clone();
         let billed_wall_ms = signed.usage.wall_ms.min(observed_ms);
         let cpu_score = self.billing_score_of(node_id);
+        let mut gpu = self.gpu_billing(node_id, gpus);
+        let metered = Metered {
+            executor: signed.usage.executor,
+            fuel_used: signed.usage.fuel_used,
+            wall_ms: billed_wall_ms,
+            memory_bytes: signed.usage.memory_limit_bytes,
+            cpu_millis: signed.usage.cpu_millis,
+            cpu_score,
+            gpu_gflops: gpu.as_ref().map_or(0, |g| g.gflops),
+            gpu_vram_mib: gpu.as_ref().map_or(0, |g| g.vram_mib),
+        };
         let exact_ucu = if provider == consumer {
             0
         } else {
-            self.policy.rates.charge(&Metered {
-                executor: signed.usage.executor,
-                fuel_used: signed.usage.fuel_used,
-                wall_ms: billed_wall_ms,
-                memory_bytes: signed.usage.memory_limit_bytes,
-                cpu_millis: signed.usage.cpu_millis,
-                cpu_score,
-            })
+            self.policy.rates.charge(&metered)
         };
+        if let Some(g) = gpu.as_mut()
+            && provider != consumer
+        {
+            g.exact_ucu = self.policy.rates.charge_gpu(&metered);
+        }
         let amount = self.carry_forward(&consumer, &provider, exact_ucu);
         if signed.usage.executor == Executor::Wasm {
             self.note_run_speed(node_id, signed.usage.fuel_used, billed_wall_ms);
@@ -1088,7 +1134,7 @@ impl State {
             check: r.check,
             recorded_unix: now_unix(),
         };
-        let receipt = Receipt::countersign(signed, billing, &self.key);
+        let receipt = Receipt::countersign_gpu(signed, billing, gpu, &self.key);
         if let Some(task) = self
             .jobs
             .get_mut(&r.job)
@@ -1260,6 +1306,7 @@ impl State {
         // idle nodes due for a benchmark check get that.
         self.drive_rollout();
         self.drive_challenges();
+        self.drive_gpu_challenges();
         let mut skipped = VecDeque::new();
         let mut dirty: Vec<(JobId, u32)> = Vec::new();
         while let Some(item) = self.queue.pop_front() {
@@ -1300,6 +1347,10 @@ impl State {
             let need = job.meta.limits.memory_bytes;
             let executor = job.meta.executor;
             let store_job = job.meta.ext.needs_store;
+            let gpu_req = job.meta.gpu.clone();
+            let vm_network = executor == Executor::Microvm
+                && job.meta.docker.as_ref().is_some_and(|d| d.network);
+            let devices = &self.devices;
             // Image jobs get their CPUs (a WASM task uses one): a node
             // offers as many as it reports, which its CPU cap lowers.
             let need_cpus = match executor {
@@ -1336,6 +1387,18 @@ impl State {
                         && ready_images.as_ref().is_none_or(|imgs| {
                             let arch = oci_arch_of(&n.info.arch);
                             imgs.iter().any(|(a, _)| *a == arch)
+                        })
+                        && (!vm_network
+                            || (n.perf.protocol >= DEVICES_PROTOCOL
+                                && devices
+                                    .get(id.as_str())
+                                    .is_some_and(|d| d.signed.profile.microvm_network)))
+                        && gpu_req.as_ref().is_none_or(|req| {
+                            n.perf.protocol >= DEVICES_PROTOCOL
+                                && !n.gpu.checking()
+                                && devices.get(id.as_str()).is_some_and(|d| {
+                                    req.pick(d.gpus(), &n.gpu.busy_set(), executor).is_some()
+                                })
                         })
                 })
                 .max_by_key(|(_, n)| {
@@ -1407,7 +1470,16 @@ impl State {
             } else {
                 OutputMode::Auto
             };
+            let gpus = gpu_req
+                .as_ref()
+                .and_then(|req| {
+                    self.devices
+                        .get(node_id.as_str())
+                        .and_then(|d| req.pick(d.gpus(), &node.gpu.busy_set(), executor))
+                })
+                .unwrap_or_default();
             let assignment = TaskAssignment {
+                gpus: gpus.clone(),
                 task: r,
                 program: job.meta.name.clone(),
                 executor: job.meta.executor,
@@ -1434,6 +1506,9 @@ impl State {
             node.sent_modules.extend(module_hash);
             node.sent_modules.extend(files_hash);
             node.running.insert(r, Instant::now());
+            if !gpus.is_empty() {
+                node.gpu.busy.insert(r, gpus);
+            }
             if item.check {
                 if let Some(c) = task.check.as_mut() {
                     c.attempts = attempt;
@@ -1534,6 +1609,11 @@ impl State {
                     perf_note,
                     rtt_us: online.and_then(|n| n.perf.rtt_us),
                     relayed: online.is_some_and(|n| n.perf.relayed),
+                    gpus: self.gpu_views(m),
+                    microvm_network: self
+                        .devices
+                        .get(&m.id)
+                        .is_some_and(|d| d.signed.profile.microvm_network),
                 }
             })
             .collect();
@@ -1614,6 +1694,8 @@ impl State {
             mounts,
             output_dataset: ext.finished.clone().filter(|f| !f.is_empty()),
             preparing,
+            gpu: job.meta.gpu.clone(),
+            network: job.meta.docker.as_ref().is_some_and(|d| d.network),
         })
     }
 
@@ -1703,6 +1785,7 @@ mod tests {
             mounts: vec![],
             task_mounts: vec![],
             output_dataset: None,
+            gpu: None,
         }
     }
 

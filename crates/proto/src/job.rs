@@ -14,6 +14,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::gpu::{GpuRequest, GpuVendor};
 use crate::store::{
     MountRequest, MountSource, STORE_PREFIX, StoreRef, expand_shard, validate_dataset_name,
 };
@@ -80,8 +81,9 @@ pub enum Tier {
 ///   language, packages and optional network. Only nodes that opted in with
 ///   `--allow-docker` get these tasks; meant for machines you own.
 /// - `Microvm`: the same OCI images, each task in its own lightweight VM
-///   (Firecracker, or QEMU's microvm machine) with its own kernel. No
-///   network. Safe to send to other people's machines, so providers that
+///   (Firecracker, QEMU or Virtualization.framework) with its own kernel.
+///   No network unless the job asks for one, and then only to the
+///   internet. Safe to send to other people's machines, so providers that
 ///   opted in with `--allow-microvm` get these tasks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -236,9 +238,12 @@ pub struct DockerSpec {
     pub image: String,
     /// Replaces the image's default command. Task args are appended.
     pub command: Vec<String>,
-    /// Allow outbound network access (default: none). Docker only.
+    /// Allow outbound network access (default: none). Docker: the bridge
+    /// network. MicroVM: a network device that reaches only the internet
+    /// (never the host, its LAN or other private addresses).
     pub network: bool,
-    /// Passed to `docker run --gpus`, e.g. "all". Docker only.
+    /// Jobs from before phase 9 only: passed to `docker run --gpus`.
+    /// Submissions now carry a [`GpuRequest`] instead.
     pub gpus: Option<String>,
 }
 
@@ -273,6 +278,8 @@ pub struct JobSubmission {
     /// Write every task's `/output` to the store and, when the job ends,
     /// make a new version of this dataset from them (`task-<i>/...`).
     pub output_dataset: Option<String>,
+    /// The GPUs each task needs (docker and microvm jobs).
+    pub gpu: Option<GpuRequest>,
 }
 
 impl JobSubmission {
@@ -298,17 +305,18 @@ impl JobSubmission {
                     !d.image.starts_with('-') && !d.image.contains(char::is_whitespace),
                     "invalid image name"
                 );
-                if kind == Executor::Microvm {
-                    ensure!(
-                        !d.network,
-                        "microvm jobs have no network; bake what the job needs into the image, or use a docker job"
-                    );
-                    ensure!(
-                        d.gpus.is_none(),
-                        "microvm jobs cannot use GPUs yet; use a docker job"
-                    );
-                }
+                ensure!(
+                    d.gpus.is_none(),
+                    "ask for GPUs with a GPU request, not docker's --gpus"
+                );
             }
+        }
+        if let Some(g) = &self.gpu {
+            ensure!(
+                self.executor.runs_images(),
+                "GPUs are for docker and microvm jobs"
+            );
+            g.validate()?;
         }
         for f in self
             .files
@@ -424,11 +432,16 @@ pub struct JobFile {
     /// under `/input/NAME/`; `{shard}` in it picks one per task).
     #[serde(default)]
     pub files: Vec<PathBuf>,
-    /// Allow network access (docker executor only).
+    /// Allow network access (docker and microvm executors). MicroVMs reach
+    /// only the internet, never private addresses.
     #[serde(default)]
     pub network: bool,
-    /// GPUs for `docker run --gpus` (docker executor only), e.g. "all".
-    pub gpus: Option<String>,
+    /// GPUs each task needs (docker and microvm executors): a number, or
+    /// "all" for every GPU of the node.
+    pub gpus: Option<GpusField>,
+    /// Which GPUs: `{ vendor = "nvidia", min_vram_gb = 16 }`. Implies
+    /// `gpus = 1` when `gpus` is not given.
+    pub gpu: Option<GpuFile>,
     pub shards: Option<u32>,
     #[serde(default, rename = "task")]
     pub tasks: Vec<TaskFile>,
@@ -441,6 +454,41 @@ pub struct JobFile {
     /// Deterministic mode (wasm only, default on): a virtual clock and
     /// seeded random numbers, so results can be checked by re-running.
     pub deterministic: Option<bool>,
+}
+
+/// `gpus = 2` or `gpus = "all"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum GpusField {
+    Count(u32),
+    Text(String),
+}
+
+impl GpusField {
+    /// GPUs per task, 0 for all of them.
+    pub fn count(&self) -> Result<u32> {
+        match self {
+            GpusField::Count(n) => {
+                ensure!(*n >= 1, "`gpus` must be at least 1 (or \"all\")");
+                Ok(*n)
+            }
+            GpusField::Text(t) if t.trim() == "all" => Ok(0),
+            GpusField::Text(t) => match t.trim().parse::<u32>() {
+                Ok(n) if n >= 1 => Ok(n),
+                _ => bail!(
+                    "`gpus` is a number of GPUs or \"all\", not {t:?} (the cluster picks the devices)"
+                ),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuFile {
+    pub vendor: Option<String>,
+    /// Smallest GPU memory, in GB (GiB).
+    pub min_vram_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -636,9 +684,12 @@ impl JobFile {
                 );
                 ensure!(
                     !self.network,
-                    "wasm tasks cannot use the network; use a docker job"
+                    "wasm tasks cannot use the network; use a docker or microvm job"
                 );
-                ensure!(self.gpus.is_none(), "`gpus` is only for docker jobs");
+                ensure!(
+                    self.gpus.is_none() && self.gpu.is_none(),
+                    "GPUs are for docker and microvm jobs"
+                );
                 let m = self.module.as_ref().context("wasm job needs `module`")?;
                 (read(m)?, None)
             }
@@ -775,8 +826,37 @@ impl JobFile {
             image,
             command,
             network: self.network,
-            gpus: self.gpus.clone(),
+            gpus: None,
         });
+        let gpu = match (&self.gpus, &self.gpu) {
+            (None, None) => None,
+            (count, which) => {
+                let which = which.clone().unwrap_or_default();
+                let min_vram_mib = match which.min_vram_gb {
+                    Some(gb) => {
+                        ensure!(
+                            gb >= 0.0 && gb <= 1024.0,
+                            "gpu.min_vram_gb must be between 0 and 1024"
+                        );
+                        (gb * 1024.0).round() as u64
+                    }
+                    None => 0,
+                };
+                Some(GpuRequest {
+                    count: match count {
+                        Some(c) => c.count()?,
+                        None => 1,
+                    },
+                    vendor: which
+                        .vendor
+                        .as_deref()
+                        .filter(|v| *v != "any")
+                        .map(str::parse::<GpuVendor>)
+                        .transpose()?,
+                    min_vram_mib,
+                })
+            }
+        };
         let output_dataset = match &self.output {
             Some(o) => {
                 let name = o
@@ -788,6 +868,7 @@ impl JobFile {
             None => None,
         };
         let sub = JobSubmission {
+            gpu,
             mounts,
             task_mounts,
             output_dataset,
@@ -972,12 +1053,55 @@ mod tests {
         assert_eq!(sub.docker.unwrap().image, "python:3.12-slim");
         let net =
             JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\nnetwork = true").unwrap();
-        assert!(net.resolve(&dir).is_err(), "microvm jobs have no network");
+        assert!(net.resolve(&dir).unwrap().docker.unwrap().network);
         let gpu =
             JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\ngpus = \"all\"").unwrap();
-        assert!(gpu.resolve(&dir).is_err(), "no GPU passthrough yet");
+        assert_eq!(gpu.resolve(&dir).unwrap().gpu.unwrap().count, 0);
         let none = JobFile::parse("executor = \"microvm\"").unwrap();
         assert!(none.resolve(&dir).is_err(), "needs an image");
+    }
+
+    #[test]
+    fn gpu_requests() {
+        let dir = tempdir();
+        let two = JobFile::parse("image = \"pytorch/pytorch\"\ngpus = 2").unwrap();
+        let sub = two.resolve(&dir).unwrap();
+        assert_eq!(
+            sub.gpu,
+            Some(GpuRequest {
+                count: 2,
+                vendor: None,
+                min_vram_mib: 0
+            })
+        );
+        assert_eq!(sub.docker.unwrap().gpus, None);
+        let picky = JobFile::parse(
+            "image = \"pytorch/pytorch\"\n[gpu]\nvendor = \"nvidia\"\nmin_vram_gb = 15.5",
+        )
+        .unwrap();
+        assert_eq!(
+            picky.resolve(&dir).unwrap().gpu,
+            Some(GpuRequest {
+                count: 1,
+                vendor: Some(GpuVendor::Nvidia),
+                min_vram_mib: 15_872
+            })
+        );
+        let any =
+            JobFile::parse("image = \"x\"\ngpus = \"all\"\ngpu = { vendor = \"any\" }").unwrap();
+        assert_eq!(any.resolve(&dir).unwrap().gpu.unwrap().vendor, None);
+        for bad in [
+            "image = \"x\"\ngpus = 0",
+            "image = \"x\"\ngpus = \"device=0\"",
+            "image = \"x\"\ngpus = 17",
+            "image = \"x\"\ngpu = { vendor = \"matrox\" }",
+            "image = \"x\"\ngpu = { min_vram_gb = -1 }",
+        ] {
+            assert!(JobFile::parse(bad).unwrap().resolve(&dir).is_err(), "{bad}");
+        }
+        write_module(&dir);
+        let wasm = JobFile::parse("module = \"m.wasm\"\ngpus = 1").unwrap();
+        assert!(wasm.resolve(&dir).is_err());
     }
 
     #[test]

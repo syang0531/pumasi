@@ -112,6 +112,8 @@ fn agent_config(name: &str, slots: u32, dir: PathBuf) -> AgentConfig {
         upgrade: None,
         corrupt_results: false,
         store_cache_bytes: None,
+        gpus: false,
+        fake_gpus: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -167,6 +169,7 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         mounts: vec![],
         task_mounts: vec![],
         output_dataset: None,
+        gpu: None,
     }
 }
 
@@ -546,6 +549,8 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         upgrade: None,
         corrupt_results: corrupt,
         store_cache_bytes: None,
+        gpus: false,
+        fake_gpus: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -693,6 +698,8 @@ async fn invited_provider_is_paid_from_prepaid_credit() {
             memory_bytes: r.usage.memory_limit_bytes,
             cpu_millis: None,
             cpu_score: 1000,
+            gpu_gflops: 0,
+            gpu_vram_mib: 0,
         });
         assert_eq!(r.billing.exact_ucu, exact);
         assert!(r.billing.amount > 0);
@@ -1121,6 +1128,7 @@ fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
         mounts: vec![],
         task_mounts: vec![],
         output_dataset: None,
+        gpu: None,
     }
 }
 
@@ -1147,6 +1155,8 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         upgrade: None,
         corrupt_results: false,
         store_cache_bytes: None,
+        gpus: false,
+        fake_gpus: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1307,6 +1317,8 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         upgrade: None,
         corrupt_results: false,
         store_cache_bytes: None,
+        gpus: false,
+        fake_gpus: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1445,10 +1457,87 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         other => panic!("expected out of memory, got {other:?}"),
     }
 
+    // Network (phase 9): only with `network = true`, only public
+    // addresses, never this host or private ranges.
+    microvm_network(&client, &node).await;
+
     client.close().await;
     wasm_only.kill().await;
     p.kill().await;
     cluster.shutdown().await.unwrap();
+}
+
+async fn microvm_network(client: &AdminClient, node: &pumasi_proto::msg::NodeView) {
+    let net_job = |script: String| {
+        let mut sub = docker_job(&["sh", "-c", &script], vec![TaskInput::default()]);
+        sub.executor = Executor::Microvm;
+        let d = sub.docker.as_mut().unwrap();
+        d.image = microvm_image();
+        d.network = true;
+        sub.limits.timeout_ms = 120_000;
+        sub.max_attempts = 1;
+        sub
+    };
+    if !node.microvm_network {
+        // Firecracker without QEMU: network jobs wait for a node that can
+        // run them.
+        let id = submit(client, net_job("echo never".into())).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let AdminResponse::Job(view) = client
+            .call(AdminOp::Job {
+                id,
+                with_output: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected a job");
+        };
+        assert_eq!(view.summary.state, JobState::Queued, "{view:#?}");
+        assert!(view.tasks.iter().all(|t| t.node.is_none()), "{view:#?}");
+        client.call(AdminOp::Cancel { id }).await.unwrap();
+        eprintln!("this node's microVMs have no network (no QEMU); network jobs stay pending");
+        return;
+    }
+    // A service on this host's own address, which the guest must not
+    // reach (it counts connections).
+    let host_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            s.local_addr()
+        })
+        .map(|a| a.ip())
+        .expect("this host's address");
+    let listener = tokio::net::TcpListener::bind((host_ip, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = reached.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((_s, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let script = format!(
+        "wget -q -T 15 -O /dev/null http://example.com/ && echo public-ok; \
+         wget -q -T 3 -O /dev/null http://{host_ip}:{port}/ || echo host-blocked; \
+         wget -q -T 3 -O /dev/null http://169.254.169.254/ || echo metadata-blocked; \
+         wget -q -T 3 -O /dev/null http://10.0.2.2:{port}/ || echo gateway-blocked"
+    );
+    let id = submit(client, net_job(script)).await;
+    let view = wait_job(client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    assert!(view.network);
+    let out = String::from_utf8_lossy(view.tasks[0].stdout.as_deref().unwrap_or_default());
+    assert_eq!(
+        out, "public-ok\nhost-blocked\nmetadata-blocked\ngateway-blocked\n",
+        "{view:#?}"
+    );
+    assert_eq!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the guest reached this host"
+    );
+    server.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -1588,6 +1677,8 @@ async fn upgradable(name: &str, dir: PathBuf, exe: PathBuf, auto: Option<bool>) 
         }),
         corrupt_results: false,
         store_cache_bytes: None,
+        gpus: false,
+        fake_gpus: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,

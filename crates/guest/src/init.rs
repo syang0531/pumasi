@@ -37,10 +37,18 @@ impl<T, E: std::fmt::Display> Ctx<T> for Result<T, E> {
 }
 
 fn log(msg: &str) {
-    eprintln!("pumasi-guest: {msg}");
+    let line = format!("pumasi-guest: {msg}\n");
+    // Never panic here: this is also the panic path. When the console is
+    // not writable, the kernel log still reaches the serial console.
+    if io::stderr().write_all(line.as_bytes()).is_err()
+        && let Ok(mut k) = OpenOptions::new().write(true).open("/dev/kmsg")
+    {
+        let _ = k.write_all(format!("<2>{line}").as_bytes());
+    }
 }
 
 pub fn main() -> ! {
+    std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
     if let Err(p) = std::panic::catch_unwind(boot) {
         let msg = p
             .downcast_ref::<String>()

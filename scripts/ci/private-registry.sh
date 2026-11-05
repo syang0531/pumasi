@@ -22,7 +22,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-docker pull busybox:1.36 >/dev/null
+docker image inspect busybox:1.36 >/dev/null 2>&1 || docker pull busybox:1.36 >/dev/null
 docker tag busybox:1.36 "$image"
 echo "$pass" | docker login localhost:5000 -u "$user" --password-stdin >/dev/null
 docker push "$image" >/dev/null

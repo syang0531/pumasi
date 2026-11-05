@@ -1645,7 +1645,9 @@ async fn wait_upgrade_state(
 }
 
 async fn wait_for(what: &str, cond: impl Fn() -> bool) {
-    for _ in 0..300 {
+    // A minute: a second timing of an inflated benchmark runs eight times
+    // longer than claimed, and slow CI runners run several tests at once.
+    for _ in 0..600 {
         if cond() {
             return;
         }

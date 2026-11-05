@@ -679,17 +679,17 @@ async fn enable_ha(inner: &Arc<Inner>) -> Result<Arc<Ha>> {
     })
     .await
     .context("timed out waiting for the first election")?;
-    let (tx, rx) = mpsc::unbounded_channel();
-    {
-        let mut st = inner.state();
-        let store = st.store.with_sink(Sink::Replicate(tx));
-        st.store = store;
-    }
+    let (sink, rx) = crate::store::pipe();
     inner
         .tasks
         .lock()
         .unwrap()
         .push(tokio::spawn(ha.clone().replicate(rx)));
+    {
+        let mut st = inner.state();
+        let store = st.store.with_sink(sink);
+        st.store = store;
+    }
     // Whatever was written before is in the database but in no log entry:
     // new replicas must start from a snapshot of it.
     ha.compact().await?;
@@ -736,23 +736,23 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
                     .await
                 {
                     Ok(Ok(_)) => {
-                        let (tx, rx) = mpsc::unbounded_channel();
-                        match start_services(&shared, shared.store.with_sink(Sink::Replicate(tx)))
-                            .await
-                        {
+                        // Replicating before the state loads: loading
+                        // writes, and reads wait for those writes.
+                        let (sink, rx) = crate::store::pipe();
+                        let replicate = tokio::spawn(ha.clone().replicate(rx));
+                        match start_services(&shared, shared.store.with_sink(sink)).await {
                             Ok(inner) => {
-                                inner
-                                    .tasks
-                                    .lock()
-                                    .unwrap()
-                                    .push(tokio::spawn(ha.clone().replicate(rx)));
+                                inner.tasks.lock().unwrap().push(replicate);
                                 replicas.clear();
                                 info!(
                                     term = ha.metrics().current_term,
                                     "this replica leads the control plane"
                                 );
                             }
-                            Err(e) => warn!("could not start the control plane: {e:#}"),
+                            Err(e) => {
+                                replicate.abort();
+                                warn!("could not start the control plane: {e:#}")
+                            }
                         }
                     }
                     Ok(Err(e)) => debug!("not ready to lead: {e}"),

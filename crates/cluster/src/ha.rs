@@ -65,10 +65,7 @@ use pumasi_proto::{
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 use crate::store::{self, Op};
@@ -1140,25 +1137,31 @@ impl Ha {
 
     /// Hands the leader's store writes to Raft, in order, several store
     /// calls per entry. Ends when this replica stops being the leader.
-    pub async fn replicate(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<Vec<Op>>) {
+    pub async fn replicate(self: Arc<Self>, pipe: store::Pipe) {
         const MAX_ENTRY: usize = 16 * 1024 * 1024;
-        while let Some(first) = rx.recv().await {
+        let store::Pipe { mut rx, in_flight } = pipe;
+        while let Some((mut last, first)) = rx.recv().await {
             let mut ops = first;
             let mut size: usize = ops.iter().map(op_size).sum();
             while size < MAX_ENTRY {
                 match rx.try_recv() {
-                    Ok(more) => {
+                    Ok((n, more)) => {
                         size += more.iter().map(op_size).sum::<usize>();
                         ops.extend(more);
+                        last = n;
                     }
                     Err(_) => break,
                 }
             }
+            // `client_write` returns once the entry is applied here.
             if let Err(e) = self.raft.client_write(Request(ops)).await {
                 warn!("could not replicate a state change: {e}");
+                in_flight.applied(u64::MAX);
                 return;
             }
+            in_flight.applied(last);
         }
+        in_flight.applied(u64::MAX);
     }
 
     pub async fn shutdown(&self) {

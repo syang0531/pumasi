@@ -323,8 +323,62 @@ pub enum Sink {
     Direct,
     /// To the Raft log (the leader of replicated control planes); the
     /// state machine applies them once committed.
-    Replicate(mpsc::UnboundedSender<Vec<Op>>),
+    Replicate(mpsc::UnboundedSender<(u64, Vec<Op>)>, Arc<InFlight>),
 }
+
+/// The receiving end of [`Sink::Replicate`]: numbered writes, and where to
+/// say which of them are applied.
+pub struct Pipe {
+    pub rx: mpsc::UnboundedReceiver<(u64, Vec<Op>)>,
+    pub in_flight: Arc<InFlight>,
+}
+
+/// A sink that hands writes to Raft, and the end Raft reads them from.
+pub fn pipe() -> (Sink, Pipe) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let in_flight = Arc::new(InFlight::default());
+    (
+        Sink::Replicate(tx, in_flight.clone()),
+        Pipe { rx, in_flight },
+    )
+}
+
+/// Writes sent to Raft and not applied yet. A read of the database waits
+/// for the writes made before it, so the leader reads what it wrote (its
+/// memory runs ahead of the database by the writes in flight).
+#[derive(Default)]
+pub struct InFlight {
+    /// (last sent, last applied)
+    counts: std::sync::Mutex<(u64, u64)>,
+    applied: std::sync::Condvar,
+}
+
+impl InFlight {
+    /// Every write up to `upto` is applied (or will never be: `u64::MAX`
+    /// when replication stopped).
+    pub fn applied(&self, upto: u64) {
+        let mut c = self.counts.lock().unwrap();
+        c.1 = c.1.max(upto);
+        self.applied.notify_all();
+    }
+
+    /// Waits until the writes sent so far are applied, for at most
+    /// `limit` (without a quorum they may never be).
+    fn wait(&self, limit: std::time::Duration) {
+        let c = self.counts.lock().unwrap();
+        let target = c.0;
+        let (_counts, r) = self
+            .applied
+            .wait_timeout_while(c, limit, |c| c.1 < target)
+            .unwrap();
+        if r.timed_out() {
+            tracing::warn!("reading the state database before the last writes were applied");
+        }
+    }
+}
+
+/// How long a read waits for the writes before it.
+const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct Store {
     db: Arc<Database>,
@@ -412,10 +466,33 @@ impl Store {
                 tx.commit()?;
                 Ok(())
             }
-            Sink::Replicate(tx) => tx
-                .send(b.0)
-                .map_err(|_| anyhow::anyhow!("this control plane replica is no longer the leader")),
+            Sink::Replicate(tx, in_flight) => {
+                // Numbered under the lock, so numbers follow channel order.
+                let mut c = in_flight.counts.lock().unwrap();
+                let n = c.0 + 1;
+                tx.send((n, b.0)).map_err(|_| {
+                    anyhow::anyhow!("this control plane replica is no longer the leader")
+                })?;
+                c.0 = n;
+                Ok(())
+            }
         }
+    }
+
+    /// A read transaction that sees every write this store made before.
+    fn read(&self) -> Result<redb::ReadTransaction> {
+        if let Sink::Replicate(_, in_flight) = &self.sink {
+            // Callers hold the state lock, which other workers may be
+            // waiting for: let the runtime move Raft's tasks elsewhere.
+            let multi = tokio::runtime::Handle::try_current()
+                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+            if multi {
+                tokio::task::block_in_place(|| in_flight.wait(READ_WAIT));
+            } else {
+                in_flight.wait(READ_WAIT);
+            }
+        }
+        Ok(self.db.begin_read()?)
     }
 
     /// Prepares a database: creates missing tables and migrates older
@@ -742,7 +819,7 @@ impl Store {
     /// with the old price of a core-hour. `None` when there is nothing to
     /// convert.
     pub(crate) fn credit_receipts(&self) -> Result<Option<(i64, Vec<legacy::ReceiptV1>)>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let meta = tx.open_table(META)?;
         if meta.get(CREDIT_RECEIPTS_DONE_META)?.is_some() {
             return Ok(None);
@@ -772,7 +849,7 @@ impl Store {
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let t = tx.open_table(META)?;
         Ok(t.get(key)?.map(|v| v.value().to_vec()))
     }
@@ -794,7 +871,7 @@ impl Store {
     }
 
     pub fn load(&self) -> Result<Snapshot> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let mut snap = Snapshot::default();
         for row in tx.open_table(MEMBERS)?.iter()? {
             let (_, v) = row?;
@@ -1056,7 +1133,7 @@ impl Store {
 
     /// The newest `limit` events, oldest first.
     pub fn load_events(&self, limit: usize) -> Result<Vec<EventView>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let mut out = Vec::new();
         for row in tx.open_table(EVENTS)?.iter()?.rev().take(limit) {
             let (_, v) = row?;
@@ -1076,7 +1153,7 @@ impl Store {
 
     /// Every stored point not older than `since[tier]`.
     pub fn load_points(&self, since: &[u64]) -> Result<Vec<(String, u8, MetricPoint)>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let mut out = Vec::new();
         for row in tx.open_table(METRICS)?.iter()? {
             let (k, v) = row?;
@@ -1103,7 +1180,7 @@ impl Store {
         let events;
         let points;
         {
-            let tx = self.db.begin_read()?;
+            let tx = self.read()?;
             let t = tx.open_table(EVENTS)?;
             let total = t.len()? as usize;
             let mut doomed = Vec::new();
@@ -1148,7 +1225,7 @@ impl Store {
     }
 
     pub fn webhooks(&self) -> Result<Vec<WebhookSpec>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let mut out = Vec::new();
         for row in tx.open_table(WEBHOOKS)?.iter()? {
             let (_, v) = row?;
@@ -1164,7 +1241,7 @@ impl Store {
     /// What each account spent (charges, storage, egress) since `since`:
     /// (account, unix, milli-CU), oldest first.
     pub fn spent_since(&self, since: u64) -> Result<Vec<(String, u64, i64)>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let mut out = Vec::new();
         for row in tx.open_table(LEDGER)?.iter()?.rev() {
             let (_, v) = row?;
@@ -1258,7 +1335,7 @@ impl Store {
 
     /// Ledger entries, newest first, optionally for one account.
     pub fn ledger(&self, account: Option<&str>, limit: usize) -> Result<Vec<LedgerEntry>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let mut out = Vec::new();
         for row in tx.open_table(LEDGER)?.iter()?.rev() {
             if out.len() >= limit {
@@ -1275,7 +1352,7 @@ impl Store {
 
     /// Every receipt of one job, in task order.
     pub fn receipts(&self, job: u128) -> Result<Vec<Receipt>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read()?;
         let t = tx.open_table(RECEIPTS)?;
         let mut out = Vec::new();
         for row in t.range((job, 0, 0, false)..=(job, u32::MAX, u32::MAX, true))? {

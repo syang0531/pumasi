@@ -1261,7 +1261,10 @@ round) has failed for `LEASE` (3 s), it stops them, which ends every agent
 and admin session. The in-memory state runs ahead of the database by the
 batches not committed yet; whatever a dead leader had not committed is
 lost exactly as on a single control plane's crash (running tasks are
-placed again; their receipts never existed).
+placed again; their receipts never existed). Reads of the database on the
+leader (receipts, the ledger) first wait, up to 5 s, for the writes sent
+before them to be applied (`store::InFlight`), so the leader reads what it
+wrote.
 
 Followers answer agents with `HelloReply::NotLeader { leader, replicas }`
 and admin calls with `AdminResponse::NotLeader { leader }`. `AdminClient`

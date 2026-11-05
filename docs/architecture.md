@@ -526,10 +526,10 @@ remotely; install the phase 4 binary on them once.
 
 ## Not yet
 
-- Remaining roadmap phases (6 to 15): old Intel Macs and availability
-  policy, a cluster file store, GPUs, cluster management, monitoring, a web
-  dashboard, Raft, WebGPU, the confidential tier, the marketplace. See the
-  roadmap in the README.
+- Remaining roadmap phases (6 to 17): old Intel Macs and availability
+  policy, benchmarks and compute units (CU), a cluster file store, GPUs,
+  cluster management, monitoring, a web dashboard, Raft, WebGPU, the
+  confidential tier, the hub, buying CU. See the roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node

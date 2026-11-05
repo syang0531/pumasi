@@ -21,12 +21,17 @@ pub const ADMIN_ALPN: &[u8] = b"pumasi/admin/0";
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        5
+        6
     };
 }
 
 /// Bumped on any incompatible change to [`msg`].
 pub const PROTOCOL_VERSION: u32 = protocol_version!();
+
+/// The oldest agent protocol the control plane still accepts, so agents of
+/// the previous release can connect and take a rollout. Protocol 5 agents
+/// lack only the availability report (6).
+pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi
 /// upgrade rollout` reads it from a binary file without running it (the

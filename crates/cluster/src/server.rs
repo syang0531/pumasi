@@ -15,7 +15,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use pumasi_proto::{
-    ADMIN_ALPN, AGENT_ALPN, PROTOCOL_VERSION, Secret,
+    ADMIN_ALPN, AGENT_ALPN, MIN_AGENT_PROTOCOL, PROTOCOL_VERSION, Secret,
     msg::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
         FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, ToAgent,
@@ -24,7 +24,7 @@ use pumasi_proto::{
     release::SignedRelease,
     secrets_eq,
     ticket::{AdminTicket, JoinTicket},
-    wire::{read_msg, write_msg},
+    wire::{read_frame, read_msg, write_msg},
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -257,13 +257,19 @@ impl ProtocolHandler for AgentHandler {
 async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
     let node_id = conn.remote_id().to_string();
     let (mut send, mut recv) = conn.accept_bi().await?;
-    let Some(hello) = read_msg::<_, AgentHello>(&mut recv).await? else {
+    let Some(frame) = read_frame(&mut recv).await? else {
         return Ok(());
     };
+    let hello = AgentHello::decode(&frame).context("decode hello")?;
 
-    let verdict: Result<(Role, String)> = if hello.protocol_version != PROTOCOL_VERSION {
+    let verdict: Result<(Role, String)> = if hello.protocol_version > PROTOCOL_VERSION {
         Err(anyhow::anyhow!(
-            "protocol version {} not supported (cluster speaks {PROTOCOL_VERSION}); upgrade the agent",
+            "protocol version {} not supported (cluster speaks {PROTOCOL_VERSION}); upgrade the control plane first",
+            hello.protocol_version
+        ))
+    } else if hello.protocol_version < MIN_AGENT_PROTOCOL {
+        Err(anyhow::anyhow!(
+            "protocol version {} not supported (cluster speaks {MIN_AGENT_PROTOCOL} to {PROTOCOL_VERSION}); upgrade the agent",
             hello.protocol_version
         ))
     } else {
@@ -307,6 +313,7 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
         &node_id,
         hello.node.clone(),
         hello.upgrade.clone(),
+        hello.availability.clone(),
         tx,
         kill_tx,
     );
@@ -336,6 +343,11 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
                     st.on_upgrade_failed(&node_id, generation, sha256, reason);
+                }
+                Ok(Some(FromAgent::Availability(a))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_availability(&node_id, generation, a);
                 }
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),

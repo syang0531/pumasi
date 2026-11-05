@@ -25,6 +25,7 @@ reqwest.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 webpki-roots.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 wat.workspace = true
@@ -37,5 +38,16 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Ioctl",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
+
+# The Virtualization.framework backend talks to the Objective-C runtime and
+# loads the framework at run time (macOS 10.15 has none).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+libc.workspace = true

@@ -32,6 +32,18 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    match read_frame(r).await? {
+        Some(buf) => Ok(Some(postcard::from_bytes(&buf).context("decode message")?)),
+        None => Ok(None),
+    }
+}
+
+/// Reads one frame's bytes, for messages decoded with a fallback (see
+/// `AgentHello::decode`). `Ok(None)` on a clean end of stream.
+pub async fn read_frame<R>(r: &mut R) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
         Ok(_) => {}
@@ -44,8 +56,7 @@ where
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await.context("read frame body")?;
-    let msg = postcard::from_bytes(&buf).context("decode message")?;
-    Ok(Some(msg))
+    Ok(Some(buf))
 }
 
 #[cfg(test)]

@@ -54,9 +54,19 @@ pub struct DockerExecutor {
     /// One pull at a time: parallel tasks on a fresh image would otherwise
     /// all pull it at once, which registries rate-limit.
     pull_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The node's CPU cap: containers of jobs that set no CPU limit get
+    /// this many.
+    cpu_cap: Option<u32>,
 }
 
 impl DockerExecutor {
+    /// Limits containers of jobs without a CPU limit to `cpus` (the node's
+    /// CPU cap; jobs with a limit are placed only within it).
+    pub fn with_cpu_cap(mut self, cpus: Option<u32>) -> Self {
+        self.cpu_cap = cpus;
+        self
+    }
+
     /// Checks that the Docker CLI works, the daemon answers, and it runs
     /// Linux containers.
     pub async fn detect(bin: &str, label: &str) -> Result<Self> {
@@ -106,6 +116,7 @@ impl DockerExecutor {
             bin: bin.to_string(),
             label: label.to_string(),
             pull_lock: Default::default(),
+            cpu_cap: None,
         };
         exec.cleanup_stale().await;
         Ok(exec)
@@ -267,7 +278,7 @@ impl DockerExecutor {
             task.attempt,
             rand_u32()
         );
-        let args = create_args(&name, &self.label, spec, input, limits);
+        let args = create_args(&name, &self.label, spec, input, limits, self.cpu_cap);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let created = self.cli(&arg_refs).await?;
         if !created.status.success() {
@@ -440,6 +451,7 @@ fn create_args(
     spec: &DockerSpec,
     input: &TaskInput,
     limits: &Limits,
+    cpu_cap: Option<u32>,
 ) -> Vec<String> {
     let memory = limits.memory_bytes.max(MIN_MEMORY);
     let mut a: Vec<String> = [
@@ -468,7 +480,7 @@ fn create_args(
     .iter()
     .map(|s| s.to_string())
     .collect();
-    if let Some(m) = limits.cpu_millis {
+    if let Some(m) = limits.cpu_millis.or(cpu_cap.map(|c| c * 1000)) {
         a.push("--cpus".into());
         a.push(format!("{:.3}", m as f64 / 1000.0));
     }
@@ -726,7 +738,7 @@ mod tests {
             cpu_millis: Some(1500),
             ..Default::default()
         };
-        let a = create_args("c1", "node", &spec, &input, &limits);
+        let a = create_args("c1", "node", &spec, &input, &limits, None);
         let joined = a.join(" ");
         assert!(joined.contains("--network none"));
         assert!(joined.contains("--memory 67108864b"));
@@ -747,9 +759,11 @@ mod tests {
             &net,
             &TaskInput::default(),
             &Limits::default(),
+            Some(2),
         )
         .join(" ");
         assert!(joined.contains("--network bridge"));
         assert!(joined.contains("--gpus all"));
+        assert!(joined.contains("--cpus 2.000"));
     }
 }

@@ -15,8 +15,8 @@ use pumasi_proto::{
     AGENT_ALPN, ModuleHash, PROTOCOL_VERSION, Secret,
     job::{Executor, FileEntry},
     msg::{
-        AgentHello, FromAgent, HelloReply, NodeInfo, Role, TaskAssignment, TaskRef, TaskReport,
-        ToAgent,
+        AgentHello, Availability, FromAgent, HelloReply, NodeInfo, Role, TaskAssignment, TaskRef,
+        TaskReport, ToAgent,
     },
     net::{NetMode, bind_endpoint, load_or_create_key},
     receipt::{SignedUsage, Usage, result_digest},
@@ -24,10 +24,11 @@ use pumasi_proto::{
     wire::{read_msg, write_msg},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::{
+    availability::AvailabilityConfig,
     docker::DockerExecutor,
     executor::WasmExecutor,
     microvm::{MicrovmConfig, MicrovmExecutor},
@@ -42,8 +43,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub struct AgentConfig {
     pub data_dir: PathBuf,
     pub name: String,
-    /// Concurrent tasks. Defaults to the number of CPUs.
+    /// Concurrent tasks. Defaults to the CPUs offered, and fewer on a
+    /// machine with little memory (one per GiB beyond the first two).
     pub slots: Option<u32>,
+    /// Offer only this share of the CPUs (1 to 100): the node reports that
+    /// many CPUs, so image jobs needing more go elsewhere, and slots and
+    /// Docker containers without a CPU limit follow it.
+    pub max_cpu_percent: Option<u32>,
+    /// When the node takes new tasks (power, idle, hours). `None`: always.
+    pub availability: Option<AvailabilityConfig>,
     pub net: NetMode,
     pub bind: Option<SocketAddr>,
     /// Docker CLI to use for docker jobs (`docker` or `podman`). `None`
@@ -84,6 +92,9 @@ pub struct Agent {
     config: AgentConfig,
     info: NodeInfo,
     upgrader: Option<Arc<Upgrader>>,
+    /// What the availability policy says now, kept current by a
+    /// background check.
+    available: watch::Receiver<Availability>,
 }
 
 /// Why a session ended.
@@ -134,6 +145,30 @@ impl Agent {
             None => None,
         };
         let mut info = node_info(&config);
+        let docker =
+            docker.map(|d| d.with_cpu_cap(config.max_cpu_percent.is_some().then_some(info.cpus)));
+        let available = match &config.availability {
+            Some(a) if a.policy.is_active() => {
+                let now = a.check().await;
+                log_availability(&now);
+                let (tx, rx) = watch::channel(now);
+                let a = a.clone();
+                tokio::spawn(async move {
+                    while !tx.is_closed() {
+                        tokio::time::sleep(a.interval).await;
+                        let now = a.check().await;
+                        if *tx.borrow() != now {
+                            log_availability(&now);
+                            if tx.send(now).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                rx
+            }
+            _ => watch::channel(Availability::Available).1,
+        };
         if docker.is_some() {
             info.executors.push(Executor::Docker);
         }
@@ -150,6 +185,7 @@ impl Agent {
             config,
             info,
             upgrader,
+            available,
         })
     }
 
@@ -270,11 +306,13 @@ impl Agent {
             Ok(s) => s,
             Err(e) => return SessionEnd::Failed(e.into()),
         };
+        let mut available = self.available.clone();
         let hello = AgentHello {
             protocol_version: PROTOCOL_VERSION,
             join_secret: *join_secret,
             node: self.info.clone(),
             upgrade: self.upgrader.as_ref().map(|u| u.hello()),
+            availability: available.borrow_and_update().clone(),
         };
         if let Err(e) = write_msg(&mut send, &hello).await {
             return SessionEnd::Failed(e);
@@ -343,6 +381,20 @@ impl Agent {
             })
         };
 
+        // Availability changes, as they happen (the hello carried the
+        // state at connect time).
+        let availability = {
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                while available.changed().await.is_ok() {
+                    let now = available.borrow_and_update().clone();
+                    if out_tx.send(FromAgent::Availability(now)).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
         // An upgrade in progress reports here when it is done.
         let (up_tx, mut up_rx) = mpsc::unbounded_channel::<([u8; 32], Result<String>)>();
         let mut upgrading = false;
@@ -356,6 +408,7 @@ impl Agent {
                     match res {
                         Ok(version) => {
                             heartbeat.abort();
+                            availability.abort();
                             writer.abort();
                             conn.close(0u32.into(), b"upgrading");
                             return SessionEnd::Upgraded(version);
@@ -458,6 +511,7 @@ impl Agent {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         heartbeat.abort();
+        availability.abort();
         writer.abort();
         conn.close(0u32.into(), b"bye");
         SessionEnd::Lost(end)
@@ -593,19 +647,48 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+fn log_availability(a: &Availability) {
+    match a.paused_reason() {
+        Some(reason) => info!(%reason, "paused: taking no new tasks"),
+        None => info!("available: taking tasks"),
+    }
+}
+
+/// CPUs a node offers: all of them, or `percent` of them (at least one).
+pub fn offered_cpus(cores: u32, percent: Option<u32>) -> u32 {
+    match percent {
+        Some(p) => (cores * p.min(100) / 100).max(1),
+        None => cores,
+    }
+}
+
+/// Default slots: one per offered CPU, but no more than one per GiB of
+/// memory beyond the first two (kept for the OS), so a 4 GiB laptop runs
+/// two tasks at once whatever its core count.
+pub fn default_slots(cpus: u32, memory_bytes: u64) -> u32 {
+    const GIB: u64 = 1 << 30;
+    let by_memory = (memory_bytes.saturating_sub(2 * GIB) / GIB).max(1);
+    cpus.min(by_memory.min(u32::MAX as u64) as u32).max(1)
+}
+
 fn node_info(config: &AgentConfig) -> NodeInfo {
-    let cpus = std::thread::available_parallelism()
+    let cores = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);
+    let cpus = offered_cpus(cores, config.max_cpu_percent);
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
+    let memory_bytes = sys.total_memory();
     NodeInfo {
         name: config.name.clone(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         cpus,
-        memory_bytes: sys.total_memory(),
-        slots: config.slots.unwrap_or(cpus).max(1),
+        memory_bytes,
+        slots: config
+            .slots
+            .unwrap_or_else(|| default_slots(cpus, memory_bytes))
+            .max(1),
         agent_version: pumasi_proto::version().to_string(),
         executors: vec![Executor::Wasm],
     }
@@ -614,4 +697,24 @@ fn node_info(config: &AgentConfig) -> NodeInfo {
 /// A reasonable default node name: the hostname, or "node".
 pub fn default_node_name() -> String {
     sysinfo::System::host_name().unwrap_or_else(|| "node".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_cap_and_low_memory_slots() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(offered_cpus(8, None), 8);
+        assert_eq!(offered_cpus(8, Some(50)), 4);
+        assert_eq!(offered_cpus(4, Some(10)), 1);
+        assert_eq!(offered_cpus(4, Some(300)), 4);
+        // A 2013 MacBook Air: 4 threads, 4 GiB.
+        assert_eq!(default_slots(4, 4 * GIB), 2);
+        assert_eq!(default_slots(4, 8 * GIB), 4);
+        assert_eq!(default_slots(16, 16 * GIB), 14);
+        assert_eq!(default_slots(8, 2 * GIB), 1);
+        assert_eq!(default_slots(2, 64 * GIB), 2);
+    }
 }

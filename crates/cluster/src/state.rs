@@ -15,12 +15,12 @@ use anyhow::{Context, Result, bail};
 use iroh::{PublicKey, SecretKey};
 use pumasi_proto::{
     ModuleHash, Secret,
-    economy::{Metered, Micros, Policy, validate_account},
+    economy::{Metered, Micros, Policy, validate_account, vcpus},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{
-        AccountView, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo, NodeView,
-        OWNER_ACCOUNT, Outcome, Role, TaskAssignment, TaskRef, TaskReport, TaskState, TaskView,
-        ToAgent, UpgradeHello, Verification,
+        AccountView, Availability, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo,
+        NodeView, OWNER_ACCOUNT, Outcome, Role, TaskAssignment, TaskRef, TaskReport, TaskState,
+        TaskView, ToAgent, UpgradeHello, Verification,
     },
     receipt::{Billing, Receipt, check_usage, result_digest},
     secrets_eq,
@@ -210,6 +210,9 @@ pub(crate) struct NodeRuntime {
     pub upgrade: Option<UpgradeHello>,
     /// Gets no new tasks so it can be upgraded once idle.
     pub draining: bool,
+    /// Its availability policy says no new tasks now (on battery, in use,
+    /// outside its hours), and why.
+    pub paused: Option<String>,
 }
 
 impl NodeRuntime {
@@ -530,6 +533,7 @@ impl State {
         id: &str,
         info: NodeInfo,
         upgrade: Option<UpgradeHello>,
+        availability: Availability,
         tx: mpsc::UnboundedSender<ToAgent>,
         kill: oneshot::Sender<()>,
     ) -> u64 {
@@ -580,10 +584,32 @@ impl State {
                 suspended,
                 upgrade,
                 draining: false,
+                paused: availability.paused_reason().map(String::from),
             },
         );
         self.schedule();
         generation
+    }
+
+    /// The node's availability policy paused or resumed it. Running tasks
+    /// stay where they are; a paused node only gets no new ones.
+    pub fn on_availability(&mut self, id: &str, generation: u64, a: Availability) {
+        let Some(n) = self.nodes.get_mut(id) else {
+            return;
+        };
+        if n.generation != generation {
+            return;
+        }
+        let paused = a.paused_reason().map(String::from);
+        if n.paused == paused {
+            return;
+        }
+        match &paused {
+            Some(reason) => info!(node = %id, %reason, "node paused"),
+            None => info!(node = %id, "node available again"),
+        }
+        n.paused = paused;
+        self.schedule();
     }
 
     /// Marks a session as gone and puts its tasks back in the queue.
@@ -1137,6 +1163,12 @@ impl State {
             }
             let need = job.meta.limits.memory_bytes;
             let executor = job.meta.executor;
+            // Image jobs get their CPUs (a WASM task uses one): a node
+            // offers as many as it reports, which its CPU cap lowers.
+            let need_cpus = match executor {
+                Executor::Wasm => 1,
+                _ => vcpus(job.meta.limits.cpu_millis),
+            };
             let consumer = job.meta.account.as_str();
             let can_pay = self.accounts.get(consumer).is_some_and(|a| a.balance > 0);
             // Free (same account) and trusted nodes first, then most free
@@ -1148,9 +1180,11 @@ impl State {
                     n.online
                         && !n.suspended
                         && !n.draining
+                        && n.paused.is_none()
                         && !self.upgrading.contains_key(id.as_str())
                         && n.free_slots() > 0
                         && n.info.memory_bytes >= need
+                        && n.info.cpus >= need_cpus
                         && n.executors.contains(&executor)
                         && (n.account == consumer || can_pay)
                         && !exclude_nodes.contains(&id.as_str())
@@ -1166,7 +1200,11 @@ impl State {
                 });
             let Some((node_id, node)) = best else {
                 skipped.push_back(item);
-                if !self.nodes.values().any(|n| n.online && n.free_slots() > 0) {
+                if !self
+                    .nodes
+                    .values()
+                    .any(|n| n.online && n.paused.is_none() && n.free_slots() > 0)
+                {
                     break;
                 }
                 continue;
@@ -1311,6 +1349,7 @@ impl State {
                     running: rt.map(|n| n.running.len() as u32).unwrap_or(0),
                     completed: rt.map(|n| n.completed).unwrap_or(0),
                     last_seen_unix: rt.map(|n| n.last_seen_unix).unwrap_or(0),
+                    paused: rt.filter(|n| n.online).and_then(|n| n.paused.clone()),
                 }
             })
             .collect();
@@ -1425,7 +1464,7 @@ mod tests {
         st.authorize(&id, &info, Some(&token.secret)).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let (kill, _) = oneshot::channel();
-        st.on_connect(&id, info, None, tx, kill);
+        st.on_connect(&id, info, None, Availability::Available, tx, kill);
         (id, rx)
     }
 

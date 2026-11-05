@@ -2936,8 +2936,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "block2",
+ "chrono",
  "flate2",
  "iroh",
+ "libc",
+ "objc2",
  "pumasi-guest",
  "pumasi-proto",
  "rand 0.10.3",

@@ -258,8 +258,8 @@ struct VmArgs {
     /// (default: <home>/vm).
     #[arg(long, env = "PUMASI_VM_DIR")]
     vm_dir: Option<PathBuf>,
-    /// VM monitor: firecracker or qemu (default: Firecracker when installed
-    /// and KVM is usable, else QEMU).
+    /// VM monitor: firecracker, qemu or vz (default: Firecracker when
+    /// installed and KVM is usable, vz on macOS 11+, else QEMU).
     #[arg(long)]
     vm_backend: Option<Backend>,
 }
@@ -374,9 +374,26 @@ struct AgentOpts {
     /// Node name shown in `pumasi status` (default: hostname).
     #[arg(long)]
     name: Option<String>,
-    /// Tasks to run at once (default: number of CPUs).
+    /// Tasks to run at once (default: the CPUs offered, fewer with little
+    /// memory: one per GiB beyond the first two).
     #[arg(long)]
     slots: Option<u32>,
+    /// Offer only this share of the CPUs (1-100). Image jobs that need
+    /// more CPUs go to other machines.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
+    max_cpu_percent: Option<u32>,
+    /// Take new tasks only while on AC power (laptops). Running tasks
+    /// finish when the power cord comes out.
+    #[arg(long)]
+    only_on_ac: bool,
+    /// Take new tasks only after the keyboard and mouse have been idle
+    /// this many minutes.
+    #[arg(long, value_name = "MINUTES")]
+    idle_minutes: Option<u64>,
+    /// Take new tasks only at these local times, e.g. `22:00-07:00` or
+    /// `00:00-08:00,12:00-13:00`.
+    #[arg(long, value_name = "HH:MM-HH:MM[,...]", value_parser = parse_hours)]
+    hours: Option<Hours>,
     /// Also run docker jobs on this machine. Only for machines you own:
     /// containers share this machine's kernel.
     #[arg(long)]
@@ -420,8 +437,28 @@ struct AdminArgs {
     admin: Option<String>,
 }
 
+/// `--hours`: one value holding several ranges.
+#[derive(Debug, Clone)]
+struct Hours(Vec<pumasi_agent::availability::HourRange>);
+
+fn parse_hours(s: &str) -> Result<Hours, String> {
+    pumasi_agent::availability::parse_hours(s)
+        .map(Hours)
+        .map_err(|e| format!("{e:#}"))
+}
+
 fn main() {
     pumasi_proto::build_info();
+    // The signed Virtualization.framework helper (a copy of this binary)
+    // runs one VM on its main thread; see `pumasi_agent::microvm::vz`.
+    let mut args = std::env::args_os().skip(1);
+    if args
+        .next()
+        .is_some_and(|a| a == pumasi_agent::microvm::vz::RUN_ARG)
+    {
+        let config = PathBuf::from(args.next().unwrap_or_default());
+        std::process::exit(pumasi_agent::microvm::vz::run_main(&config));
+    }
     let cli = Cli::parse();
     let long_running = matches!(
         cli.cmd,
@@ -794,6 +831,17 @@ async fn agent(
         data_dir,
         name: opts.name.unwrap_or_else(default_node_name),
         slots: opts.slots,
+        max_cpu_percent: opts.max_cpu_percent,
+        availability: {
+            let policy = pumasi_agent::availability::Policy {
+                only_on_ac: opts.only_on_ac,
+                idle_for: opts.idle_minutes.map(|m| Duration::from_secs(m * 60)),
+                hours: opts.hours.clone().map(|h| h.0).unwrap_or_default(),
+            };
+            policy
+                .is_active()
+                .then(|| pumasi_agent::AvailabilityConfig::new(policy))
+        },
         net,
         bind: opts.net.bind,
         docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
@@ -1032,6 +1080,8 @@ fn print_status(s: &ClusterStatus) {
         };
         let state = if n.suspended {
             "suspended"
+        } else if n.online && n.paused.is_some() {
+            "paused"
         } else if n.online {
             "online"
         } else {
@@ -1056,6 +1106,11 @@ fn print_status(s: &ClusterStatus) {
             n.completed,
             checks
         );
+    }
+    for n in s.nodes.iter().filter(|n| n.online) {
+        if let Some(reason) = &n.paused {
+            println!("{} is paused: {reason}", truncate(&n.info.name, 16));
+        }
     }
     if s.nodes.iter().any(|n| n.role == Role::Provider) {
         println!(
@@ -1415,6 +1470,8 @@ fn vm_status(config: &MicrovmConfig) -> Result<i32> {
     }
     let qemu_hint = if cfg!(windows) {
         "run `pumasi vm setup` as administrator"
+    } else if cfg!(target_os = "macos") {
+        "optional, untested on macOS; the vz backend needs none"
     } else {
         "optional; install QEMU"
     };
@@ -1437,8 +1494,14 @@ fn vm_status(config: &MicrovmConfig) -> Result<i32> {
             Err(why) => println!("  {:<12} not usable: {why}", "whpx"),
         }
     }
+    if let Some(vz) = &a.vz {
+        match vz {
+            Ok(()) => println!("  {:<12} usable (Virtualization.framework)", "vz"),
+            Err(why) => println!("  {:<12} not usable: {why}", "vz"),
+        }
+    }
     let ready = a.kernel.is_some() && a.guest.is_some();
-    match a.pick(config.backend) {
+    match a.pick(config.backend, &config.dir) {
         Ok(vmm) if ready => {
             println!(
                 "ready: microVMs boot with {}{}",

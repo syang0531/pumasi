@@ -76,6 +76,9 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_VCPUS: u32 = 32;
 /// Last part of the VM console kept for error messages.
 const CONSOLE_TAIL: usize = 2048;
+/// What the probe VM copies, and how long it may take.
+const PROBE_BYTES: usize = 4 << 20;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Where the executor finds its kernel and init, and keeps its cache.
 #[derive(Debug, Clone)]
@@ -341,18 +344,7 @@ impl MicrovmExecutor {
             let _ = std::fs::remove_dir_all(&run_dir);
         }
         std::fs::create_dir_all(&run_dir)?;
-        info!(
-            backend = %vmm.backend,
-            vmm = %vmm.bin.display(),
-            accelerated = vmm.accelerated,
-            "microvm executor enabled"
-        );
-        if !vmm.accelerated {
-            warn!(
-                "no hardware virtualization (KVM, HVF or WHPX): microVMs run in software emulation and will be slow"
-            );
-        }
-        Ok(Self {
+        let mut exec = Self {
             vmm,
             kernel,
             initrd,
@@ -360,7 +352,112 @@ impl MicrovmExecutor {
             run_dir,
             registry: Registry::new()?,
             pull_lock: Default::default(),
-        })
+        };
+        // WHPX is not equally good everywhere: nested under Hyper-V (cloud
+        // Windows machines, CI runners) QEMU's virtio disks can break under
+        // it. One tiny VM tells, and the slow software emulation still works.
+        let whpx = cfg!(windows) && exec.vmm.backend == Backend::Qemu && exec.vmm.accelerated;
+        if whpx && std::env::var_os("PUMASI_QEMU_ACCEL").is_none() {
+            let start = Instant::now();
+            match exec.probe().await {
+                Ok(()) => debug!(
+                    ms = start.elapsed().as_millis() as u64,
+                    "WHPX probe VM passed"
+                ),
+                Err(e) => {
+                    warn!(
+                        "microVMs do not work under WHPX on this machine, so they run in software emulation (slow); set PUMASI_QEMU_ACCEL=whpx to use WHPX anyway. The probe VM failed: {e:#}"
+                    );
+                    exec.vmm.accelerated = false;
+                    exec.vmm.tsc_khz = None;
+                }
+            }
+        }
+        let vmm = &exec.vmm;
+        info!(
+            backend = %vmm.backend,
+            vmm = %vmm.bin.display(),
+            accelerated = vmm.accelerated,
+            "microvm executor enabled"
+        );
+        if !vmm.accelerated && !whpx {
+            warn!(
+                "no hardware virtualization (KVM, HVF or WHPX): microVMs run in software emulation and will be slow"
+            );
+        }
+        Ok(exec)
+    }
+
+    /// Boots a small VM that copies a few MiB from one disk to another, and
+    /// checks the copy. `Err` says how it went wrong.
+    pub async fn probe(&self) -> Result<()> {
+        let scratch = TempDir::new_in(&self.run_dir, "probe")?;
+        let dir = scratch.path().to_path_buf();
+        let mut data = vec![0u8; PROBE_BYTES];
+        blake3::Hasher::new()
+            .update(b"pumasi probe")
+            .finalize_xof()
+            .fill(&mut data);
+        let input = dir.join("input.tar");
+        let output = dir.join("output.img");
+        let file = FileEntry {
+            path: "probe.bin".into(),
+            data,
+        };
+        write_input_disk(
+            &input,
+            &RunSpec::default(),
+            b"",
+            &[],
+            std::slice::from_ref(&file),
+        )?;
+        make_output_disk(&output)?;
+        let vm = VmSpec {
+            kernel: self.kernel.clone(),
+            initrd: self.initrd.clone(),
+            mode: "probe",
+            disks: vec![
+                Disk {
+                    path: input,
+                    read_only: true,
+                },
+                Disk {
+                    path: output.clone(),
+                    read_only: false,
+                },
+            ],
+            vcpus: 1,
+            mem_mib: MIN_VM_MIB,
+        };
+        let deadline = Instant::now() + PROBE_TIMEOUT;
+        let status = match self
+            .boot(&vm, &dir, Some(deadline), &AtomicBool::new(false))
+            .await?
+        {
+            VmEnd::Exited(status) => status,
+            _ => bail!(
+                "no answer within {} s; console:\n{}",
+                PROBE_TIMEOUT.as_secs(),
+                console_tail(&dir)
+            ),
+        };
+        let out = read_output_disk(&output)?.with_context(|| {
+            format!(
+                "no result ({} {status}); console:\n{}",
+                self.vmm.backend,
+                console_tail(&dir)
+            )
+        })?;
+        match out.result.outcome {
+            GuestOutcome::Exited(0) => {}
+            GuestOutcome::Failed(msg) => bail!("{msg}"),
+            other => bail!("unexpected result {other:?}"),
+        }
+        ensure!(
+            out.files.len() == 1 && out.files[0] == file,
+            "the copy came back different"
+        );
+        Ok(())
     }
 
     pub fn backend(&self) -> Backend {
@@ -932,6 +1029,23 @@ fn console_tail(dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Needs a VM directory set up with `pumasi vm setup`.
+    #[tokio::test]
+    async fn probe_vm_copies_its_input() {
+        let Some(dir) = std::env::var_os("PUMASI_TEST_VM_DIR") else {
+            eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+            return;
+        };
+        let config = MicrovmConfig {
+            dir: dir.into(),
+            backend: None,
+        };
+        let exec = MicrovmExecutor::detect(&config, "probe-test")
+            .await
+            .unwrap();
+        exec.probe().await.unwrap();
+    }
 
     #[test]
     fn limits_match_the_guest() {

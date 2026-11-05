@@ -169,30 +169,6 @@ jobs:
           ./target/debug/pumasi vm status --vm-dir "$VM_DIR" | tee status.txt
           grep -q "built into this binary" status.txt
           grep -q "qemu-system-x86_64.exe" status.txt
-      # Hosted Windows runners currently do have nested virtualization, so
-      # this also tries the WHPX settings one by one (diagnostics only).
-      - name: Try QEMU settings (diagnostics)
-        continue-on-error: true
-        shell: bash
-        timeout-minutes: 25
-        run: |
-          try() {
-            echo "::group::$1"
-            shift
-            env "$@" timeout 150 ./target/debug/pumasi vm run --vm-dir "$VM_DIR" busybox:1.36 -- echo vm-ok < /dev/null || echo "failed: $?"
-            for f in $(find "$VM_DIR/run" -type f -name '*.log' 2>/dev/null); do echo "--- $f"; tail -c 6000 "$f"; echo; done
-            echo "::endgroup::"
-          }
-          export PUMASI_VM_CONSOLE_TAIL=20000
-          K="PUMASI_VM_KERNEL_ARGS=loglevel=7"
-          try "default" $K
-          try "legacy virtio-mmio" $K "PUMASI_QEMU_ARGS=-global virtio-mmio.force-legacy=on"
-          try "no ioeventfd" $K "PUMASI_QEMU_ARGS=-global virtio-mmio.ioeventfd=off"
-          try "whpx irqchip on" $K PUMASI_QEMU_ACCEL=whpx
-          try "cpu max" $K PUMASI_QEMU_CPU=max
-          try "cpu qemu64" $K PUMASI_QEMU_CPU=qemu64
-          try "microvm acpi=off" $K "PUMASI_QEMU_ARGS=-M microvm,acpi=off"
-          try "tcg" $K PUMASI_QEMU_ACCEL=tcg
       - name: Run an image in a microVM
         shell: bash
         timeout-minutes: 20
@@ -200,9 +176,14 @@ jobs:
           PUMASI_LOG: debug
         run: |
           mkdir -p in && echo "from the host" > in/note.txt
+          # Hosted runners have WHPX, nested under Hyper-V, where QEMU's
+          # virtio disks break; the probe VM notices and falls back to TCG.
           ./target/debug/pumasi vm run --vm-dir "$VM_DIR" --input in --out vm-out \
             busybox:1.36 -- sh -c 'cat /input/note.txt; uname -m; echo done > /output/r.txt' \
-            < /dev/null | tee vm.txt
+            < /dev/null 2>&1 | tee vm.txt
+          if grep -q "do not work under WHPX" vm.txt; then
+            echo "::notice::the WHPX probe VM failed on this runner; microVMs ran under TCG"
+          fi
           grep -q "^from the host" vm.txt
           grep -q "^x86_64" vm.txt
           grep -q "^done" vm-out/r.txt

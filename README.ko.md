@@ -85,7 +85,7 @@ pumasi vm status       # "whpx usable"이면 하드웨어 가속 microVM
 pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
 ```
 
-- WHPX가 없으면(기능이 꺼졌거나 펌웨어에서 가상화가 꺼짐) microVM은 QEMU 소프트웨어 에뮬레이션으로 돕니다. 결과는 같고 몇 배 느립니다. 비교하려면 `PUMASI_QEMU_ACCEL=tcg`로 강제할 수 있습니다.
+- WHPX가 없으면(기능이 꺼졌거나 펌웨어에서 가상화가 꺼짐) microVM은 QEMU 소프트웨어 에뮬레이션으로 돕니다. 결과는 같고 몇 배 느립니다. 비교하려면 `PUMASI_QEMU_ACCEL=tcg`로 강제할 수 있습니다. WHPX가 있어도 클라우드 VM처럼 중첩된 환경에서는 VM 디스크가 깨지는데, 에이전트가 시작할 때 작은 프로브 VM을 띄워 보고 그러면 자동으로 에뮬레이션으로 돌리며 로그에 남깁니다.
 - Docker 작업에는 WSL 2 백엔드, Linux 컨테이너 모드로 실행 중인 Docker Desktop이 필요합니다. Docker Desktop은 로그인한 사용자와 함께 시작하므로, 아무도 로그인하지 않은 기기는 WASM과 microVM 작업만 받습니다(Docker Desktop 로그인 시 시작과 자동 로그인을 켜면 해결).
 - `pumasi service install`은 사설·도메인 네트워크에서 에이전트가 UDP를 받도록 방화벽 규칙을 추가해, 릴레이 대신 직접 연결되게 합니다. `service uninstall`이 규칙을 지웁니다. Windows가 공용(Public)으로 분류한 네트워크에서는 릴레이로 연결되며, 넓히려면 `netsh advfirewall firewall set rule name="Pumasi agent (UDP in)" new profile=any`.
 - 에이전트가 띄운 VM과 Docker CLI는 Windows Job Object에 묶여, 에이전트가 비정상 종료해도 함께 끝납니다.
@@ -267,7 +267,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 14 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
 | 15 | 마켓 허브와 실결제 | 예정 |
 
-알려진 한계: microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux)이나 WHPX(Windows x86_64)가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, macOS의 QEMU 경로는 아직 검증하지 않았으며, ARM Windows는 아직 microVM이 없습니다). CI 러너에는 중첩 가상화가 없어서 WHPX는 실기에서만 확인합니다.
+알려진 한계: microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux)이나 WHPX(Windows x86_64)가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, macOS의 QEMU 경로는 아직 검증하지 않았으며, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고 에뮬레이션으로 넘어가므로, WHPX는 실기에서만 확인합니다.
 
 ## 라이선스
 

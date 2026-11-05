@@ -163,6 +163,9 @@ pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
 - Without WHPX (feature off, or virtualization disabled in the firmware)
   microVMs still run, in QEMU's software emulation: correct but several
   times slower. `PUMASI_QEMU_ACCEL=tcg` forces that, e.g. to compare.
+  The agent also boots one small probe VM at start and falls back to that
+  emulation when WHPX is there but breaks the VM's disks, as it does nested
+  in cloud VMs; the log says so.
 - Docker jobs need Docker Desktop running with the WSL 2 backend and Linux
   containers. Docker Desktop starts with the signed-in user, so a machine
   nobody is logged into takes only WASM and microVM jobs (or set Docker
@@ -514,7 +517,8 @@ through the control plane. MicroVMs pull only public images, have no
 network and no GPUs yet, and need KVM (Linux) or WHPX (Windows x86_64) for
 speed (QEMU without them works but is slow; the macOS path through QEMU is
 untested, and Windows on ARM has no microVMs yet). WHPX itself is checked
-on real machines only, since CI runners have no nested virtualization.
+on real machines only: CI runners have it only nested, where it breaks
+QEMU's disks and the agent falls back to emulation.
 
 ## Development
 

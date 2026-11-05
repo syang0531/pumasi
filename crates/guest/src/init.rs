@@ -112,6 +112,7 @@ fn boot() {
     let payload = match mode.as_str() {
         "build" => build(&disks),
         "run" => run(&disks),
+        "probe" => probe(&disks),
         other => Payload::failed(format!("unknown mode {other:?}")),
     };
     if let Err(e) = write_output(&output, payload) {
@@ -282,6 +283,36 @@ fn oom_kills() -> u64 {
                 .find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok())
         })
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Probe mode: copy the input files to the output, to check disk I/O
+// ---------------------------------------------------------------------------
+
+fn probe(d: &Disks) -> Payload {
+    let dir = Path::new("/probe");
+    let copied = d
+        .input
+        .as_deref()
+        .ok_or_else(|| "no input disk".to_string())
+        .and_then(|input| {
+            fs::create_dir_all(TASK_DIR).ctx(TASK_DIR)?;
+            read_input(input, dir).map(|_| ())
+        });
+    match copied {
+        Ok(()) => Payload {
+            result: GuestResult {
+                outcome: GuestOutcome::Exited(0),
+                stdout_dropped: 0,
+                stderr_dropped: 0,
+                files_dropped: 0,
+            },
+            stdout: None,
+            stderr: None,
+            output_dir: Some(dir.to_path_buf()),
+        },
+        Err(e) => Payload::failed(e),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -448,6 +448,19 @@ loading `WinHvPlatform.dll` from System32 at run time (it exists only with
 the feature on) and asking `WHvGetCapability(HypervisorPresent)`; `pumasi
 vm status` prints the reason when it is not.
 
+WHPX being present does not mean it works. Nested under Hyper-V (cloud
+Windows VMs, GitHub's hosted runners) QEMU's virtio-mmio disks break under
+it: the device sees garbage ring indices ("Guest says index 12855 is
+available") and the guest never gets its disks. So when the microVM executor
+starts on Windows with WHPX it boots one probe VM (guest `probe` mode: copy
+a 4 MiB file from the input disk to the output disk) and compares the copy.
+If that fails it logs why and runs every microVM in TCG instead, which is
+slow but correct. `PUMASI_QEMU_ACCEL` skips the probe. Two more WHPX
+quirks are handled in the command: a guest reset is a triple fault that
+leaves WHPX stuck ("Unexpected VP exit code 4"), so guests reboot through
+ACPI (`reboot=a`), and the host also watches the serial log and stops a
+QEMU still running 3 s after the guest said it was restarting.
+
 `pumasi vm setup` on Windows x86_64 downloads a pinned QEMU installer
 (Stefan Weil's build, the one qemu.org links to; it has `microvm` and
 `whpx`), checks size and SHA-256 while streaming it to disk, and runs it
@@ -479,11 +492,12 @@ works). Public networks are left closed. `service uninstall` removes it.
 
 ### CI
 
-The `microvm (windows, qemu tcg)` job builds the guest init on Linux, embeds
+The `microvm (windows, qemu)` job builds the guest init on Linux, embeds
 it (`PUMASI_EMBED_GUEST`), runs `pumasi vm setup` (kernel and the pinned
-QEMU installer), boots an image with `pumasi vm run`, and runs the microVM
-end-to-end test, all under TCG since hosted runners have no nested
-virtualization. WHPX is verified on a real PC. The release workflow builds
+QEMU installer, cached between runs), boots an image with `pumasi vm run`,
+and runs the microVM end-to-end test. Hosted runners have nested WHPX with
+the broken disks described above, so the probe VM fails there and the runs
+go through the TCG fallback; WHPX itself is verified on a real PC. The release workflow builds
 the guest for x86_64 and aarch64 and embeds the matching one in all six
 binaries.
 

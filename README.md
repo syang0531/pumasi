@@ -610,11 +610,65 @@ schedule nightly-wordcount: created (0 3 * * *)
 `pumasi get nodes|jobs|accounts|schedules|access [-o json]` lists them and
 `pumasi describe node|job|account|schedule NAME` shows one in detail.
 
+### Monitoring and alerts
+
+Every agent reports its CPU, memory, the disk under its data directory,
+network traffic, the hottest temperature sensor and each GPU's use, VRAM,
+temperature and power every 5 seconds. The control plane keeps them for 7
+days (`--metrics-retention`): 10-second steps for the last hour, 1-minute
+steps for a day, 10-minute steps after that.
+
+```sh
+pumasi top                     # every node, the queue and firing alerts, live
+pumasi metrics desktop --since 24h
+pumasi logs JOB_ID -t 3 -f     # a task's stdout and stderr while it runs
+pumasi events -f               # nodes coming and going, jobs finishing, alerts
+```
+
+```
+2026-11-05 14:02:11  runs: 5 running, 37 queued (p10: 5, p0: 32), 2 jobs waiting, 0 held by quotas   alerts: 1
+since the control plane started: 412 runs succeeded, 3 failed, 2 preempted, 0 check mismatches
+
+NODE             STATE    TASKS   CPU  LOAD              MEMORY  DISK            NET IN / OUT   TEMP            GPU
+desktop          online     4/8   87%   6.1   21.3 GiB/31.2 GiB   62%  1.2 MiB/s / 88.0 KiB/s   71°C   97% 18.1 GiB
+laptop           online     1/4   24%   1.0    9.8 GiB/16.0 GiB   41%  12.0 KiB/s / 3.1 KiB/s   52°C              -
+old-mac          offline    0/2
+```
+
+Output of WASM and Docker tasks reaches `pumasi logs -f` within a fraction
+of a second; microVM tasks show theirs when they finish.
+
+**Prometheus and Grafana.** `pumasi cluster start --metrics-addr
+127.0.0.1:9464` serves `/metrics` in the Prometheus text format: node
+metrics, the queue by priority, runs and preemptions, check mismatches,
+firing alerts, account balances and the file store's size. It is off
+unless you give the address; `--metrics-token` (or
+`PUMASI_METRICS_TOKEN`) requires `Authorization: Bearer TOKEN`. See
+[`examples/prometheus.yml`](examples/prometheus.yml) and the Grafana
+dashboard in [`examples/grafana`](examples/grafana).
+
+**Alerts.** The control plane watches for a node offline for a minute, half
+the runs of the last 15 minutes failing, a disk (a node's or its own) 90%
+full, a sensor at 90 °C, a benchmark 25% slower than the node's last one, a
+drive failing SMART and a check run disagreeing with a provider. Change the
+thresholds or turn rules off, and send alerts to Slack, Mattermost, Discord
+or any URL that takes JSON; each alert is sent when it starts and when it
+clears.
+
+```sh
+pumasi alert set --node-offline 2m --disk 85% --temperature off
+pumasi webhook add ops https://hooks.slack.com/services/...   # sends a test alert
+pumasi alert ls
+```
+
+Both can also live in `cluster.toml` (`[alerts]` and `[webhooks.NAME]`,
+with `url_env` to keep the URL out of the file).
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. |
+| `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR] [--metrics-addr ADDR]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. `--metrics-addr` serves Prometheus metrics. |
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`). GPUs are offered unless `--no-gpus`. |
@@ -644,8 +698,14 @@ schedule nightly-wordcount: created (0 3 * * *)
 | `pumasi quota [ACCOUNT --slots N --gpus N --cu-per-day CU --max-priority N --storage SIZE] [--clear]` | Show every account's limits and usage, or change one (`none` lifts a limit). |
 | `pumasi access create NAME --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|NAME` | Tickets with a role for other people; `pumasi whoami` shows the one in use. |
 | `pumasi schedule add NAME job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm NAME` / `run NAME` | Jobs submitted on a cron schedule. |
-| `pumasi apply -f cluster.toml [--dry-run] [--prune]` | Make labels, taints, cordons, quotas and schedules match a file; applying twice changes nothing. |
+| `pumasi apply -f cluster.toml [--dry-run] [--prune]` | Make labels, taints, cordons, quotas, schedules, alert rules and webhooks match a file; applying twice changes nothing. |
 | `pumasi get nodes\|jobs\|accounts\|schedules\|access [-l SELECTOR] [-o json]` / `describe node\|job\|account\|schedule NAME` | List things, or show one in detail. |
+| `pumasi top [--interval 2s] [--once]` | Every node's CPU, memory, disk, network, temperature and GPUs, the queue and firing alerts, refreshed until Ctrl-C. |
+| `pumasi metrics [NODE] [--since 1h] [-o json]` | The latest metrics of every node, or one node's history. |
+| `pumasi logs <JOB> [-t TASK] [-f]` | A task's stdout and stderr; `-f` follows it while it runs. |
+| `pumasi events [-f] [--since 1h] [-n 50] [-o json]` | Cluster events: nodes, jobs, checks, preemptions, alerts. |
+| `pumasi alert ls` / `alert set [--node-offline 1m] [--failure-rate 50%] [--disk 90%] [--temperature 90] [--perf-drop 25%] [--smart on] [--check-mismatch on] [--defaults]` | Alert rules and what fires now; `off` turns a rule off. |
+| `pumasi webhook add NAME URL [--format slack\|discord\|json]` / `ls` / `rm NAME` / `test NAME` | Where alerts go. |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode). |
 
 `--home DIR` or `PUMASI_HOME` changes the state directory, which lets you run
@@ -875,8 +935,8 @@ with other clusters.
 | 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | done |
 | 8 | Cluster file store (iroh-blobs): versioned datasets, `store:` mounts and output datasets, inputs and outputs of any size, resumable hash-checked transfers, node caches shared between nodes, reference GC, quotas, storage and egress billed in CU, private registry images | done |
 | 9 | GPUs and microVM devices: NVIDIA (NVML, CUDA benchmark) and AMD detection, signed device profiles, GPU time billed in CU, per-GPU scheduling, Docker GPU jobs, GPU checks for providers, VFIO passthrough (experimental), filtered microVM networking | done |
-| 10 | Cluster management: node labels and taints, job selectors and tolerations, cordon and drain, priorities with preemption, per-account quotas (slots, GPUs, CU per day, priority, storage), role tickets (admin, submitter, viewer), declarative `apply` with `get` and `describe`, cron schedules, job dependencies | this release |
-| 11 | Monitoring and alerts: node metrics, Prometheus endpoint, live logs, webhooks | planned |
+| 10 | Cluster management: node labels and taints, job selectors and tolerations, cordon and drain, priorities with preemption, per-account quotas (slots, GPUs, CU per day, priority, storage), role tickets (admin, submitter, viewer), declarative `apply` with `get` and `describe`, cron schedules, job dependencies | done |
+| 11 | Monitoring and alerts: node metrics (CPU, memory, disk, network, temperature, GPUs) kept 7 days with downsampling, `top`, live `logs -f`, `events`, opt-in Prometheus endpoint with a Grafana dashboard, alert rules (node offline, failure rate, disk, temperature, benchmark drop, SMART, check mismatch) sent to Slack, Discord or JSON webhooks | this release |
 | 12 | Web dashboard (built into the binary) | planned |
 | 13 | Control plane high availability (Raft) | planned |
 | 14 | WebGPU executor (experimental) | planned |
@@ -901,6 +961,10 @@ Virtualization.framework guests are checked on real machines only: CI
 runners have WHPX only nested, where it breaks QEMU's disks and the agent
 falls back to emulation, and hosted Mac runners cannot virtualize at all.
 macOS 10.15 and 11 themselves have no CI runners either.
+MicroVM task output reaches `pumasi logs` only when the task ends (the
+guest writes it to its output disk), Intel and Apple GPUs report no
+metrics, and the 10-second metric steps of the last hour are not kept
+across a control plane restart.
 
 ## Development
 

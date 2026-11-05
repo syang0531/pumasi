@@ -19,6 +19,7 @@ use pumasi_proto::{
     gpu::{GpuRequest, GpuVendor},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     manage::{LabelSet, Selector, Toleration, tolerated},
+    monitor::EventLevel,
     msg::{
         AccountView, Availability, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo,
         NodeView, OWNER_ACCOUNT, Outcome, Role, TaskAssignment, TaskRef, TaskReport, TaskState,
@@ -38,6 +39,7 @@ use crate::{
     datasets::{FileState, oci_arch_of},
     gpu::{DeviceRecord, GpuRuntime},
     manage::{JobSched, Mgmt, MgmtSnapshot, sched_of},
+    monitor::Monitor,
     perf::{PerfCheck, PerfRuntime, cpu_score},
     rollout::RolloutRecord,
     store::Store,
@@ -324,6 +326,8 @@ pub struct State {
     /// Labels, quotas, access tickets, schedules and the rest of cluster
     /// management.
     pub(crate) mgmt: Mgmt,
+    /// Metrics, events, live output and alerts.
+    pub(crate) monitor: Monitor,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -397,6 +401,7 @@ impl State {
             files: FileState::default(),
             devices: snap.devices.into_iter().collect(),
             mgmt: Mgmt::default(),
+            monitor: Monitor::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -482,6 +487,7 @@ impl State {
             access: snap.access,
             schedules: snap.schedules,
         })?;
+        state.load_monitor(Duration::from_secs(7 * 86_400))?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(
@@ -607,7 +613,12 @@ impl State {
         self.store.put_member(&member)?;
         info!(node = %id, name = %info.name, role = %member.role, account = %member.account, "new node joined");
         let out = (member.role, member.account.clone());
+        let msg = format!(
+            "node {} joined ({}, account {})",
+            info.name, member.role, member.account
+        );
         self.members.insert(id.to_string(), member);
+        self.event(EventLevel::Info, "node.joined", Some(id), None, msg);
         Ok(out)
     }
 
@@ -616,6 +627,14 @@ impl State {
     pub fn remove_node(&mut self, id: &str) -> Result<()> {
         let id = self.resolve_member(id)?;
         let id = id.as_str();
+        let name = self.node_name(id);
+        self.event(
+            EventLevel::Info,
+            "node.removed",
+            Some(id),
+            None,
+            format!("node {name} removed"),
+        );
         self.members.remove(id);
         self.devices.remove(id);
         self.mgmt.node_config.remove(id);
@@ -712,6 +731,14 @@ impl State {
                 gpu: GpuRuntime::default(),
             },
         );
+        let name = self.node_name(id);
+        self.event(
+            EventLevel::Info,
+            "node.online",
+            Some(id),
+            None,
+            format!("node {name} online"),
+        );
         self.schedule();
         generation
     }
@@ -733,7 +760,24 @@ impl State {
             Some(reason) => info!(node = %id, %reason, "node paused"),
             None => info!(node = %id, "node available again"),
         }
-        n.paused = paused;
+        n.paused = paused.clone();
+        let name = self.node_name(id);
+        match paused {
+            Some(reason) => self.event(
+                EventLevel::Info,
+                "node.paused",
+                Some(id),
+                None,
+                format!("node {name} paused: {reason}"),
+            ),
+            None => self.event(
+                EventLevel::Info,
+                "node.resumed",
+                Some(id),
+                None,
+                format!("node {name} takes tasks again"),
+            ),
+        }
         self.schedule();
     }
 
@@ -757,6 +801,12 @@ impl State {
         if !lost.is_empty() {
             warn!(node = %id, tasks = lost.len(), "node lost; rescheduling its tasks");
         }
+        let name = self.node_name(id);
+        let msg = match lost.len() {
+            0 => format!("node {name} offline"),
+            n => format!("node {name} offline; {n} runs moved back to the queue"),
+        };
+        self.event(EventLevel::Warning, "node.offline", Some(id), None, msg);
         for t in lost {
             self.requeue(t, "node disconnected");
         }
@@ -848,6 +898,7 @@ impl State {
             self.drive_challenges();
             self.drive_gpu_challenges();
         }
+        self.tick_monitor();
     }
 
     // -- jobs -----------------------------------------------------------------
@@ -948,7 +999,15 @@ impl State {
             self.modules.insert(h, Arc::new(b));
         }
         info!(job = %id, name = %meta.name, tasks = tasks.len(), account = %meta.account, priority = meta.sched.priority, "job submitted");
+        let msg = format!(
+            "job {id} ({}) submitted: {} tasks, account {}",
+            meta.name,
+            tasks.len(),
+            meta.account
+        );
         self.jobs.insert(id, Job { meta, tasks });
+        self.monitor.active_jobs.insert(id);
+        self.event(EventLevel::Info, "job.submitted", None, Some(id), msg);
         if wait {
             self.mgmt.waiting.insert(id);
         } else {
@@ -1093,6 +1152,7 @@ impl State {
             self.on_check_report(node_id, report, digest);
         } else {
             self.set_stored(r.job, r.index, stored);
+            self.note_run(node_id, r, &report.outcome);
             self.on_primary_report(node_id, report, digest);
         }
         self.schedule();
@@ -1304,10 +1364,19 @@ impl State {
             warn!("persist member: {e:#}");
         }
         if suspended && let Some(n) = self.nodes.get_mut(node_id) {
-            if !n.suspended {
-                warn!(node = %node_id, "too many failed checks; node suspended");
-            }
+            let newly = !n.suspended;
             n.suspended = true;
+            if newly {
+                warn!(node = %node_id, "too many failed checks; node suspended");
+                let name = self.node_name(node_id);
+                self.event(
+                    EventLevel::Critical,
+                    "node.suspended",
+                    Some(node_id),
+                    None,
+                    format!("node {name} suspended after {max} failed checks"),
+                );
+            }
         }
     }
 
@@ -1355,13 +1424,16 @@ impl State {
         }
         task.node = None;
         let mut retry = false;
+        let mut gave_up = None;
         if cancelled {
             task.state = TaskState::Cancelled;
         } else if task.attempts.saturating_sub(free) >= max {
-            task.state = TaskState::Failed(Outcome::Error(format!(
+            let why = format!(
                 "{reason}; gave up after {} attempts",
                 task.attempts.saturating_sub(free)
-            )));
+            );
+            task.state = TaskState::Failed(Outcome::Error(why.clone()));
+            gave_up = Some(why);
         } else {
             task.state = TaskState::Pending;
             retry = true;
@@ -1373,6 +1445,15 @@ impl State {
             // Retries go first (within their priority) so a job is not
             // starved by later jobs.
             self.push_run(r.job, r.index, false, true);
+        }
+        if let Some(why) = gave_up {
+            self.event(
+                EventLevel::Warning,
+                "task.failed",
+                None,
+                Some(r.job),
+                format!("task {}/{} failed: {why}", r.job, r.index),
+            );
         }
     }
 
@@ -1508,6 +1589,7 @@ impl State {
         self.drive_gpu_challenges();
         self.release_waiting();
         if self.queue.is_empty() {
+            self.monitor.quota_blocked = 0;
             return;
         }
         let labels: HashMap<String, LabelSet> = self
@@ -1519,6 +1601,7 @@ impl State {
         let mut usage = self.account_usage();
         let mut skipped = VecDeque::new();
         let mut dirty: Vec<(JobId, u32)> = Vec::new();
+        let mut quota_blocked = 0;
         while let Some(item) = self.queue.pop_front() {
             let Some(need) = self.need_for(&item) else {
                 continue;
@@ -1526,6 +1609,7 @@ impl State {
             // Over its account's quota: waits, and so do the account's
             // other runs behind it.
             if !self.within_quota(&need, &usage) {
+                quota_blocked += 1;
                 skipped.push_back(item);
                 continue;
             }
@@ -1574,6 +1658,7 @@ impl State {
                 None => skipped.push_back(item),
             }
         }
+        self.monitor.quota_blocked = quota_blocked;
         // Whatever could not be placed keeps its order at the front.
         while let Some(item) = skipped.pop_back() {
             self.queue.push_front(item);
@@ -2327,8 +2412,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use pumasi_proto::manage::{
-        AccessRole, AccountQuota, ApplySpec, NodeEdit, NodeSpec, ScheduleSpec,
+        AccessRole, AccountQuota, ApplySpec, NodeConfig, NodeEdit, NodeSpec, ScheduleSpec,
     };
+    use pumasi_proto::msg::AdminOp;
 
     /// Joins an owner machine and keeps its key, to sign reports.
     fn join_keyed(
@@ -2733,6 +2819,7 @@ mod tests {
             }],
             prune: true,
             dry_run: false,
+            ..Default::default()
         };
         let mut dry = spec.clone();
         dry.dry_run = true;
@@ -2768,7 +2855,6 @@ mod tests {
     #[test]
     fn access_tickets_have_roles() {
         use crate::manage::Caller;
-        use pumasi_proto::msg::AdminOp;
         let mut st = state();
         let (node, _) = join(&mut st, "a", vec![Executor::Wasm], None);
         let sub = st
@@ -2837,5 +2923,284 @@ mod tests {
         let gone = st.revoke_access("alice laptop").unwrap();
         assert_eq!(gone.len(), 1);
         assert!(st.access_caller(&sub.secret).is_none());
+    }
+
+    // -- monitoring (phase 11) -----------------------------------------------
+
+    fn events_of(st: &State) -> Vec<String> {
+        st.events(0, 0, 1000).into_iter().map(|e| e.kind).collect()
+    }
+
+    #[test]
+    fn alerts_fire_and_resolve() {
+        let mut st = state();
+        st.set_alert_policy(pumasi_proto::monitor::AlertPolicy {
+            node_offline_secs: Some(0),
+            failure_rate: Some(pumasi_proto::monitor::FailureRate {
+                percent: 50,
+                window_secs: 600,
+                min_runs: 2,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let (a, _rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        st.tick_monitor();
+        assert!(st.alerts_view().firing.is_empty());
+
+        let generation = st.nodes[&a].generation;
+        st.on_disconnect(&a, generation);
+        st.tick_monitor();
+        let firing = st.alerts_view().firing;
+        assert_eq!(firing.len(), 1, "{firing:?}");
+        assert_eq!(firing[0].rule, "node_offline");
+        assert_eq!(firing[0].subject, "a");
+        let n = st.recent_notices();
+        assert_eq!(n.last().unwrap().status, "firing");
+        assert!(n.last().unwrap().message.contains("node a offline"));
+        // Still offline: no second notice.
+        st.tick_monitor();
+        assert_eq!(st.recent_notices().len(), 1);
+
+        // Back online: resolved.
+        let (tx, _rx2) = mpsc::unbounded_channel();
+        let (kill, _) = oneshot::channel();
+        st.on_connect(
+            &a,
+            pumasi_proto::PROTOCOL_VERSION,
+            info("a", vec![Executor::Wasm]),
+            None,
+            Availability::Available,
+            tx,
+            kill,
+        );
+        st.tick_monitor();
+        assert!(st.alerts_view().firing.is_empty());
+        assert_eq!(st.recent_notices().last().unwrap().status, "resolved");
+
+        // A cordoned node may go away quietly.
+        let c = NodeConfig {
+            cordoned: true,
+            ..Default::default()
+        };
+        st.set_node_config(&a, c).unwrap();
+        let generation = st.nodes[&a].generation;
+        st.on_disconnect(&a, generation);
+        st.tick_monitor();
+        assert!(st.alerts_view().firing.is_empty());
+
+        // Half the runs failing.
+        let t = TaskRef {
+            job: JobId(1),
+            index: 0,
+            attempt: 1,
+            check: false,
+        };
+        st.note_run(&a, t, &Outcome::Exited(0));
+        st.note_run(&a, t, &Outcome::Exited(1));
+        st.tick_monitor();
+        let firing = st.alerts_view().firing;
+        assert_eq!(firing[0].rule, "failure_rate", "{firing:?}");
+        assert!(firing[0].message.contains("1 of 2 runs failed"));
+
+        let kinds = events_of(&st);
+        for k in [
+            "node.joined",
+            "node.online",
+            "node.offline",
+            "alert.firing",
+            "alert.resolved",
+            "task.failed",
+        ] {
+            assert!(kinds.iter().any(|x| x == k), "no {k} in {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn disk_temperature_and_smart_alerts_from_node_reports() {
+        let mut st = state();
+        let (a, _rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let generation = st.nodes[&a].generation;
+        st.on_metrics(
+            &a,
+            generation,
+            pumasi_proto::monitor::NodeMetrics {
+                disk_used: 95,
+                disk_total: 100,
+                temp_c: Some(95.0),
+                ..Default::default()
+            },
+        );
+        st.monitor_cp_disk(Some((10, 100)));
+        st.tick_monitor();
+        let rules: Vec<String> = st
+            .alerts_view()
+            .firing
+            .into_iter()
+            .map(|a| a.rule)
+            .collect();
+        assert_eq!(rules, ["disk", "temperature"]);
+        st.monitor_cp_disk(Some((99, 100)));
+        st.tick_monitor();
+        assert!(
+            st.alerts_view()
+                .firing
+                .iter()
+                .any(|a| a.subject == "control-plane")
+        );
+    }
+
+    #[test]
+    fn live_logs_follow_a_running_task() {
+        let mut st = state();
+        let (a, key, mut rx) = join_keyed(&mut st, "a", 1);
+        let id = st.submit(job(Executor::Wasm, 1)).unwrap();
+        let run = assigned(&mut rx).pop().unwrap();
+        let generation = st.nodes[&a].generation;
+        let first = st.logs(id, 0, 0, 0, 0).unwrap();
+        assert_eq!(first.attempt, 1);
+        assert!(first.stdout.is_empty() && !first.done);
+
+        st.on_logs(&a, generation, run.task, b"hel".to_vec(), b"warn".to_vec());
+        // Another node cannot write into it.
+        let (b, _rxb) = join(&mut st, "b", vec![Executor::Wasm], None);
+        let gb = st.nodes[&b].generation;
+        st.on_logs(&b, gb, run.task, b"forged".to_vec(), vec![]);
+        let c = st.logs(id, 0, 1, 0, 0).unwrap();
+        assert_eq!(c.stdout, b"hel");
+        assert_eq!(c.stderr, b"warn");
+        assert!(c.live);
+        st.on_logs(&a, generation, run.task, b"lo".to_vec(), vec![]);
+        let c = st.logs(id, 0, 1, 3, 4).unwrap();
+        assert_eq!((c.stdout_from, c.stdout.as_slice()), (3, b"lo".as_slice()));
+        assert!(c.stderr.is_empty());
+        // Asking for an older run starts again from the beginning.
+        let c = st.logs(id, 0, 0, 3, 4).unwrap();
+        assert_eq!(c.stdout, b"hello");
+
+        finish(&mut st, &a, &key, &run);
+        let c = st.logs(id, 0, 1, 0, 0).unwrap();
+        assert!(c.done);
+        assert_eq!(c.state, TaskState::Succeeded);
+        assert!(
+            st.monitor.live.is_empty(),
+            "the live copy goes with the run"
+        );
+        st.tick_monitor();
+        st.monitor.last_jobs_check -= Duration::from_secs(2);
+        st.tick_monitor();
+        assert!(events_of(&st).iter().any(|k| k == "job.succeeded"));
+        assert_eq!(st.monitor.counters.runs_succeeded, 1);
+    }
+
+    #[test]
+    fn prometheus_text_lints() {
+        let mut st = state();
+        let (a, _rx) = join(&mut st, "a \"quoted\"", vec![Executor::Wasm], None);
+        let generation = st.nodes[&a].generation;
+        st.on_metrics(
+            &a,
+            generation,
+            pumasi_proto::monitor::NodeMetrics {
+                cpu_percent: 50.0,
+                memory_used: 1 << 30,
+                memory_total: 2 << 30,
+                disk_used: 1,
+                disk_total: 2,
+                net_rx: 10,
+                net_tx: 20,
+                temp_c: Some(40.0),
+                gpus: vec![pumasi_proto::monitor::GpuMetrics {
+                    index: 0,
+                    util_percent: 30.0,
+                    mem_used_mib: 100,
+                    mem_total_mib: 8000,
+                    temp_c: Some(55.0),
+                    power_w: Some(120.5),
+                }],
+                ..Default::default()
+            },
+        );
+        st.submit(job(Executor::Docker, 3)).unwrap();
+        let text = st.prometheus();
+        let n = pumasi_proto::monitor::lint_exposition(&text)
+            .unwrap_or_else(|e| panic!("{e:#}\n{text}"));
+        assert!(n > 20, "{text}");
+        assert!(
+            text.contains("pumasi_node_cpu_usage_ratio{node=\"a \\\"quoted\\\"\""),
+            "{text}"
+        );
+        assert!(text.contains("pumasi_gpu_power_watts{"), "{text}");
+        assert!(
+            text.contains("pumasi_queued_runs{priority=\"0\"} 3"),
+            "{text}"
+        );
+        assert!(text.contains("pumasi_jobs{state=\"queued\"} 1"), "{text}");
+        assert!(text.contains("pumasi_node_up{"), "{text}");
+    }
+
+    #[test]
+    fn monitoring_calls_and_roles() {
+        let mut st = state();
+        let sub = st
+            .create_access(
+                "alice",
+                AccessRole::Submitter {
+                    account: "alice".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let viewer = st.create_access("wall", AccessRole::Viewer, None).unwrap();
+        let alice = st.access_caller(&sub.secret).unwrap();
+        let v = st.access_caller(&viewer.secret).unwrap();
+        let owners = st.submit(job(Executor::Wasm, 1)).unwrap();
+        let logs = |id| AdminOp::Logs {
+            job: id,
+            index: 0,
+            attempt: 0,
+            stdout_from: 0,
+            stderr_from: 0,
+        };
+        for op in [
+            AdminOp::Metrics {
+                node: None,
+                since_secs: 60,
+            },
+            AdminOp::Events {
+                after: 0,
+                since_unix: 0,
+                limit: 10,
+            },
+            AdminOp::Alerts,
+            logs(owners),
+        ] {
+            assert!(crate::access::admit(&st, &v, op).is_ok());
+        }
+        assert!(crate::access::admit(&st, &alice, logs(owners)).is_err());
+        assert!(crate::access::admit(&st, &alice, AdminOp::Alerts).is_ok());
+        let hook = AdminOp::SetWebhook(Box::new(pumasi_proto::monitor::WebhookSpec {
+            name: "ops".into(),
+            url: "https://hooks.slack.com/services/x".into(),
+            format: pumasi_proto::monitor::WebhookFormat::Slack,
+        }));
+        let err = crate::access::admit(&st, &v, hook).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot change webhooks"),
+            "{err:#}"
+        );
+        // A submitter sees node events and its own jobs' events only.
+        let mut mine = job(Executor::Wasm, 1);
+        mine.account = Some("alice".into());
+        st.submit(mine).unwrap();
+        let resp = crate::access::scope(
+            &alice,
+            pumasi_proto::msg::AdminResponse::Events(st.events(0, 0, 100)),
+        );
+        let pumasi_proto::msg::AdminResponse::Events(seen) = resp else {
+            panic!()
+        };
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].account.as_deref(), Some("alice"));
     }
 }

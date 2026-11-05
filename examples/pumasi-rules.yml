@@ -1,0 +1,34 @@
+# Example Prometheus alerting rules for Pumasi (see examples/prometheus.yml).
+groups:
+  - name: pumasi
+    rules:
+      - alert: PumasiNodeDown
+        expr: pumasi_node_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pumasi node {{ $labels.node }} is offline"
+      - alert: PumasiDiskFull
+        expr: pumasi_node_disk_used_bytes / pumasi_node_disk_total_bytes > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk of {{ $labels.node }} is {{ $value | humanizePercentage }} full"
+      - alert: PumasiRunsFailing
+        expr: |
+          sum(rate(pumasi_runs_total{outcome="failed"}[15m]))
+            / sum(rate(pumasi_runs_total[15m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over half of the cluster's runs fail"
+      - alert: PumasiQueueStuck
+        expr: sum(pumasi_queued_runs) > 0 and sum(pumasi_running_runs) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Runs are queued but nothing runs"

@@ -293,6 +293,15 @@ impl State {
             warn!("persist preemption: {e:#}");
         }
         info!(node = %node_id, task = %t, "{reason}; run moved back to the queue");
+        self.monitor.counters.preemptions += 1;
+        let name = self.node_name(node_id);
+        self.event(
+            pumasi_proto::monitor::EventLevel::Info,
+            "task.preempted",
+            Some(node_id),
+            Some(t.job),
+            format!("task {}/{} on {name}: {reason}", t.job, t.index),
+        );
         self.requeue_run(t, reason);
         true
     }
@@ -910,7 +919,8 @@ impl State {
 
     // -- apply --------------------------------------------------------------
 
-    /// Makes nodes, quotas and schedules match `spec`. Applying the same
+    /// Makes nodes, quotas, schedules, alert rules and webhooks match
+    /// `spec`. Applying the same
     /// spec again changes nothing. Returns one line per change.
     pub fn apply(&mut self, spec: ApplySpec) -> Result<Vec<String>> {
         spec.validate()?;
@@ -960,6 +970,39 @@ impl State {
             }
             if !dry {
                 self.set_schedule(s.clone())?;
+            }
+        }
+        if let Some(p) = &spec.alerts
+            && *p != self.monitor.policy
+        {
+            changes.push("alerts: policy updated".to_string());
+            if !dry {
+                self.set_alert_policy(p.clone())?;
+            }
+        }
+        let current = self.webhook_specs();
+        for w in &spec.webhooks {
+            match current.iter().find(|c| c.name == w.name) {
+                Some(c) if c == w => continue,
+                Some(_) => changes.push(format!("webhook {}: updated", w.name)),
+                None => changes.push(format!(
+                    "webhook {}: created ({})",
+                    w.name,
+                    pumasi_proto::monitor::redact_url(&w.url)
+                )),
+            }
+            if !dry {
+                self.set_webhook(w.clone())?;
+            }
+        }
+        if spec.prune {
+            for c in &current {
+                if !spec.webhooks.iter().any(|w| w.name == c.name) {
+                    changes.push(format!("webhook {}: removed", c.name));
+                    if !dry {
+                        self.remove_webhook(&c.name)?;
+                    }
+                }
             }
         }
         if spec.prune {

@@ -26,6 +26,7 @@ use crate::{
         AccessRole, AccessView, AccountQuota, ApplySpec, LabelSet, NodeConfig, NodeEdit, QuotaView,
         ScheduleSpec, ScheduleView, Selector, Toleration,
     },
+    monitor::{AlertPolicy, LogChunk, NodeMetrics, WebhookSpec},
     perf::{BenchChallenge, PerfProfile, SignedPerf},
     receipt::{Receipt, SignedUsage},
     release::{ReleaseFile, SignedRelease, Target},
@@ -382,6 +383,15 @@ pub enum FromAgent {
         nonce: u64,
         solutions: Vec<u64>,
     },
+    /// A sample of the machine's CPU, memory, disk, network, temperature
+    /// and GPUs, every few seconds (protocol 10).
+    Metrics(Box<NodeMetrics>),
+    /// What a running task printed since the last chunk (protocol 10).
+    Logs {
+        task: TaskRef,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +572,40 @@ pub enum AdminOp {
     },
     /// Makes the cluster match a `cluster.toml`.
     Apply(Box<ApplySpec>),
+    // Phase 11 from here.
+    /// Nodes' latest metrics and, with `since_secs`, their time series
+    /// over that long (`node`: name or id prefix, or every node).
+    Metrics {
+        node: Option<String>,
+        since_secs: u64,
+    },
+    /// Cluster events after sequence number `after` (and not older than
+    /// `since_unix`), oldest first; with `after` 0, the newest `limit`.
+    Events {
+        after: u64,
+        since_unix: u64,
+        limit: u32,
+    },
+    /// A task's output from these offsets of run `attempt`.
+    Logs {
+        job: JobId,
+        index: u32,
+        attempt: u32,
+        stdout_from: u64,
+        stderr_from: u64,
+    },
+    /// Alert rules, firing alerts and webhooks.
+    Alerts,
+    SetAlertPolicy(Box<AlertPolicy>),
+    /// Creates or replaces a webhook.
+    SetWebhook(Box<WebhookSpec>),
+    RemoveWebhook {
+        name: String,
+    },
+    /// Sends a test alert to a webhook now and waits for the answer.
+    TestWebhook {
+        name: String,
+    },
 }
 
 /// Terms of an invite for someone else's machine.
@@ -638,6 +682,11 @@ pub enum AdminResponse {
     Drained {
         moved: u32,
     },
+    // Phase 11 from here.
+    Metrics(Box<crate::monitor::MetricsView>),
+    Events(Vec<crate::monitor::EventView>),
+    Logs(Box<LogChunk>),
+    Alerts(Box<crate::monitor::AlertsView>),
 }
 
 /// A secret's name and when it was set; the value never leaves the

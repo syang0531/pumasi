@@ -7,6 +7,7 @@ pub mod bench;
 pub mod docker;
 pub mod executor;
 pub mod gpu;
+pub mod metrics;
 pub mod microvm;
 pub mod platform;
 pub mod store;

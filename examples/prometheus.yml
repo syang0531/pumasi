@@ -1,0 +1,23 @@
+# Scrape a Pumasi control plane started with
+#
+#   pumasi cluster start --metrics-addr 127.0.0.1:9464 [--metrics-token TOKEN]
+#
+# and run `prometheus --config.file=examples/prometheus.yml`. Node metrics
+# change every 5 seconds, so scraping more often than that gains nothing.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: pumasi
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+    # With --metrics-token (or PUMASI_METRICS_TOKEN):
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/pumasi-token
+
+# Alerting from Prometheus is optional: the control plane already sends its
+# own alerts to webhooks (`pumasi webhook add`). These are examples for
+# Alertmanager users.
+rule_files:
+  - pumasi-rules.yml

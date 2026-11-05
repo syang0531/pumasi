@@ -3292,6 +3292,7 @@ name = "pumasi-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "iroh",
  "libc",
@@ -3321,8 +3322,10 @@ dependencies = [
  "pumasi-proto",
  "rand 0.9.5",
  "redb",
+ "reqwest",
  "serde",
  "serde_json",
+ "sysinfo",
  "tokio",
  "tracing",
  "tracing-subscriber",

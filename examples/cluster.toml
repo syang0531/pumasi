@@ -1,11 +1,11 @@
 # The cluster as you want it: node labels, taints and cordons, account
-# quotas, scheduled jobs. Apply it from wherever the admin ticket is:
+# quotas, scheduled jobs, alert rules and where alerts go. Apply it from wherever the admin ticket is:
 #
 #   pumasi apply -f examples/cluster.toml --dry-run   # what would change
 #   pumasi apply -f examples/cluster.toml             # change it
 #
 # Applying it again changes nothing. Nodes and accounts the file does not
-# list are left alone; schedules too, unless you pass --prune.
+# list are left alone; schedules and webhooks too, unless you pass --prune.
 
 # Nodes by name (or id prefix). `labels` are the node's own labels (the
 # built-in ones, like os, arch, gpu and disk, come from the node itself);
@@ -37,3 +37,25 @@ cron = "0 3 * * *"
 job = "python-wordcount/job.toml"
 account = "alice"
 overlap = false                    # skip a run while the last one is going
+
+# Alert rules. The section is the whole policy: a rule left out takes its
+# default (shown here), "off" or false turns it off.
+[alerts]
+node_offline = "1m"                # a node (not cordoned) gone this long
+failure_rate = "50%"               # of runs failing...
+failure_window = "15m"             # ...over this long...
+failure_min_runs = 10              # ...once there are at least this many
+disk = "90%"                       # a node's disk or the control plane's
+temperature = 90                   # °C, CPU or GPU
+perf_drop = "25%"                  # a new benchmark this much slower
+smart = true                       # a drive failing SMART or worn out
+check_mismatch = true              # a check run disagreeing with a provider
+
+# Where alerts go: a Slack or Mattermost incoming webhook, a Discord
+# webhook, or any URL that takes JSON (format: slack, discord, json;
+# guessed from the URL when left out). Keep the URL out of the file with
+# url_env, read where you run `pumasi apply`:
+#
+# [webhooks.ops]
+# url_env = "PUMASI_SLACK_WEBHOOK"   # or url = "https://hooks.slack.com/..."
+# format = "slack"

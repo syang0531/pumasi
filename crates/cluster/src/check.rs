@@ -158,8 +158,16 @@ impl State {
             }
         }
         let inconclusive = matches!(check.status, Verification::Inconclusive);
+        let mismatch = match &check.status {
+            Verification::Mismatch { bad } => Some(bad.clone()),
+            Verification::Inconclusive => Some(Vec::new()),
+            _ => None,
+        };
         self.settle_check_stored(r.job, r.index, won_attempt);
         self.persist_task(r);
+        if let Some(bad) = mismatch {
+            self.note_mismatch(r, &bad, inconclusive);
+        }
         for node in passed {
             self.credit_pass(&node);
         }

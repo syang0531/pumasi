@@ -9,6 +9,7 @@ pub mod economy;
 pub mod gpu;
 pub mod job;
 pub mod manage;
+pub mod monitor;
 pub mod msg;
 pub mod net;
 pub mod perf;
@@ -31,11 +32,14 @@ pub const STORE_PROTOCOL: u32 = 8;
 /// The first agent protocol with devices: GPUs, GPU challenges and microVM
 /// networking.
 pub const DEVICES_PROTOCOL: u32 = 9;
+/// The first agent protocol with monitoring: node metrics and live task
+/// output.
+pub const MONITOR_PROTOCOL: u32 = 10;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        9
+        10
     };
 }
 
@@ -49,7 +53,7 @@ pub const PROTOCOL_VERSION: u32 = protocol_version!();
 /// Protocol 7 agents lack the file store (8): they get no jobs that mount
 /// datasets, write outputs to the store or use private images. Protocol 8
 /// agents lack devices (9): they get no GPU jobs and no microVM jobs with
-/// a network.
+/// a network. Protocol 9 agents send no metrics and no live output.
 pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi
@@ -89,6 +93,15 @@ pub fn secrets_eq(a: &Secret, b: &Secret) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+/// Compares two strings in constant time (for their length).
+pub fn secrets_eq_str(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// Content hash of a WASM module (BLAKE3).

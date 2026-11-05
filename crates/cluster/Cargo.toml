@@ -19,6 +19,9 @@ uuid.workspace = true
 redb.workspace = true
 postcard.workspace = true
 data-encoding.workspace = true
+# Monitoring: the control plane's own disk, and webhook deliveries.
+sysinfo.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 pumasi-agent.workspace = true

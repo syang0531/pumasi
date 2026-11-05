@@ -356,8 +356,19 @@ impl MicrovmExecutor {
         // WHPX is not equally good everywhere: nested under Hyper-V (cloud
         // Windows machines, CI runners) QEMU's virtio disks can break under
         // it. One tiny VM tells, and the slow software emulation still works.
+        let accel_override = std::env::var("PUMASI_QEMU_ACCEL").ok();
+        if exec.vmm.backend == Backend::Qemu
+            && accel_override
+                .as_deref()
+                .is_some_and(|a| a.starts_with("tcg"))
+        {
+            // Software emulation asked for: the guest gets the settings
+            // that go with it (fixed TSC rate, emulated timers).
+            exec.vmm.accelerated = false;
+            exec.vmm.tsc_khz = None;
+        }
         let whpx = cfg!(windows) && exec.vmm.backend == Backend::Qemu && exec.vmm.accelerated;
-        if whpx && std::env::var_os("PUMASI_QEMU_ACCEL").is_none() {
+        if whpx && accel_override.is_none() {
             let start = Instant::now();
             match exec.probe().await {
                 Ok(()) => debug!(
@@ -380,7 +391,7 @@ impl MicrovmExecutor {
             accelerated = vmm.accelerated,
             "microvm executor enabled"
         );
-        if !vmm.accelerated && !whpx {
+        if !vmm.accelerated && !whpx && accel_override.is_none() {
             warn!(
                 "no hardware virtualization (KVM, HVF or WHPX): microVMs run in software emulation and will be slow"
             );

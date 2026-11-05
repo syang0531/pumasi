@@ -202,6 +202,13 @@ pub enum HelloReply {
     Rejected {
         reason: String,
     },
+    /// This control plane replica is not the leader (sent to protocol 11
+    /// agents only; older ones get a closed connection). `leader` is where
+    /// to go, when this replica knows; `replicas` are all of them.
+    NotLeader {
+        leader: Option<EndpointAddr>,
+        replicas: Vec<EndpointAddr>,
+    },
 }
 
 /// One placement of one task. `attempt` distinguishes retries so stale
@@ -281,6 +288,10 @@ pub enum ToAgent {
     /// Solve this GPU challenge now and answer with
     /// [`FromAgent::GpuResult`]; the control plane times it (protocol 9).
     GpuChallenge(GpuChallenge),
+    /// The control plane replicas, after the welcome and whenever they
+    /// change; the agent tries them when the connection drops (protocol
+    /// 11).
+    Replicas(Vec<EndpointAddr>),
 }
 
 /// How a task ended.
@@ -606,6 +617,23 @@ pub enum AdminOp {
     TestWebhook {
         name: String,
     },
+    // Phase 13 from here.
+    /// The control plane replicas and the Raft state.
+    HaStatus,
+    /// A replica ticket for one more control plane replica, valid for
+    /// `ttl_secs`. Turns replication on if it is off.
+    HaInvite {
+        ttl_secs: u64,
+    },
+    /// Takes a replica out of the control plane (id or prefix).
+    HaRemove {
+        id: String,
+    },
+    /// A consistent copy of the control plane's state, from `offset`
+    /// (made when `offset` is 0, kept for a while for the next chunks).
+    Backup {
+        offset: u64,
+    },
 }
 
 /// Terms of an invite for someone else's machine.
@@ -687,6 +715,20 @@ pub enum AdminResponse {
     Events(Vec<crate::monitor::EventView>),
     Logs(Box<LogChunk>),
     Alerts(Box<crate::monitor::AlertsView>),
+    // Phase 13 from here.
+    /// This control plane replica is not the leader; nothing was done.
+    /// `leader` is where to ask, when this replica knows.
+    NotLeader {
+        leader: Option<EndpointAddr>,
+    },
+    Ha(Box<crate::ha::HaView>),
+    /// A chunk of a backup: its total size and BLAKE3 hash (the same for
+    /// every chunk of one backup).
+    Backup {
+        total: u64,
+        digest: [u8; 32],
+        bytes: Vec<u8>,
+    },
 }
 
 /// A secret's name and when it was set; the value never leaves the

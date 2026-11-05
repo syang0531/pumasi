@@ -22,6 +22,8 @@ data-encoding.workspace = true
 # Monitoring: the control plane's own disk, and webhook deliveries.
 sysinfo.workspace = true
 reqwest.workspace = true
+openraft.workspace = true
+n0-future.workspace = true
 
 [dev-dependencies]
 pumasi-agent.workspace = true

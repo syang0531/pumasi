@@ -375,6 +375,7 @@ async fn rejects_bad_ticket_and_reconnects_known_node() {
     let forged = JoinTicket {
         cluster: cluster.addr(),
         secret: [7; 32],
+        replicas: vec![],
     };
     let res = tokio::time::timeout(
         Duration::from_secs(10),

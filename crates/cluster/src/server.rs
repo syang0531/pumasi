@@ -1,21 +1,30 @@
 //! Network front of the control plane: accepts agent and admin connections
 //! over iroh and drives the [`State`] machine.
+//!
+//! A control plane with replicas (phase 13, see [`crate::ha`]) runs the
+//! same services, but only on the replica that leads: [`Shared`] is what
+//! a replica keeps for its whole life (endpoint, file store, Raft), and
+//! [`Inner`] is one term of leadership (the state machine and the tasks
+//! that drive it), started when the replica becomes the leader and
+//! stopped when it is not anymore. Other replicas answer agents and admin
+//! calls with where the leader is.
 
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use iroh::{
-    Endpoint, EndpointAddr,
+    Endpoint, EndpointAddr, SecretKey,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use pumasi_proto::{
-    ADMIN_ALPN, AGENT_ALPN, BLOBS_ALPN, MIN_AGENT_PROTOCOL, PROTOCOL_VERSION, Secret, blobs,
+    ADMIN_ALPN, AGENT_ALPN, BLOBS_ALPN, HA_PROTOCOL, MIN_AGENT_PROTOCOL, PROTOCOL_VERSION,
+    RAFT_ALPN, Secret, blobs,
     msg::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
         FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, ToAgent,
@@ -25,12 +34,12 @@ use pumasi_proto::{
     perf::kernel_native,
     release::SignedRelease,
     secrets_eq,
-    store::{MAX_STORE_OUTPUT_BYTES, StoreTarget, format_size},
-    ticket::{AdminTicket, JoinTicket},
+    store::{BlobHash, MAX_STORE_OUTPUT_BYTES, StoreTarget, format_size},
+    ticket::{AdminTicket, JoinTicket, ReplicaTicket},
     wire::{read_frame, read_msg, write_msg},
 };
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tracing::{debug, info, warn};
@@ -38,11 +47,12 @@ use tracing::{debug, info, warn};
 use crate::{
     access,
     datasets::StoreCmd,
-    files::FileStore,
+    files::{FileStore, Peer},
+    ha::{self, Ha},
     manage::Caller,
     rollout::{ReleaseStore, release_dir},
     state::State,
-    store::Store,
+    store::{Sink, Store},
 };
 
 const KEY_FILE: &str = "secret.key";
@@ -50,6 +60,10 @@ const DB_FILE: &str = "state.redb";
 pub const ADMIN_TICKET_FILE: &str = "admin.ticket";
 const ADMIN_SECRET_META: &str = "admin_secret";
 const NAME_META: &str = "cluster_name";
+/// How long a backup made for `pumasi backup` is kept for its chunks.
+const BACKUP_TTL: Duration = Duration::from_secs(600);
+/// Largest chunk of a backup in one answer.
+const BACKUP_CHUNK: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
@@ -73,6 +87,8 @@ pub struct ClusterConfig {
     pub metrics_token: Option<String>,
     /// How long node metrics and events are kept.
     pub metrics_retention: Duration,
+    /// How often a follower copies the leader's file store.
+    pub mirror_every: Duration,
 }
 
 impl ClusterConfig {
@@ -90,18 +106,122 @@ impl ClusterConfig {
             metrics_addr: None,
             metrics_token: None,
             metrics_retention: Duration::from_secs(7 * 86_400),
+            mirror_every: Duration::from_secs(30),
         }
     }
 }
 
+/// What a control plane replica keeps for its whole life.
+pub(crate) struct Shared {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) config: ClusterConfig,
+    addr: Mutex<EndpointAddr>,
+    pub(crate) releases: ReleaseStore,
+    pub(crate) files: FileStore,
+    /// The cluster key: signs releases and receipts.
+    key: SecretKey,
+    /// The state database, writing directly (the state machine's side).
+    store: Store,
+    /// Raft, when replication is on.
+    ha: RwLock<Option<Arc<Ha>>>,
+    /// The services of the current term, on the leader.
+    active: RwLock<Option<Arc<Inner>>>,
+    /// The last backup made, and when.
+    backup: Mutex<Option<(Instant, Arc<Vec<u8>>, [u8; 32])>>,
+    /// Follows Raft: starts and stops the services (replicas only).
+    lead: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Shared {
+    fn addr(&self) -> EndpointAddr {
+        self.addr.lock().unwrap().clone()
+    }
+
+    pub(crate) fn active(&self) -> Option<Arc<Inner>> {
+        self.active.read().unwrap().clone()
+    }
+
+    fn ha(&self) -> Option<Arc<Ha>> {
+        self.ha.read().unwrap().clone()
+    }
+
+    /// The cluster's key as an address (with this replica's addresses
+    /// when it is the replica that created the cluster), and the
+    /// replicas, for tickets.
+    fn ticket_addrs(&self) -> (EndpointAddr, Vec<EndpointAddr>) {
+        let me = self.addr();
+        let cluster_id = self.key.public();
+        let Some(ha) = self.ha() else {
+            return (me, Vec::new());
+        };
+        let mut replicas = ha.replica_addrs();
+        if let Some(r) = replicas.iter_mut().find(|r| r.id == me.id) {
+            *r = me.clone();
+        }
+        let cluster = if me.id == cluster_id {
+            me
+        } else {
+            replicas
+                .iter()
+                .find(|r| r.id == cluster_id)
+                .cloned()
+                .unwrap_or_else(|| EndpointAddr::new(cluster_id))
+        };
+        (cluster, replicas)
+    }
+
+    /// Where the leader is, when this replica is not it.
+    fn leader_hint(&self) -> Option<EndpointAddr> {
+        self.ha().and_then(|h| h.leader_addr())
+    }
+
+    /// Who may use the file store: members of the cluster, and the other
+    /// control plane replicas (they copy everything).
+    fn store_peer(&self, id: &iroh::EndpointId) -> Peer {
+        if self.ha().is_some_and(|h| h.is_replica(id)) && *id != self.endpoint.id() {
+            return Peer {
+                member: true,
+                pusher: false,
+            };
+        }
+        match self.active() {
+            Some(inner) => inner.state().store_peer(id),
+            None => Peer::default(),
+        }
+    }
+
+    fn write_admin_ticket(&self, secret: Secret) {
+        let (cluster, replicas) = self.ticket_addrs();
+        let t = AdminTicket {
+            cluster,
+            secret,
+            replicas,
+        };
+        if let Err(e) = write_private(
+            &self.config.data_dir.join(ADMIN_TICKET_FILE),
+            t.to_string().as_bytes(),
+        ) {
+            warn!("could not write the admin ticket: {e:#}");
+        }
+    }
+}
+
+/// One term of leadership: the state machine and what drives it.
 pub(crate) struct Inner {
+    shared: Arc<Shared>,
     state: Mutex<State>,
     admin_secret: Secret,
-    endpoint: Endpoint,
-    config: ClusterConfig,
-    addr: Mutex<EndpointAddr>,
-    releases: ReleaseStore,
-    files: FileStore,
+    /// Set when this term ends; sessions close.
+    stopped: watch::Sender<bool>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    metrics_addr: Option<SocketAddr>,
+}
+
+impl std::ops::Deref for Inner {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
 }
 
 impl Inner {
@@ -109,176 +229,306 @@ impl Inner {
         self.state.lock().expect("state lock poisoned")
     }
 
-    fn addr(&self) -> EndpointAddr {
-        self.addr.lock().unwrap().clone()
+    fn ticket_addrs(&self) -> (EndpointAddr, Vec<EndpointAddr>) {
+        self.shared.ticket_addrs()
+    }
+
+    /// Ends this term: sessions close, tasks stop.
+    fn stop(&self) {
+        let _ = self.stopped.send(true);
+        for t in self.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
     }
 }
 
-/// A running control plane.
+/// Starts the services of a term on `store` (writing directly on a single
+/// control plane, to Raft on a leader).
+async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>> {
+    let config = &shared.config;
+    let admin_secret: Secret = match store.get_meta(ADMIN_SECRET_META)? {
+        Some(b) => b
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("corrupt admin secret"))?,
+        None => {
+            let s = pumasi_proto::new_secret();
+            store.put_meta(ADMIN_SECRET_META, &s)?;
+            s
+        }
+    };
+    let name = match store.get_meta(NAME_META)? {
+        Some(b) => String::from_utf8(b).unwrap_or_else(|_| config.name.clone()),
+        None => {
+            store.put_meta(NAME_META, config.name.as_bytes())?;
+            config.name.clone()
+        }
+    };
+    let mut state = State::load(
+        name.clone(),
+        shared.key.public().to_string(),
+        store,
+        shared.key.clone(),
+    )?;
+    state.set_metrics_retention(config.metrics_retention);
+    let (stopped, _) = watch::channel(false);
+    let prometheus = match config.metrics_addr {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind the metrics address {addr}"))?;
+            let local = listener.local_addr()?;
+            if !local.ip().is_loopback() && config.metrics_token.is_none() {
+                warn!(
+                    "metrics are served on {local} without a token; anyone who reaches it sees node names and usage"
+                );
+            }
+            info!(addr = %local, "serving Prometheus metrics on /metrics");
+            Some((listener, local))
+        }
+        None => None,
+    };
+    let inner = Arc::new(Inner {
+        shared: shared.clone(),
+        state: Mutex::new(state),
+        admin_secret,
+        stopped,
+        tasks: Mutex::new(Vec::new()),
+        metrics_addr: prometheus.as_ref().map(|(_, a)| *a),
+    });
+
+    let mut tasks = Vec::new();
+    let (store_tx, store_rx) = mpsc::unbounded_channel();
+    inner
+        .state()
+        .attach_store(store_tx, config.disk_class, config.storage_bill_every);
+    tasks.push(tokio::spawn(store_worker(inner.clone(), store_rx)));
+    let (hook_tx, hook_rx) = mpsc::unbounded_channel();
+    inner.state().attach_webhooks(hook_tx);
+    tasks.push(tokio::spawn(crate::prometheus::webhook_worker(
+        inner.clone(),
+        hook_rx,
+    )));
+    if let Some((listener, _)) = prometheus {
+        tasks.push(tokio::spawn(crate::prometheus::serve(
+            inner.clone(),
+            listener,
+            config.metrics_token.clone(),
+        )));
+    }
+    tasks.push({
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            let mut ticks: u64 = 0;
+            loop {
+                tick.tick().await;
+                // The control plane's own disk, every 30 seconds.
+                if ticks.is_multiple_of(60) {
+                    let dir = inner.config.data_dir.clone();
+                    if let Ok(disk) =
+                        tokio::task::spawn_blocking(move || crate::prometheus::disk_of(&dir)).await
+                    {
+                        inner.state().monitor_cp_disk(disk);
+                    }
+                }
+                ticks += 1;
+                inner.state().tick(inner.config.node_timeout);
+                // Keep the advertised address fresh (relay may change).
+                let fresh = inner.endpoint.addr();
+                if !fresh.addrs.is_empty() {
+                    *inner.shared.addr.lock().unwrap() = fresh;
+                }
+            }
+        })
+    });
+    *inner.tasks.lock().unwrap() = tasks;
+    // The local CLI picks this up to talk to the cluster.
+    shared.write_admin_ticket(admin_secret);
+    *shared.active.write().unwrap() = Some(inner.clone());
+    Ok(inner)
+}
+
+/// A running control plane (or control plane replica).
 pub struct Cluster {
-    inner: Arc<Inner>,
+    shared: Arc<Shared>,
     router: Router,
-    ticker: JoinHandle<()>,
-    worker: JoinHandle<()>,
-    webhooks: JoinHandle<()>,
-    prometheus: Option<(JoinHandle<()>, SocketAddr)>,
+}
+
+/// The endpoint key of the replica in `dir`: its own when it has one, else
+/// the cluster key.
+fn endpoint_key(dir: &std::path::Path, cluster_key: &SecretKey) -> Result<SecretKey> {
+    let path = dir.join(ha::ENDPOINT_KEY_FILE);
+    if path.exists() {
+        load_or_create_key(&path)
+    } else {
+        Ok(cluster_key.clone())
+    }
 }
 
 impl Cluster {
     pub async fn start(config: ClusterConfig) -> Result<Self> {
-        std::fs::create_dir_all(&config.data_dir)
-            .with_context(|| format!("create {}", config.data_dir.display()))?;
-        let key = load_or_create_key(&config.data_dir.join(KEY_FILE))?;
-        let signing_key = key.clone();
-        let store = Store::open(&config.data_dir.join(DB_FILE))?;
+        Self::start_on(config, None).await
+    }
 
-        let admin_secret: Secret = match store.get_meta(ADMIN_SECRET_META)? {
-            Some(b) => b
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("corrupt admin secret"))?,
-            None => {
-                let s = pumasi_proto::new_secret();
-                store.put_meta(ADMIN_SECRET_META, &s)?;
-                s
-            }
-        };
-        let name = match store.get_meta(NAME_META)? {
-            Some(b) => String::from_utf8(b).unwrap_or_else(|_| config.name.clone()),
-            None => {
-                store.put_meta(NAME_META, config.name.as_bytes())?;
-                config.name.clone()
-            }
-        };
-
-        let files = FileStore::open(&config.data_dir.join("blobs"), config.gc_interval).await?;
-        let endpoint = bind_endpoint(
+    async fn bind(config: &ClusterConfig, key: SecretKey) -> Result<Endpoint> {
+        bind_endpoint(
             key,
             config.net,
             vec![
                 AGENT_ALPN.to_vec(),
                 ADMIN_ALPN.to_vec(),
                 BLOBS_ALPN.to_vec(),
+                RAFT_ALPN.to_vec(),
             ],
             config.bind,
         )
-        .await?;
-        let mut state = State::load(name.clone(), endpoint.id().to_string(), store, signing_key)?;
-        state.set_metrics_retention(config.metrics_retention);
-        let addr = dialable_addr(&endpoint, config.net).await;
+        .await
+    }
 
-        let inner = Arc::new(Inner {
-            state: Mutex::new(state),
-            admin_secret,
+    /// Starts on an endpoint already bound (a replica that just joined
+    /// keeps the address it joined with), or binds one.
+    async fn start_on(config: ClusterConfig, endpoint: Option<Endpoint>) -> Result<Self> {
+        std::fs::create_dir_all(&config.data_dir)
+            .with_context(|| format!("create {}", config.data_dir.display()))?;
+        let key = load_or_create_key(&config.data_dir.join(KEY_FILE))?;
+        let store = Store::open(&config.data_dir.join(DB_FILE))?;
+        let replicated = Ha::enabled_in(&config.data_dir);
+
+        let files = FileStore::open(&config.data_dir.join("blobs"), config.gc_interval).await?;
+        let endpoint = match endpoint {
+            Some(e) => e,
+            None => Self::bind(&config, endpoint_key(&config.data_dir, &key)?).await?,
+        };
+        let addr = dialable_addr(&endpoint, config.net).await;
+        let shared = Arc::new(Shared {
             endpoint: endpoint.clone(),
             config: config.clone(),
             addr: Mutex::new(addr),
             releases: ReleaseStore::new(release_dir(&config.data_dir)),
             files,
+            key,
+            store,
+            ha: RwLock::new(None),
+            active: RwLock::new(None),
+            backup: Mutex::new(None),
+            lead: Mutex::new(None),
         });
 
-        let (store_tx, store_rx) = mpsc::unbounded_channel();
-        inner
-            .state()
-            .attach_store(store_tx, config.disk_class, config.storage_bill_every);
-        let worker = tokio::spawn(store_worker(inner.clone(), store_rx));
-        let (hook_tx, hook_rx) = mpsc::unbounded_channel();
-        inner.state().attach_webhooks(hook_tx);
-        let webhooks = tokio::spawn(crate::prometheus::webhook_worker(inner.clone(), hook_rx));
-        let prometheus = match config.metrics_addr {
-            Some(addr) => {
-                let listener = tokio::net::TcpListener::bind(addr)
-                    .await
-                    .with_context(|| format!("bind the metrics address {addr}"))?;
-                let local = listener.local_addr()?;
-                if !local.ip().is_loopback() && config.metrics_token.is_none() {
-                    warn!(
-                        "metrics are served on {local} without a token; anyone who reaches it sees node names and usage"
-                    );
-                }
-                info!(addr = %local, "serving Prometheus metrics on /metrics");
-                Some((
-                    tokio::spawn(crate::prometheus::serve(
-                        inner.clone(),
-                        listener,
-                        config.metrics_token.clone(),
-                    )),
-                    local,
-                ))
-            }
-            None => None,
-        };
         let blobs_protocol = {
-            let gate_inner = inner.clone();
-            let egress_inner = inner.clone();
-            inner.files.protocol(
-                Arc::new(move |id| gate_inner.state().store_peer(id)),
-                Arc::new(move |account, bytes| egress_inner.state().charge_egress(account, bytes)),
+            let gate = shared.clone();
+            let egress = shared.clone();
+            shared.files.protocol(
+                Arc::new(move |id| gate.store_peer(id)),
+                Arc::new(move |account, bytes| {
+                    if let Some(inner) = egress.active() {
+                        inner.state().charge_egress(account, bytes);
+                    }
+                }),
             )
         };
-
         let router = Router::builder(endpoint.clone())
-            .accept(AGENT_ALPN, AgentHandler(inner.clone()))
-            .accept(ADMIN_ALPN, AdminHandler(inner.clone()))
+            .accept(AGENT_ALPN, AgentHandler(shared.clone()))
+            .accept(ADMIN_ALPN, AdminHandler(shared.clone()))
             .accept(BLOBS_ALPN, blobs_protocol)
+            .accept(RAFT_ALPN, RaftHandler(shared.clone()))
             .spawn();
 
-        let ticker = {
-            let inner = inner.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_millis(500));
-                let mut ticks: u64 = 0;
-                loop {
-                    tick.tick().await;
-                    // The control plane's own disk, every 30 seconds.
-                    if ticks.is_multiple_of(60) {
-                        let dir = inner.config.data_dir.clone();
-                        if let Ok(disk) =
-                            tokio::task::spawn_blocking(move || crate::prometheus::disk_of(&dir))
-                                .await
-                        {
-                            inner.state().monitor_cp_disk(disk);
-                        }
-                    }
-                    ticks += 1;
-                    inner.state().tick(inner.config.node_timeout);
-                    // Keep the advertised address fresh (relay may change).
-                    let fresh = inner.endpoint.addr();
-                    if !fresh.addrs.is_empty() {
-                        *inner.addr.lock().unwrap() = fresh;
-                    }
-                }
-            })
-        };
-
         let cluster = Self {
-            inner,
+            shared: shared.clone(),
             router,
-            ticker,
-            worker,
-            webhooks,
-            prometheus,
         };
-        // The local CLI picks this up to talk to the cluster.
-        write_private(
-            &config.data_dir.join(ADMIN_TICKET_FILE),
-            cluster.admin_ticket().to_string().as_bytes(),
-        )?;
-        info!(name = %name, id = %endpoint.id(), "control plane started");
+        if replicated {
+            let ha = Ha::start(
+                &config.data_dir,
+                endpoint.clone(),
+                shared.addr(),
+                shared.store.db().clone(),
+                false,
+            )
+            .await?;
+            *shared.ha.write().unwrap() = Some(ha.clone());
+            *shared.lead.lock().unwrap() = Some(tokio::spawn(lead(shared.clone(), ha)));
+            info!(id = %endpoint.id(), cluster = %shared.key.public(), "control plane replica started");
+        } else {
+            let inner = start_services(&shared, shared.store.with_sink(Sink::Direct)).await?;
+            info!(name = %inner.state().cluster_name, id = %endpoint.id(), "control plane started");
+        }
         Ok(cluster)
     }
 
+    /// Joins an existing cluster's control plane as a new replica with a
+    /// replica ticket, then runs like [`Cluster::start`] (which restarts
+    /// it later). `config.data_dir` must not hold a control plane yet.
+    pub async fn join_replica(config: ClusterConfig, ticket: &ReplicaTicket) -> Result<Self> {
+        let dir = &config.data_dir;
+        anyhow::ensure!(
+            !dir.join(DB_FILE).exists() && !dir.join(KEY_FILE).exists(),
+            "{} already holds a control plane; use an empty directory",
+            dir.display()
+        );
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let own = load_or_create_key(&dir.join(ha::ENDPOINT_KEY_FILE))?;
+        // The endpoint this replica keeps: the leader records its address.
+        let endpoint = Self::bind(&config, own).await?;
+        let addr = dialable_addr(&endpoint, config.net).await;
+        let res = ha::request_join(&endpoint, addr, &ticket.candidates(), ticket.secret).await;
+        let (cluster_key, leader, replicas) = match res {
+            Ok(r) => r,
+            Err(e) => {
+                endpoint.close().await;
+                let _ = std::fs::remove_file(dir.join(ha::ENDPOINT_KEY_FILE));
+                return Err(e);
+            }
+        };
+        let key = SecretKey::from_bytes(&cluster_key);
+        anyhow::ensure!(
+            key.public() == ticket.cluster.id,
+            "the control plane sent a key that is not the cluster's"
+        );
+        pumasi_proto::net::save_key(&dir.join(KEY_FILE), &key)?;
+        let mut peers: Vec<iroh::EndpointId> = replicas.iter().map(|r| r.id).collect();
+        peers.push(leader.id);
+        Ha::prepare_join(dir, &peers)?;
+        info!(leader = %leader.id.fmt_short(), "joined the control plane; catching up");
+        Self::start_on(config, Some(endpoint)).await
+    }
+
+    fn inner(&self) -> Arc<Inner> {
+        self.shared
+            .active()
+            .expect("this control plane replica is not the leader")
+    }
+
+    /// Whether this replica runs the cluster now (always, without
+    /// replicas).
+    pub fn is_leader(&self) -> bool {
+        self.shared.active().is_some()
+    }
+
+    /// The Raft state, when replication is on.
+    pub fn ha_view(&self) -> Option<pumasi_proto::ha::HaView> {
+        self.shared.ha().map(|h| h.view())
+    }
+
+    /// This replica's own endpoint id.
+    pub fn endpoint_id(&self) -> iroh::EndpointId {
+        self.shared.endpoint.id()
+    }
+
     pub fn name(&self) -> String {
-        self.inner.state().cluster_name.clone()
+        self.inner().state().cluster_name.clone()
     }
 
     pub fn addr(&self) -> EndpointAddr {
-        self.inner.addr()
+        self.shared.addr()
     }
 
     pub fn admin_ticket(&self) -> AdminTicket {
+        let (cluster, replicas) = self.shared.ticket_addrs();
         AdminTicket {
-            cluster: self.addr(),
-            secret: self.inner.admin_secret,
+            cluster,
+            secret: self.inner().admin_secret,
+            replicas,
         }
     }
 
@@ -294,71 +544,285 @@ impl Cluster {
         uses: Option<u32>,
         invite: Option<Invite>,
     ) -> Result<JoinTicket> {
-        let token = self.inner.state().create_token(ttl, uses, invite)?;
+        let token = self.inner().state().create_token(ttl, uses, invite)?;
+        let (cluster, replicas) = self.shared.ticket_addrs();
         Ok(JoinTicket {
-            cluster: self.addr(),
+            cluster,
             secret: token.secret,
+            replicas,
         })
     }
 
     pub fn status(&self) -> ClusterStatus {
-        self.inner.state().status()
+        self.inner().state().status()
     }
 
     /// Where uploaded release binaries are kept.
     pub fn release_store(&self) -> ReleaseStore {
-        self.inner.releases.clone()
+        self.shared.releases.clone()
     }
 
     /// Sends a release to a node as is. For tests of forged releases.
     #[doc(hidden)]
     pub fn send_release_for_tests(&self, node: &str, release: SignedRelease) -> Result<()> {
-        self.inner.state().send_release_for_tests(node, release)
+        self.inner().state().send_release_for_tests(node, release)
     }
 
     /// Bytes the file store takes on disk.
     pub fn store_disk_bytes(&self) -> u64 {
-        self.inner.files.disk_bytes()
+        self.shared.files.disk_bytes()
     }
 
     /// Where `/metrics` is served, when it is.
     pub fn metrics_addr(&self) -> Option<SocketAddr> {
-        self.prometheus.as_ref().map(|(_, a)| *a)
+        self.shared.active().and_then(|i| i.metrics_addr)
     }
 
     /// The Prometheus text `/metrics` serves.
     pub fn prometheus_text(&self) -> String {
-        self.inner.state().prometheus()
+        self.inner().state().prometheus()
     }
 
     /// Alerts sent to webhooks lately (for tests).
     pub fn recent_notices(&self) -> Vec<crate::monitor::Notice> {
-        self.inner.state().recent_notices()
+        self.inner().state().recent_notices()
+    }
+
+    /// Stops at once without saving anything pending, like a crash or a
+    /// power cut: writes not yet committed are lost. For tests.
+    #[doc(hidden)]
+    pub async fn crash(self) {
+        let lead_task = self.shared.lead.lock().unwrap().take();
+        if let Some(l) = lead_task {
+            l.abort();
+            let _ = l.await;
+        }
+        if let Some(inner) = self.shared.active.write().unwrap().take() {
+            inner.stop();
+        }
+        if let Some(ha) = self.shared.ha.write().unwrap().take() {
+            ha.shutdown().await;
+        }
+        self.shared.endpoint.close().await;
+        let _ = self.router.shutdown().await;
+        self.shared.files.store.shutdown().await.ok();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&self.shared) > 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub async fn shutdown(self) -> Result<()> {
-        self.ticker.abort();
-        self.worker.abort();
-        self.webhooks.abort();
-        if let Some((p, _)) = &self.prometheus {
-            p.abort();
+        let lead_task = self.shared.lead.lock().unwrap().take();
+        if let Some(l) = lead_task {
+            l.abort();
+            let _ = l.await;
         }
-        // Aborted tasks drop their state handles when they next yield;
-        // wait for that so the database is closed when this returns.
-        let _ = self.ticker.await;
-        let _ = self.worker.await;
-        let _ = self.webhooks.await;
-        if let Some((p, _)) = self.prometheus {
-            let _ = p.await;
+        let active = self.shared.active.write().unwrap().take();
+        if let Some(inner) = active {
+            inner.stop();
+            let tasks: Vec<_> = inner.tasks.lock().unwrap().drain(..).collect();
+            for t in tasks {
+                let _ = t.await;
+            }
+            // Pending metrics and events (with replicas, only if this is
+            // still the leader: Raft takes them while it runs).
+            inner.state().flush_monitor();
+            if let Some(ha) = self.shared.ha() {
+                // Give the last writes a moment to commit.
+                let _ = tokio::time::timeout(Duration::from_secs(2), ha.raft.ensure_linearizable())
+                    .await;
+            }
+            drop(inner);
         }
-        self.inner.state().flush_monitor();
+        if let Some(ha) = self.shared.ha.write().unwrap().take() {
+            ha.shutdown().await;
+        }
         self.router.shutdown().await.context("router shutdown")?;
-        self.inner.files.store.shutdown().await.ok();
+        self.shared.files.store.shutdown().await.ok();
         // Tasks of ended sessions let go of the state as their connections
         // close; the database stays locked until the last one has.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while Arc::strong_count(&self.inner) > 1 && tokio::time::Instant::now() < deadline {
+        while Arc::strong_count(&self.shared) > 1 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+}
+
+/// Turns replication on for a running single control plane: Raft starts
+/// with this replica alone, the state machine's writes go through it from
+/// now on, and a snapshot covers everything from before.
+async fn enable_ha(inner: &Arc<Inner>) -> Result<Arc<Ha>> {
+    let shared = &inner.shared;
+    if let Some(ha) = shared.ha() {
+        return Ok(ha);
+    }
+    let ha = Ha::start(
+        &shared.config.data_dir,
+        shared.endpoint.clone(),
+        shared.addr(),
+        shared.store.db().clone(),
+        true,
+    )
+    .await?;
+    // Wait until this replica leads its cluster of one.
+    let mut m = ha.raft.metrics();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !ha.is_leader() {
+            if m.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for the first election")?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    {
+        let mut st = inner.state();
+        let store = st.store.with_sink(Sink::Replicate(tx));
+        st.store = store;
+    }
+    inner
+        .tasks
+        .lock()
+        .unwrap()
+        .push(tokio::spawn(ha.clone().replicate(rx)));
+    // Whatever was written before is in the database but in no log entry:
+    // new replicas must start from a snapshot of it.
+    ha.compact().await?;
+    *shared.ha.write().unwrap() = Some(ha.clone());
+    *shared.lead.lock().unwrap() = Some(tokio::spawn(lead(shared.clone(), ha.clone())));
+    shared.write_admin_ticket(inner.admin_secret);
+    Ok(ha)
+}
+
+/// Follows Raft on a replica: serves while this replica is the leader and
+/// a majority answers it, stops serving otherwise; copies the file store
+/// while following.
+async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
+    let mut metrics = ha.raft.metrics();
+    let mut last_quorum = Instant::now();
+    let mut last_check: Option<Instant> = None;
+    let mut last_mirror: Option<Instant> = None;
+    let mut replicas: Vec<EndpointAddr> = Vec::new();
+    let mut check = tokio::time::interval(Duration::from_millis(500));
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let leader = ha.is_leader();
+        let active = shared.active();
+        if leader && last_check.is_none_or(|t| t.elapsed() >= Duration::from_millis(450)) {
+            // A leader cut off from the majority must stop serving before
+            // the others elect a new one: confirm it with a heartbeat
+            // round to a majority.
+            last_check = Some(Instant::now());
+            let ok = tokio::time::timeout(Duration::from_secs(1), ha.raft.get_read_log_id())
+                .await
+                .is_ok_and(|r| r.is_ok());
+            if ok {
+                last_quorum = Instant::now();
+            }
+        } else if !leader {
+            last_check = None;
+        }
+        let serve = leader && last_quorum.elapsed() < ha::LEASE;
+        match (serve, active) {
+            (true, None) => {
+                // Everything committed must be applied before the state
+                // machine loads.
+                match tokio::time::timeout(Duration::from_secs(10), ha.raft.ensure_linearizable()).await {
+                    Ok(Ok(_)) => {
+                        let (tx, rx) = mpsc::unbounded_channel();
+                        match start_services(&shared, shared.store.with_sink(Sink::Replicate(tx))).await {
+                            Ok(inner) => {
+                                inner
+                                    .tasks
+                                    .lock()
+                                    .unwrap()
+                                    .push(tokio::spawn(ha.clone().replicate(rx)));
+                                replicas.clear();
+                                info!(term = ha.metrics().current_term, "this replica leads the control plane");
+                            }
+                            Err(e) => warn!("could not start the control plane: {e:#}"),
+                        }
+                    }
+                    Ok(Err(e)) => debug!("not ready to lead: {e}"),
+                    Err(_) => debug!("not ready to lead: timed out"),
+                }
+            }
+            (false, Some(inner)) => {
+                *shared.active.write().unwrap() = None;
+                inner.stop();
+                warn!("this replica stopped leading the control plane");
+            }
+            (true, Some(inner)) => {
+                let now = ha.replica_addrs();
+                if now != replicas {
+                    inner.state().send_replicas(&now);
+                    shared.write_admin_ticket(inner.admin_secret);
+                    replicas = now;
+                }
+            }
+            (false, None) => {
+                let due = last_mirror.is_none_or(|t| t.elapsed() >= shared.config.mirror_every);
+                if due
+                    && let Some(leader) = ha.leader_addr()
+                    && leader.id != shared.endpoint.id()
+                {
+                    last_mirror = Some(Instant::now());
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        match ha::mirror::sync(&shared.endpoint, &shared.files, leader).await {
+                            Ok(0) => {}
+                            Ok(n) => info!(collections = n, "copied from the leader's file store"),
+                            Err(e) => debug!("copying the leader's file store: {e:#}"),
+                        }
+                        // Keep a local admin ticket that works with any
+                        // replica once the state has the admin secret.
+                        if let Ok(Some(b)) = shared.store.get_meta(ADMIN_SECRET_META)
+                            && let Ok(secret) = <Secret>::try_from(b)
+                        {
+                            shared.write_admin_ticket(secret);
+                        }
+                    });
+                }
+            }
+        }
+        tokio::select! {
+            _ = metrics.changed() => {}
+            _ = check.tick() => {}
+        }
+    }
+}
+
+/// Lists the file store's tags for followers.
+#[derive(Clone)]
+struct Tags(Arc<Shared>);
+
+impl ha::AsyncTags for Tags {
+    async fn list(&self) -> Result<Vec<(String, BlobHash)>> {
+        self.0.files.tags().await
+    }
+}
+
+#[derive(Clone)]
+struct RaftHandler(Arc<Shared>);
+
+impl std::fmt::Debug for RaftHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RaftHandler")
+    }
+}
+
+impl ProtocolHandler for RaftHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let Some(ha) = self.0.ha() else {
+            conn.close(1u32.into(), b"replication is off");
+            return Ok(());
+        };
+        let key = self.0.key.to_bytes();
+        if let Err(e) = ha.serve(conn, key, Tags(self.0.clone())).await {
+            debug!("raft connection ended: {e:#}");
         }
         Ok(())
     }
@@ -369,7 +833,7 @@ impl Cluster {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct AgentHandler(Arc<Inner>);
+struct AgentHandler(Arc<Shared>);
 
 impl std::fmt::Debug for AgentHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -379,21 +843,44 @@ impl std::fmt::Debug for AgentHandler {
 
 impl ProtocolHandler for AgentHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let inner = self.0.clone();
-        if let Err(e) = agent_session(inner, conn).await {
+        if let Err(e) = agent_session(self.0.clone(), conn).await {
             debug!("agent session ended: {e:#}");
         }
         Ok(())
     }
 }
 
-async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
+async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
     let node_id = conn.remote_id().to_string();
     let (mut send, mut recv) = conn.accept_bi().await?;
     let Some(frame) = read_frame(&mut recv).await? else {
         return Ok(());
     };
     let hello = AgentHello::decode(&frame).context("decode hello")?;
+    let Some(inner) = shared.active() else {
+        // A replica that is not the leader: say where it is to agents that
+        // understand, close on older ones (they retry).
+        if hello.protocol_version >= HA_PROTOCOL {
+            let (_, replicas) = shared.ticket_addrs();
+            write_msg(
+                &mut send,
+                &HelloReply::NotLeader {
+                    leader: shared.leader_hint(),
+                    replicas,
+                },
+            )
+            .await?;
+            send.finish()?;
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+        } else {
+            conn.close(2u32.into(), b"not the leader");
+        }
+        return Ok(());
+    };
+    let mut stopped = inner.stopped.subscribe();
+    if *stopped.borrow() {
+        return Ok(());
+    }
 
     let verdict: Result<(Role, String)> = if hello.protocol_version > PROTOCOL_VERSION {
         Err(anyhow::anyhow!(
@@ -441,6 +928,12 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
     .await?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ToAgent>();
+    if hello.protocol_version >= HA_PROTOCOL {
+        let (_, replicas) = inner.ticket_addrs();
+        if !replicas.is_empty() {
+            let _ = tx.send(ToAgent::Replicas(replicas));
+        }
+    }
     let (kill_tx, mut kill_rx) = oneshot::channel();
     let generation = inner.state().on_connect(
         &node_id,
@@ -580,6 +1073,7 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
                 Err(e) => break Err(e),
             },
             _ = &mut kill_rx => break Ok(()),
+            _ = stopped.changed() => break Ok(()),
         }
     };
 
@@ -647,7 +1141,7 @@ async fn serve_fetches(inner: Arc<Inner>, conn: Connection, node_id: String) {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct AdminHandler(Arc<Inner>);
+struct AdminHandler(Arc<Shared>);
 
 impl std::fmt::Debug for AdminHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -662,10 +1156,22 @@ impl ProtocolHandler for AdminHandler {
                 Ok(s) => s,
                 Err(_) => return Ok(()),
             };
-            let inner = self.0.clone();
+            let shared = self.0.clone();
             tokio::spawn(async move {
                 let res: Result<()> = async {
                     let Some(req) = read_msg::<_, AdminRequest>(&mut recv).await? else {
+                        return Ok(());
+                    };
+                    let Some(inner) = shared.active() else {
+                        // Nothing done: the client asks the leader instead.
+                        write_msg(
+                            &mut send,
+                            &AdminResponse::NotLeader {
+                                leader: shared.leader_hint(),
+                            },
+                        )
+                        .await?;
+                        send.finish()?;
                         return Ok(());
                     };
                     let caller = if secrets_eq(&req.secret, &inner.admin_secret) {
@@ -856,8 +1362,85 @@ async fn handle_store_admin(
             }
             .await
         }
+        AdminOp::HaStatus => Ok(AdminResponse::Ha(Box::new(match inner.ha() {
+            Some(ha) => ha.view(),
+            None => pumasi_proto::ha::HaView {
+                enabled: false,
+                leader: inner.endpoint.id().to_string(),
+                replicas: vec![pumasi_proto::ha::ReplicaView {
+                    id: inner.endpoint.id().to_string(),
+                    voter: true,
+                    leader: true,
+                    matched: None,
+                    last_seen_ms: Some(0),
+                }],
+                ..Default::default()
+            },
+        }))),
+        AdminOp::HaInvite { ttl_secs } => {
+            async {
+                let ttl = Duration::from_secs(ttl_secs.clamp(60, 7 * 86_400));
+                let ha = enable_ha(inner).await?;
+                let secret = ha.invite(ttl);
+                let (cluster, replicas) = inner.ticket_addrs();
+                let ticket = ReplicaTicket {
+                    cluster,
+                    secret,
+                    replicas,
+                };
+                Ok(AdminResponse::JoinToken {
+                    ticket: ticket.to_string(),
+                    expires_unix: crate::state::now_unix() + ttl.as_secs(),
+                })
+            }
+            .await
+        }
+        AdminOp::HaRemove { id } => {
+            async {
+                let ha = inner
+                    .ha()
+                    .context("this control plane has no replicas")?;
+                ha.remove(&id).await?;
+                Ok(AdminResponse::Ha(Box::new(ha.view())))
+            }
+            .await
+        }
+        AdminOp::Backup { offset } => {
+            async {
+                let (bytes, digest) = backup_bytes(&inner.shared, offset == 0).await?;
+                let start = (offset as usize).min(bytes.len());
+                let end = (start + BACKUP_CHUNK).min(bytes.len());
+                Ok(AdminResponse::Backup {
+                    total: bytes.len() as u64,
+                    digest,
+                    bytes: bytes[start..end].to_vec(),
+                })
+            }
+            .await
+        }
         other => return Err(other),
     })
+}
+
+/// The current backup: made anew when `fresh` or when the last one is
+/// old.
+async fn backup_bytes(shared: &Arc<Shared>, fresh: bool) -> Result<(Arc<Vec<u8>>, [u8; 32])> {
+    {
+        let b = shared.backup.lock().unwrap();
+        if let Some((made, bytes, digest)) = &*b
+            && !fresh
+            && made.elapsed() < BACKUP_TTL
+        {
+            return Ok((bytes.clone(), *digest));
+        }
+    }
+    let db = shared.store.db().clone();
+    let key = shared.key.to_bytes();
+    let bytes = tokio::task::spawn_blocking(move || crate::backup::make(&db, key)).await??;
+    let digest = *blake3::hash(&bytes).as_bytes();
+    let bytes = Arc::new(bytes);
+    *shared.backup.lock().unwrap() = Some((Instant::now(), bytes.clone(), digest));
+    Ok((bytes, digest))
 }
 
 fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
@@ -870,9 +1453,11 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             let token = inner
                 .state()
                 .create_token(Duration::from_secs(ttl_secs), uses, invite)?;
+            let (cluster, replicas) = inner.ticket_addrs();
             let ticket = JoinTicket {
-                cluster: inner.addr(),
+                cluster,
                 secret: token.secret,
+                replicas,
             };
             Ok(AdminResponse::JoinToken {
                 ticket: ticket.to_string(),
@@ -974,9 +1559,11 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             let r = inner
                 .state()
                 .create_access(&name, role, ttl_secs.map(Duration::from_secs))?;
+            let (cluster, replicas) = inner.ticket_addrs();
             let ticket = AdminTicket {
-                cluster: inner.addr(),
+                cluster,
                 secret: r.secret,
+                replicas,
             };
             Ok(AdminResponse::AccessTicket {
                 ticket: ticket.to_string(),
@@ -1051,11 +1638,64 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
 // ---------------------------------------------------------------------------
 
 /// Client for the admin protocol, used by the CLI and tests.
+///
+/// With control plane replicas it tries the ticket's addresses until one
+/// answers and follows a replica that is not the leader to the leader. A
+/// call is sent again only when it certainly did not run: the replica
+/// said it is not the leader, or the call could not be sent at all.
 pub struct AdminClient {
     pub(crate) endpoint: Endpoint,
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
     secret: Secret,
+    /// The ticket's cluster address: its id is the cluster key.
     pub(crate) cluster: EndpointAddr,
+    /// Every address worth trying, newest knowledge first.
+    candidates: Arc<Mutex<Vec<EndpointAddr>>>,
+}
+
+/// Connects to the first of `candidates` that answers on the admin ALPN.
+async fn connect_any(endpoint: &Endpoint, candidates: &[EndpointAddr]) -> Result<Connection> {
+    let per = if candidates.len() > 1 {
+        Duration::from_secs(8)
+    } else {
+        Duration::from_secs(20)
+    };
+    let mut last = anyhow::anyhow!("the ticket names no control plane");
+    for addr in candidates {
+        match tokio::time::timeout(per, endpoint.connect(addr.clone(), ADMIN_ALPN)).await {
+            Ok(Ok(c)) => return Ok(c),
+            Ok(Err(e)) => last = anyhow::Error::from(e).context("could not connect to the cluster"),
+            Err(_) => last = anyhow::anyhow!("timed out connecting to the cluster"),
+        }
+    }
+    Err(last)
+}
+
+/// How sending one call went.
+enum Sent {
+    Answered(AdminResponse),
+    /// The call never left: safe to send elsewhere.
+    NotSent(anyhow::Error),
+    /// It may have run; the answer was lost.
+    Lost(anyhow::Error),
+}
+
+async fn send_call(conn: &Connection, req: &AdminRequest) -> Sent {
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(s) => s,
+        Err(e) => return Sent::NotSent(e.into()),
+    };
+    if let Err(e) = write_msg(&mut send, req).await {
+        return Sent::NotSent(e);
+    }
+    if let Err(e) = send.finish() {
+        return Sent::Lost(e.into());
+    }
+    match read_msg::<_, AdminResponse>(&mut recv).await {
+        Ok(Some(r)) => Sent::Answered(r),
+        Ok(None) => Sent::Lost(anyhow::anyhow!("cluster closed the stream without replying")),
+        Err(e) => Sent::Lost(e),
+    }
 }
 
 impl AdminClient {
@@ -1065,18 +1705,14 @@ impl AdminClient {
     }
 
     pub async fn connect_with(endpoint: Endpoint, ticket: &AdminTicket) -> Result<Self> {
-        let conn = tokio::time::timeout(
-            Duration::from_secs(20),
-            endpoint.connect(ticket.cluster.clone(), ADMIN_ALPN),
-        )
-        .await
-        .context("timed out connecting to the cluster")?
-        .context("could not connect to the cluster")?;
+        let candidates = ticket.candidates();
+        let conn = connect_any(&endpoint, &candidates).await?;
         Ok(Self {
             endpoint,
-            conn,
+            conn: Arc::new(Mutex::new(conn)),
             secret: ticket.secret,
             cluster: ticket.cluster.clone(),
+            candidates: Arc::new(Mutex::new(candidates)),
         })
     }
 
@@ -1089,54 +1725,119 @@ impl AdminClient {
             conn: self.conn.clone(),
             secret,
             cluster: self.cluster.clone(),
+            candidates: self.candidates.clone(),
         }
+    }
+
+    fn conn(&self) -> Connection {
+        self.conn.lock().unwrap().clone()
     }
 
     /// The connection is gone (the control plane restarted, the network
     /// dropped); calls fail until [`Self::reconnect`].
     pub fn is_closed(&self) -> bool {
-        self.conn.close_reason().is_some()
+        self.conn().close_reason().is_some()
     }
 
     /// A new connection from the same endpoint, with the same secret.
     pub async fn reconnect(&self) -> Result<Self> {
-        Self::connect_with(
-            self.endpoint.clone(),
-            &AdminTicket {
-                cluster: self.cluster.clone(),
-                secret: self.secret,
-            },
-        )
-        .await
+        let candidates = self.candidates.lock().unwrap().clone();
+        let conn = connect_any(&self.endpoint, &candidates).await?;
+        Ok(Self {
+            endpoint: self.endpoint.clone(),
+            conn: Arc::new(Mutex::new(conn)),
+            secret: self.secret,
+            cluster: self.cluster.clone(),
+            candidates: self.candidates.clone(),
+        })
     }
 
-    /// The control plane's endpoint id.
+    /// The cluster's id (its key), whichever replica answers.
     pub fn cluster_id(&self) -> iroh::EndpointId {
         self.cluster.id
     }
 
-    pub async fn call(&self, op: AdminOp) -> Result<AdminResponse> {
-        let (mut send, mut recv) = self.conn.open_bi().await?;
-        write_msg(
-            &mut send,
-            &AdminRequest {
-                secret: self.secret,
-                op,
-            },
-        )
-        .await?;
-        send.finish()?;
-        let resp = read_msg::<_, AdminResponse>(&mut recv)
-            .await?
-            .context("cluster closed the stream without replying")?;
-        if let AdminResponse::Error(e) = resp {
-            anyhow::bail!(e);
+    /// The address of the control plane replica this client talks to.
+    pub(crate) fn current_addr(&self) -> EndpointAddr {
+        let id = self.conn().remote_id();
+        self.candidates
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|a| a.id == id)
+            .cloned()
+            .unwrap_or_else(|| EndpointAddr::new(id))
+    }
+
+    /// Moves to another replica: `leader` when one was named, else the
+    /// next address that answers.
+    async fn switch(&self, leader: Option<EndpointAddr>) -> Result<()> {
+        let current = self.conn().remote_id();
+        let order: Vec<EndpointAddr> = {
+            let mut c = self.candidates.lock().unwrap();
+            if let Some(l) = &leader {
+                c.retain(|a| a.id != l.id);
+                c.insert(0, l.clone());
+            }
+            let mut order: Vec<EndpointAddr> =
+                c.iter().filter(|a| a.id != current).cloned().collect();
+            // The current one last: it may have become the leader.
+            order.extend(c.iter().filter(|a| a.id == current).cloned());
+            order
+        };
+        let conn = connect_any(&self.endpoint, &order).await?;
+        let old = std::mem::replace(&mut *self.conn.lock().unwrap(), conn);
+        if old.remote_id() != self.conn().remote_id() {
+            old.close(0u32.into(), b"moved to the leader");
         }
-        Ok(resp)
+        Ok(())
+    }
+
+    pub async fn call(&self, op: AdminOp) -> Result<AdminResponse> {
+        let req = AdminRequest {
+            secret: self.secret,
+            op,
+        };
+        // Elections take a few seconds; keep trying a little longer.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut last: anyhow::Error;
+        loop {
+            match send_call(&self.conn(), &req).await {
+                Sent::Answered(AdminResponse::Error(e)) => anyhow::bail!(e),
+                Sent::Answered(AdminResponse::NotLeader { leader }) => {
+                    last = anyhow::anyhow!("no control plane replica is the leader right now");
+                    if tokio::time::Instant::now() > deadline {
+                        return Err(last);
+                    }
+                    if leader.is_none() {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    if let Err(e) = self.switch(leader).await {
+                        last = e;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+                Sent::Answered(resp) => return Ok(resp),
+                Sent::NotSent(e) => {
+                    last = e;
+                    if tokio::time::Instant::now() > deadline
+                        || self.candidates.lock().unwrap().len() < 2
+                    {
+                        return Err(last);
+                    }
+                    if let Err(e) = self.switch(None).await {
+                        last = e;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+                Sent::Lost(e) => return Err(e),
+            }
+            let _ = &last;
+        }
     }
 
     pub async fn close(self) {
-        self.conn.close(0u32.into(), b"done");
+        self.conn().close(0u32.into(), b"done");
         self.endpoint.close().await;
     }
 }

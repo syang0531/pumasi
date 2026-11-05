@@ -64,6 +64,9 @@ fn op_name(op: &AdminOp) -> &'static str {
         SetAlertPolicy(_) => "change alert rules",
         SetWebhook(_) | RemoveWebhook { .. } => "change webhooks",
         TestWebhook { .. } => "test webhooks",
+        HaStatus => "read the control plane replicas",
+        HaInvite { .. } | HaRemove { .. } => "change the control plane replicas",
+        Backup { .. } => "back up the control plane",
     }
 }
 
@@ -103,7 +106,8 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | Metrics { .. }
             | Events { .. }
             | Logs { .. }
-            | Alerts => Ok(op),
+            | Alerts
+            | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
         Caller::Submitter { account, .. } => submitter(st, caller, account, op),

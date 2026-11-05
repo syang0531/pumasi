@@ -29,7 +29,7 @@ impl AdminClient {
     async fn blobs_conn(&self) -> Result<iroh::endpoint::Connection> {
         tokio::time::timeout(
             Duration::from_secs(20),
-            self.endpoint.connect(self.cluster.clone(), BLOBS_ALPN),
+            self.endpoint.connect(self.current_addr(), BLOBS_ALPN),
         )
         .await
         .context("timed out connecting to the file store")?

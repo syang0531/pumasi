@@ -4,8 +4,15 @@
 //! completing rewrites only that task, not the whole job. Postcard is not
 //! self-describing, so the record layout is versioned (`schema` in `meta`)
 //! and older layouts are migrated when the database is opened.
+//!
+//! Every write is recorded as a [`Batch`] of row puts and deletes. A
+//! single control plane applies it at once in one transaction; a leader
+//! of replicated control planes (phase 13) hands it to Raft instead, and
+//! every replica (the leader too) applies it once a majority has it, so
+//! the database only ever holds committed writes. The leader's state
+//! machine in memory runs ahead of its database by that commit.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use pumasi_proto::{
@@ -15,8 +22,12 @@ use pumasi_proto::{
     msg::{AccountView, LedgerEntry, LedgerKind, TaskRef},
     receipt::Receipt,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
-use serde::{Serialize, de::DeserializeOwned};
+use redb::{
+    Database, Key, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition, TableError, TableHandle, Value, WriteTransaction,
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::{
@@ -101,8 +112,223 @@ fn run_key(t: &TaskRef) -> RunKey {
     (t.job.0, t.index, t.attempt, t.check)
 }
 
+/// Calls `$m!(TABLE, ...)` with every table of the state, in a fixed order
+/// (a table's position is its number in [`Op`]; append new tables at the
+/// end).
+macro_rules! tables {
+    ($m:ident) => {
+        $m!(
+            META,
+            MEMBERS,
+            TOKENS,
+            JOBS,
+            TASKS,
+            MODULES,
+            ACCOUNTS,
+            LEDGER,
+            HOLDS,
+            RECEIPTS,
+            CARRY,
+            CREDIT_LEDGER,
+            CREDIT_RECEIPTS,
+            JOB_EXT,
+            TASK_EXT,
+            DATASETS,
+            QUOTAS,
+            SECRETS,
+            UPLOADS,
+            MEMBER_DEVICES,
+            JOB_GPU,
+            JOB_SCHED,
+            NODE_CONFIG,
+            ACCOUNT_QUOTAS,
+            PREEMPTED,
+            ACCESS,
+            SCHEDULES,
+            EVENTS,
+            METRICS,
+            WEBHOOKS
+        )
+    };
+}
+
+macro_rules! table_names {
+    ($($t:ident),*) => {
+        [$($t.name()),*]
+    };
+}
+
+/// The number of a table in [`Op`].
+fn table_no(name: &str) -> u8 {
+    let names = tables!(table_names);
+    names
+        .iter()
+        .position(|n| *n == name)
+        .expect("every table is listed in tables!") as u8
+}
+
+/// One row write, in redb's own encoding of the key and value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Op {
+    Put {
+        table: u8,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Del {
+        table: u8,
+        key: Vec<u8>,
+    },
+}
+
+/// The writes of one store call, applied all or nothing.
+#[derive(Debug, Default)]
+pub struct Batch(pub Vec<Op>);
+
+impl Batch {
+    fn put<'k, 'v, K: Key + 'static, V: Value + 'static>(
+        &mut self,
+        table: TableDefinition<K, V>,
+        key: impl std::borrow::Borrow<K::SelfType<'k>>,
+        value: impl std::borrow::Borrow<V::SelfType<'v>>,
+    ) {
+        self.0.push(Op::Put {
+            table: table_no(table.name()),
+            key: K::as_bytes(key.borrow()).as_ref().to_vec(),
+            value: V::as_bytes(value.borrow()).as_ref().to_vec(),
+        });
+    }
+
+    fn del<'k, K: Key + 'static, V: Value + 'static>(
+        &mut self,
+        table: TableDefinition<K, V>,
+        key: impl std::borrow::Borrow<K::SelfType<'k>>,
+    ) {
+        self.0.push(Op::Del {
+            table: table_no(table.name()),
+            key: K::as_bytes(key.borrow()).as_ref().to_vec(),
+        });
+    }
+}
+
+fn apply_typed<K: Key + 'static, V: Value + 'static>(
+    tx: &WriteTransaction,
+    table: TableDefinition<K, V>,
+    op: &Op,
+) -> Result<()> {
+    let mut t = tx.open_table(table)?;
+    match op {
+        Op::Put { key, value, .. } => {
+            t.insert(K::from_bytes(key), V::from_bytes(value))?;
+        }
+        Op::Del { key, .. } => {
+            t.remove(K::from_bytes(key))?;
+        }
+    }
+    Ok(())
+}
+
+/// Applies row writes inside a write transaction.
+pub fn apply_ops(tx: &WriteTransaction, ops: &[Op]) -> Result<()> {
+    macro_rules! dispatch {
+        ($($t:ident),*) => {
+            for op in ops {
+                let (Op::Put { table, .. } | Op::Del { table, .. }) = op;
+                let names = tables!(table_names);
+                let Some(name) = names.get(*table as usize) else {
+                    bail!("a write to table {table}, which this build does not know");
+                };
+                $(
+                    if *name == $t.name() {
+                        apply_typed(tx, $t, op)?;
+                        continue;
+                    }
+                )*
+            }
+        };
+    }
+    tables!(dispatch);
+    Ok(())
+}
+
+/// Every row of the state: (table, key, value) in redb's encoding. A copy
+/// of the database for snapshots and backups.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Dump {
+    pub rows: Vec<(u8, Vec<u8>, Vec<u8>)>,
+}
+
+fn dump_typed<K: Key + 'static, V: Value + 'static>(
+    tx: &ReadTransaction,
+    table: TableDefinition<K, V>,
+    out: &mut Dump,
+) -> Result<()> {
+    let t = match tx.open_table(table) {
+        Ok(t) => t,
+        // Tables of old layouts that this database never had.
+        Err(TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let no = table_no(table.name());
+    for row in t.iter()? {
+        let (k, v) = row?;
+        out.rows.push((
+            no,
+            K::as_bytes(&k.value()).as_ref().to_vec(),
+            V::as_bytes(&v.value()).as_ref().to_vec(),
+        ));
+    }
+    Ok(())
+}
+
+/// Copies every row as of a read transaction.
+pub fn dump(tx: &ReadTransaction) -> Result<Dump> {
+    let mut out = Dump::default();
+    macro_rules! each {
+        ($($t:ident),*) => {
+            $( dump_typed(tx, $t, &mut out)?; )*
+        };
+    }
+    tables!(each);
+    Ok(out)
+}
+
+/// Replaces every table's rows with a dump's, inside a write transaction.
+pub fn load_dump(tx: &WriteTransaction, d: &Dump) -> Result<()> {
+    macro_rules! wipe {
+        ($($t:ident),*) => {
+            $(
+                tx.delete_table($t)?;
+                tx.open_table($t)?;
+            )*
+        };
+    }
+    tables!(wipe);
+    let ops: Vec<Op> = d
+        .rows
+        .iter()
+        .map(|(table, key, value)| Op::Put {
+            table: *table,
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect();
+    apply_ops(tx, &ops)
+}
+
+/// Where a store's writes go.
+#[derive(Clone)]
+pub enum Sink {
+    /// Straight into the database.
+    Direct,
+    /// To the Raft log (the leader of replicated control planes); the
+    /// state machine applies them once committed.
+    Replicate(mpsc::UnboundedSender<Vec<Op>>),
+}
+
 pub struct Store {
-    db: Database,
+    db: Arc<Database>,
+    sink: Sink,
 }
 
 /// Everything loaded at startup.
@@ -158,6 +384,43 @@ impl Store {
             std::fs::create_dir_all(dir)?;
         }
         let db = Database::create(path).with_context(|| format!("open {}", path.display()))?;
+        Self::init(Arc::new(db), path)
+    }
+
+    /// The same database, with writes going to `sink`.
+    pub fn with_sink(&self, sink: Sink) -> Self {
+        Self {
+            db: self.db.clone(),
+            sink,
+        }
+    }
+
+    /// The database, shared with the Raft state machine.
+    pub fn db(&self) -> &Arc<Database> {
+        &self.db
+    }
+
+    /// Records writes: applied now, or replicated first.
+    fn commit(&self, b: Batch) -> Result<()> {
+        if b.0.is_empty() {
+            return Ok(());
+        }
+        match &self.sink {
+            Sink::Direct => {
+                let tx = self.db.begin_write()?;
+                apply_ops(&tx, &b.0)?;
+                tx.commit()?;
+                Ok(())
+            }
+            Sink::Replicate(tx) => tx
+                .send(b.0)
+                .map_err(|_| anyhow::anyhow!("this control plane replica is no longer the leader")),
+        }
+    }
+
+    /// Prepares a database: creates missing tables and migrates older
+    /// layouts.
+    fn init(db: Arc<Database>, path: &Path) -> Result<Self> {
         // Create all tables so reads never fail on a fresh database.
         let tx = db.begin_write()?;
         let fresh = {
@@ -212,7 +475,10 @@ impl Store {
                 path.display()
             );
         }
-        let store = Self { db };
+        let store = Self {
+            db,
+            sink: Sink::Direct,
+        };
         if schema < 2 {
             store.migrate_v1()?;
         }
@@ -497,17 +763,12 @@ impl Store {
 
     /// Stores the receipts countersigned again in CU.
     pub(crate) fn finish_credit_receipts(&self, receipts: &[Receipt]) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(RECEIPTS)?;
-            for r in receipts {
-                t.insert(run_key(&r.usage.task), enc(r).as_slice())?;
-            }
-            tx.open_table(META)?
-                .insert(CREDIT_RECEIPTS_DONE_META, [1u8].as_slice())?;
+        let mut b = Batch::default();
+        for r in receipts {
+            b.put(RECEIPTS, run_key(&r.usage.task), enc(r).as_slice());
         }
-        tx.commit()?;
-        Ok(())
+        b.put(META, CREDIT_RECEIPTS_DONE_META, [1u8].as_slice());
+        self.commit(b)
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -517,17 +778,15 @@ impl Store {
     }
 
     pub fn put_meta(&self, key: &str, value: &[u8]) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(META)?.insert(key, value)?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.put(META, key, value);
+        self.commit(b)
     }
 
     pub fn delete_meta(&self, key: &str) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(META)?.remove(key)?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.del(META, key);
+        self.commit(b)
     }
 
     pub fn put_policy(&self, p: &Policy) -> Result<()> {
@@ -648,43 +907,35 @@ impl Store {
     }
 
     pub fn put_member(&self, m: &Member) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(MEMBERS)?
-            .insert(m.id.as_str(), enc(m).as_slice())?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.put(MEMBERS, m.id.as_str(), enc(m).as_slice());
+        self.commit(b)
     }
 
     pub fn remove_member(&self, id: &str) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(MEMBERS)?.remove(id)?;
-        tx.open_table(MEMBER_DEVICES)?.remove(id)?;
-        tx.open_table(NODE_CONFIG)?.remove(id)?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.del(MEMBERS, id);
+        b.del(MEMBER_DEVICES, id);
+        b.del(NODE_CONFIG, id);
+        self.commit(b)
     }
 
     pub fn put_devices(&self, id: &str, d: &crate::gpu::DeviceRecord) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(MEMBER_DEVICES)?
-            .insert(id, enc(d).as_slice())?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.put(MEMBER_DEVICES, id, enc(d).as_slice());
+        self.commit(b)
     }
 
     pub fn put_token(&self, t: &TokenRecord) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(TOKENS)?
-            .insert(t.secret.as_slice(), enc(t).as_slice())?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.put(TOKENS, t.secret.as_slice(), enc(t).as_slice());
+        self.commit(b)
     }
 
     pub fn remove_token(&self, secret: &Secret) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(TOKENS)?.remove(secret.as_slice())?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.del(TOKENS, secret.as_slice());
+        self.commit(b)
     }
 
     /// Writes a new job with all its tasks and any new content blobs
@@ -697,79 +948,54 @@ impl Store {
         blobs: &[(ModuleHash, &[u8])],
         used_uploads: &[[u8; 32]],
     ) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(MODULES)?;
-            for (hash, bytes) in blobs {
-                t.insert(hash.as_slice(), *bytes)?;
-            }
-            drop(t);
-            tx.open_table(JOBS)?
-                .insert(meta.id.0, enc(meta).as_slice())?;
-            if !meta.ext.is_empty() {
-                tx.open_table(JOB_EXT)?
-                    .insert(meta.id.0, enc(&meta.ext).as_slice())?;
-            }
-            if let Some(g) = &meta.gpu {
-                tx.open_table(JOB_GPU)?
-                    .insert(meta.id.0, enc(g).as_slice())?;
-            }
-            if !meta.sched.is_empty() {
-                tx.open_table(JOB_SCHED)?
-                    .insert(meta.id.0, enc(&meta.sched).as_slice())?;
-            }
-            let mut t = tx.open_table(TASKS)?;
-            let mut ext = tx.open_table(TASK_EXT)?;
-            for (i, task) in tasks.iter().enumerate() {
-                t.insert((meta.id.0, i as u32), enc(task).as_slice())?;
-                if !task.ext.is_empty() {
-                    ext.insert((meta.id.0, i as u32), enc(&task.ext).as_slice())?;
-                }
-            }
-            let mut up = tx.open_table(UPLOADS)?;
-            for root in used_uploads {
-                up.remove(root.as_slice())?;
+        let mut b = Batch::default();
+        for (hash, bytes) in blobs {
+            b.put(MODULES, hash.as_slice(), *bytes);
+        }
+        b.put(JOBS, meta.id.0, enc(meta).as_slice());
+        if !meta.ext.is_empty() {
+            b.put(JOB_EXT, meta.id.0, enc(&meta.ext).as_slice());
+        }
+        if let Some(g) = &meta.gpu {
+            b.put(JOB_GPU, meta.id.0, enc(g).as_slice());
+        }
+        if !meta.sched.is_empty() {
+            b.put(JOB_SCHED, meta.id.0, enc(&meta.sched).as_slice());
+        }
+        for (i, task) in tasks.iter().enumerate() {
+            b.put(TASKS, (meta.id.0, i as u32), enc(task).as_slice());
+            if !task.ext.is_empty() {
+                b.put(TASK_EXT, (meta.id.0, i as u32), enc(&task.ext).as_slice());
             }
         }
-        tx.commit()?;
-        Ok(())
+        for root in used_uploads {
+            b.del(UPLOADS, root.as_slice());
+        }
+        self.commit(b)
     }
 
     pub fn put_job_meta(&self, meta: &JobMeta) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            tx.open_table(JOBS)?
-                .insert(meta.id.0, enc(meta).as_slice())?;
-            let mut ext = tx.open_table(JOB_EXT)?;
-            if meta.ext.is_empty() {
-                ext.remove(meta.id.0)?;
-            } else {
-                ext.insert(meta.id.0, enc(&meta.ext).as_slice())?;
-            }
+        let mut b = Batch::default();
+        b.put(JOBS, meta.id.0, enc(meta).as_slice());
+        if meta.ext.is_empty() {
+            b.del(JOB_EXT, meta.id.0);
+        } else {
+            b.put(JOB_EXT, meta.id.0, enc(&meta.ext).as_slice());
         }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     pub fn put_tasks(&self, job: u128, tasks: &[(u32, &TaskRecord)]) -> Result<()> {
-        if tasks.is_empty() {
-            return Ok(());
-        }
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(TASKS)?;
-            let mut ext = tx.open_table(TASK_EXT)?;
-            for (i, task) in tasks {
-                t.insert((job, *i), enc(*task).as_slice())?;
-                if task.ext.is_empty() {
-                    ext.remove((job, *i))?;
-                } else {
-                    ext.insert((job, *i), enc(&task.ext).as_slice())?;
-                }
+        let mut b = Batch::default();
+        for (i, task) in tasks {
+            b.put(TASKS, (job, *i), enc(*task).as_slice());
+            if task.ext.is_empty() {
+                b.del(TASK_EXT, (job, *i));
+            } else {
+                b.put(TASK_EXT, (job, *i), enc(&task.ext).as_slice());
             }
         }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     /// Writes (or with `None` deletes) one row of a table keyed by a
@@ -780,20 +1006,12 @@ impl Store {
         key: &str,
         value: Option<Vec<u8>>,
     ) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(table)?;
-            match value {
-                Some(v) => {
-                    t.insert(key, v.as_slice())?;
-                }
-                None => {
-                    t.remove(key)?;
-                }
-            }
+        let mut b = Batch::default();
+        match value {
+            Some(v) => b.put(table, key, v.as_slice()),
+            None => b.del(table, key),
         }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     pub fn put_node_config(&self, id: &str, c: Option<&NodeConfig>) -> Result<()> {
@@ -809,42 +1027,31 @@ impl Store {
     }
 
     pub fn put_preempted(&self, key: (u128, u32, bool), count: u32) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(PREEMPTED)?.insert(key, count)?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.put(PREEMPTED, key, count);
+        self.commit(b)
     }
 
     pub fn put_access(&self, r: &AccessRecord) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(ACCESS)?
-            .insert(r.secret.as_slice(), enc(r).as_slice())?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.put(ACCESS, r.secret.as_slice(), enc(r).as_slice());
+        self.commit(b)
     }
 
     pub fn remove_access(&self, secret: &Secret) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(ACCESS)?.remove(secret.as_slice())?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.del(ACCESS, secret.as_slice());
+        self.commit(b)
     }
 
     // -- monitoring (phase 11) ---------------------------------------------
 
     pub fn put_events(&self, events: &[EventView]) -> Result<()> {
-        if events.is_empty() {
-            return Ok(());
+        let mut b = Batch::default();
+        for e in events {
+            b.put(EVENTS, e.seq, enc(e).as_slice());
         }
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(EVENTS)?;
-            for e in events {
-                t.insert(e.seq, enc(e).as_slice())?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     /// The newest `limit` events, oldest first.
@@ -860,18 +1067,11 @@ impl Store {
     }
 
     pub fn put_points(&self, points: &[(String, u8, MetricPoint)]) -> Result<()> {
-        if points.is_empty() {
-            return Ok(());
+        let mut b = Batch::default();
+        for (node, tier, p) in points {
+            b.put(METRICS, (node.as_str(), *tier, p.unix), enc(p).as_slice());
         }
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(METRICS)?;
-            for (node, tier, p) in points {
-                t.insert((node.as_str(), *tier, p.unix), enc(p).as_slice())?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     /// Every stored point not older than `since[tier]`.
@@ -890,7 +1090,8 @@ impl Store {
 
     /// Deletes events before `events_before` (and beyond the newest
     /// `max_events`), points older than `points_before[tier]`, and every
-    /// point of nodes not in `nodes`.
+    /// point of nodes not in `nodes`. With replication the rows are picked
+    /// from what is applied so far, which only misses rows too new to go.
     pub fn prune_monitor(
         &self,
         events_before: u64,
@@ -898,11 +1099,12 @@ impl Store {
         points_before: &[u64],
         nodes: &std::collections::HashSet<String>,
     ) -> Result<(usize, usize)> {
-        let tx = self.db.begin_write()?;
+        let mut b = Batch::default();
         let events;
         let points;
         {
-            let mut t = tx.open_table(EVENTS)?;
+            let tx = self.db.begin_read()?;
+            let t = tx.open_table(EVENTS)?;
             let total = t.len()? as usize;
             let mut doomed = Vec::new();
             for (i, row) in t.iter()?.enumerate() {
@@ -915,27 +1117,23 @@ impl Store {
                 }
             }
             for k in &doomed {
-                t.remove(k)?;
+                b.del(EVENTS, *k);
             }
             events = doomed.len();
-        }
-        {
-            let mut t = tx.open_table(METRICS)?;
-            let mut doomed: Vec<(String, u8, u64)> = Vec::new();
+            let t = tx.open_table(METRICS)?;
+            let mut n = 0;
             for row in t.iter()? {
                 let (k, _) = row?;
                 let (node, tier, unix) = k.value();
                 let old = points_before.get(tier as usize).is_none_or(|b| unix < *b);
                 if old || !nodes.contains(node) {
-                    doomed.push((node.to_string(), tier, unix));
+                    b.del(METRICS, (node, tier, unix));
+                    n += 1;
                 }
             }
-            for (node, tier, unix) in &doomed {
-                t.remove((node.as_str(), *tier, *unix))?;
-            }
-            points = doomed.len();
+            points = n;
         }
-        tx.commit()?;
+        self.commit(b)?;
         Ok((events, points))
     }
 
@@ -988,57 +1186,35 @@ impl Store {
     }
 
     pub fn put_dataset(&self, d: &DatasetRecord) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(DATASETS)?
-            .insert((d.name.as_str(), d.version), enc(d).as_slice())?;
-        tx.commit()?;
-        Ok(())
+        let mut b = Batch::default();
+        b.put(DATASETS, (d.name.as_str(), d.version), enc(d).as_slice());
+        self.commit(b)
     }
 
     pub fn remove_datasets(&self, keys: &[(String, u32)]) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(DATASETS)?;
-            for (n, v) in keys {
-                t.remove((n.as_str(), *v))?;
-            }
+        let mut b = Batch::default();
+        for (n, v) in keys {
+            b.del(DATASETS, (n.as_str(), *v));
         }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     pub fn set_quota(&self, account: &str, bytes: Option<u64>) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(QUOTAS)?;
-            match bytes {
-                Some(b) => {
-                    t.insert(account, b)?;
-                }
-                None => {
-                    t.remove(account)?;
-                }
-            }
+        let mut b = Batch::default();
+        match bytes {
+            Some(n) => b.put(QUOTAS, account, n),
+            None => b.del(QUOTAS, account),
         }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     pub fn put_secret(&self, name: &str, set_unix: u64, value: Option<&str>) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(SECRETS)?;
-            match value {
-                Some(v) => {
-                    t.insert(name, enc(&(set_unix, v.to_string())).as_slice())?;
-                }
-                None => {
-                    t.remove(name)?;
-                }
-            }
+        let mut b = Batch::default();
+        match value {
+            Some(v) => b.put(SECRETS, name, enc(&(set_unix, v.to_string())).as_slice()),
+            None => b.del(SECRETS, name),
         }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     pub fn put_upload(
@@ -1046,53 +1222,38 @@ impl Store {
         root: &[u8; 32],
         u: Option<&crate::state::UploadRecord>,
     ) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(UPLOADS)?;
-            match u {
-                Some(u) => {
-                    t.insert(root.as_slice(), enc(u).as_slice())?;
-                }
-                None => {
-                    t.remove(root.as_slice())?;
-                }
-            }
+        let mut b = Batch::default();
+        match u {
+            Some(u) => b.put(UPLOADS, root.as_slice(), enc(u).as_slice()),
+            None => b.del(UPLOADS, root.as_slice()),
         }
-        tx.commit()?;
-        Ok(())
+        self.commit(b)
     }
 
     /// Applies balance changes, ledger entries, holds and a receipt
-    /// atomically, so money is never half-moved.
+    /// atomically, so money is never half-moved (with replication, one
+    /// log entry: every replica has all of it or none).
     pub fn write_ledger(&self, w: &LedgerWrite<'_>) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(ACCOUNTS)?;
-            for a in &w.accounts {
-                t.insert(a.name.as_str(), enc(*a).as_slice())?;
-            }
-            let mut t = tx.open_table(LEDGER)?;
-            for e in w.entries {
-                t.insert(e.seq, enc(e).as_slice())?;
-            }
-            let mut t = tx.open_table(HOLDS)?;
-            for h in w.put_holds {
-                t.insert(run_key(&h.task), enc(h).as_slice())?;
-            }
-            for k in w.del_holds {
-                t.remove(run_key(k))?;
-            }
-            let mut t = tx.open_table(CARRY)?;
-            for (c, p, v) in w.carries {
-                t.insert((c.as_str(), p.as_str()), *v)?;
-            }
-            if let Some(r) = w.receipt {
-                tx.open_table(RECEIPTS)?
-                    .insert(run_key(&r.usage.task), enc(r).as_slice())?;
-            }
+        let mut b = Batch::default();
+        for a in &w.accounts {
+            b.put(ACCOUNTS, a.name.as_str(), enc(*a).as_slice());
         }
-        tx.commit()?;
-        Ok(())
+        for e in w.entries {
+            b.put(LEDGER, e.seq, enc(e).as_slice());
+        }
+        for h in w.put_holds {
+            b.put(HOLDS, run_key(&h.task), enc(h).as_slice());
+        }
+        for k in w.del_holds {
+            b.del(HOLDS, run_key(k));
+        }
+        for (c, p, v) in w.carries {
+            b.put(CARRY, (c.as_str(), p.as_str()), *v);
+        }
+        if let Some(r) = w.receipt {
+            b.put(RECEIPTS, run_key(&r.usage.task), enc(r).as_slice());
+        }
+        self.commit(b)
     }
 
     /// Ledger entries, newest first, optionally for one account.

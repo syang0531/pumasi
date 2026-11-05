@@ -13,6 +13,7 @@ iroh-blobs.workspace = true
 n0-future.workspace = true
 tokio.workspace = true
 blake3.workspace = true
+chrono.workspace = true
 data-encoding.workspace = true
 sha2.workspace = true
 rand.workspace = true

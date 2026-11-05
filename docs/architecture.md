@@ -5,8 +5,9 @@ cluster of phase 1, the invited providers, receipts, ledger and
 result checks of phase 2, the microVM executor of phase 3, the
 releases, OS services and signed agent upgrades of phase 4, the
 Windows support of phase 5, the Mac support and availability policy of
-phase 6, the benchmarks and compute units of phase 7, and the cluster
-file store of phase 8. The
+phase 6, the benchmarks and compute units of phase 7, the cluster
+file store of phase 8, the GPUs and microVM devices of phase 9, and the
+cluster management of phase 10. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -53,14 +54,16 @@ Frames are a 4-byte big-endian length plus a postcard body, capped at 64 MiB.
 ### Tickets
 
 A ticket is `prefix + base32(postcard({cluster EndpointAddr, secret}))`.
-`pumasijoin...` admits a new node; `pumasiadmin...` grants admin access. Join
+`pumasijoin...` admits a new node; `pumasiadmin...` grants admin access
+(or, since phase 10, the role of an access ticket). Join
 tokens have an expiry and an optional use count, are stored in redb, and are
 compared in constant time. After a node joins, its endpoint id is a member
 and reconnects need no secret.
 
 ## Scheduling
 
-- Tasks enter a FIFO queue at submission. Retried tasks go to the front.
+- Tasks enter a queue ordered by job priority, first in, first out within
+  a priority (phase 10). Retried tasks go to the front of their priority.
   Check runs (below) share the queue.
 - `schedule()` runs after every event (submit, connect, disconnect, report,
   tick, deposit, availability change). A node is eligible for a task when
@@ -916,6 +919,103 @@ look) and adds them to `LD_LIBRARY_PATH` and `PATH`.
 and an NVIDIA driver release (its open kernel modules, so Turing and
 newer). It has not run in CI: GPU hosts are checked by hand.
 
+## Phase 10: cluster management
+
+Everything in this phase lives in the control plane (`manage.rs`,
+`access.rs`); agents and the agent protocol are unchanged.
+
+### Labels, taints and selectors
+
+A node's labels are its built-in labels, computed from what it reports
+(`name`, `os`, `arch`, `role`, `account`, `executor` and `gpu` with one
+value per executor or GPU vendor, `gpus`, `disk`), plus the user labels in
+its `NodeConfig`. Label sets are multi-valued, so `executor=docker` matches
+a node that offers WASM and Docker. User labels cannot reuse a built-in
+key. A `Selector` is a list of terms, all of which must hold: `key=a|b`
+(In), `key!=a` (NotIn, also true when the key is missing), `key`
+(Exists) and `!key` (NotExists); job.toml writes it as a table of
+strings, `"!value"`, arrays or booleans. A `Taint` is `key` or
+`key=value`; a node with taints is eligible only for jobs whose
+`tolerations` cover every one (`key` tolerates any value, `*` everything).
+`NodeConfig` also holds `cordoned`. Configs are keyed by endpoint id and
+deleted with the member.
+
+### Priorities and preemption
+
+The queue is ordered by job priority (higher first), first in, first out
+within a priority; retries and check runs go to the front of their
+priority band. `schedule()` walks it in order. For each run it first looks
+for an eligible node as before (now also: not cordoned, taints tolerated,
+selector matches, account within quota). If there is none, `preempt_for`
+looks for a node that would be eligible with some runs of strictly lower
+priority stopped, and picks the one that needs the fewest victims and the
+lowest priorities, taking the newest run first among equals. The victims
+are cancelled on the agent and requeued at the front of their band; the
+run takes their place in the same pass. Preempted and drained runs are
+counted in `preempted` per run and subtracted from `attempts` when
+comparing with `max_attempts`, so being moved never fails a job. `drain`
+cordons the node and evicts every run on it the same way.
+
+### Quotas
+
+`AccountQuota` caps an account's running tasks (`slots`), GPUs in use,
+CU spent in any 24 hours, the highest priority its jobs may ask for, and
+store bytes (the phase 8 storage quota, folded into the same view). Slot
+and GPU usage is counted from the nodes' running runs; a run over either
+cap stays queued (`within_quota`), and later runs of other accounts are
+still placed. Spending is noted on every `Charge` and `Transfer` the
+ledger writes (`note_spend`, rebuilt from the last day of ledger entries at
+start); an account at its daily cap can still use its own machines, which
+cost nothing. `max_priority` is checked at submit: admin tickets are
+unlimited without one, submitter tickets get 0.
+
+### Access tickets
+
+`pumasi access create` makes an `AccessRecord` (secret, name, role, expiry)
+and returns a ticket in the admin ticket format (`pumasiadmin...`) with
+that secret, so `pumasi login` takes either. The admin handler maps the
+secret to a `Caller`: the cluster admin secret is `Admin`, a live access
+record is its role, anything else is refused. `access::admit` checks each
+call against the role before it runs: viewers get read-only calls;
+submitters get their own account's jobs, receipts, ledger, datasets and
+schedules, with `account` fields pinned to theirs and anything of another
+account refused (including mounting another account's dataset);
+everything else needs an admin. `access::scope` then filters replies
+(status jobs, accounts, datasets, store usage, quotas, schedules) to the
+submitter's account. Revoking deletes the record; the next call with it
+fails. Access ids are a short BLAKE3 digest of the secret, never the
+secret itself, but the records hold the secret, so `state.redb` is as
+sensitive as `admin.ticket`.
+
+### Schedules and dependencies
+
+A `ScheduleSpec` keeps a whole `JobSubmission` (with its inline files, up
+to 16 MiB) and a cron expression: five fields with lists, ranges and
+steps, or `@hourly`, `@daily`, `@weekly`, `@monthly`, evaluated in the
+control plane's local time (day of month and weekday are OR'ed when both
+are restricted, as in cron). `tick()` submits due schedules; a run whose
+previous job has not finished is skipped (and recorded as the last error)
+unless `overlap` is set. The next time is computed from now, so a control
+plane that was down submits one catch-up run, not one per missed slot.
+
+`after` names jobs that must exist at submit. A job with unfinished
+dependencies is kept out of the queue in `waiting`; when a dependency
+ends, `release_waiting` queues the job once all have succeeded, or fails
+its tasks with a `not run: ...` error naming the dependency (a
+cancelled dependency counts as failed). Waiting is recomputed from the jobs at start.
+
+### Apply
+
+`pumasi apply -f cluster.toml` resolves the file on the CLI (job files are
+read relative to it, like `pumasi run`) into an `ApplySpec` and sends it
+in one call. The control plane compares each listed node's config, each
+listed account's quota and each schedule with what it has, writes only
+the differences and returns one line per change; `--dry-run` returns the
+lines without writing. Nodes and accounts the file does not mention are
+untouched, schedules too unless `--prune`. A node the cluster does not
+know is reported as skipped. Applying the same file twice returns no
+changes the second time.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -961,6 +1061,14 @@ and `job_gpu` (a job's GPU request, kept apart so job metadata keeps its
 layout). Receipts with GPU billing use the new receipt layout; older ones
 decode with the previous one.
 
+Layout 6 (phase 10) adds tables and changes no record, so the migration
+only writes the version: `job_sched` (a job's priority, selector,
+tolerations, dependencies and schedule, apart from job metadata like
+`job_gpu`), `node_config` (labels, taints, cordon per member),
+`account_quotas`, `preempted` keyed by run, `access` and `schedules`.
+`JobSubmission` gained fields at the end, which matters for stored
+schedules: a later change to it needs a migration of `schedules`.
+
 `PROTOCOL_VERSION` is 9: protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
@@ -993,8 +1101,12 @@ remotely; install a current binary on them once.
 - MicroVM network: TCP and DNS only (no other UDP, ICMP or IPv6), no
   per-job allow lists or bandwidth caps, egress is not billed, and the vz
   backend and Firecracker without QEMU have no network.
-- Remaining roadmap phases (10 to 18): cluster
-  management, monitoring, a web dashboard, Raft, WebGPU, the confidential
+- Cluster management: no affinity or anti-affinity between jobs, no
+  gang scheduling (all tasks of a job at once), no per-node or per-label
+  quotas, quotas count tasks rather than CPU or memory, preemption stops a
+  task instead of letting it checkpoint, and schedules use the control
+  plane's time zone only.
+- Remaining roadmap phases (11 to 18): monitoring, a web dashboard, Raft, WebGPU, the confidential
   tier, self-hosting 1.0 (SSO, audit log, external security review), the
   hub, buying CU. See the roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
@@ -1002,8 +1114,8 @@ remotely; install a current binary on them once.
 - Rollouts go to every node; there is no canary group or per-node
   selection yet, and the control plane does not upgrade itself.
 - High availability: one control plane; Raft (openraft) planned.
-- Accounts other than `owner` exist only as ledger entries; consumer
-  tickets that let other people submit (and see only their jobs) are next.
+- Access tickets are handed out by the admin; signing in with SSO and
+  mapping groups to roles is phase 16.
 - CU cannot be bought or exchanged, and there is no platform fee; both
   belong to the hub.
 - "Honeypot" tasks with known answers (needed for non-deterministic Docker

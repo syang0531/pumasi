@@ -8,6 +8,7 @@ pub mod blobs;
 pub mod economy;
 pub mod gpu;
 pub mod job;
+pub mod manage;
 pub mod msg;
 pub mod net;
 pub mod perf;

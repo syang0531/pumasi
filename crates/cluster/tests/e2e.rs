@@ -170,6 +170,10 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         task_mounts: vec![],
         output_dataset: None,
         gpu: None,
+        priority: 0,
+        selector: Default::default(),
+        tolerations: vec![],
+        after: vec![],
     }
 }
 
@@ -1129,6 +1133,10 @@ fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
         task_mounts: vec![],
         output_dataset: None,
         gpu: None,
+        priority: 0,
+        selector: Default::default(),
+        tolerations: vec![],
+        after: vec![],
     }
 }
 

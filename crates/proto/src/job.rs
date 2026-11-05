@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::gpu::{GpuRequest, GpuVendor};
+use crate::manage::{MAX_PRIORITY, MIN_PRIORITY, Selector, SelectorValue, Taint, Toleration};
 use crate::store::{
     MountRequest, MountSource, STORE_PREFIX, StoreRef, expand_shard, validate_dataset_name,
 };
@@ -280,6 +281,16 @@ pub struct JobSubmission {
     pub output_dataset: Option<String>,
     /// The GPUs each task needs (docker and microvm jobs).
     pub gpu: Option<GpuRequest>,
+    // Phase 10 from here.
+    /// Higher runs first and may preempt lower ([`MIN_PRIORITY`] to
+    /// [`MAX_PRIORITY`], default 0).
+    pub priority: i32,
+    /// Only nodes whose labels match run the job.
+    pub selector: Selector,
+    /// Taints of nodes the job may run on anyway.
+    pub tolerations: Vec<Toleration>,
+    /// Jobs that must succeed before this one starts.
+    pub after: Vec<JobId>,
 }
 
 impl JobSubmission {
@@ -364,6 +375,16 @@ impl JobSubmission {
         if let Some(a) = &self.account {
             crate::economy::validate_account(a)?;
         }
+        ensure!(
+            (MIN_PRIORITY..=MAX_PRIORITY).contains(&self.priority),
+            "priority must be between {MIN_PRIORITY} and {MAX_PRIORITY}"
+        );
+        self.selector.validate()?;
+        ensure!(self.tolerations.len() <= 32, "at most 32 tolerations");
+        for t in &self.tolerations {
+            t.validate()?;
+        }
+        ensure!(self.after.len() <= 64, "a job waits for at most 64 jobs");
         ensure!(self.limits.timeout_ms > 0, "timeout must be positive");
         ensure!(
             self.limits.memory_bytes >= 64 * 1024,
@@ -454,6 +475,18 @@ pub struct JobFile {
     /// Deterministic mode (wasm only, default on): a virtual clock and
     /// seeded random numbers, so results can be checked by re-running.
     pub deterministic: Option<bool>,
+    /// Higher runs first and may preempt lower (-1000 to 1000, default 0).
+    pub priority: Option<i32>,
+    /// Labels a node must have: `os = "linux"`, `disk = ["nvme", "ssd"]`,
+    /// `gpu = "!amd"`, `zone = true`.
+    #[serde(default)]
+    pub selector: BTreeMap<String, SelectorValue>,
+    /// Node taints the job accepts: `"gpu-only"`, `"owner=alice"`.
+    #[serde(default)]
+    pub tolerations: Vec<String>,
+    /// Ids of jobs that must succeed first.
+    #[serde(default)]
+    pub after: Vec<String>,
 }
 
 /// `gpus = 2` or `gpus = "all"`.
@@ -868,6 +901,18 @@ impl JobFile {
             None => None,
         };
         let sub = JobSubmission {
+            priority: self.priority.unwrap_or(0),
+            selector: Selector::from_table(&self.selector)?,
+            tolerations: self
+                .tolerations
+                .iter()
+                .map(|t| t.parse::<Taint>())
+                .collect::<Result<_>>()?,
+            after: self
+                .after
+                .iter()
+                .map(|a| a.parse::<JobId>())
+                .collect::<Result<_>>()?,
             gpu,
             mounts,
             task_mounts,

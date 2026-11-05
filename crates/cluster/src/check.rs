@@ -11,7 +11,7 @@
 use pumasi_proto::msg::{Outcome, TaskRef, TaskReport, TaskState, Verification};
 use tracing::{info, warn};
 
-use crate::state::{QueueItem, RunOutput, RunRecord, State, final_state, reproducible};
+use crate::state::{RunOutput, RunRecord, State, final_state, reproducible};
 
 /// Two runs agree when they produced the same result. Fuel must match
 /// too, unless the nodes run different agent versions (which may meter
@@ -67,11 +67,7 @@ impl State {
                     Verification::Skipped(format!("check run ended with {}", report.outcome));
                 task.state = final_state(&check.runs[0].outcome);
             } else {
-                self.queue.push_front(QueueItem {
-                    job: r.job,
-                    index: r.index,
-                    check: true,
-                });
+                self.push_run(r.job, r.index, true, true);
             }
             self.persist_task(r);
             return;
@@ -148,11 +144,7 @@ impl State {
             }
             None if runs.len() < MAX_RUNS => {
                 info!(task = %r, "runs disagree; asking another node");
-                self.queue.push_front(QueueItem {
-                    job: r.job,
-                    index: r.index,
-                    check: true,
-                });
+                self.push_run(r.job, r.index, true, true);
                 self.persist_task(r);
                 return;
             }
@@ -189,6 +181,12 @@ impl State {
         };
         let max = job.meta.max_attempts;
         let cancelled = job.meta.cancelled;
+        let free = self
+            .mgmt
+            .preempted
+            .get(&(r.job, r.index, true))
+            .copied()
+            .unwrap_or(0);
         let Some(task) = job.tasks.get_mut(r.index as usize) else {
             return;
         };
@@ -202,15 +200,11 @@ impl State {
         if cancelled || task.state != TaskState::Verifying {
             return;
         }
-        if check.attempts >= max {
+        if check.attempts.saturating_sub(free) >= max {
             check.status = Verification::Skipped(format!("{reason}; no node finished a check run"));
             task.state = final_state(&check.runs[0].outcome);
         } else {
-            self.queue.push_front(QueueItem {
-                job: r.job,
-                index: r.index,
-                check: true,
-            });
+            self.push_run(r.job, r.index, true, true);
         }
         self.persist_task(r);
     }

@@ -19,9 +19,11 @@ use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, Tab
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::info;
 
-use crate::state::{
-    DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord,
+use crate::{
+    manage::{AccessRecord, JobSched, ScheduleRecord},
+    state::{DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord},
 };
+use pumasi_proto::manage::{AccountQuota, NodeConfig};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("members");
@@ -63,6 +65,20 @@ const UPLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("uploads");
 const MEMBER_DEVICES: TableDefinition<&str, &[u8]> = TableDefinition::new("member_devices");
 /// The GPUs a job's tasks need (phase 9), by job id.
 const JOB_GPU: TableDefinition<u128, &[u8]> = TableDefinition::new("job_gpu");
+/// Cluster management (phase 10), again in tables of their own. A job's
+/// priority, selector, tolerations, dependencies and schedule, by job id.
+const JOB_SCHED: TableDefinition<u128, &[u8]> = TableDefinition::new("job_sched");
+/// Labels, taints and cordon an admin set on a node, by node id.
+const NODE_CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("node_config");
+/// Account quotas (all but storage, which stays in `quotas`).
+const ACCOUNT_QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("account_quotas");
+/// Runs stopped to make room (preemption, drain), by (job, task, check):
+/// placements that do not count against the job's attempts.
+const PREEMPTED: TableDefinition<(u128, u32, bool), u32> = TableDefinition::new("preempted");
+/// Access tickets, by secret.
+const ACCESS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("access");
+/// Schedules, by name.
+const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -71,7 +87,7 @@ const CREDIT_RATE_META: &str = "credit_cpu_hour";
 /// Set once the credit receipts were countersigned again in CU.
 const CREDIT_RECEIPTS_DONE_META: &str = "credit_receipts_converted";
 /// Layout version written by this build.
-const SCHEMA: u32 = 5;
+const SCHEMA: u32 = 6;
 
 fn run_key(t: &TaskRef) -> RunKey {
     (t.job.0, t.index, t.attempt, t.check)
@@ -92,6 +108,12 @@ pub struct Snapshot {
     pub uploads: Vec<([u8; 32], crate::state::UploadRecord)>,
     pub devices: Vec<(String, crate::gpu::DeviceRecord)>,
     pub job_gpu: Vec<(u128, GpuRequest)>,
+    pub job_sched: Vec<(u128, JobSched)>,
+    pub node_config: Vec<(String, NodeConfig)>,
+    pub account_quotas: Vec<(String, AccountQuota)>,
+    pub preempted: Vec<((u128, u32, bool), u32)>,
+    pub access: Vec<AccessRecord>,
+    pub schedules: Vec<ScheduleRecord>,
     pub members: Vec<Member>,
     pub tokens: Vec<TokenRecord>,
     pub jobs: Vec<(JobMeta, Vec<TaskRecord>)>,
@@ -151,6 +173,12 @@ impl Store {
         tx.open_table(UPLOADS)?;
         tx.open_table(MEMBER_DEVICES)?;
         tx.open_table(JOB_GPU)?;
+        tx.open_table(JOB_SCHED)?;
+        tx.open_table(NODE_CONFIG)?;
+        tx.open_table(ACCOUNT_QUOTAS)?;
+        tx.open_table(PREEMPTED)?;
+        tx.open_table(ACCESS)?;
+        tx.open_table(SCHEDULES)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -185,6 +213,13 @@ impl Store {
         }
         if schema < 5 {
             store.migrate_v4()?;
+        }
+        if schema < 6 {
+            // Layout 6 (phase 10) only adds tables; older binaries would
+            // ignore selectors, priorities and access tickets, so the
+            // version keeps them from opening the database.
+            store.put_meta(SCHEMA_META, &6u32.to_le_bytes())?;
+            info!("migrated state database to layout 6");
         }
         Ok(store)
     }
@@ -561,6 +596,32 @@ impl Store {
             let (k, v) = row?;
             snap.job_gpu.push((k.value(), dec(v.value())?));
         }
+        for row in tx.open_table(JOB_SCHED)?.iter()? {
+            let (k, v) = row?;
+            snap.job_sched.push((k.value(), dec(v.value())?));
+        }
+        for row in tx.open_table(NODE_CONFIG)?.iter()? {
+            let (k, v) = row?;
+            snap.node_config
+                .push((k.value().to_string(), dec(v.value())?));
+        }
+        for row in tx.open_table(ACCOUNT_QUOTAS)?.iter()? {
+            let (k, v) = row?;
+            snap.account_quotas
+                .push((k.value().to_string(), dec(v.value())?));
+        }
+        for row in tx.open_table(PREEMPTED)?.iter()? {
+            let (k, v) = row?;
+            snap.preempted.push((k.value(), v.value()));
+        }
+        for row in tx.open_table(ACCESS)?.iter()? {
+            let (_, v) = row?;
+            snap.access.push(dec(v.value())?);
+        }
+        for row in tx.open_table(SCHEDULES)?.iter()? {
+            let (_, v) = row?;
+            snap.schedules.push(dec(v.value())?);
+        }
         snap.next_ledger_seq = tx
             .open_table(LEDGER)?
             .last()?
@@ -585,6 +646,7 @@ impl Store {
         let tx = self.db.begin_write()?;
         tx.open_table(MEMBERS)?.remove(id)?;
         tx.open_table(MEMBER_DEVICES)?.remove(id)?;
+        tx.open_table(NODE_CONFIG)?.remove(id)?;
         tx.commit()?;
         Ok(())
     }
@@ -639,6 +701,10 @@ impl Store {
                 tx.open_table(JOB_GPU)?
                     .insert(meta.id.0, enc(g).as_slice())?;
             }
+            if !meta.sched.is_empty() {
+                tx.open_table(JOB_SCHED)?
+                    .insert(meta.id.0, enc(&meta.sched).as_slice())?;
+            }
             let mut t = tx.open_table(TASKS)?;
             let mut ext = tx.open_table(TASK_EXT)?;
             for (i, task) in tasks.iter().enumerate() {
@@ -691,6 +757,88 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Writes (or with `None` deletes) one row of a table keyed by a
+    /// string.
+    fn put_str_row(
+        &self,
+        table: TableDefinition<&str, &[u8]>,
+        key: &str,
+        value: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(table)?;
+            match value {
+                Some(v) => {
+                    t.insert(key, v.as_slice())?;
+                }
+                None => {
+                    t.remove(key)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_node_config(&self, id: &str, c: Option<&NodeConfig>) -> Result<()> {
+        self.put_str_row(NODE_CONFIG, id, c.map(enc))
+    }
+
+    pub fn put_account_quota(&self, account: &str, q: Option<&AccountQuota>) -> Result<()> {
+        self.put_str_row(ACCOUNT_QUOTAS, account, q.map(enc))
+    }
+
+    pub fn put_schedule(&self, name: &str, r: Option<&ScheduleRecord>) -> Result<()> {
+        self.put_str_row(SCHEDULES, name, r.map(enc))
+    }
+
+    pub fn put_preempted(&self, key: (u128, u32, bool), count: u32) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(PREEMPTED)?.insert(key, count)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_access(&self, r: &AccessRecord) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(ACCESS)?
+            .insert(r.secret.as_slice(), enc(r).as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_access(&self, secret: &Secret) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(ACCESS)?.remove(secret.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// What each account spent (charges, storage, egress) since `since`:
+    /// (account, unix, milli-CU), oldest first.
+    pub fn spent_since(&self, since: u64) -> Result<Vec<(String, u64, i64)>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(LEDGER)?.iter()?.rev() {
+            let (_, v) = row?;
+            let e: LedgerEntry = dec(v.value())?;
+            if e.unix < since {
+                break;
+            }
+            if e.amount < 0
+                && matches!(
+                    e.kind,
+                    LedgerKind::Charge | LedgerKind::Storage | LedgerKind::Egress
+                )
+            {
+                out.push((e.account, e.unix, -e.amount));
+            }
+        }
+        out.reverse();
+        Ok(out)
     }
 
     pub fn put_dataset(&self, d: &DatasetRecord) -> Result<()> {
@@ -1163,6 +1311,7 @@ pub(crate) mod legacy {
                 deterministic: false,
                 ext: Default::default(),
                 gpu: None,
+                sched: Default::default(),
             }
         }
     }

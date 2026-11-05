@@ -154,6 +154,7 @@ impl State {
                 a.balance -= amount;
                 a.spent += amount;
             }
+            self.note_spend(from, amount);
             self.entry(&mut b, from, kind, -amount, None, memo.clone());
             {
                 let a = self.account(to);
@@ -186,6 +187,7 @@ impl State {
                 c.balance -= amount;
                 c.spent += amount;
             }
+            self.note_spend(&billing.consumer, amount);
             self.entry(
                 &mut b,
                 &billing.consumer,

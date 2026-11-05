@@ -18,6 +18,7 @@ use pumasi_proto::{
     economy::{Metered, MilliCu, Policy, validate_account, vcpus},
     gpu::{GpuRequest, GpuVendor},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
+    manage::{LabelSet, Selector, Toleration, tolerated},
     msg::{
         AccountView, Availability, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo,
         NodeView, OWNER_ACCOUNT, Outcome, Role, TaskAssignment, TaskRef, TaskReport, TaskState,
@@ -26,7 +27,7 @@ use pumasi_proto::{
     perf::SignedPerf,
     receipt::{Billing, Receipt, check_usage, output_digest},
     secrets_eq,
-    store::{BlobHash, OutputMode, StoredOutput},
+    store::{BlobHash, ImageBlob, OutputMode, StoredOutput},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -36,6 +37,7 @@ pub use crate::datasets::{DatasetRecord, ImageState, JobExt, TaskExt, UploadReco
 use crate::{
     datasets::{FileState, oci_arch_of},
     gpu::{DeviceRecord, GpuRuntime},
+    manage::{JobSched, Mgmt, MgmtSnapshot, sched_of},
     perf::{PerfCheck, PerfRuntime, cpu_score},
     rollout::RolloutRecord,
     store::Store,
@@ -134,6 +136,10 @@ pub struct JobMeta {
     /// The GPUs each task needs, persisted in their own table.
     #[serde(skip)]
     pub gpu: Option<GpuRequest>,
+    /// Priority, selector, tolerations and dependencies, persisted in
+    /// their own table.
+    #[serde(skip)]
+    pub sched: JobSched,
 }
 
 /// What a run produced, kept for a check run until the check settles in
@@ -258,6 +264,27 @@ pub(crate) struct QueueItem {
     pub job: JobId,
     pub index: u32,
     pub check: bool,
+    /// The job's priority: the queue is ordered by it, highest first.
+    pub priority: i32,
+}
+
+/// What a queued run needs from a node.
+pub(crate) struct Need {
+    pub item: QueueItem,
+    pub executor: Executor,
+    pub memory: u64,
+    pub cpus: u32,
+    pub store_job: bool,
+    pub gpu: Option<GpuRequest>,
+    pub vm_network: bool,
+    /// Private image jobs: the architectures it is ready for.
+    pub images: Option<Vec<(String, ImageBlob)>>,
+    pub consumer: String,
+    pub can_pay: bool,
+    pub exclude_nodes: Vec<String>,
+    pub exclude_accounts: Vec<String>,
+    pub selector: Selector,
+    pub tolerations: Vec<Toleration>,
 }
 
 pub struct State {
@@ -294,6 +321,9 @@ pub struct State {
     pub(crate) files: FileState,
     /// Nodes' device profiles (GPUs) and the cluster's GPU checks.
     pub(crate) devices: HashMap<String, DeviceRecord>,
+    /// Labels, quotas, access tickets, schedules and the rest of cluster
+    /// management.
+    pub(crate) mgmt: Mgmt,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -366,7 +396,9 @@ impl State {
             upgrading: HashMap::new(),
             files: FileState::default(),
             devices: snap.devices.into_iter().collect(),
+            mgmt: Mgmt::default(),
         };
+        let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
         let mut job_ext: HashMap<u128, JobExt> = snap.job_ext.into_iter().collect();
         let mut task_ext: HashMap<(u128, u32), TaskExt> = snap.task_ext.into_iter().collect();
@@ -378,6 +410,7 @@ impl State {
         for (mut meta, mut tasks) in jobs {
             state.next_seq = state.next_seq.max(meta.seq + 1);
             meta.ext = job_ext.remove(&meta.id.0).unwrap_or_default();
+            meta.sched = job_sched.remove(&meta.id.0).unwrap_or_default();
             meta.gpu = job_gpu.remove(&meta.id.0).or_else(|| {
                 // Jobs from before phase 9 passed `--gpus` to docker: that
                 // was every NVIDIA GPU of the node.
@@ -419,11 +452,13 @@ impl State {
                         job: meta.id,
                         index,
                         check: false,
+                        priority: meta.sched.priority,
                     }),
                     TaskState::Verifying => state.queue.push_back(QueueItem {
                         job: meta.id,
                         index,
                         check: true,
+                        priority: meta.sched.priority,
                     }),
                     _ => {}
                 }
@@ -434,7 +469,19 @@ impl State {
             state.store.put_tasks(meta.id.0, &refs)?;
             state.jobs.insert(meta.id, Job { meta, tasks });
         }
+        // Highest priority first; submission order within a priority.
+        state
+            .queue
+            .make_contiguous()
+            .sort_by_key(|q| std::cmp::Reverse(q.priority));
         state.load_files(snap.datasets, snap.quotas, snap.secrets, snap.uploads)?;
+        state.load_mgmt(MgmtSnapshot {
+            node_config: snap.node_config,
+            account_quotas: snap.account_quotas,
+            preempted: snap.preempted,
+            access: snap.access,
+            schedules: snap.schedules,
+        })?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(
@@ -571,6 +618,7 @@ impl State {
         let id = id.as_str();
         self.members.remove(id);
         self.devices.remove(id);
+        self.mgmt.node_config.remove(id);
         self.store.remove_member(id)?;
         if let Some(n) = self.nodes.get_mut(id)
             && let Some(kill) = n.kill.take()
@@ -787,6 +835,7 @@ impl State {
             self.requeue(t, "task lease expired");
         }
         self.release_holds(now_unix());
+        self.tick_schedules(now_unix());
         self.tick_files();
         self.expire_upgrades();
         self.expire_challenges();
@@ -803,9 +852,28 @@ impl State {
 
     // -- jobs -----------------------------------------------------------------
 
-    pub fn submit(&mut self, mut sub: JobSubmission) -> Result<JobId> {
+    pub fn submit(&mut self, sub: JobSubmission) -> Result<JobId> {
+        self.submit_from(sub, false, None)
+    }
+
+    /// Submits a job for a submitter ticket (`submitter`: priorities above
+    /// 0 need the account's quota to allow them) or a schedule.
+    pub fn submit_from(
+        &mut self,
+        mut sub: JobSubmission,
+        submitter: bool,
+        schedule: Option<String>,
+    ) -> Result<JobId> {
         sub.validate()?;
         let account = sub.account.take().unwrap_or_else(|| OWNER_ACCOUNT.into());
+        validate_account(&account)?;
+        let cap = self.priority_cap(&account, submitter);
+        anyhow::ensure!(
+            sub.priority <= cap,
+            "priority {} is above the {cap} account {account} may use (`pumasi quota {account} --max-priority`)",
+            sub.priority
+        );
+        let wait = self.check_deps(&sub.after)?;
         self.ensure_account(&account)?;
         let (ext, task_exts) = self.prepare_store(&sub, &account)?;
         let mut blobs: Vec<(ModuleHash, Vec<u8>)> = Vec::new();
@@ -832,6 +900,7 @@ impl State {
                 break id;
             }
         };
+        let sched = sched_of(&sub, schedule);
         let meta = JobMeta {
             id,
             name: sub.name,
@@ -849,6 +918,7 @@ impl State {
             account,
             deterministic: sub.deterministic,
             ext,
+            sched,
             gpu: sub.gpu,
         };
         self.next_seq += 1;
@@ -877,15 +947,13 @@ impl State {
         for (h, b) in blobs {
             self.modules.insert(h, Arc::new(b));
         }
-        for i in 0..tasks.len() {
-            self.queue.push_back(QueueItem {
-                job: id,
-                index: i as u32,
-                check: false,
-            });
-        }
-        info!(job = %id, name = %meta.name, tasks = tasks.len(), account = %meta.account, "job submitted");
+        info!(job = %id, name = %meta.name, tasks = tasks.len(), account = %meta.account, priority = meta.sched.priority, "job submitted");
         self.jobs.insert(id, Job { meta, tasks });
+        if wait {
+            self.mgmt.waiting.insert(id);
+        } else {
+            self.queue_job(id);
+        }
         self.after_submit(id);
         self.schedule();
         Ok(id)
@@ -947,6 +1015,7 @@ impl State {
         self.store.put_tasks(id.0, &refs)?;
         self.store.put_job_meta(&meta)?;
         self.queue.retain(|q| q.job != id);
+        self.mgmt.waiting.remove(&id);
         info!(job = %id, "job cancelled");
         Ok(())
     }
@@ -1167,6 +1236,7 @@ impl State {
         task.stdout = report.stdout;
         task.stderr = report.stderr;
         task.output_files = report.files;
+        let mut queue_check = false;
         if sample {
             task.state = TaskState::Verifying;
             task.check = Some(CheckRecord {
@@ -1185,17 +1255,16 @@ impl State {
                 running_on: None,
                 status: Verification::Pending,
             });
-            self.queue.push_back(QueueItem {
-                job: r.job,
-                index: r.index,
-                check: true,
-            });
+            queue_check = true;
             info!(task = %r, node = %node_id, "result picked for a check run");
         } else {
             task.state = final_state(&report.outcome);
         }
         if let Err(e) = self.store.put_tasks(r.job.0, &[(r.index, task)]) {
             warn!("persist task: {e:#}");
+        }
+        if queue_check {
+            self.push_run(r.job, r.index, true, false);
         }
     }
 
@@ -1255,7 +1324,7 @@ impl State {
     }
 
     /// Puts a run back in the queue after its node vanished or misbehaved.
-    fn requeue_run(&mut self, r: TaskRef, reason: &str) {
+    pub(crate) fn requeue_run(&mut self, r: TaskRef, reason: &str) {
         if r.check {
             self.requeue_check(r, reason);
         } else {
@@ -1272,6 +1341,12 @@ impl State {
         };
         let max = job.meta.max_attempts;
         let cancelled = job.meta.cancelled;
+        let free = self
+            .mgmt
+            .preempted
+            .get(&(r.job, r.index, false))
+            .copied()
+            .unwrap_or(0);
         let Some(task) = job.tasks.get_mut(r.index as usize) else {
             return;
         };
@@ -1279,249 +1354,225 @@ impl State {
             return;
         }
         task.node = None;
+        let mut retry = false;
         if cancelled {
             task.state = TaskState::Cancelled;
-        } else if task.attempts >= max {
+        } else if task.attempts.saturating_sub(free) >= max {
             task.state = TaskState::Failed(Outcome::Error(format!(
                 "{reason}; gave up after {} attempts",
-                task.attempts
+                task.attempts.saturating_sub(free)
             )));
         } else {
             task.state = TaskState::Pending;
-            // Retries go first so a job is not starved by later jobs.
-            self.queue.push_front(QueueItem {
-                job: r.job,
-                index: r.index,
-                check: false,
-            });
+            retry = true;
         }
         if let Err(e) = self.store.put_tasks(r.job.0, &[(r.index, task)]) {
             warn!("persist task: {e:#}");
         }
+        if retry {
+            // Retries go first (within their priority) so a job is not
+            // starved by later jobs.
+            self.push_run(r.job, r.index, false, true);
+        }
     }
 
-    /// Places as many queued runs as free slots allow.
+    /// What a queued run needs from a node, or `None` when the item is
+    /// stale (the task moved on).
+    fn need_for(&mut self, item: &QueueItem) -> Option<Need> {
+        // A private image is pulled into the store per architecture; only
+        // nodes of an architecture it is ready for can run it.
+        let images = self
+            .jobs
+            .get(&item.job)
+            .is_some_and(|j| j.meta.ext.private_image)
+            .then(|| self.want_images(item.job));
+        let job = self.jobs.get(&item.job)?;
+        let task = job.tasks.get(item.index as usize)?;
+        // Nodes (and accounts) that already ran this task are out for a
+        // check run.
+        let mut exclude_nodes = Vec::new();
+        let mut exclude_accounts = Vec::new();
+        if item.check {
+            let check = task.check.as_ref()?;
+            if task.state != TaskState::Verifying
+                || check.status != Verification::Pending
+                || check.running_on.is_some()
+            {
+                return None;
+            }
+            for run in &check.runs {
+                exclude_nodes.push(run.node.clone());
+                exclude_accounts.push(run.account.clone());
+            }
+        } else if task.state != TaskState::Pending {
+            return None;
+        }
+        let executor = job.meta.executor;
+        let consumer = job.meta.account.clone();
+        let floor = self.policy.ledger.floor();
+        let can_pay = self
+            .accounts
+            .get(&consumer)
+            .is_some_and(|a| a.balance > floor)
+            && !self.over_daily(&consumer);
+        Some(Need {
+            item: *item,
+            executor,
+            memory: job.meta.limits.memory_bytes,
+            // Image jobs get their CPUs (a WASM task uses one): a node
+            // offers as many as it reports, which its CPU cap lowers.
+            cpus: match executor {
+                Executor::Wasm => 1,
+                _ => vcpus(job.meta.limits.cpu_millis),
+            },
+            store_job: job.meta.ext.needs_store,
+            gpu: job.meta.gpu.clone(),
+            vm_network: executor == Executor::Microvm
+                && job.meta.docker.as_ref().is_some_and(|d| d.network),
+            images,
+            consumer,
+            can_pay,
+            exclude_nodes,
+            exclude_accounts,
+            selector: job.meta.sched.selector.clone(),
+            tolerations: job.meta.sched.tolerations.clone(),
+        })
+    }
+
+    /// Whether node `id` can take the run, with `extra_slots` more free
+    /// slots and the GPUs in `freed` free (what stopping some of its runs
+    /// would give).
+    pub(crate) fn fits(
+        &self,
+        id: &str,
+        n: &NodeRuntime,
+        need: &Need,
+        labels: &HashMap<String, LabelSet>,
+        extra_slots: u32,
+        freed: &[u32],
+    ) -> bool {
+        let config = self.node_config(id);
+        n.online
+            && !n.suspended
+            && !n.draining
+            && n.paused.is_none()
+            && !n.perf.wanted
+            && n.perf.challenge.is_none()
+            && !self.upgrading.contains_key(id)
+            && !config.is_some_and(|c| c.cordoned)
+            && n.free_slots() + extra_slots > 0
+            && n.info.memory_bytes >= need.memory
+            && n.info.cpus >= need.cpus
+            && n.executors.contains(&need.executor)
+            && (n.account == need.consumer || need.can_pay)
+            && !need.exclude_nodes.iter().any(|x| x == id)
+            && !need.exclude_accounts.contains(&n.account)
+            && (!need.store_job || n.perf.protocol >= STORE_PROTOCOL)
+            && need.images.as_ref().is_none_or(|imgs| {
+                let arch = oci_arch_of(&n.info.arch);
+                imgs.iter().any(|(a, _)| *a == arch)
+            })
+            && (!need.vm_network
+                || (n.perf.protocol >= DEVICES_PROTOCOL
+                    && self
+                        .devices
+                        .get(id)
+                        .is_some_and(|d| d.signed.profile.microvm_network)))
+            && need.gpu.as_ref().is_none_or(|req| {
+                let mut busy = n.gpu.busy_set();
+                for g in freed {
+                    busy.remove(g);
+                }
+                n.perf.protocol >= DEVICES_PROTOCOL
+                    && !n.gpu.checking()
+                    && self
+                        .devices
+                        .get(id)
+                        .is_some_and(|d| req.pick(d.gpus(), &busy, need.executor).is_some())
+            })
+            && tolerated(
+                config.map(|c| c.taints.as_slice()).unwrap_or_default(),
+                &need.tolerations,
+            )
+            && (need.selector.is_empty()
+                || labels.get(id).is_some_and(|l| need.selector.matches(l)))
+    }
+
+    /// Places as many queued runs as free slots allow, highest priority
+    /// first, stopping lower-priority runs when a higher one finds no room.
     pub fn schedule(&mut self) {
         // Idle nodes due for an upgrade get it before any new task, and
         // idle nodes due for a benchmark check get that.
         self.drive_rollout();
         self.drive_challenges();
         self.drive_gpu_challenges();
+        self.release_waiting();
+        if self.queue.is_empty() {
+            return;
+        }
+        let labels: HashMap<String, LabelSet> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.online)
+            .map(|(id, _)| (id.clone(), self.node_labels(id)))
+            .collect();
+        let mut usage = self.account_usage();
         let mut skipped = VecDeque::new();
         let mut dirty: Vec<(JobId, u32)> = Vec::new();
         while let Some(item) = self.queue.pop_front() {
-            // A private image is pulled into the store per architecture;
-            // only nodes of an architecture it is ready for can run it.
-            let ready_images = self
-                .jobs
-                .get(&item.job)
-                .is_some_and(|j| j.meta.ext.private_image)
-                .then(|| self.want_images(item.job));
-            let Some(job) = self.jobs.get_mut(&item.job) else {
+            let Some(need) = self.need_for(&item) else {
                 continue;
             };
-            let Some(task) = job.tasks.get_mut(item.index as usize) else {
-                continue;
-            };
-            // Nodes (and accounts) that already ran this task are out for a
-            // check run.
-            let mut exclude_nodes: Vec<&str> = Vec::new();
-            let mut exclude_accounts: Vec<&str> = Vec::new();
-            if item.check {
-                let Some(check) = task.check.as_ref() else {
-                    continue;
-                };
-                if task.state != TaskState::Verifying
-                    || check.status != Verification::Pending
-                    || check.running_on.is_some()
-                {
-                    continue;
-                }
-                for run in &check.runs {
-                    exclude_nodes.push(&run.node);
-                    exclude_accounts.push(&run.account);
-                }
-            } else if task.state != TaskState::Pending {
+            // Over its account's quota: waits, and so do the account's
+            // other runs behind it.
+            if !self.within_quota(&need, &usage) {
+                skipped.push_back(item);
                 continue;
             }
-            let need = job.meta.limits.memory_bytes;
-            let executor = job.meta.executor;
-            let store_job = job.meta.ext.needs_store;
-            let gpu_req = job.meta.gpu.clone();
-            let vm_network = executor == Executor::Microvm
-                && job.meta.docker.as_ref().is_some_and(|d| d.network);
-            let devices = &self.devices;
-            // Image jobs get their CPUs (a WASM task uses one): a node
-            // offers as many as it reports, which its CPU cap lowers.
-            let need_cpus = match executor {
-                Executor::Wasm => 1,
-                _ => vcpus(job.meta.limits.cpu_millis),
-            };
-            let consumer = job.meta.account.as_str();
-            let floor = self.policy.ledger.floor();
-            let can_pay = self
-                .accounts
-                .get(consumer)
-                .is_some_and(|a| a.balance > floor);
             // Free (same account) and trusted nodes first, then most free
             // slots to spread work.
             let best = self
                 .nodes
-                .iter_mut()
-                .filter(|(id, n)| {
-                    n.online
-                        && !n.suspended
-                        && !n.draining
-                        && n.paused.is_none()
-                        && !n.perf.wanted
-                        && n.perf.challenge.is_none()
-                        && !self.upgrading.contains_key(id.as_str())
-                        && n.free_slots() > 0
-                        && n.info.memory_bytes >= need
-                        && n.info.cpus >= need_cpus
-                        && n.executors.contains(&executor)
-                        && (n.account == consumer || can_pay)
-                        && !exclude_nodes.contains(&id.as_str())
-                        && !exclude_accounts.contains(&n.account.as_str())
-                        && (!store_job || n.perf.protocol >= STORE_PROTOCOL)
-                        && ready_images.as_ref().is_none_or(|imgs| {
-                            let arch = oci_arch_of(&n.info.arch);
-                            imgs.iter().any(|(a, _)| *a == arch)
-                        })
-                        && (!vm_network
-                            || (n.perf.protocol >= DEVICES_PROTOCOL
-                                && devices
-                                    .get(id.as_str())
-                                    .is_some_and(|d| d.signed.profile.microvm_network)))
-                        && gpu_req.as_ref().is_none_or(|req| {
-                            n.perf.protocol >= DEVICES_PROTOCOL
-                                && !n.gpu.checking()
-                                && devices.get(id.as_str()).is_some_and(|d| {
-                                    req.pick(d.gpus(), &n.gpu.busy_set(), executor).is_some()
-                                })
-                        })
-                })
+                .iter()
+                .filter(|(id, n)| self.fits(id, n, &need, &labels, 0, &[]))
                 .max_by_key(|(_, n)| {
                     let pref = if item.check {
                         n.trusted
                     } else {
-                        n.account == consumer
+                        n.account == need.consumer
                     };
                     (pref, n.free_slots())
-                });
-            let Some((node_id, node)) = best else {
-                skipped.push_back(item);
-                if !self
-                    .nodes
-                    .values()
-                    .any(|n| n.online && n.paused.is_none() && n.free_slots() > 0)
-                {
-                    break;
-                }
-                continue;
-            };
-            let Some(tx) = &node.tx else {
-                skipped.push_back(item);
-                continue;
-            };
-            let attempt = if item.check {
-                task.check.as_ref().map(|c| c.attempts + 1).unwrap_or(1)
-            } else {
-                task.attempts + 1
-            };
-            let r = TaskRef {
-                job: item.job,
-                index: item.index,
-                attempt,
-                check: item.check,
-            };
-            let module_hash = job.meta.module_hash;
-            let module = module_hash
-                .filter(|h| !node.sent_modules.contains(h))
-                .and_then(|h| self.modules.get(&h))
-                .map(|m| m.as_ref().clone());
-            let files_hash = job.meta.files_hash;
-            let files = files_hash
-                .filter(|h| !node.sent_modules.contains(h))
-                .and_then(|h| self.modules.get(&h))
-                .and_then(|b| postcard::from_bytes::<Vec<FileEntry>>(b).ok());
-            let speaks_store = node.perf.protocol >= STORE_PROTOCOL;
-            let mounts: Vec<_> = job
-                .meta
-                .ext
-                .mounts
-                .iter()
-                .chain(task.ext.mounts.iter())
-                .cloned()
-                .collect();
-            let image = ready_images.as_ref().and_then(|imgs| {
-                let arch = oci_arch_of(&node.info.arch);
-                imgs.iter()
-                    .find(|(a, _)| *a == arch)
-                    .map(|(_, i)| i.clone())
-            });
-            let mut roots: Vec<BlobHash> = mounts.iter().map(|m| m.root).collect();
-            roots.extend(image.as_ref().map(|i| i.root));
-            let peers = crate::datasets::peers_for(&self.files.caches, node_id, &roots);
-            let output = if !speaks_store {
-                OutputMode::Inline
-            } else if job.meta.ext.output_dataset.is_some() {
-                OutputMode::Store
-            } else {
-                OutputMode::Auto
-            };
-            let gpus = gpu_req
-                .as_ref()
-                .and_then(|req| {
-                    self.devices
-                        .get(node_id.as_str())
-                        .and_then(|d| req.pick(d.gpus(), &node.gpu.busy_set(), executor))
                 })
-                .unwrap_or_default();
-            let assignment = TaskAssignment {
-                gpus: gpus.clone(),
-                task: r,
-                program: job.meta.name.clone(),
-                executor: job.meta.executor,
-                module_hash,
-                module,
-                docker: job.meta.docker.clone(),
-                files_hash,
-                files,
-                input: task.input.clone(),
-                limits: job.meta.limits,
-                seed: job
-                    .meta
-                    .deterministic
-                    .then(|| task_seed(item.job, item.index)),
-                mounts,
-                output,
-                image,
-                peers,
+                .map(|(id, _)| id.clone());
+            let node_id = match best {
+                Some(id) => id,
+                None => match self.preempt_for(&need, &labels) {
+                    Some(id) => id,
+                    None => {
+                        skipped.push_back(item);
+                        // Nothing behind it can preempt either: the queue
+                        // is in priority order.
+                        if !self
+                            .nodes
+                            .values()
+                            .any(|n| n.online && n.paused.is_none() && n.free_slots() > 0)
+                            && !self.lower_priority_running(item.priority)
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                },
             };
-            if tx.send(ToAgent::Assign(Box::new(assignment))).is_err() {
-                skipped.push_back(item);
-                continue;
-            }
-            node.sent_modules.extend(module_hash);
-            node.sent_modules.extend(files_hash);
-            node.running.insert(r, Instant::now());
-            if !gpus.is_empty() {
-                node.gpu.busy.insert(r, gpus);
-            }
-            if item.check {
-                if let Some(c) = task.check.as_mut() {
-                    c.attempts = attempt;
-                    c.running_on = Some(node_id.clone());
+            match self.place(&need, &node_id) {
+                Some(gpus) => {
+                    let e = usage.entry(need.consumer.clone()).or_default();
+                    e.0 += 1;
+                    e.1 += gpus;
+                    dirty.push((item.job, item.index));
                 }
-            } else {
-                task.attempts = attempt;
-                task.state = TaskState::Running {
-                    node: node_id.clone(),
-                };
-                task.node = Some(node_id.clone());
+                None => skipped.push_back(item),
             }
-            dirty.push((item.job, item.index));
         }
         // Whatever could not be placed keeps its order at the front.
         while let Some(item) = skipped.pop_back() {
@@ -1539,6 +1590,115 @@ impl State {
         }
     }
 
+    /// Sends a run to a node. Returns the number of GPUs it got, or `None`
+    /// if the node could not take it after all.
+    fn place(&mut self, need: &Need, node_id: &str) -> Option<u32> {
+        let item = need.item;
+        let job = self.jobs.get_mut(&item.job)?;
+        let task = job.tasks.get_mut(item.index as usize)?;
+        let node = self.nodes.get_mut(node_id)?;
+        let tx = node.tx.as_ref()?;
+        let attempt = if item.check {
+            task.check.as_ref().map(|c| c.attempts + 1).unwrap_or(1)
+        } else {
+            task.attempts + 1
+        };
+        let r = TaskRef {
+            job: item.job,
+            index: item.index,
+            attempt,
+            check: item.check,
+        };
+        let module_hash = job.meta.module_hash;
+        let module = module_hash
+            .filter(|h| !node.sent_modules.contains(h))
+            .and_then(|h| self.modules.get(&h))
+            .map(|m| m.as_ref().clone());
+        let files_hash = job.meta.files_hash;
+        let files = files_hash
+            .filter(|h| !node.sent_modules.contains(h))
+            .and_then(|h| self.modules.get(&h))
+            .and_then(|b| postcard::from_bytes::<Vec<FileEntry>>(b).ok());
+        let speaks_store = node.perf.protocol >= STORE_PROTOCOL;
+        let mounts: Vec<_> = job
+            .meta
+            .ext
+            .mounts
+            .iter()
+            .chain(task.ext.mounts.iter())
+            .cloned()
+            .collect();
+        let image = need.images.as_ref().and_then(|imgs| {
+            let arch = oci_arch_of(&node.info.arch);
+            imgs.iter()
+                .find(|(a, _)| *a == arch)
+                .map(|(_, i)| i.clone())
+        });
+        let mut roots: Vec<BlobHash> = mounts.iter().map(|m| m.root).collect();
+        roots.extend(image.as_ref().map(|i| i.root));
+        let peers = crate::datasets::peers_for(&self.files.caches, node_id, &roots);
+        let output = if !speaks_store {
+            OutputMode::Inline
+        } else if job.meta.ext.output_dataset.is_some() {
+            OutputMode::Store
+        } else {
+            OutputMode::Auto
+        };
+        let gpus = need
+            .gpu
+            .as_ref()
+            .and_then(|req| {
+                self.devices
+                    .get(node_id)
+                    .and_then(|d| req.pick(d.gpus(), &node.gpu.busy_set(), need.executor))
+            })
+            .unwrap_or_default();
+        let assignment = TaskAssignment {
+            gpus: gpus.clone(),
+            task: r,
+            program: job.meta.name.clone(),
+            executor: job.meta.executor,
+            module_hash,
+            module,
+            docker: job.meta.docker.clone(),
+            files_hash,
+            files,
+            input: task.input.clone(),
+            limits: job.meta.limits,
+            seed: job
+                .meta
+                .deterministic
+                .then(|| task_seed(item.job, item.index)),
+            mounts,
+            output,
+            image,
+            peers,
+        };
+        if tx.send(ToAgent::Assign(Box::new(assignment))).is_err() {
+            return None;
+        }
+        node.sent_modules.extend(module_hash);
+        node.sent_modules.extend(files_hash);
+        node.running.insert(r, Instant::now());
+        let n_gpus = gpus.len() as u32;
+        if !gpus.is_empty() {
+            node.gpu.busy.insert(r, gpus);
+        }
+        if item.check {
+            if let Some(c) = task.check.as_mut() {
+                c.attempts = attempt;
+                c.running_on = Some(node_id.to_string());
+            }
+        } else {
+            task.attempts = attempt;
+            task.state = TaskState::Running {
+                node: node_id.to_string(),
+            };
+            task.node = Some(node_id.to_string());
+        }
+        Some(n_gpus)
+    }
+
     // -- views ------------------------------------------------------------------
 
     pub(crate) fn summary(job: &Job) -> JobSummary {
@@ -1553,6 +1713,7 @@ impl State {
             submitted_unix: job.meta.submitted_unix,
             account: job.meta.account.clone(),
             cost: job.tasks.iter().map(|t| t.cost).sum(),
+            priority: job.meta.sched.priority,
         };
         let mut cancelled = 0;
         for t in &job.tasks {
@@ -1614,6 +1775,8 @@ impl State {
                         .devices
                         .get(&m.id)
                         .is_some_and(|d| d.signed.profile.microvm_network),
+                    config: self.node_config(&m.id).cloned().unwrap_or_default(),
+                    labels: self.node_labels(&m.id),
                 }
             })
             .collect();
@@ -1665,6 +1828,8 @@ impl State {
                     .unwrap_or(Verification::NotChecked),
                 cost: t.cost,
                 stored: t.ext.stored,
+                preempted: self.free_attempts(id, i as u32, false)
+                    + self.free_attempts(id, i as u32, true),
             })
             .collect();
         let ext = &job.meta.ext;
@@ -1696,6 +1861,11 @@ impl State {
             preparing,
             gpu: job.meta.gpu.clone(),
             network: job.meta.docker.as_ref().is_some_and(|d| d.network),
+            selector: job.meta.sched.selector.clone(),
+            tolerations: job.meta.sched.tolerations.clone(),
+            after: job.meta.sched.after.clone(),
+            waiting: self.waiting_reason(id),
+            schedule: job.meta.sched.schedule.clone(),
         })
     }
 
@@ -1786,6 +1956,10 @@ mod tests {
             task_mounts: vec![],
             output_dataset: None,
             gpu: None,
+            priority: 0,
+            selector: Default::default(),
+            tolerations: vec![],
+            after: vec![],
         }
     }
 
@@ -2146,5 +2320,522 @@ mod tests {
                 assert_eq!(node.strikes, 1);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cluster management (phase 10)
+    // -----------------------------------------------------------------------
+
+    use pumasi_proto::manage::{
+        AccessRole, AccountQuota, ApplySpec, NodeEdit, NodeSpec, ScheduleSpec,
+    };
+
+    /// Joins an owner machine and keeps its key, to sign reports.
+    fn join_keyed(
+        st: &mut State,
+        name: &str,
+        slots: u32,
+    ) -> (String, SecretKey, mpsc::UnboundedReceiver<ToAgent>) {
+        let key = SecretKey::generate();
+        let id = key.public().to_string();
+        let token = st
+            .create_token(Duration::from_secs(60), Some(1), None)
+            .unwrap();
+        let mut info = info(name, vec![Executor::Wasm]);
+        info.slots = slots;
+        st.authorize(&id, &info, Some(&token.secret)).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (kill, _) = oneshot::channel();
+        st.on_connect(
+            &id,
+            pumasi_proto::PROTOCOL_VERSION,
+            info,
+            None,
+            Availability::Available,
+            tx,
+            kill,
+        );
+        (id, key, rx)
+    }
+
+    /// Reports a run as finished (exit 0) with a signed receipt.
+    fn finish(st: &mut State, node: &str, key: &SecretKey, a: &TaskAssignment) {
+        let outcome = Outcome::Exited(0);
+        let digest = pumasi_proto::receipt::result_digest(&outcome, b"", &[]);
+        let usage = pumasi_proto::receipt::Usage {
+            cluster: *st.key.public().as_bytes(),
+            node: *key.public().as_bytes(),
+            task: a.task,
+            executor: a.executor,
+            outcome: outcome.clone(),
+            fuel_used: 0,
+            wall_ms: 1,
+            memory_limit_bytes: a.limits.memory_bytes,
+            peak_memory_bytes: None,
+            cpu_millis: a.limits.cpu_millis,
+            result_digest: digest,
+            finished_unix: now_unix(),
+        };
+        let generation = st.nodes[node].generation;
+        st.on_report(
+            node,
+            generation,
+            TaskReport {
+                task: a.task,
+                outcome,
+                stdout: vec![],
+                stderr: vec![],
+                files: vec![],
+                fuel_used: 0,
+                wall_ms: 1,
+                usage: Some(pumasi_proto::receipt::SignedUsage::sign(usage, key)),
+            },
+        );
+    }
+
+    fn cancels(rx: &mut mpsc::UnboundedReceiver<ToAgent>) -> (Vec<TaskAssignment>, Vec<TaskRef>) {
+        let (mut a, mut c) = (Vec::new(), Vec::new());
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                ToAgent::Assign(x) => a.push(*x),
+                ToAgent::Cancel(t) => c.push(t),
+                _ => {}
+            }
+        }
+        (a, c)
+    }
+
+    fn labels(st: &mut State, node: &str, pairs: &[(&str, &str)]) {
+        let edit = NodeEdit {
+            set_labels: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        st.edit_node(node, &edit).unwrap();
+    }
+
+    #[test]
+    fn selectors_and_taints_choose_nodes() {
+        let mut st = state();
+        let (a_id, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let (_, mut b_rx) = join(&mut st, "b", vec![Executor::Wasm], None);
+        labels(&mut st, "a", &[("zone", "home")]);
+        st.edit_node(
+            "b",
+            &NodeEdit {
+                add_taints: vec!["gpu-only".parse().unwrap()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let view = st.status();
+        let a = view.nodes.iter().find(|n| n.id == a_id).unwrap();
+        assert_eq!(a.labels["zone"], vec!["home".to_string()]);
+        assert_eq!(a.labels["os"], vec!["linux".to_string()]);
+        assert_eq!(a.labels["executor"], vec!["wasm".to_string()]);
+
+        // Untolerated taint: everything goes to a, and the rest waits.
+        let id = st.submit(job(Executor::Wasm, 3)).unwrap();
+        assert_eq!(assigned(&mut a_rx).len(), 2);
+        assert!(assigned(&mut b_rx).is_empty(), "b is tainted");
+        assert_eq!(st.jobs[&id].tasks[2].state, TaskState::Pending);
+        st.cancel(id).unwrap();
+
+        // A selector nobody matches keeps the job queued.
+        let mut sub = job(Executor::Wasm, 1);
+        sub.selector = "zone=lab".parse().unwrap();
+        let id = st.submit(sub).unwrap();
+        assert!(assigned(&mut a_rx).is_empty() && assigned(&mut b_rx).is_empty());
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+        // Labelling b matches it, but b's taint still keeps it off.
+        labels(&mut st, "b", &[("zone", "lab")]);
+        assert!(assigned(&mut b_rx).is_empty());
+        st.cancel(id).unwrap();
+        let mut sub = job(Executor::Wasm, 1);
+        sub.selector = "zone=lab".parse().unwrap();
+        sub.tolerations = vec!["gpu-only".parse().unwrap()];
+        st.submit(sub).unwrap();
+        assert_eq!(assigned(&mut b_rx).len(), 1);
+    }
+
+    #[test]
+    fn drain_moves_runs_and_cordon_keeps_new_ones_off() {
+        let mut st = state();
+        let (_, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let mut sub = job(Executor::Wasm, 2);
+        sub.max_attempts = 1;
+        let id = st.submit(sub).unwrap();
+        assert_eq!(assigned(&mut a_rx).len(), 2);
+        assert_eq!(st.drain("a").unwrap(), 2);
+        let (got, cancelled) = cancels(&mut a_rx);
+        assert!(got.is_empty(), "a drained node gets nothing new");
+        assert_eq!(cancelled.len(), 2);
+        // Moved runs do not count against max_attempts = 1.
+        assert!(
+            st.jobs[&id]
+                .tasks
+                .iter()
+                .all(|t| t.state == TaskState::Pending)
+        );
+        let (_, mut b_rx) = join(&mut st, "b", vec![Executor::Wasm], None);
+        let got = assigned(&mut b_rx);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|a| a.task.attempt == 2));
+        let view = st.job_view(id, false).unwrap();
+        assert!(view.tasks.iter().all(|t| t.preempted == 1));
+        // Uncordon: a takes work again.
+        st.edit_node(
+            "a",
+            &NodeEdit {
+                cordon: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        st.submit(job(Executor::Wasm, 1)).unwrap();
+        assert_eq!(assigned(&mut a_rx).len(), 1);
+    }
+
+    #[test]
+    fn higher_priority_preempts_lower() {
+        let mut st = state();
+        let (_, mut rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let low = st.submit(job(Executor::Wasm, 2)).unwrap();
+        assert_eq!(assigned(&mut rx).len(), 2);
+        // Same priority: waits.
+        let same = st.submit(job(Executor::Wasm, 1)).unwrap();
+        let (got, cancelled) = cancels(&mut rx);
+        assert!(got.is_empty() && cancelled.is_empty());
+        // Higher priority: one low run makes room, and the high run goes
+        // ahead of the waiting job.
+        let mut sub = job(Executor::Wasm, 1);
+        sub.priority = 10;
+        let high = st.submit(sub).unwrap();
+        let (got, cancelled) = cancels(&mut rx);
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].job, low);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].task.job, high);
+        let v = st.job_view(low, false).unwrap();
+        assert_eq!(
+            v.tasks
+                .iter()
+                .filter(|t| t.state == TaskState::Pending)
+                .count(),
+            1
+        );
+        assert_eq!(v.tasks.iter().map(|t| t.preempted).sum::<u32>(), 1);
+        // Queue order: the preempted low run is back before the later
+        // job of the same priority.
+        assert_eq!(st.queue.front().map(|q| q.job), Some(low));
+        assert_eq!(st.queue.back().map(|q| q.job), Some(same));
+        assert_eq!(
+            st.status()
+                .jobs
+                .iter()
+                .find(|j| j.id == high)
+                .unwrap()
+                .priority,
+            10
+        );
+    }
+
+    #[test]
+    fn quotas_hold_work_and_cap_priorities() {
+        let mut st = state();
+        let (_, mut rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        st.deposit("alice", 1_000_000, "").unwrap();
+        st.set_account_quota(
+            "alice",
+            AccountQuota {
+                slots: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sub = job(Executor::Wasm, 3);
+        sub.account = Some("alice".into());
+        st.submit(sub).unwrap();
+        assert_eq!(assigned(&mut rx).len(), 1, "one slot for alice");
+        // Other accounts still get the free slot.
+        st.submit(job(Executor::Wasm, 1)).unwrap();
+        assert_eq!(assigned(&mut rx).len(), 1);
+        let q = st.quotas();
+        let alice = q.iter().find(|q| q.account == "alice").unwrap();
+        assert_eq!((alice.running, alice.queued), (1, 2));
+        assert_eq!(alice.quota.slots, Some(1));
+
+        // Submitters stay at priority 0 unless the quota allows more; the
+        // admin may use any priority.
+        let mut sub = job(Executor::Wasm, 1);
+        sub.account = Some("alice".into());
+        sub.priority = 5;
+        assert!(st.submit_from(sub.clone(), true, None).is_err());
+        st.submit_from(sub.clone(), false, None).unwrap();
+        st.set_account_quota(
+            "alice",
+            AccountQuota {
+                max_priority: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        st.submit_from(sub.clone(), true, None).unwrap();
+        sub.priority = 6;
+        assert!(
+            st.submit_from(sub, false, None).is_err(),
+            "the quota caps everyone"
+        );
+
+        // A daily CU limit that is used up keeps paid work off other
+        // accounts' machines.
+        st.set_account_quota(
+            "alice",
+            AccountQuota {
+                cu_per_day: Some(1_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!st.over_daily("alice"));
+        st.note_spend("alice", 1_000);
+        assert!(st.over_daily("alice"));
+    }
+
+    #[test]
+    fn dependent_jobs_wait_and_fail_with_their_dependency() {
+        let mut st = state();
+        let (a, key, mut rx) = join_keyed(&mut st, "a", 4);
+        let first = st.submit(job(Executor::Wasm, 1)).unwrap();
+        let run = assigned(&mut rx).pop().unwrap();
+        let mut sub = job(Executor::Wasm, 2);
+        sub.after = vec![first];
+        let second = st.submit(sub).unwrap();
+        assert!(assigned(&mut rx).is_empty(), "waits for the first job");
+        let v = st.job_view(second, false).unwrap();
+        assert_eq!(
+            v.waiting.as_deref(),
+            Some(&*format!("waiting for job {first}"))
+        );
+        assert_eq!(v.after, vec![first]);
+        finish(&mut st, &a, &key, &run);
+        assert_eq!(
+            assigned(&mut rx).len(),
+            2,
+            "queued once the first succeeded"
+        );
+        assert!(st.job_view(second, false).unwrap().waiting.is_none());
+
+        // A failed dependency fails the jobs after it, down the chain. (The
+        // first one waits for a node nobody has, so cancelling ends it.)
+        let mut sub = job(Executor::Wasm, 1);
+        sub.selector = "zone=nowhere".parse().unwrap();
+        let third = st.submit(sub).unwrap();
+        let mut sub = job(Executor::Wasm, 1);
+        sub.after = vec![third];
+        let fourth = st.submit(sub).unwrap();
+        let mut sub = job(Executor::Wasm, 1);
+        sub.after = vec![fourth];
+        let fifth = st.submit(sub).unwrap();
+        st.cancel(third).unwrap();
+        st.schedule();
+        st.schedule();
+        assert_eq!(Self_summary(&st, fourth), JobState::Failed);
+        assert_eq!(Self_summary(&st, fifth), JobState::Failed);
+        // Nothing to wait for: refused.
+        let mut sub = job(Executor::Wasm, 1);
+        sub.after = vec![third];
+        assert!(st.submit(sub).is_err());
+        let mut sub = job(Executor::Wasm, 1);
+        sub.after = vec![JobId(42)];
+        assert!(st.submit(sub).is_err());
+    }
+
+    #[allow(non_snake_case)]
+    fn Self_summary(st: &State, id: JobId) -> JobState {
+        State::summary(&st.jobs[&id]).state
+    }
+
+    #[test]
+    fn schedules_submit_on_time_without_overlap() {
+        let mut st = state();
+        let spec = ScheduleSpec {
+            name: "nightly".into(),
+            cron: "0 3 * * *".into(),
+            job: job(Executor::Wasm, 2),
+            overlap: false,
+        };
+        st.set_schedule(spec.clone()).unwrap();
+        let next = st.schedules()[0].next_unix.unwrap();
+        assert!(next > now_unix() && next <= now_unix() + 24 * 3600 + 3600);
+        // Setting the same schedule again changes nothing.
+        st.set_schedule(spec).unwrap();
+        assert_eq!(st.schedules()[0].next_unix, Some(next));
+        // Due: submitted with the schedule's name.
+        st.mgmt.schedules.get_mut("nightly").unwrap().next_unix = Some(now_unix() - 1);
+        st.tick_schedules(now_unix());
+        let v = st.schedules();
+        let id = v[0].last_job.expect("submitted");
+        assert_eq!(v[0].runs, 1);
+        assert!(v[0].next_unix.unwrap() > now_unix());
+        let job = st.job_view(id, false).unwrap();
+        assert_eq!(job.schedule.as_deref(), Some("nightly"));
+        assert_eq!(job.summary.tasks, 2);
+        // Due again while the last run has not finished: skipped.
+        st.mgmt.schedules.get_mut("nightly").unwrap().next_unix = Some(now_unix() - 1);
+        st.tick_schedules(now_unix());
+        let v = st.schedules();
+        assert_eq!(v[0].runs, 1);
+        assert!(
+            v[0].last_error
+                .as_deref()
+                .unwrap()
+                .contains("has not finished")
+        );
+        st.remove_schedule("nightly").unwrap();
+        assert!(st.schedules().is_empty());
+    }
+
+    #[test]
+    fn apply_twice_changes_nothing_the_second_time() {
+        let mut st = state();
+        join(&mut st, "a", vec![Executor::Wasm], None);
+        let spec = ApplySpec {
+            nodes: vec![
+                NodeSpec {
+                    node: "a".into(),
+                    labels: [("zone".to_string(), "home".to_string())].into(),
+                    taints: vec!["gpu-only".parse().unwrap()],
+                    cordoned: Some(true),
+                },
+                NodeSpec {
+                    node: "missing".into(),
+                    labels: Default::default(),
+                    taints: vec![],
+                    cordoned: None,
+                },
+            ],
+            accounts: vec![(
+                "alice".into(),
+                AccountQuota {
+                    slots: Some(2),
+                    storage_bytes: Some(1 << 30),
+                    ..Default::default()
+                },
+            )],
+            schedules: vec![ScheduleSpec {
+                name: "hourly".into(),
+                cron: "@hourly".into(),
+                job: job(Executor::Wasm, 1),
+                overlap: true,
+            }],
+            prune: true,
+            dry_run: false,
+        };
+        let mut dry = spec.clone();
+        dry.dry_run = true;
+        let planned = st.apply(dry).unwrap();
+        assert_eq!(planned.len(), 4, "{planned:?}");
+        assert!(st.schedules().is_empty(), "a dry run changes nothing");
+        let first = st.apply(spec.clone()).unwrap();
+        assert_eq!(first, planned);
+        assert!(first[0].contains("labels {} -> {zone=home}"), "{first:?}");
+        assert!(first[1].contains("skipped"), "{first:?}");
+        let second = st.apply(spec.clone()).unwrap();
+        assert_eq!(
+            second,
+            vec![first[1].clone()],
+            "only the skipped node again"
+        );
+        assert_eq!(st.account_quota("alice").storage_bytes, Some(1 << 30));
+        assert!(st.status().nodes[0].config.cordoned);
+        // Pruning removes schedules the file no longer lists.
+        st.set_schedule(ScheduleSpec {
+            name: "extra".into(),
+            ..spec.schedules[0].clone()
+        })
+        .unwrap();
+        let third = st.apply(spec).unwrap();
+        assert!(
+            third.iter().any(|c| c == "schedule extra: removed"),
+            "{third:?}"
+        );
+        assert_eq!(st.schedules().len(), 1);
+    }
+
+    #[test]
+    fn access_tickets_have_roles() {
+        use crate::manage::Caller;
+        use pumasi_proto::msg::AdminOp;
+        let mut st = state();
+        let (node, _) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let sub = st
+            .create_access(
+                "alice laptop",
+                AccessRole::Submitter {
+                    account: "alice".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let viewer = st
+            .create_access(
+                "dashboard",
+                AccessRole::Viewer,
+                Some(Duration::from_secs(60)),
+            )
+            .unwrap();
+        let alice = st.access_caller(&sub.secret).unwrap();
+        assert_eq!(
+            alice,
+            Caller::Submitter {
+                name: "alice laptop".into(),
+                account: "alice".into()
+            }
+        );
+        assert!(st.access_caller(&pumasi_proto::new_secret()).is_none());
+        // A submitter cannot remove nodes, and submits only for its account.
+        let err = crate::access::admit(&st, &alice, AdminOp::RemoveNode { id: node.clone() })
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot remove nodes"),
+            "{err:#}"
+        );
+        let AdminOp::Submit(pinned) = crate::access::admit(
+            &st,
+            &alice,
+            AdminOp::Submit(Box::new(job(Executor::Wasm, 1))),
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(pinned.account.as_deref(), Some("alice"));
+        let mut other = job(Executor::Wasm, 1);
+        other.account = Some("bob".into());
+        assert!(crate::access::admit(&st, &alice, AdminOp::Submit(Box::new(other))).is_err());
+        // Other accounts' jobs are out of reach.
+        let owners = st.submit(job(Executor::Wasm, 1)).unwrap();
+        assert!(crate::access::admit(&st, &alice, AdminOp::Cancel { id: owners }).is_err());
+        let mine = st.submit(*pinned).unwrap();
+        assert!(crate::access::admit(&st, &alice, AdminOp::Cancel { id: mine }).is_ok());
+        let status = crate::access::scope(
+            &alice,
+            pumasi_proto::msg::AdminResponse::Status(st.status()),
+        );
+        let pumasi_proto::msg::AdminResponse::Status(status) = status else {
+            panic!()
+        };
+        assert_eq!(status.jobs.len(), 1);
+        assert_eq!(status.jobs[0].id, mine);
+        // A viewer reads but changes nothing.
+        let v = st.access_caller(&viewer.secret).unwrap();
+        assert!(crate::access::admit(&st, &v, AdminOp::Status).is_ok());
+        assert!(crate::access::admit(&st, &v, AdminOp::Cancel { id: mine }).is_err());
+        assert_eq!(st.list_access().len(), 2);
+        let gone = st.revoke_access("alice laptop").unwrap();
+        assert_eq!(gone.len(), 1);
+        assert!(st.access_caller(&sub.secret).is_none());
     }
 }

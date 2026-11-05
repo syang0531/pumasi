@@ -36,8 +36,10 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    access,
     datasets::StoreCmd,
     files::FileStore,
+    manage::Caller,
     rollout::{ReleaseStore, release_dir},
     state::State,
     store::Store,
@@ -580,13 +582,33 @@ impl ProtocolHandler for AdminHandler {
                     let Some(req) = read_msg::<_, AdminRequest>(&mut recv).await? else {
                         return Ok(());
                     };
-                    let resp = if secrets_eq(&req.secret, &inner.admin_secret) {
-                        match handle_store_admin(&inner, req.op).await {
-                            Ok(r) => r.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}"))),
-                            Err(op) => handle_admin(&inner, op),
-                        }
+                    let caller = if secrets_eq(&req.secret, &inner.admin_secret) {
+                        Some(Caller::Admin {
+                            name: "cluster admin".into(),
+                        })
                     } else {
-                        AdminResponse::Error("invalid admin credentials".into())
+                        inner.state().access_caller(&req.secret)
+                    };
+                    let resp = match caller {
+                        None => AdminResponse::Error(
+                            "invalid admin credentials (a wrong, expired or revoked ticket)".into(),
+                        ),
+                        Some(caller) => {
+                            let admitted = {
+                                let st = inner.state();
+                                access::admit(&st, &caller, req.op)
+                            };
+                            let resp = match admitted {
+                                Err(e) => AdminResponse::Error(format!("{e:#}")),
+                                Ok(op) => match handle_store_admin(&inner, op).await {
+                                    Ok(r) => {
+                                        r.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))
+                                    }
+                                    Err(op) => handle_admin(&inner, &caller, op),
+                                },
+                            };
+                            access::scope(&caller, resp)
+                        }
                     };
                     write_msg(&mut send, &resp).await?;
                     send.finish()?;
@@ -733,7 +755,7 @@ async fn handle_store_admin(
     })
 }
 
-fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
+fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
     let result: Result<AdminResponse> = (|| match op {
         AdminOp::CreateJoinToken {
             ttl_secs,
@@ -753,7 +775,8 @@ fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
             })
         }
         AdminOp::Submit(sub) => {
-            let id = inner.state().submit(*sub)?;
+            let submitter = matches!(caller, Caller::Submitter { .. });
+            let id = inner.state().submit_from(*sub, submitter, None)?;
             Ok(AdminResponse::Submitted { id })
         }
         AdminOp::Status => Ok(AdminResponse::Status(inner.state().status())),
@@ -826,6 +849,56 @@ fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
             inner.state().cancel_rollout()?;
             Ok(AdminResponse::Ok)
         }
+        AdminOp::EditNode { node, edit } => {
+            inner.state().edit_node(&node, &edit)?;
+            Ok(AdminResponse::Ok)
+        }
+        AdminOp::Drain { node } => Ok(AdminResponse::Drained {
+            moved: inner.state().drain(&node)?,
+        }),
+        AdminOp::SetQuota { account, quota } => {
+            inner.state().set_account_quota(&account, quota)?;
+            Ok(AdminResponse::Ok)
+        }
+        AdminOp::Quotas => Ok(AdminResponse::Quotas(inner.state().quotas())),
+        AdminOp::CreateAccess {
+            name,
+            role,
+            ttl_secs,
+        } => {
+            let r = inner
+                .state()
+                .create_access(&name, role, ttl_secs.map(Duration::from_secs))?;
+            let ticket = AdminTicket {
+                cluster: inner.addr(),
+                secret: r.secret,
+            };
+            Ok(AdminResponse::AccessTicket {
+                ticket: ticket.to_string(),
+                view: r.view(),
+            })
+        }
+        AdminOp::ListAccess => Ok(AdminResponse::AccessList(inner.state().list_access())),
+        AdminOp::RevokeAccess { id } => {
+            Ok(AdminResponse::AccessList(inner.state().revoke_access(&id)?))
+        }
+        AdminOp::WhoAmI => Ok(AdminResponse::WhoAmI {
+            name: caller.name().to_string(),
+            role: caller.role(),
+        }),
+        AdminOp::SetSchedule(spec) => {
+            inner.state().set_schedule(*spec)?;
+            Ok(AdminResponse::Ok)
+        }
+        AdminOp::Schedules => Ok(AdminResponse::Schedules(inner.state().schedules())),
+        AdminOp::RemoveSchedule { name } => {
+            inner.state().remove_schedule(&name)?;
+            Ok(AdminResponse::Ok)
+        }
+        AdminOp::RunSchedule { name } => Ok(AdminResponse::Submitted {
+            id: inner.state().run_schedule(&name, true)?,
+        }),
+        AdminOp::Apply(spec) => Ok(AdminResponse::Applied(inner.state().apply(*spec)?)),
         other => anyhow::bail!("unexpected admin call {other:?}"),
     })();
     result.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))

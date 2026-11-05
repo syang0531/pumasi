@@ -166,6 +166,7 @@ mod imp {
         msg_send,
         rc::{Allocated, Retained},
         runtime::{AnyClass, AnyObject, Bool},
+        sel,
     };
 
     use super::VzConfig;
@@ -205,6 +206,11 @@ mod imp {
     pub fn status() -> std::result::Result<(), String> {
         load()?;
         let cls = class(c"VZVirtualMachine").map_err(|e| e.to_string())?;
+        // An unknown selector would raise an Objective-C exception, which
+        // aborts the process (the agent, here), so check first.
+        if !cls.metaclass().responds_to(sel!(isSupported)) {
+            return Err("this macOS has no +[VZVirtualMachine isSupported]".into());
+        }
         // SAFETY: `+[VZVirtualMachine isSupported]`, macOS 11.
         let ok: Bool = unsafe { msg_send![cls, isSupported] };
         if ok.as_bool() {

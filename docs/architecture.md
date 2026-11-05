@@ -3,8 +3,9 @@
 This document records how the cluster is built and why: the private
 cluster of phase 1, the invited providers, receipts, credit ledger and
 result checks of phase 2, the microVM executor of phase 3, the
-releases, OS services and signed agent upgrades of phase 4, and the
-Windows support of phase 5. The
+releases, OS services and signed agent upgrades of phase 4, the
+Windows support of phase 5, and the Mac support and availability policy of
+phase 6. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -15,7 +16,7 @@ the project; this file covers the code.
 | --- | --- |
 | `pumasi-proto` | Job spec (`job.toml`), wire messages, framing, tickets, endpoint helpers, receipts (signing and verification), price list and policy. No business logic. |
 | `pumasi-guest` | `pumasi-guest`, the init process inside every microVM (a static musl binary), and the disk protocol the agent shares with it. |
-| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `MicrovmExecutor` (registry client, ext4 formatter, Firecracker/QEMU), `platform` (sparse files, Windows Job Objects, the WHPX check) and the `Agent` session loop, which signs usage. |
+| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `MicrovmExecutor` (registry client, ext4 formatter, Firecracker/QEMU/Virtualization.framework), `availability` (power, idle and hours policy), `platform` (sparse files, Windows Job Objects, the WHPX check) and the `Agent` session loop, which signs usage. |
 | `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
 | `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. `service.rs` installs the agent as an OS service, `upgrade.rs` drives rollouts. |
 
@@ -58,8 +59,10 @@ and reconnects need no secret.
 - Tasks enter a FIFO queue at submission. Retried tasks go to the front.
   Check runs (below) share the queue.
 - `schedule()` runs after every event (submit, connect, disconnect, report,
-  tick, deposit). A node is eligible for a task when it is online, not
-  suspended, has a free slot, enough memory, and the job's executor among
+  tick, deposit, availability change). A node is eligible for a task when
+  it is online, not suspended, not paused by its availability policy, has a
+  free slot, enough memory, at least the job's vCPUs (image jobs; a WASM
+  task needs one), and the job's executor among
   the executors the cluster allows it (provider machines: WASM and microVM,
   plus Docker only with an invite that allows it). A node of another account than the
   job's is eligible only while that account's balance is positive. Among
@@ -155,10 +158,7 @@ or QEMU on Windows, and the guest init (release binaries embed it). Backends:
 | --- | --- | --- |
 | Firecracker | Linux with `/dev/kvm` | default when installed; `--no-api --config-file`, its own seccomp filters |
 | QEMU | Linux, macOS, Windows | `-M microvm` on x86_64, `-M virt` on ARM64; KVM, HVF or WHPX when available, else TCG (slow; adds `tsc_early_khz` so boot never stalls calibrating the TSC) |
-
-The research doc names libkrun for macOS; QEMU came first because the same
-command line covers Linux and macOS and CI can test it. libkrun stays an
-option once a Mac runner can exercise it.
+| vz | macOS 11+ | Apple's Virtualization.framework in a signed helper process; the default on macOS (phase 6, below) |
 
 Nothing crosses the VM boundary except virtio block devices, which the
 guest identifies by content (VMMs attach them in different orders):
@@ -501,6 +501,97 @@ go through the TCG fallback; WHPX itself is verified on a real PC. The release w
 the guest for x86_64 and aarch64 and embeds the matching one in all six
 binaries.
 
+## Phase 6: Macs and availability
+
+### Old Intel Macs
+
+The x86_64 macOS binary is built with `MACOSX_DEPLOYMENT_TARGET=10.15`
+(Rust supports 10.12), the last macOS of the oldest 2013-2014 Macs. CI
+builds it on the `macos-15-intel` runner, checks the Mach-O minimum OS
+with `vtool` and that Virtualization.framework is not among the linked
+libraries, and runs the tests and the service/upgrade script there.
+Catalina Macs run WASM jobs; Docker Desktop and current QEMU builds do not
+support these macOS versions, so Docker stays off on old Macs.
+
+### Virtualization.framework
+
+The `vz` backend replaces the untested macOS QEMU path as the default from
+macOS 11 (QEMU stays selectable). Two constraints shape it:
+
+- The framework serves only processes signed with the
+  `com.apple.security.virtualization` entitlement; an ad-hoc signature is
+  enough. `pumasi vm setup` (and the agent when it starts) writes a copy of
+  the running binary to `<vm dir>/pumasi-vz` and signs it with
+  `/usr/bin/codesign`; `pumasi-vz.source` holds the BLAKE3 of the binary
+  it came from, so an upgraded agent re-signs a fresh copy. Each VM runs as
+  `pumasi-vz __vz-run <dir>/vz.json`, which `main` intercepts before
+  parsing arguments: a VMM process like Firecracker or QEMU, killed at the
+  deadline. The agent's own binary is never re-signed, because upgrades
+  compare its SHA-256.
+- macOS 10.15 lacks the framework, and a linked framework that is missing
+  stops a binary from starting. So `microvm/vz.rs` loads it with `dlopen`
+  and talks to it through the Objective-C runtime (`objc2` for messages,
+  `block2` for the start completion handler); classes are looked up by
+  name.
+
+The helper builds a `VZVirtualMachineConfiguration`: `VZLinuxBootLoader`
+with the kernel, the initramfs and the command line (`console=hvc0`), one
+`VZVirtioBlockDeviceConfiguration` over a `VZDiskImageStorageDeviceAttachment`
+per disk (raw images; the agent already pads them to 4 KiB), a virtio
+console on its stdout (the task's `console.log`) and an entropy device,
+with CPUs and memory clamped to what the framework allows. It validates
+the configuration, starts the VM on the main queue and runs the main run
+loop until the VM stops; a guest reboot stops a VZ VM. The agent also
+watches `console.log` for the kernel's "reboot:" line, as it does for
+WHPX, in case a VM lingers.
+
+VZ devices are virtio-pci; the Firecracker 1.10 kernels used elsewhere have
+virtio-mmio only. Firecracker's 1.15 CI configuration for 6.1 has PCI and
+virtio-console, so Apple Silicon boots its arm64 `Image` (6.1.155) as is.
+On Intel, `VZLinuxBootLoader` boots a bzImage, which Firecracker does not
+publish: `scripts/kernel/build.sh` builds one from the same configuration
+(pinned source and config hashes, fixed build timestamp, user and host), and
+`.github/workflows/guest-kernel.yml` runs it on every change to the script.
+On main, the first build whose SHA-256 equals the pin in `setup.rs` is
+published as the prerelease `guest-kernel-6.1.155-1` (not "latest", so the
+install scripts keep finding the pumasi release); later builds are compared
+with it. The kernel file is `vz-kernel` on macOS so a phase 3 `vmlinux`
+there is not used by mistake. Kernels after 6.1 have an ACPI regression
+under Virtualization.framework on x86_64, one more reason to stay on 6.1.
+
+Hosted Mac runners are VMs without nested virtualization, so CI checks the
+helper up to the framework's answer (signing, entitlement, the
+`__vz-run` path through the Objective-C calls); guests are booted on real
+Macs.
+
+### Availability policy
+
+`availability.rs` holds the owner's policy (`--only-on-ac`,
+`--idle-minutes`, `--hours`) and a `Probe` that reads the machine:
+
+| | Power | Idle time |
+| --- | --- | --- |
+| macOS | `pmset -g batt` | `HIDIdleTime` of `IOHIDSystem` via `ioreg`: system-wide, so a LaunchDaemon sees it |
+| Linux | `/sys/class/power_supply`: on battery when a battery discharges and no mains/USB supply is online | most recent of terminal access times (`/dev/tty<N>`, `/dev/pts/*`, as `w` shows) and logind's idle hint for graphical sessions; nobody logged in is idle |
+| Windows | `GetSystemPowerStatus` | `GetLastInputInfo`, own session only; a service in session 0 reports that it cannot tell |
+
+No battery counts as AC power; idle time that cannot be read pauses the
+node with the reason instead of guessing. The agent evaluates the policy
+every 15 s on a blocking thread and keeps the answer in a `watch` channel.
+The hello carries the state at connect time, so a node that joins on
+battery is never placed a task, and `FromAgent::Availability` reports each
+change. The control plane keeps it as `NodeRuntime::paused`: paused nodes
+get no new tasks, running tasks finish (a laptop that then sleeps is
+handled like any node that goes silent), and `NodeView::paused` shows the
+reason in `pumasi status`.
+
+Two related defaults: `--max-cpu-percent` makes the node report that share
+of its CPUs as `NodeInfo::cpus`, which the scheduler now compares with an
+image job's vCPUs (and Docker containers of jobs without a CPU limit get
+`--cpus` at the cap); and default slots are one per offered CPU but at most
+one per GiB of memory beyond the first two, so a 4 GiB laptop runs two
+tasks at once.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -519,17 +610,22 @@ belong to `owner` and are not deterministic. Layout 3 (phase 3) adds
 `Executor::Microvm` was appended to the enum, so older records decode
 unchanged. Phase 4 adds no new record layout: the rollout lives under the
 new `meta.rollout` key and uploaded binaries are files in
-`<cluster dir>/releases/`. `PROTOCOL_VERSION` is 5 (the hello carries
-`UpgradeHello`, and upgrade messages were added): agents and the control
-plane must both be phase 4 builds. Phase 3 agents cannot be upgraded
-remotely; install the phase 4 binary on them once.
+`<cluster dir>/releases/`. Phase 6 adds none either. `PROTOCOL_VERSION`
+is 6: protocol 5 (phase 4) added `UpgradeHello` and the upgrade messages,
+protocol 6 appends `AgentHello::availability` and
+`FromAgent::Availability`. The control plane accepts hellos from
+`MIN_AGENT_PROTOCOL` (5) up: `AgentHello::decode` tries the current layout
+and falls back to the protocol 5 one (available), so phase 4 and 5 agents
+keep working and can take a rollout. Upgrade the control plane first; it
+rejects agents newer than itself. Phase 3 agents cannot be upgraded
+remotely; install a current binary on them once.
 
 ## Not yet
 
-- Remaining roadmap phases (6 to 17): old Intel Macs and availability
-  policy, benchmarks and compute units (CU), a cluster file store, GPUs,
-  cluster management, monitoring, a web dashboard, Raft, WebGPU, the
-  confidential tier, the hub, buying CU. See the roadmap in the README.
+- Remaining roadmap phases (7 to 17): benchmarks and compute units (CU),
+  a cluster file store, GPUs, cluster management, monitoring, a web
+  dashboard, Raft, WebGPU, the confidential tier, the hub, buying CU. See
+  the roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node
@@ -542,8 +638,9 @@ remotely; install the phase 4 binary on them once.
 - Benchmarks at join and "honeypot" tasks with known answers (needed for
   non-deterministic Docker and microVM work, which checks cannot cover).
 - MicroVM: private registries, network (a tap device with egress rules),
-  GPU passthrough (VFIO), a snapshot pool for faster boots, and libkrun on
-  macOS.
+  GPU passthrough (VFIO), a snapshot pool for faster boots.
+- Availability: running tasks are not stopped when a node pauses, and
+  idle detection under a Windows service is not possible yet.
 - WASI preview 2 components, job garbage collection.
 - Large files: inputs and outputs travel through the control plane and are
   capped (48 MiB in per job, 32 MiB out per task). Direct node-to-node

@@ -18,6 +18,9 @@ pub enum Backend {
     /// QEMU's `microvm` machine (x86_64) or `virt` machine (aarch64), with
     /// KVM or HVF when available and software emulation otherwise.
     Qemu,
+    /// Apple's Virtualization.framework (macOS 11+), run in the signed
+    /// helper. The default on macOS.
+    Vz,
 }
 
 impl fmt::Display for Backend {
@@ -25,6 +28,7 @@ impl fmt::Display for Backend {
         f.write_str(match self {
             Backend::Firecracker => "firecracker",
             Backend::Qemu => "qemu",
+            Backend::Vz => "vz",
         })
     }
 }
@@ -35,7 +39,8 @@ impl FromStr for Backend {
         match s {
             "firecracker" => Ok(Backend::Firecracker),
             "qemu" => Ok(Backend::Qemu),
-            _ => bail!("unknown VM backend {s:?} (expected firecracker or qemu)"),
+            "vz" => Ok(Backend::Vz),
+            _ => bail!("unknown VM backend {s:?} (expected firecracker, qemu or vz)"),
         }
     }
 }
@@ -92,7 +97,31 @@ impl Vmm {
         match self.backend {
             Backend::Firecracker => self.firecracker(spec, dir),
             Backend::Qemu => Ok(self.qemu(spec, dir)),
+            Backend::Vz => self.vz(spec, dir),
         }
+    }
+
+    /// The signed helper with a JSON config: `pumasi-vz __vz-run vz.json`.
+    fn vz(&self, spec: &VmSpec, dir: &Path) -> Result<tokio::process::Command> {
+        let config = super::vz::VzConfig {
+            kernel: spec.kernel.clone(),
+            initrd: spec.initrd.clone(),
+            // The console is virtio (hvc0); a guest reboot stops the VM.
+            cmdline: cmdline(&["console=hvc0", "panic=1"], spec.mode),
+            disks: spec
+                .disks
+                .iter()
+                .map(|d| (d.path.clone(), d.read_only))
+                .collect(),
+            cpus: spec.vcpus,
+            mem_mib: spec.mem_mib,
+        };
+        let path = dir.join("vz.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
+            .with_context(|| format!("write {}", path.display()))?;
+        let mut cmd = tokio::process::Command::new(&self.bin);
+        cmd.arg(super::vz::RUN_ARG).arg(&path);
+        Ok(cmd)
     }
 
     fn firecracker(&self, spec: &VmSpec, dir: &Path) -> Result<tokio::process::Command> {
@@ -387,5 +416,40 @@ mod tests {
         assert!(joined.contains("pumasi.mode=run"));
         assert!(joined.contains("-smp 2"));
         assert!(!joined.contains("-accel kvm"));
+    }
+
+    #[test]
+    fn vz_command_writes_its_config() {
+        let dir = crate::tempdir::TempDir::new("vz").unwrap();
+        let vmm = Vmm {
+            backend: Backend::Vz,
+            bin: "/vm/pumasi-vz".into(),
+            accelerated: true,
+            tsc_khz: None,
+        };
+        let spec = VmSpec {
+            kernel: "/k".into(),
+            initrd: "/i".into(),
+            mode: "run",
+            disks: vec![Disk {
+                path: "/a.img".into(),
+                read_only: true,
+            }],
+            vcpus: 2,
+            mem_mib: 300,
+        };
+        let cmd = vmm.command(&spec, dir.path()).unwrap();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "__vz-run");
+        let config: super::super::vz::VzConfig =
+            serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
+        assert!(config.cmdline.contains("console=hvc0"));
+        assert!(config.cmdline.contains("pumasi.mode=run"));
+        assert_eq!(config.disks, vec![("/a.img".into(), true)]);
+        assert_eq!("vz".parse::<Backend>().unwrap(), Backend::Vz);
     }
 }

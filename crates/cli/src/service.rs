@@ -18,6 +18,8 @@ use clap::{Args, Subcommand};
 /// rollback). `EX_TEMPFAIL` from sysexits.h.
 pub const RESTART_EXIT_CODE: i32 = 75;
 
+// launchd uses its own label (`pumasi.agent`).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const NAME: &str = "pumasi-agent";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const LAUNCHD_LABEL: &str = "pumasi.agent";

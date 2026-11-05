@@ -97,7 +97,11 @@ impl RunningAgent {
 }
 
 async fn agent(name: &str, slots: u32, dir: PathBuf) -> Agent {
-    Agent::new(AgentConfig {
+    Agent::new(agent_config(name, slots, dir)).await.unwrap()
+}
+
+fn agent_config(name: &str, slots: u32, dir: PathBuf) -> AgentConfig {
+    AgentConfig {
         data_dir: dir,
         name: name.into(),
         slots: Some(slots),
@@ -107,9 +111,9 @@ async fn agent(name: &str, slots: u32, dir: PathBuf) -> Agent {
         microvm: None,
         upgrade: None,
         corrupt_results: false,
-    })
-    .await
-    .unwrap()
+        max_cpu_percent: None,
+        availability: None,
+    }
 }
 
 fn spawn_join(agent: Agent, ticket: JoinTicket) -> RunningAgent {
@@ -224,6 +228,86 @@ async fn runs_a_sharded_job_across_two_nodes() {
     client.close().await;
     a.kill().await;
     b.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+/// A laptop's power state, as the availability policy reads it.
+struct Battery(std::sync::atomic::AtomicBool);
+
+impl pumasi_agent::availability::Probe for Battery {
+    fn on_battery(&self) -> Option<bool> {
+        Some(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    fn idle_time(&self) -> std::result::Result<Duration, String> {
+        Ok(Duration::MAX)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_on_battery_takes_no_new_tasks_until_plugged_in() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let battery = std::sync::Arc::new(Battery(true.into()));
+    let laptop = Agent::new(AgentConfig {
+        availability: Some(pumasi_agent::AvailabilityConfig {
+            policy: pumasi_agent::availability::Policy {
+                only_on_ac: true,
+                ..Default::default()
+            },
+            probe: battery.clone(),
+            interval: Duration::from_millis(100),
+        }),
+        // The scheduler checks CPUs for image jobs only; WASM needs one.
+        max_cpu_percent: Some(1),
+        ..agent_config("laptop", 2, tempdir("laptop"))
+    })
+    .await
+    .unwrap();
+    assert_eq!(laptop.info().cpus, 1);
+    let laptop = spawn_join(laptop, ticket);
+    wait_online(&cluster, 1).await;
+    // It joined on battery: paused from the start, with the reason.
+    let node = cluster.status().nodes.remove(0);
+    assert_eq!(
+        node.paused.as_deref(),
+        Some("on battery power"),
+        "{node:#?}"
+    );
+
+    let client = admin(&cluster).await;
+    let id = submit(&client, submission(vec![vec!["one"], vec!["two"]])).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let AdminResponse::Job(view) = client
+        .call(AdminOp::Job {
+            id,
+            with_output: false,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected job view");
+    };
+    assert_eq!(view.summary.state, JobState::Queued, "{view:#?}");
+
+    // Plugged in: the queued tasks run.
+    battery.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    let view = wait_job(&client, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    assert!(cluster.status().nodes[0].paused.is_none());
+
+    // Unplugged again: paused again.
+    battery.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while cluster.status().nodes[0].paused.is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "never paused");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    client.close().await;
+    laptop.kill().await;
     cluster.shutdown().await.unwrap();
 }
 
@@ -456,6 +540,8 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         microvm: None,
         upgrade: None,
         corrupt_results: corrupt,
+        max_cpu_percent: None,
+        availability: None,
     })
     .await
     .unwrap()
@@ -858,6 +944,8 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         microvm: None,
         upgrade: None,
         corrupt_results: false,
+        max_cpu_percent: None,
+        availability: None,
     })
     .await
     .unwrap();
@@ -1007,6 +1095,8 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         microvm: Some(vm),
         upgrade: None,
         corrupt_results: false,
+        max_cpu_percent: None,
+        availability: None,
     })
     .await
     .unwrap();
@@ -1164,6 +1254,8 @@ async fn upgradable(name: &str, dir: PathBuf, exe: PathBuf, auto: Option<bool>) 
             smoke_test: false,
         }),
         corrupt_results: false,
+        max_cpu_percent: None,
+        availability: None,
     })
     .await
     .unwrap()

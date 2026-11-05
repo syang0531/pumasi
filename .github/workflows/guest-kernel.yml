@@ -1,0 +1,74 @@
+name: Guest kernel
+
+# Builds the x86_64 bzImage that microVMs boot under Virtualization.framework
+# on Intel Macs (scripts/kernel/build.sh). Branch builds upload it as an
+# artifact. On main, the first build whose SHA-256 matches the pin in
+# crates/agent/src/microvm/setup.rs is published as the prerelease named in
+# KERNEL_TAG, which `pumasi vm setup` downloads; later builds are compared
+# with it to show the build is reproducible. A branch build that matches
+# the pin shows the published one will too.
+
+on:
+  push:
+    paths:
+      - scripts/kernel/**
+      - .github/workflows/guest-kernel.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_TAG: guest-kernel-6.1.155-1
+
+jobs:
+  bzimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends flex bison bc libelf-dev
+      - name: Build
+        run: scripts/kernel/build.sh out
+      - name: Compare with the pinned SHA-256
+        run: |
+          pinned=$(grep -A1 'const VZ_KERNEL_X86_64_SHA256' crates/agent/src/microvm/setup.rs | grep -o '[0-9a-f]\{64\}' | head -n1)
+          built=$(awk '$2 == "bzImage-x86_64" { print $1 }' out/SHA256SUMS)
+          echo "pinned: ${pinned:-none}"; echo "built:  $built"
+          if [ "$pinned" = "$built" ]; then echo "MATCH=1" >> "$GITHUB_ENV"; else echo "::warning::bzImage SHA-256 $built is not the pinned one"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-kernel-x86_64
+          path: out/
+
+  publish:
+    needs: bzimage
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-kernel-x86_64
+          path: out
+      - name: Publish once, or compare with the published build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned=$(grep -A1 'const VZ_KERNEL_X86_64_SHA256' crates/agent/src/microvm/setup.rs | grep -o '[0-9a-f]\{64\}' | head -n1)
+          built=$(awk '$2 == "bzImage-x86_64" { print $1 }' out/SHA256SUMS)
+          if gh release view "$KERNEL_TAG" >/dev/null 2>&1; then
+            gh release download "$KERNEL_TAG" -p SHA256SUMS -O published.txt
+            diff published.txt out/SHA256SUMS && echo "reproduced the published build" \
+              || echo "::warning::this build differs from the published $KERNEL_TAG"
+          elif [ "$pinned" = "$built" ]; then
+            gh release create "$KERNEL_TAG" out/* \
+              --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "Guest kernel 6.1.155 for Intel Macs" \
+              --notes "x86_64 bzImage for microVMs under Virtualization.framework, built by .github/workflows/guest-kernel.yml from scripts/kernel/build.sh at $GITHUB_SHA. Downloaded by \`pumasi vm setup\` on Intel Macs; not a pumasi release."
+          else
+            echo "::error::built $built but setup.rs pins $pinned; not publishing"
+            exit 1
+          fi

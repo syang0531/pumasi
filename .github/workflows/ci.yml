@@ -25,7 +25,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macos-15-intel: the last Intel image, for old Intel Macs.
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -135,6 +136,67 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/pumasi-guest
           if-no-files-found: error
 
+  # macOS: the binary's minimum OS, and the Virtualization.framework
+  # helper (signing, loading the framework at run time). Hosted Mac
+  # runners are VMs without nested virtualization, so booting a guest is
+  # checked on real Macs; the helper still runs up to the framework's
+  # answer.
+  macos-vz:
+    name: macos (vz, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            minos: "10.15"
+          - os: macos-latest
+            # Apple Silicon starts at macOS 11.
+            minos: "11.0"
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+      VM_DIR: ${{ github.workspace }}/.vm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-vz
+      - run: cargo build -p pumasi-cli
+      - name: Minimum macOS, and Virtualization.framework not linked
+        run: |
+          bin=target/debug/pumasi
+          vtool -show-build "$bin" | tee /dev/stderr | grep -Eq "(minos|version) ${{ matrix.minos }}( |$)"
+          otool -L "$bin" | tee libs.txt
+          if grep -q Virtualization libs.txt; then
+            echo "Virtualization.framework is linked; the binary would not start on macOS 10.15"; exit 1
+          fi
+      - name: Set up microVMs (signs the helper)
+        run: |
+          # The Intel kernel is a release asset of this repository, which
+          # exists once the guest kernel workflow ran on main.
+          ./target/debug/pumasi vm setup --vm-dir "$VM_DIR" || echo "::warning::vm setup failed"
+          ./target/debug/pumasi vm status --vm-dir "$VM_DIR" | tee status.txt || true
+          grep -Eq "^  vz +(usable|not usable)" status.txt
+          codesign -d --entitlements - "$VM_DIR/pumasi-vz" 2>&1 | tee ent.txt
+          grep -q com.apple.security.virtualization ent.txt
+      - name: The helper runs a VM config up to the framework
+        run: |
+          head -c 1048576 /dev/zero > disk.img
+          echo kernel > kernel; echo initrd > initrd
+          cat > vz.json <<JSON
+          {"kernel":"$PWD/kernel","initrd":"$PWD/initrd","cmdline":"console=hvc0","disks":[["$PWD/disk.img",true]],"cpus":1,"mem_mib":256}
+          JSON
+          set +e
+          "$VM_DIR/pumasi-vz" __vz-run vz.json > out.txt 2>&1
+          code=$?
+          set -e
+          cat out.txt; echo "exit $code"
+          # 0: it booted and stopped; 1: a reported error (no nested
+          # virtualization here, or the fake kernel). Anything else is a crash.
+          [ "$code" -le 1 ]
+          [ "$code" = 0 ] || grep -q "^pumasi-vz: " out.txt
+
   # QEMU on Windows: WHPX where the runner offers it, and TCG.
   microvm-windows:
     name: microvm (windows, qemu)
@@ -220,7 +282,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       # Smaller binaries to roll out (debug info makes them ~650 MiB).

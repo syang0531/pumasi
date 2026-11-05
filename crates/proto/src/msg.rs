@@ -71,6 +71,69 @@ pub struct AgentHello {
     pub node: NodeInfo,
     /// Set when the agent can replace its own binary.
     pub upgrade: Option<UpgradeHello>,
+    /// Whether the node takes new tasks right now (its availability
+    /// policy). Protocol 6; protocol 5 hellos end before it, see
+    /// [`AgentHello::decode`].
+    pub availability: Availability,
+}
+
+/// The protocol 5 hello: [`AgentHello`] without `availability`.
+#[derive(Deserialize)]
+struct AgentHelloV5 {
+    protocol_version: u32,
+    join_secret: Option<Secret>,
+    node: NodeInfo,
+    upgrade: Option<UpgradeHello>,
+}
+
+impl AgentHello {
+    /// Decodes a hello of this protocol or of protocol 5 (no availability,
+    /// so always available), which lets older agents connect and be
+    /// upgraded by a rollout.
+    pub fn decode(bytes: &[u8]) -> postcard::Result<Self> {
+        postcard::from_bytes::<Self>(bytes).or_else(|e| {
+            let old: AgentHelloV5 = match postcard::from_bytes(bytes) {
+                Ok(
+                    old @ AgentHelloV5 {
+                        protocol_version: ..=5,
+                        ..
+                    },
+                ) => old,
+                _ => return Err(e),
+            };
+            Ok(Self {
+                protocol_version: old.protocol_version,
+                join_secret: old.join_secret,
+                node: old.node,
+                upgrade: old.upgrade,
+                availability: Availability::Available,
+            })
+        })
+    }
+}
+
+/// Whether a node takes new tasks, as its owner's availability policy says
+/// (`pumasi agent start --only-on-ac`, `--idle-minutes`, `--hours`). Tasks
+/// already running when a node pauses finish.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Availability {
+    #[default]
+    Available,
+    /// Takes no new tasks, for this reason (e.g. "on battery power").
+    Paused { reason: String },
+}
+
+impl Availability {
+    pub fn is_available(&self) -> bool {
+        matches!(self, Availability::Available)
+    }
+
+    pub fn paused_reason(&self) -> Option<&str> {
+        match self {
+            Availability::Available => None,
+            Availability::Paused { reason } => Some(reason),
+        }
+    }
 }
 
 /// What an agent tells the cluster about upgrading itself.
@@ -243,6 +306,8 @@ pub enum FromAgent {
         sha256: [u8; 32],
         reason: String,
     },
+    /// The node's availability changed (protocol 6).
+    Availability(Availability),
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +620,8 @@ pub struct NodeView {
     pub running: u32,
     pub completed: u64,
     pub last_seen_unix: u64,
+    /// Online but taking no new tasks, and why (its availability policy).
+    pub paused: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -607,4 +674,75 @@ pub struct JobView {
     pub tasks: Vec<TaskView>,
     pub total_fuel: u64,
     pub deterministic: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node() -> NodeInfo {
+        NodeInfo {
+            name: "n".into(),
+            os: "macos".into(),
+            arch: "x86_64".into(),
+            cpus: 4,
+            memory_bytes: 8 << 30,
+            slots: 2,
+            agent_version: "0.5.0".into(),
+            executors: vec![Executor::Wasm],
+        }
+    }
+
+    #[test]
+    fn hello_decodes_this_and_the_previous_protocol() {
+        #[derive(Serialize)]
+        struct V5 {
+            protocol_version: u32,
+            join_secret: Option<Secret>,
+            node: NodeInfo,
+            upgrade: Option<UpgradeHello>,
+        }
+        let old = postcard::to_stdvec(&V5 {
+            protocol_version: 5,
+            join_secret: None,
+            node: node(),
+            upgrade: Some(UpgradeHello {
+                exe_sha256: [7; 32],
+                auto: None,
+            }),
+        })
+        .unwrap();
+        let h = AgentHello::decode(&old).unwrap();
+        assert_eq!(h.protocol_version, 5);
+        assert_eq!(h.node, node());
+        assert_eq!(h.availability, Availability::Available);
+        assert_eq!(h.upgrade.unwrap().exe_sha256, [7; 32]);
+
+        let paused = Availability::Paused {
+            reason: "on battery power".into(),
+        };
+        let new = postcard::to_stdvec(&AgentHello {
+            protocol_version: crate::PROTOCOL_VERSION,
+            join_secret: None,
+            node: node(),
+            upgrade: None,
+            availability: paused.clone(),
+        })
+        .unwrap();
+        let h = AgentHello::decode(&new).unwrap();
+        assert_eq!(h.availability, paused);
+        assert!(h.upgrade.is_none());
+        // A protocol 5 control plane reads the new hello's version (and
+        // rejects it with a message) instead of failing to decode it.
+        let seen: V5Read = postcard::from_bytes(&new).unwrap();
+        assert_eq!(seen.protocol_version, crate::PROTOCOL_VERSION);
+        assert!(AgentHello::decode(&new[..new.len() - 3]).is_err());
+    }
+
+    #[derive(Deserialize)]
+    struct V5Read {
+        protocol_version: u32,
+        #[allow(dead_code)]
+        node_and_rest: (Option<Secret>, NodeInfo, Option<UpgradeHello>),
+    }
 }

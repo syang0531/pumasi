@@ -25,6 +25,7 @@ pub mod ext4;
 pub mod registry;
 pub mod setup;
 pub mod vmm;
+pub mod vz;
 
 use std::{
     io::{BufReader, Read, Write},
@@ -58,8 +59,14 @@ pub use vmm::{Backend, Disk, VmSpec, Vmm};
 
 use crate::{executor::RunResult, tempdir::TempDir};
 
-/// Guest kernel file name in the VM directory.
-pub const KERNEL_FILE: &str = "vmlinux";
+/// Guest kernel file name in the VM directory. macOS needs another kernel
+/// (virtio-pci for Virtualization.framework, a bzImage on Intel), so it has
+/// its own name there and a phase 3 install is not mistaken for it.
+pub const KERNEL_FILE: &str = if cfg!(target_os = "macos") {
+    "vz-kernel"
+} else {
+    "vmlinux"
+};
 /// Guest init file name (in the VM directory or next to the agent).
 pub const GUEST_FILE: &str = "pumasi-guest";
 /// Firecracker binary name (in the VM directory or on `PATH`).
@@ -141,6 +148,9 @@ pub struct Assets {
     /// Windows only: whether QEMU can use the Windows Hypervisor Platform,
     /// or why not.
     pub whpx: Option<std::result::Result<(), String>>,
+    /// macOS only: whether Virtualization.framework can run VMs, or why
+    /// not.
+    pub vz: Option<std::result::Result<(), String>>,
 }
 
 impl Assets {
@@ -173,6 +183,7 @@ impl Assets {
             qemu: vmm::find_program(&vmm::qemu_name(), Some(&dir.join(QEMU_DIR)), qemu_extra),
             kvm: vmm::kvm_usable(),
             whpx: cfg!(windows).then(crate::platform::whpx_status),
+            vz: cfg!(target_os = "macos").then(vz::status),
         }
     }
 
@@ -183,8 +194,24 @@ impl Assets {
             || (cfg!(target_arch = "x86_64") && matches!(self.whpx, Some(Ok(()))))
     }
 
-    /// The VMM to use, or why there is none.
-    pub fn pick(&self, want: Option<Backend>) -> Result<Vmm> {
+    /// The VMM to use, or why there is none. `dir` is the VM directory,
+    /// where the Virtualization.framework helper lives.
+    pub fn pick(&self, want: Option<Backend>, dir: &Path) -> Result<Vmm> {
+        let vz = || -> Result<Vmm> {
+            match &self.vz {
+                None => bail!("the vz backend (Virtualization.framework) runs only on macOS"),
+                Some(Err(why)) => bail!("{why}"),
+                Some(Ok(())) => Ok(Vmm {
+                    backend: Backend::Vz,
+                    bin: vz::ensure_helper(dir)?,
+                    accelerated: true,
+                    tsc_khz: None,
+                }),
+            }
+        };
+        if want == Some(Backend::Vz) || (want.is_none() && matches!(self.vz, Some(Ok(())))) {
+            return vz();
+        }
         let firecracker = |bin: &PathBuf| -> Result<Vmm> {
             ensure!(
                 self.kvm,
@@ -221,6 +248,7 @@ impl Assets {
                 }
                 None => bail!("Firecracker runs only on Linux; use the qemu backend"),
             },
+            Some(Backend::Vz) => unreachable!("handled above"),
             Some(Backend::Qemu) => match &self.qemu {
                 Some(b) => Ok(qemu(b)),
                 None => bail!("{no_qemu}"),
@@ -232,6 +260,13 @@ impl Assets {
                 (None, None) if cfg!(target_os = "linux") => bail!(
                     "no VM monitor found: run `pumasi vm setup` (Firecracker) or install QEMU"
                 ),
+                (None, None) if cfg!(target_os = "macos") => {
+                    let why = match &self.vz {
+                        Some(Err(why)) => why.clone(),
+                        _ => "Virtualization.framework is not usable".into(),
+                    };
+                    bail!("no VM monitor: {why}")
+                }
                 (None, None) => bail!("no VM monitor found: {no_qemu}"),
             },
         }
@@ -321,7 +356,7 @@ impl MicrovmExecutor {
                 config.dir.display()
             )
         })?;
-        let vmm = assets.pick(config.backend)?;
+        let vmm = assets.pick(config.backend, &config.dir)?;
         let init = guest.read()?;
         ensure!(
             init.starts_with(b"\x7fELF"),
@@ -646,9 +681,14 @@ impl MicrovmExecutor {
             .map_err(|e| warn!("could not put the VMM in a job object: {e}"))
             .ok();
         // When QEMU writes the console to a file (Windows), watch it: under
-        // WHPX a guest reset can leave QEMU stuck instead of exiting.
-        let serial = dir.join(vmm::SERIAL_LOG);
-        let watch_serial = cfg!(windows) && self.vmm.backend == Backend::Qemu;
+        // WHPX a guest reset can leave QEMU stuck instead of exiting. The
+        // vz helper writes the console to its stdout; should a guest reboot
+        // not stop the VM, the same watch ends it.
+        let (serial, watch_serial) = match self.vmm.backend {
+            Backend::Qemu if cfg!(windows) => (dir.join(vmm::SERIAL_LOG), true),
+            Backend::Vz => (dir.join("console.log"), true),
+            _ => (PathBuf::new(), false),
+        };
         let mut done_since: Option<Instant> = None;
         let mut ticks = 0u32;
         loop {

@@ -1,6 +1,7 @@
 //! `pumasi vm setup`: downloads a pinned guest kernel (and Firecracker on
 //! Linux, QEMU on Windows) into the VM directory, checking each download
-//! against a SHA-256 recorded here.
+//! against a SHA-256 recorded here. On macOS it also signs the
+//! Virtualization.framework helper.
 
 use std::{io::Read, path::Path};
 
@@ -39,6 +40,49 @@ const QEMU_MARKER: &str = "pumasi-installer.txt";
 
 /// Firecracker's CI guest kernel (virtio-mmio, ext4, overlayfs, initramfs).
 const KERNEL_VERSION: &str = "6.1.102";
+
+/// macOS kernels: Virtualization.framework has only virtio-pci devices,
+/// which Firecracker's CI kernels have since its 1.15 configuration. Apple
+/// Silicon boots its arm64 Image as is; Intel Macs need a bzImage, built
+/// from the same configuration by `.github/workflows/guest-kernel.yml`
+/// (`scripts/kernel/build.sh`) and published as a prerelease.
+const VZ_KERNEL_VERSION: &str = "6.1.155";
+const VZ_KERNEL_AARCH64_URL: &str =
+    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155";
+const VZ_KERNEL_AARCH64_SHA256: &str =
+    "e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591";
+const VZ_KERNEL_X86_64_URL: &str =
+    "https://github.com/syang0531/pumasi/releases/download/guest-kernel-6.1.155-1/bzImage-x86_64";
+const VZ_KERNEL_X86_64_SHA256: &str =
+    "a18b8737ab2f12b9cce9304c3f5295ef0a37492affa38ee57d46a57b9ae6a014";
+
+/// Where the guest kernel for `os` and `arch` comes from, its SHA-256 and
+/// a label.
+fn kernel_source(os: &str, arch: &str) -> Option<(String, &'static str, String)> {
+    if os == "macos" {
+        return match arch {
+            "aarch64" => Some((
+                VZ_KERNEL_AARCH64_URL.into(),
+                VZ_KERNEL_AARCH64_SHA256,
+                format!("Linux {VZ_KERNEL_VERSION}, arm64 Image"),
+            )),
+            "x86_64" => Some((
+                VZ_KERNEL_X86_64_URL.into(),
+                VZ_KERNEL_X86_64_SHA256,
+                format!("Linux {VZ_KERNEL_VERSION}, bzImage"),
+            )),
+            _ => None,
+        };
+    }
+    let pin = PINNED.iter().find(|p| p.arch == arch)?;
+    Some((
+        format!(
+            "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/{arch}/vmlinux-{KERNEL_VERSION}"
+        ),
+        pin.kernel_sha256,
+        format!("Linux {KERNEL_VERSION}"),
+    ))
+}
 const FIRECRACKER_VERSION: &str = "v1.10.1";
 
 struct Pinned {
@@ -71,29 +115,44 @@ pub struct SetupReport {
 /// `dir`. Files already present are kept unless `force`.
 pub async fn setup(dir: &Path, guest: Option<&Path>, force: bool) -> Result<SetupReport> {
     let arch = std::env::consts::ARCH;
-    let pin = PINNED
-        .iter()
-        .find(|p| p.arch == arch)
+    let (kernel_url, kernel_sha256, kernel_label) = kernel_source(std::env::consts::OS, arch)
         .with_context(|| format!("no microVM kernel for {arch}"))?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let http = registry::http_client()?;
     let mut report = SetupReport::default();
 
+    // macOS 11+: the signed copy of this binary that runs the VMs. Made
+    // even where the hardware cannot virtualize, which `vm status` reports.
+    if cfg!(target_os = "macos") {
+        if super::vz::framework_present() {
+            let helper = super::vz::ensure_helper(dir)?;
+            report.installed.push(format!(
+                "{} (this binary, signed for Virtualization.framework)",
+                helper.display()
+            ));
+        } else {
+            eprintln!(
+                "note: macOS 10.15 has no Virtualization.framework, so this Mac runs WASM jobs only; the kernel is kept for a later macOS"
+            );
+        }
+    }
+
     let kernel = dir.join(KERNEL_FILE);
     if kernel.exists() && !force {
         report.kept.push(kernel.display().to_string());
     } else {
-        let url = format!(
-            "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/{arch}/vmlinux-{KERNEL_VERSION}"
-        );
-        let bytes = fetch(&http, &url, pin.kernel_sha256).await?;
+        let bytes = fetch(&http, &kernel_url, kernel_sha256).await?;
         write_atomic(&kernel, &bytes, 0o644)?;
         report
             .installed
-            .push(format!("{} (Linux {KERNEL_VERSION})", kernel.display()));
+            .push(format!("{} ({kernel_label})", kernel.display()));
     }
 
     if cfg!(target_os = "linux") {
+        let pin = PINNED
+            .iter()
+            .find(|p| p.arch == arch)
+            .with_context(|| format!("no Firecracker for {arch}"))?;
         let fc = dir.join(FIRECRACKER_FILE);
         if fc.exists() && !force {
             report.kept.push(fc.display().to_string());
@@ -312,4 +371,27 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let _ = mode;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_platform_has_a_pinned_kernel() {
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            let (url, sha, _) = kernel_source(os, arch).unwrap();
+            assert!(url.starts_with("https://"), "{url}");
+            assert_eq!(sha.len(), 64);
+        }
+        let (url, _, label) = kernel_source("macos", "x86_64").unwrap();
+        assert!(url.ends_with("bzImage-x86_64") && label.contains("bzImage"));
+        assert!(kernel_source("linux", "riscv64").is_none());
+    }
 }

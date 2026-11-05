@@ -58,10 +58,10 @@ python3 examples/python-wordcount/merge.py pumasi-out/<작업 ID>
 
 ### microVM 작업: 내 것이 아닌 기기에서 컨테이너 돌리기
 
-컨테이너는 호스트 커널을 공유하므로 Docker 작업은 내 기기용입니다. microVM 실행기는 같은 OCI 이미지를 태스크마다 가벼운 VM(KVM이 있는 Linux는 [Firecracker](https://firecracker-microvm.github.io/), Windows는 WHPX 가속 QEMU, 그 밖에는 QEMU) 안에서 자기 Linux 커널로, 네트워크 없이 돌립니다. 작업 명세에는 `executor = "microvm"` 한 줄만 더합니다.
+컨테이너는 호스트 커널을 공유하므로 Docker 작업은 내 기기용입니다. microVM 실행기는 같은 OCI 이미지를 태스크마다 가벼운 VM(KVM이 있는 Linux는 [Firecracker](https://firecracker-microvm.github.io/), macOS 11 이상은 Apple Virtualization.framework, Windows는 WHPX 가속 QEMU, 그 밖에는 QEMU) 안에서 자기 Linux 커널로, 네트워크 없이 돌립니다. 작업 명세에는 `executor = "microvm"` 한 줄만 더합니다.
 
 ```sh
-# 기기마다 한 번 (KVM이 있는 Linux, Windows 10/11 x86_64. Windows는 QEMU를 설치하므로 관리자 터미널에서)
+# 기기마다 한 번 (KVM이 있는 Linux, macOS 11 이상, Windows 10/11 x86_64. Windows는 QEMU를 설치하므로 관리자 터미널에서)
 pumasi vm setup
 pumasi vm run python:3.12-slim -- python -c 'import platform; print(platform.release())'
 # 6.1.102   <- 호스트가 아니라 게스트 커널
@@ -89,6 +89,40 @@ pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
 - Docker 작업에는 WSL 2 백엔드, Linux 컨테이너 모드로 실행 중인 Docker Desktop이 필요합니다. Docker Desktop은 로그인한 사용자와 함께 시작하므로, 아무도 로그인하지 않은 기기는 WASM과 microVM 작업만 받습니다(Docker Desktop 로그인 시 시작과 자동 로그인을 켜면 해결).
 - `pumasi service install`은 사설·도메인 네트워크에서 에이전트가 UDP를 받도록 방화벽 규칙을 추가해, 릴레이 대신 직접 연결되게 합니다. `service uninstall`이 규칙을 지웁니다. Windows가 공용(Public)으로 분류한 네트워크에서는 릴레이로 연결되며, 넓히려면 `netsh advfirewall firewall set rule name="Pumasi agent (UDP in)" new profile=any`.
 - 에이전트가 띄운 VM과 Docker CLI는 Windows Job Object에 묶여, 에이전트가 비정상 종료해도 함께 끝납니다.
+
+### Mac, 구형 Intel Mac까지
+
+macOS 10.15 이상이면 어떤 Mac이든 에이전트를 돌릴 수 있습니다. 마지막 macOS가 10.15·11·12인 2013~2014년 Intel 기종도 포함됩니다.
+
+| Mac | 마지막 macOS | WASM | microVM | Docker |
+| --- | --- | --- | --- | --- |
+| Mac mini(Late 2014), Mac Pro(Late 2013) | 12 Monterey | 가능 | 가능 | 불가 |
+| MacBook Air(Mid 2013, Early 2014), MacBook Pro(Late 2013, Mid 2014), iMac(Mid 2014, 5K Late 2014) | 11 Big Sur | 가능 | 가능 | 불가 |
+| iMac(Late 2013), MacBook Pro(Early 2013) | 10.15 Catalina | 가능 | 불가 | 불가 |
+| Apple Silicon | 최신 | 가능 | 가능 | Docker Desktop으로 가능 |
+
+macOS 11부터 microVM은 macOS에 내장된 Apple Virtualization.framework로 돌아서 따로 설치할 것이 없습니다. `pumasi vm setup`은 게스트 커널을 받고, 바이너리 사본에 서명해 VM 헬퍼로 둘 뿐입니다(이 프레임워크는 서명된 프로그램만 씁니다). Docker Desktop과 Homebrew의 QEMU는 최근 macOS만 지원하므로, 구형 Mac은 WASM과 microVM 작업을 받습니다.
+
+```sh
+curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.sh | sudo sh
+pumasi vm setup        # macOS 11 이상: 게스트 커널 + 서명된 VM 헬퍼
+pumasi vm status       # "vz usable"이면 microVM 사용 가능
+sudo pumasi service install --ticket pumasijoin... -- --allow-microvm --only-on-ac --idle-minutes 10
+```
+
+### 기기가 일을 받는 때 (가용 정책)
+
+사람이 쓰는 기기는 아무도 눈치채지 못할 때만 빌려줄 수 있습니다. 에이전트 옵션(`pumasi service install`에서는 `--` 뒤에):
+
+| 옵션 | 효과 |
+| --- | --- |
+| `--only-on-ac` | 배터리로 돌 때는 새 작업을 받지 않음 |
+| `--idle-minutes 10` | 키보드·마우스 입력이 10분 없을 때만 새 작업을 받음 |
+| `--hours 22:00-07:00` | 이 현지 시각 밖에서는 새 작업을 받지 않음(여러 개: `00:00-08:00,12:00-13:00`) |
+| `--max-cpu-percent 50` | CPU의 절반만 제공: 더 필요한 이미지 작업은 다른 기기로 가고, 슬롯도 따라 줄어듦 |
+| `--slots N` | 동시 작업 수(기본: 제공 CPU당 하나, 단 메모리 2 GiB를 빼고 1 GiB당 하나까지) |
+
+일시 정지된 기기는 새 작업을 받지 않고, 돌던 작업은 끝까지 마칩니다. `pumasi status`에 `paused`와 이유(예: "on battery power")가 나옵니다. 유휴 시간은 macOS에서는 기기 전체 기준이라 LaunchDaemon에서도 보이고, Linux에서는 터미널과 데스크톱 세션 기준입니다. Windows에서는 에이전트가 사용자 세션에서 돌아야 입력을 볼 수 있습니다(서비스로 돌면 알 수 없다고 보고하고 정지 상태로 둡니다).
 
 ### 다른 사람의 기기: 초대, 크레딧, 검증
 
@@ -255,8 +289,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 2 | 초대한 외부 제공자(오픈 등급), 노드·클러스터 공동 서명 사용 영수증, 고정 요금표, 선불 크레딧 원장, 표본 재실행 검증 | 완료 |
 | 3 | microVM 실행기: Docker 작업과 같은 OCI 이미지를 Firecracker·QEMU VM에서, 같은 작업 명세로, 제공자에게도 | 완료 |
 | 4 | 배포·설치: 6개 플랫폼 릴리스 바이너리와 SHA256SUMS, 설치 스크립트, OS 서비스, 클러스터 서명 업그레이드와 롤백 | 완료 |
-| 5 | Windows 정식 지원: Docker Desktop(WSL 2), QEMU + WHPX microVM(없으면 TCG), 고정 버전 QEMU 설치, Job Object, 내장 ext4 포맷터와 게스트 init | 이번 릴리스 |
-| 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대) | 예정 |
+| 5 | Windows 정식 지원: Docker Desktop(WSL 2), QEMU + WHPX microVM(없으면 TCG), 고정 버전 QEMU 설치, Job Object, 내장 ext4 포맷터와 게스트 init | 완료 |
+| 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대, CPU 상한, 메모리에 맞춘 슬롯) | 이번 릴리스 |
 | 7 | 성능 벤치마크와 컴퓨팅 유닛(CU): 노드가 서명한 성능 프로필(CPU, 메모리 대역폭, fio로 디스크 종류·속도, SMART 마모도, 지연), 1 CU = 기준 vCPU 1개를 1시간 쓰는 값과 자원별 CU 단가, 정수 milli-CU 원장, 돈 없이 서로 빌려 쓰는 그룹 로컬 원장 | 예정 |
 | 8 | 클러스터 파일 저장소(iroh-blobs): 데이터셋, 대용량 입출력, 이어받기, 저장 용량 CU 과금, 비공개 레지스트리 이미지 | 예정 |
 | 9 | GPU·microVM 장치: 탐지, GPU 벤치마크와 CU 환산, 스케줄링, Docker GPU 작업, VFIO 패스스루, microVM 네트워크 | 예정 |
@@ -269,7 +303,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 16 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
 | 17 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux)이나 WHPX(Windows x86_64)가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, macOS의 QEMU 경로는 아직 검증하지 않았으며, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고 에뮬레이션으로 넘어가므로, WHPX는 실기에서만 확인합니다.
+알려진 한계: microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
 
 ## 라이선스
 

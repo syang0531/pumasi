@@ -2,7 +2,7 @@
 
 이미 가진 여러 대의 기기를 하나의 사설 클러스터로 묶어 배치 작업을 나눠 돌립니다. 모든 기기에서 도는 안전한 WebAssembly 작업, 허용한 기기에서 도는 일반 Docker 이미지 작업(Python, 원하는 패키지, 선택적 네트워크), 그리고 같은 이미지를 태스크마다 자기 커널을 가진 microVM 안에서 돌리는 작업(남이 빌려준 기기에도 보낼 수 있을 만큼 격리됨)을 같은 방식으로 실행합니다. Linux, macOS, Windows와 x86_64, ARM64에서 같은 Rust 단일 바이너리 하나로 동작합니다.
 
-단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 크레딧 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계(이번 릴리스)는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드입니다. 이후 Windows, 구형 Mac, 저장소, GPU, 클러스터 관리, 모니터링, 대시보드를 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
+단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 크레딧 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드, 5단계(이번 릴리스)는 세 실행기 모두를 Windows에서 정식 지원하는 것입니다. 이후 구형 Mac, 저장소, GPU, 클러스터 관리, 모니터링, 대시보드를 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
 
 ## 설치
 
@@ -43,7 +43,7 @@ pumasi run examples/montecarlo/job.toml --output
 
 ### Docker 작업: Python, 파일, 그 밖의 무엇이든
 
-컨테이너를 돌려도 되는 기기의 에이전트를 `--allow-docker`로 시작합니다(그 기기에 Docker가 설치되어 있어야 합니다).
+컨테이너를 돌려도 되는 기기의 에이전트를 `--allow-docker`로 시작합니다(그 기기에 Docker가 설치되어 있어야 합니다. Windows는 WSL 2 백엔드에 Linux 컨테이너 모드인 Docker Desktop).
 
 ```sh
 pumasi agent join pumasijoin... --allow-docker
@@ -58,12 +58,11 @@ python3 examples/python-wordcount/merge.py pumasi-out/<작업 ID>
 
 ### microVM 작업: 내 것이 아닌 기기에서 컨테이너 돌리기
 
-컨테이너는 호스트 커널을 공유하므로 Docker 작업은 내 기기용입니다. microVM 실행기는 같은 OCI 이미지를 태스크마다 가벼운 VM([Firecracker](https://firecracker-microvm.github.io/), KVM이 있는 Linux, 또는 QEMU) 안에서 자기 Linux 커널로, 네트워크 없이 돌립니다. 작업 명세에는 `executor = "microvm"` 한 줄만 더합니다.
+컨테이너는 호스트 커널을 공유하므로 Docker 작업은 내 기기용입니다. microVM 실행기는 같은 OCI 이미지를 태스크마다 가벼운 VM(KVM이 있는 Linux는 [Firecracker](https://firecracker-microvm.github.io/), Windows는 WHPX 가속 QEMU, 그 밖에는 QEMU) 안에서 자기 Linux 커널로, 네트워크 없이 돌립니다. 작업 명세에는 `executor = "microvm"` 한 줄만 더합니다.
 
 ```sh
-# 기기마다 한 번 (KVM이 있는 Linux x86_64/ARM64, macOS는 QEMU로도 동작)
-cargo build --release -p pumasi-guest --target x86_64-unknown-linux-musl
-pumasi vm setup --guest target/x86_64-unknown-linux-musl/release/pumasi-guest
+# 기기마다 한 번 (KVM이 있는 Linux, Windows 10/11 x86_64. Windows는 QEMU를 설치하므로 관리자 터미널에서)
+pumasi vm setup
 pumasi vm run python:3.12-slim -- python -c 'import platform; print(platform.release())'
 # 6.1.102   <- 호스트가 아니라 게스트 커널
 
@@ -71,7 +70,25 @@ pumasi agent join pumasijoin... --allow-microvm
 pumasi run examples/python-wordcount/job-microvm.toml --output
 ```
 
-`pumasi vm setup`은 버전이 고정된 게스트 커널(Linux에서는 Firecracker도)을 받아 SHA-256을 확인하고, `pumasi vm status`는 설치 상태와 쓸 VM 모니터를 보여 줍니다. 에이전트가 이미지를 직접 받고(Docker 불필요) VM 안에서 풀기 때문에, 믿을 수 없는 이미지 레이어가 호스트 파일시스템에 닿지 않습니다.
+`pumasi vm setup`은 버전이 고정된 게스트 커널(Linux는 Firecracker, Windows는 QEMU도)을 받아 SHA-256을 확인하고, `pumasi vm status`는 설치 상태와 쓸 VM 모니터를 보여 줍니다. 릴리스 바이너리에는 게스트 init(VM의 PID 1)이 들어 있고, 소스 빌드는 `--guest`로 정적 Linux 빌드(`cargo build --release -p pumasi-guest --target x86_64-unknown-linux-musl`)를 넘깁니다. 에이전트가 이미지를 직접 받고(Docker 불필요) VM 디스크도 직접 포맷하며(e2fsprogs 불필요) 이미지는 VM 안에서 풀기 때문에, 믿을 수 없는 이미지 레이어가 호스트 파일시스템에 닿지 않습니다.
+
+### Windows
+
+Windows 10·11(x86_64)에서 모두 동작합니다. WASM은 그대로, Docker는 Docker Desktop으로, microVM은 Windows 하이퍼바이저 플랫폼(WHPX)을 쓰는 QEMU로 돌립니다. 관리자 PowerShell에서:
+
+```powershell
+# 한 번만: QEMU가 쓰는 하이퍼바이저 API를 켜고 재부팅
+Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
+
+pumasi vm setup        # 게스트 커널과 버전 고정 QEMU (~\.pumasi\vm\qemu에 설치)
+pumasi vm status       # "whpx usable"이면 하드웨어 가속 microVM
+pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
+```
+
+- WHPX가 없으면(기능이 꺼졌거나 펌웨어에서 가상화가 꺼짐) microVM은 QEMU 소프트웨어 에뮬레이션으로 돕니다. 결과는 같고 몇 배 느립니다. 비교하려면 `PUMASI_QEMU_ACCEL=tcg`로 강제할 수 있습니다. WHPX가 있어도 클라우드 VM처럼 중첩된 환경에서는 VM 디스크가 깨지는데, 에이전트가 시작할 때 작은 프로브 VM을 띄워 보고 그러면 자동으로 에뮬레이션으로 돌리며 로그에 남깁니다.
+- Docker 작업에는 WSL 2 백엔드, Linux 컨테이너 모드로 실행 중인 Docker Desktop이 필요합니다. Docker Desktop은 로그인한 사용자와 함께 시작하므로, 아무도 로그인하지 않은 기기는 WASM과 microVM 작업만 받습니다(Docker Desktop 로그인 시 시작과 자동 로그인을 켜면 해결).
+- `pumasi service install`은 사설·도메인 네트워크에서 에이전트가 UDP를 받도록 방화벽 규칙을 추가해, 릴레이 대신 직접 연결되게 합니다. `service uninstall`이 규칙을 지웁니다. Windows가 공용(Public)으로 분류한 네트워크에서는 릴레이로 연결되며, 넓히려면 `netsh advfirewall firewall set rule name="Pumasi agent (UDP in)" new profile=any`.
+- 에이전트가 띄운 VM과 Docker CLI는 Windows Job Object에 묶여, 에이전트가 비정상 종료해도 함께 끝납니다.
 
 ### 다른 사람의 기기: 초대, 크레딧, 검증
 
@@ -129,7 +146,7 @@ pumasi upgrade status
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | 이전에 참가한 클러스터에 티켓 없이 재접속 |
 | `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- 에이전트 옵션]` | 부팅 시 시작하는 서비스로 에이전트 설치 (systemd, launchd, Windows 서비스). `status`, `uninstall`도 있음 |
 | `pumasi upgrade rollout 파일... [--wait] [--force]` | 클러스터 키로 서명한 새 에이전트 바이너리를 노드에 배포. `upgrade status`로 노드별 상태, `upgrade cancel`로 중단 |
-| `pumasi vm setup [--guest FILE] [--force]` | 게스트 커널, Firecracker(Linux), 게스트 init을 `~/.pumasi/vm`에 설치 |
+| `pumasi vm setup [--guest FILE] [--force]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
 | `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
 | `pumasi run job.toml [--account A] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
@@ -237,8 +254,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 1 | 사설 클러스터: 에이전트, 컨트롤 플레인, iroh 연결, WASM·Docker 실행기, 파일 입출력, CLI | 완료 |
 | 2 | 초대한 외부 제공자(오픈 등급), 노드·클러스터 공동 서명 사용 영수증, 고정 요금표, 선불 크레딧 원장, 표본 재실행 검증 | 완료 |
 | 3 | microVM 실행기: Docker 작업과 같은 OCI 이미지를 Firecracker·QEMU VM에서, 같은 작업 명세로, 제공자에게도 | 완료 |
-| 4 | 배포·설치: 6개 플랫폼 릴리스 바이너리와 SHA256SUMS, 설치 스크립트, OS 서비스, 클러스터 서명 업그레이드와 롤백 | 이번 릴리스 |
-| 5 | Windows 정식 지원: Docker Desktop, QEMU + WHPX microVM | 예정 |
+| 4 | 배포·설치: 6개 플랫폼 릴리스 바이너리와 SHA256SUMS, 설치 스크립트, OS 서비스, 클러스터 서명 업그레이드와 롤백 | 완료 |
+| 5 | Windows 정식 지원: Docker Desktop(WSL 2), QEMU + WHPX microVM(없으면 TCG), 고정 버전 QEMU 설치, Job Object, 내장 ext4 포맷터와 게스트 init | 이번 릴리스 |
 | 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대) | 예정 |
 | 7 | 클러스터 파일 저장소(iroh-blobs): 데이터셋, 대용량 입출력, 이어받기 | 예정 |
 | 8 | GPU: 탐지, 스케줄링, Docker GPU 작업, microVM VFIO 패스스루 | 예정 |
@@ -250,7 +267,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 14 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
 | 15 | 마켓 허브와 실결제 | 예정 |
 
-알려진 한계: microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM이 있는 Linux가 필요합니다(KVM 없는 QEMU는 동작하지만 느리고, macOS의 QEMU 경로는 아직 검증하지 않았습니다).
+알려진 한계: microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux)이나 WHPX(Windows x86_64)가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, macOS의 QEMU 경로는 아직 검증하지 않았으며, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고 에뮬레이션으로 넘어가므로, WHPX는 실기에서만 확인합니다.
 
 ## 라이선스
 

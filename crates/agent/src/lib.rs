@@ -5,6 +5,7 @@ pub mod agent;
 pub mod docker;
 pub mod executor;
 pub mod microvm;
+pub mod platform;
 mod tempdir;
 pub mod upgrade;
 

@@ -14,11 +14,13 @@
 //! | input | tar of the run spec, stdin and `/input` files (run mode) | same, `input` |
 //! | output | written by the guest: a tar of the result | starts with [`OUTPUT_MARK`] until the guest overwrites it |
 //!
-//! The mode comes from the kernel command line (`pumasi.mode=build|run`).
+//! The mode comes from the kernel command line (`pumasi.mode=build|run|probe`).
 //! In build mode the guest unpacks the layers onto the empty base disk, so
 //! the untrusted image tarballs are never unpacked on the host. In run mode
 //! it stacks an overlay of the scratch disk on the read-only base, copies
-//! the inputs in, runs the command, and writes the result.
+//! the inputs in, runs the command, and writes the result. In probe mode
+//! it copies the input files to the output, which tells the host that disk
+//! I/O works under its accelerator.
 
 use serde::{Deserialize, Serialize};
 

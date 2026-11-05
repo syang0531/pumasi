@@ -14,9 +14,10 @@ Pumasi grows in phases: a private cluster tool that is useful on its own
 usage receipts, a prepaid credit ledger and spot checks of their results
 (phase 2), then a microVM executor that runs container images on those
 machines with VM isolation (phase 3), then release binaries, OS services
-and signed cluster-wide upgrades (phase 4, this release), and later
-Windows, old Macs, storage, GPUs, cluster management, monitoring, a
-dashboard and a marketplace. See [docs/architecture.md](docs/architecture.md)
+and signed cluster-wide upgrades (phase 4), then Windows as a first-class
+host for all three executors (phase 5, this release), and later old Macs,
+storage, GPUs, cluster management, monitoring, a dashboard and a
+marketplace. See [docs/architecture.md](docs/architecture.md)
 and the roadmap below.
 
 ## Install
@@ -87,7 +88,8 @@ pumasi run examples/montecarlo/job.toml -o | grep -E '^[0-9]+ ' \
 ### Docker jobs: Python, files and more
 
 Start the agents that may run containers with `--allow-docker` (Docker or a
-compatible CLI must be installed there):
+compatible CLI must be installed there; on Windows, Docker Desktop with the
+WSL 2 backend in Linux containers mode):
 
 ```sh
 pumasi agent join pumasijoin... --allow-docker
@@ -118,13 +120,14 @@ saved 4 output files to pumasi-out/6d916b0dc63f63ea
 A container shares the host's kernel, so Docker jobs are for your own
 machines. The microVM executor runs the same OCI images, but boots every
 task in its own lightweight VM ([Firecracker](https://firecracker-microvm.github.io/)
-on Linux with KVM, or QEMU) with its own Linux kernel and no network. The
-job file only adds `executor = "microvm"`:
+on Linux with KVM, QEMU with WHPX on Windows, or QEMU elsewhere) with its
+own Linux kernel and no network. The job file only adds
+`executor = "microvm"`:
 
 ```sh
-# Once per machine (Linux x86_64/ARM64 with KVM; QEMU also works on macOS).
-cargo build --release -p pumasi-guest --target x86_64-unknown-linux-musl
-pumasi vm setup --guest target/x86_64-unknown-linux-musl/release/pumasi-guest
+# Once per machine (Linux with KVM, Windows 10/11 x86_64; on Windows run it
+# from an administrator terminal, since it installs QEMU).
+pumasi vm setup
 pumasi vm run python:3.12-slim -- python -c 'import platform; print(platform.release())'
 # 6.1.102   <- the guest kernel, not the host's
 
@@ -132,11 +135,48 @@ pumasi agent join pumasijoin... --allow-microvm
 pumasi run examples/python-wordcount/job-microvm.toml --output
 ```
 
-`pumasi vm setup` downloads a pinned guest kernel (and Firecracker on Linux)
-and checks their SHA-256; `pumasi vm status` shows what is installed and
-which VM monitor will be used. The agent pulls images itself (no Docker
-needed) and unpacks them inside a VM, so untrusted image layers never touch
-the host's filesystem.
+`pumasi vm setup` downloads a pinned guest kernel (plus Firecracker on Linux,
+QEMU on Windows) and checks their SHA-256; `pumasi vm status` shows what is
+installed and which VM monitor will be used. Release binaries carry the
+guest init (the VM's PID 1); a source build needs `--guest`, a static
+Linux build of `pumasi-guest`
+(`cargo build --release -p pumasi-guest --target x86_64-unknown-linux-musl`).
+The agent pulls images itself (no Docker needed), formats the VM disks
+itself (no e2fsprogs), and unpacks images inside a VM, so untrusted image
+layers never touch the host's filesystem.
+
+### Windows
+
+Everything works on Windows 10 and 11 (x86_64): WASM jobs out of the box,
+Docker jobs through Docker Desktop, microVM jobs through QEMU with the
+Windows Hypervisor Platform (WHPX). From an administrator PowerShell:
+
+```powershell
+# Once: the hypervisor API QEMU uses, then reboot.
+Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
+
+pumasi vm setup        # guest kernel + pinned QEMU (installed into ~\.pumasi\vm\qemu)
+pumasi vm status       # "whpx usable" means hardware-accelerated microVMs
+pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
+```
+
+- Without WHPX (feature off, or virtualization disabled in the firmware)
+  microVMs still run, in QEMU's software emulation: correct but several
+  times slower. `PUMASI_QEMU_ACCEL=tcg` forces that, e.g. to compare.
+  The agent also boots one small probe VM at start and falls back to that
+  emulation when WHPX is there but breaks the VM's disks, as it does nested
+  in cloud VMs; the log says so.
+- Docker jobs need Docker Desktop running with the WSL 2 backend and Linux
+  containers. Docker Desktop starts with the signed-in user, so a machine
+  nobody is logged into takes only WASM and microVM jobs (or set Docker
+  Desktop to start at sign-in and enable automatic sign-in).
+- `pumasi service install` adds a firewall rule letting the agent receive
+  UDP on private and domain networks, so peers connect directly instead of
+  through the relay; `service uninstall` removes it. On a network Windows
+  calls Public, connections go through the relay unless you widen the rule:
+  `netsh advfirewall firewall set rule name="Pumasi agent (UDP in)" new profile=any`.
+- The VMs and Docker CLIs an agent starts are kept in Windows Job Objects,
+  so they end with the agent even if it crashes.
 
 ### Other people's machines: invites, credit and checks
 
@@ -253,7 +293,7 @@ back.
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
 | `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- AGENT OPTIONS]` | Run the agent as a service that starts at boot (systemd, launchd, Windows service). `status` and `uninstall` too. |
 | `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
-| `pumasi vm setup [--guest FILE] [--force]` | Install the guest kernel, Firecracker (Linux) and the guest init into `~/.pumasi/vm`. |
+| `pumasi vm setup [--guest FILE] [--force]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
 | `pumasi run job.toml [--account A] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
@@ -456,8 +496,8 @@ checked.
 | 1 | Private cluster: agent, control plane, iroh networking, WASM and Docker executors, file input/output, CLI | done |
 | 2 | Invited outside providers (open tier), usage receipts signed by node and cluster, fixed price list, prepaid credit ledger, sampled re-runs to check results | done |
 | 3 | microVM executor: same OCI images as docker jobs in Firecracker or QEMU VMs, behind the same job format, open to providers | done |
-| 4 | Distribution and install: release binaries for six platforms with SHA256SUMS, install scripts, OS services, signed cluster-driven upgrades with rollback | this release |
-| 5 | Windows: Docker Desktop, microVMs with QEMU + WHPX | planned |
+| 4 | Distribution and install: release binaries for six platforms with SHA256SUMS, install scripts, OS services, signed cluster-driven upgrades with rollback | done |
+| 5 | Windows: Docker Desktop (WSL 2), microVMs with QEMU + WHPX (TCG fallback), pinned QEMU install, Job Objects, built-in ext4 formatter and guest init | this release |
 | 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours) | planned |
 | 7 | Cluster file store (iroh-blobs): datasets, large inputs and outputs, resumable transfers | planned |
 | 8 | GPUs: detection, scheduling, Docker GPU jobs, VFIO passthrough for microVMs | planned |
@@ -474,8 +514,11 @@ exist only inside one cluster and only the admin can submit (with
 `--account`), credits are not connected to real payments, input and output
 files are size-capped (48 MiB in, 32 MiB out per task) because they travel
 through the control plane. MicroVMs pull only public images, have no
-network and no GPUs yet, and need Linux with KVM for speed (QEMU without KVM
-works but is slow; the macOS path through QEMU is untested).
+network and no GPUs yet, and need KVM (Linux) or WHPX (Windows x86_64) for
+speed (QEMU without them works but is slow; the macOS path through QEMU is
+untested, and Windows on ARM has no microVMs yet). WHPX itself is checked
+on real machines only: CI runners have it only nested, where it breaks
+QEMU's disks and the agent falls back to emulation.
 
 ## Development
 
@@ -501,7 +544,9 @@ dishonest provider caught by check runs, refunded and suspended, microVM
 jobs on an invited provider, and an agent upgrade rollout (opt-in, forged
 signature and tampered binary refused). The microVM test runs when `PUMASI_TEST_VM_DIR`
 points at a directory prepared with `pumasi vm setup` (CI does this on Linux
-with KVM, for Firecracker and for QEMU):
+with KVM, for Firecracker and for QEMU, and on Windows with QEMU in software
+emulation, using a binary built with the guest init embedded through
+`PUMASI_EMBED_GUEST=<absolute path>`):
 
 ```sh
 cargo build --release -p pumasi-guest --target x86_64-unknown-linux-musl

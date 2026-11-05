@@ -21,6 +21,7 @@
 //! The VM has no network device. Timeouts and cancellation kill the VMM
 //! process. See `pumasi_guest` for the disk protocol.
 
+pub mod ext4;
 pub mod registry;
 pub mod setup;
 pub mod vmm;
@@ -75,14 +76,9 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_VCPUS: u32 = 32;
 /// Last part of the VM console kept for error messages.
 const CONSOLE_TAIL: usize = 2048;
-/// Directories searched for `mkfs.ext4` besides `PATH` (Homebrew's
-/// e2fsprogs is keg-only on macOS).
-const MKFS_DIRS: &[&str] = &[
-    "/sbin",
-    "/usr/sbin",
-    "/opt/homebrew/opt/e2fsprogs/sbin",
-    "/usr/local/opt/e2fsprogs/sbin",
-];
+/// What the probe VM copies, and how long it may take.
+const PROBE_BYTES: usize = 4 << 20;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Where the executor finds its kernel and init, and keeps its cache.
 #[derive(Debug, Clone)]
@@ -95,15 +91,56 @@ pub struct MicrovmConfig {
     pub backend: Option<Backend>,
 }
 
+// `EMBEDDED_GUEST`: the guest init built into this binary, if any.
+include!(concat!(env!("OUT_DIR"), "/guest.rs"));
+
+/// Where the guest init comes from.
+#[derive(Debug, Clone)]
+pub enum GuestSource {
+    /// Built into this binary (release builds), so it always matches the
+    /// agent's version.
+    Embedded,
+    File(PathBuf),
+}
+
+impl std::fmt::Display for GuestSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuestSource::Embedded => write!(
+                f,
+                "built into this binary ({} KiB)",
+                EMBEDDED_GUEST.map_or(0, |g| g.len() >> 10)
+            ),
+            GuestSource::File(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
+impl GuestSource {
+    pub fn read(&self) -> Result<Vec<u8>> {
+        match self {
+            GuestSource::Embedded => Ok(EMBEDDED_GUEST.unwrap_or_default().to_vec()),
+            GuestSource::File(p) => {
+                std::fs::read(p).with_context(|| format!("read {}", p.display()))
+            }
+        }
+    }
+}
+
+/// Where `pumasi vm setup` installs QEMU on Windows, inside the VM directory.
+pub const QEMU_DIR: &str = "qemu";
+
 /// What is installed, for `pumasi vm setup` and error messages.
 #[derive(Debug, Clone)]
 pub struct Assets {
     pub kernel: Option<PathBuf>,
-    pub guest: Option<PathBuf>,
+    pub guest: Option<GuestSource>,
     pub firecracker: Option<PathBuf>,
     pub qemu: Option<PathBuf>,
-    pub mkfs: Option<PathBuf>,
     pub kvm: bool,
+    /// Windows only: whether QEMU can use the Windows Hypervisor Platform,
+    /// or why not.
+    pub whpx: Option<std::result::Result<(), String>>,
 }
 
 impl Assets {
@@ -112,24 +149,38 @@ impl Assets {
             .ok()
             .and_then(|e| e.parent().map(|p| p.join(GUEST_FILE)))
             .filter(|p| p.is_file());
+        let guest = if EMBEDDED_GUEST.is_some() {
+            Some(GuestSource::Embedded)
+        } else {
+            Some(dir.join(GUEST_FILE))
+                .filter(|p| p.is_file())
+                .or(beside_exe)
+                .map(GuestSource::File)
+        };
+        let qemu_extra: &[&str] = if cfg!(windows) {
+            &[r"C:\Program Files\qemu"]
+        } else {
+            &["/opt/homebrew/bin", "/usr/local/bin", "/usr/libexec"]
+        };
         Self {
             kernel: Some(dir.join(KERNEL_FILE)).filter(|p| p.is_file()),
-            guest: Some(dir.join(GUEST_FILE))
-                .filter(|p| p.is_file())
-                .or(beside_exe),
+            guest,
             firecracker: if cfg!(target_os = "linux") {
                 vmm::find_program(FIRECRACKER_FILE, Some(dir), &[])
             } else {
                 None
             },
-            qemu: vmm::find_program(
-                &vmm::qemu_name(),
-                None,
-                &["/opt/homebrew/bin", "/usr/local/bin", "/usr/libexec"],
-            ),
-            mkfs: vmm::find_program("mkfs.ext4", None, MKFS_DIRS),
+            qemu: vmm::find_program(&vmm::qemu_name(), Some(&dir.join(QEMU_DIR)), qemu_extra),
             kvm: vmm::kvm_usable(),
+            whpx: cfg!(windows).then(crate::platform::whpx_status),
         }
+    }
+
+    /// Whether QEMU gets a hardware accelerator here.
+    pub fn qemu_accelerated(&self) -> bool {
+        self.kvm
+            || cfg!(target_os = "macos")
+            || (cfg!(target_arch = "x86_64") && matches!(self.whpx, Some(Ok(()))))
     }
 
     /// The VMM to use, or why there is none.
@@ -143,29 +194,45 @@ impl Assets {
                 backend: Backend::Firecracker,
                 bin: bin.clone(),
                 accelerated: true,
+                tsc_khz: None,
             })
         };
-        let qemu = |bin: &PathBuf| Vmm {
-            backend: Backend::Qemu,
-            bin: bin.clone(),
-            accelerated: self.kvm || cfg!(target_os = "macos"),
+        let qemu = |bin: &PathBuf| {
+            let accelerated = self.qemu_accelerated();
+            Vmm {
+                backend: Backend::Qemu,
+                bin: bin.clone(),
+                accelerated,
+                tsc_khz: (cfg!(windows) && accelerated)
+                    .then(|| crate::platform::measure_tsc_khz(Duration::from_millis(50)))
+                    .flatten(),
+            }
+        };
+        let no_qemu = if cfg!(windows) {
+            "QEMU is not installed; run `pumasi vm setup`"
+        } else {
+            "QEMU is not installed (Linux: the qemu-system package; macOS: `brew install qemu`)"
         };
         match want {
             Some(Backend::Firecracker) => match &self.firecracker {
                 Some(b) => firecracker(b),
-                None => bail!("Firecracker is not installed; run `pumasi vm setup`"),
+                None if cfg!(target_os = "linux") => {
+                    bail!("Firecracker is not installed; run `pumasi vm setup`")
+                }
+                None => bail!("Firecracker runs only on Linux; use the qemu backend"),
             },
             Some(Backend::Qemu) => match &self.qemu {
                 Some(b) => Ok(qemu(b)),
-                None => bail!("{} is not installed", vmm::qemu_name()),
+                None => bail!("{no_qemu}"),
             },
             None => match (&self.firecracker, &self.qemu) {
                 (Some(b), _) if self.kvm => firecracker(b),
                 (_, Some(b)) => Ok(qemu(b)),
                 (Some(b), None) => firecracker(b),
-                (None, None) => bail!(
-                    "no VM monitor found: run `pumasi vm setup` (Firecracker, Linux) or install QEMU"
+                (None, None) if cfg!(target_os = "linux") => bail!(
+                    "no VM monitor found: run `pumasi vm setup` (Firecracker) or install QEMU"
                 ),
+                (None, None) => bail!("no VM monitor found: {no_qemu}"),
             },
         }
     }
@@ -185,7 +252,6 @@ pub struct MicrovmExecutor {
     vmm: Vmm,
     kernel: PathBuf,
     initrd: PathBuf,
-    mkfs: PathBuf,
     images: PathBuf,
     /// This agent's scratch space (cleared at start).
     run_dir: PathBuf,
@@ -196,22 +262,52 @@ pub struct MicrovmExecutor {
 
 /// How a VM run ended, as seen from the host.
 enum VmEnd {
-    /// The VMM process ended by itself, with this status.
-    Exited(std::process::ExitStatus),
+    /// The guest shut down: the VMM exited by itself (with this status), or
+    /// the guest console said it was restarting and the host stopped a VMM
+    /// that did not exit.
+    Exited(String),
     Timeout,
     Cancelled,
 }
 
+/// Lines the guest kernel prints (at emergency level, so even with
+/// `quiet`) when it is done.
+const GUEST_DONE: &[&str] = &[
+    "reboot: Restarting system",
+    "reboot: Power down",
+    "Kernel panic",
+];
+/// How long a VMM may keep running after the guest said it was done.
+const AFTER_GUEST_DONE: Duration = Duration::from_secs(3);
+
+/// Whether the end of the serial log says the guest is done.
+fn guest_said_done(serial: &Path) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(serial) else {
+        return false;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(4096)));
+    let mut tail = Vec::new();
+    let _ = f.read_to_end(&mut tail);
+    let tail = String::from_utf8_lossy(&tail);
+    GUEST_DONE.iter().any(|l| tail.contains(l))
+}
+
 impl MicrovmExecutor {
-    /// Checks that a VMM, the guest kernel and init, and `mkfs.ext4` are
+    /// Checks that a VMM and the guest kernel and init are
     /// available. `label` keeps this agent's scratch space apart.
     pub async fn detect(config: &MicrovmConfig, label: &str) -> Result<Self> {
-        ensure!(
-            cfg!(any(target_os = "linux", target_os = "macos")),
-            "the microVM executor runs on Linux and macOS"
-        );
         std::fs::create_dir_all(&config.dir)
             .with_context(|| format!("create {}", config.dir.display()))?;
+        // Task files live about 100 characters below the VM directory, and
+        // QEMU on Windows is not long-path aware (260 characters).
+        if cfg!(windows) && config.dir.as_os_str().len() > 140 {
+            warn!(
+                "the VM directory path is long ({} characters); QEMU may fail to open disks under it. Use a shorter --vm-dir",
+                config.dir.as_os_str().len()
+            );
+        }
         let assets = Assets::find(&config.dir);
         let kernel = assets.kernel.clone().with_context(|| {
             format!(
@@ -225,16 +321,11 @@ impl MicrovmExecutor {
                 config.dir.display()
             )
         })?;
-        let mkfs = assets
-            .mkfs
-            .clone()
-            .context("mkfs.ext4 not found; install e2fsprogs")?;
         let vmm = assets.pick(config.backend)?;
-        let init = std::fs::read(&guest).with_context(|| format!("read {}", guest.display()))?;
+        let init = guest.read()?;
         ensure!(
             init.starts_with(b"\x7fELF"),
-            "{} is not a Linux binary",
-            guest.display()
+            "{guest} is not a Linux binary"
         );
         let cpio = vmm::initramfs(&init);
         let initrd = config.dir.join(format!(
@@ -253,25 +344,131 @@ impl MicrovmExecutor {
             let _ = std::fs::remove_dir_all(&run_dir);
         }
         std::fs::create_dir_all(&run_dir)?;
+        let mut exec = Self {
+            vmm,
+            kernel,
+            initrd,
+            images,
+            run_dir,
+            registry: Registry::new()?,
+            pull_lock: Default::default(),
+        };
+        // WHPX is not equally good everywhere: nested under Hyper-V (cloud
+        // Windows machines, CI runners) QEMU's virtio disks can break under
+        // it. One tiny VM tells, and the slow software emulation still works.
+        let accel_override = std::env::var("PUMASI_QEMU_ACCEL").ok();
+        if exec.vmm.backend == Backend::Qemu
+            && accel_override
+                .as_deref()
+                .is_some_and(|a| a.starts_with("tcg"))
+        {
+            // Software emulation asked for: the guest gets the settings
+            // that go with it (fixed TSC rate, emulated timers).
+            exec.vmm.accelerated = false;
+            exec.vmm.tsc_khz = None;
+        }
+        let whpx = cfg!(windows) && exec.vmm.backend == Backend::Qemu && exec.vmm.accelerated;
+        if whpx && accel_override.is_none() {
+            let start = Instant::now();
+            match exec.probe().await {
+                Ok(()) => debug!(
+                    ms = start.elapsed().as_millis() as u64,
+                    "WHPX probe VM passed"
+                ),
+                Err(e) => {
+                    warn!(
+                        "microVMs do not work under WHPX on this machine, so they run in software emulation (slow); set PUMASI_QEMU_ACCEL=whpx to use WHPX anyway. The probe VM failed: {e:#}"
+                    );
+                    exec.vmm.accelerated = false;
+                    exec.vmm.tsc_khz = None;
+                }
+            }
+        }
+        let vmm = &exec.vmm;
         info!(
             backend = %vmm.backend,
             vmm = %vmm.bin.display(),
             accelerated = vmm.accelerated,
             "microvm executor enabled"
         );
-        if !vmm.accelerated {
-            warn!("no KVM/HVF: microVMs run in software emulation and will be slow");
+        if !vmm.accelerated && !whpx && accel_override.is_none() {
+            warn!(
+                "no hardware virtualization (KVM, HVF or WHPX): microVMs run in software emulation and will be slow"
+            );
         }
-        Ok(Self {
-            vmm,
-            kernel,
-            initrd,
-            mkfs,
-            images,
-            run_dir,
-            registry: Registry::new()?,
-            pull_lock: Default::default(),
-        })
+        Ok(exec)
+    }
+
+    /// Boots a small VM that copies a few MiB from one disk to another, and
+    /// checks the copy. `Err` says how it went wrong.
+    pub async fn probe(&self) -> Result<()> {
+        let scratch = TempDir::new_in(&self.run_dir, "probe")?;
+        let dir = scratch.path().to_path_buf();
+        let mut data = vec![0u8; PROBE_BYTES];
+        blake3::Hasher::new()
+            .update(b"pumasi probe")
+            .finalize_xof()
+            .fill(&mut data);
+        let input = dir.join("input.tar");
+        let output = dir.join("output.img");
+        let file = FileEntry {
+            path: "probe.bin".into(),
+            data,
+        };
+        write_input_disk(
+            &input,
+            &RunSpec::default(),
+            b"",
+            &[],
+            std::slice::from_ref(&file),
+        )?;
+        make_output_disk(&output)?;
+        let vm = VmSpec {
+            kernel: self.kernel.clone(),
+            initrd: self.initrd.clone(),
+            mode: "probe",
+            disks: vec![
+                Disk {
+                    path: input,
+                    read_only: true,
+                },
+                Disk {
+                    path: output.clone(),
+                    read_only: false,
+                },
+            ],
+            vcpus: 1,
+            mem_mib: MIN_VM_MIB,
+        };
+        let deadline = Instant::now() + PROBE_TIMEOUT;
+        let status = match self
+            .boot(&vm, &dir, Some(deadline), &AtomicBool::new(false))
+            .await?
+        {
+            VmEnd::Exited(status) => status,
+            _ => bail!(
+                "no answer within {} s; console:\n{}",
+                PROBE_TIMEOUT.as_secs(),
+                console_tail(&dir)
+            ),
+        };
+        let out = read_output_disk(&output)?.with_context(|| {
+            format!(
+                "no result ({} {status}); console:\n{}",
+                self.vmm.backend,
+                console_tail(&dir)
+            )
+        })?;
+        match out.result.outcome {
+            GuestOutcome::Exited(0) => {}
+            GuestOutcome::Failed(msg) => bail!("{msg}"),
+            other => bail!("unexpected result {other:?}"),
+        }
+        ensure!(
+            out.files.len() == 1 && out.files[0] == file,
+            "the copy came back different"
+        );
+        Ok(())
     }
 
     pub fn backend(&self) -> Backend {
@@ -333,12 +530,11 @@ impl MicrovmExecutor {
         let run_spec = run_spec(&image.config, spec, input);
         let disks = {
             let dir = dir.clone();
-            let mkfs = self.mkfs.clone();
             let input = input.clone();
             let shared = shared_files.to_vec();
             tokio::task::spawn_blocking(move || -> Result<[PathBuf; 3]> {
                 let scratch = dir.join("scratch.ext4");
-                make_ext4(&mkfs, &scratch, SCRATCH_BYTES, SCRATCH_LABEL)?;
+                ext4::mkfs(&scratch, SCRATCH_BYTES, SCRATCH_LABEL)?;
                 let input_disk = dir.join("input.tar");
                 write_input_disk(&input_disk, &run_spec, &input.stdin, &shared, &input.files)?;
                 let output = dir.join("output.img");
@@ -443,6 +639,18 @@ impl MicrovmExecutor {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("start {}", self.vmm.bin.display()))?;
+        // Windows: the VMM dies with its job, so not even a crashed agent
+        // leaves VMs running.
+        let _job = crate::platform::ProcessJob::new()
+            .and_then(|job| job.assign(&child).map(|()| job))
+            .map_err(|e| warn!("could not put the VMM in a job object: {e}"))
+            .ok();
+        // When QEMU writes the console to a file (Windows), watch it: under
+        // WHPX a guest reset can leave QEMU stuck instead of exiting.
+        let serial = dir.join(vmm::SERIAL_LOG);
+        let watch_serial = cfg!(windows) && self.vmm.backend == Backend::Qemu;
+        let mut done_since: Option<Instant> = None;
+        let mut ticks = 0u32;
         loop {
             tokio::select! {
                 status = child.wait() => {
@@ -450,13 +658,20 @@ impl MicrovmExecutor {
                     if !status.success() {
                         debug!(%status, "vmm exited");
                     }
-                    return Ok(VmEnd::Exited(status));
+                    return Ok(VmEnd::Exited(status.to_string()));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    ticks += 1;
+                    if watch_serial && done_since.is_none() && ticks.is_multiple_of(10) && guest_said_done(&serial) {
+                        done_since = Some(Instant::now());
+                    }
                     let end = if cancel.load(Ordering::Relaxed) {
                         Some(VmEnd::Cancelled)
                     } else if deadline.is_some_and(|d| Instant::now() >= d) {
                         Some(VmEnd::Timeout)
+                    } else if done_since.is_some_and(|t| t.elapsed() >= AFTER_GUEST_DONE) {
+                        warn!("the guest restarted but the VMM did not exit; stopping it");
+                        Some(VmEnd::Exited("stopped by the host after the guest restarted".into()))
                     } else {
                         None
                     };
@@ -502,14 +717,9 @@ impl MicrovmExecutor {
         let layers_disk = work.path().join("layers.tar");
         let output = work.path().join("output.img");
         {
-            let (mkfs, base, layers_disk, output) = (
-                self.mkfs.clone(),
-                base.clone(),
-                layers_disk.clone(),
-                output.clone(),
-            );
+            let (base, layers_disk, output) = (base.clone(), layers_disk.clone(), output.clone());
             tokio::task::spawn_blocking(move || -> Result<()> {
-                make_ext4(&mkfs, &base, size, BASE_LABEL)?;
+                ext4::mkfs(&base, size, BASE_LABEL)?;
                 write_layers_disk(&layers_disk, &blobs)?;
                 for b in &blobs {
                     let _ = std::fs::remove_file(b);
@@ -644,27 +854,6 @@ fn run_spec(config: &ContainerConfig, spec: &DockerSpec, input: &TaskInput) -> R
     }
 }
 
-/// Creates a sparse file of `size` bytes holding an empty ext4 filesystem.
-/// No journal: the disks are thrown away or used read-only afterwards.
-fn make_ext4(mkfs: &Path, path: &Path, size: u64, label: &str) -> Result<()> {
-    let f = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    f.set_len(size)?;
-    drop(f);
-    let out = std::process::Command::new(mkfs)
-        .args(["-q", "-F", "-L", label, "-O", "^has_journal", "-m", "0"])
-        .args(["-E", "lazy_itable_init=1,nodiscard"])
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("run {}", mkfs.display()))?;
-    ensure!(
-        out.status.success(),
-        "mkfs.ext4 failed: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    Ok(())
-}
-
 fn tar_entry<W: Write>(b: &mut tar::Builder<W>, name: &str, data: &[u8]) -> Result<()> {
     let mut h = tar::Header::new_gnu();
     h.set_size(data.len() as u64);
@@ -721,9 +910,8 @@ fn write_input_disk(
 }
 
 fn make_output_disk(path: &Path) -> Result<()> {
-    let mut f = std::fs::File::create(path)?;
+    let mut f = create_sparse(path, OUTPUT_DISK_BYTES.div_ceil(4096) * 4096)?;
     f.write_all(OUTPUT_MARK)?;
-    f.set_len(OUTPUT_DISK_BYTES.div_ceil(4096) * 4096)?;
     Ok(())
 }
 
@@ -818,15 +1006,57 @@ fn note_dropped(stderr: &mut Vec<u8>, r: &GuestResult) {
     }
 }
 
+/// Creates `path` as a sparse file of `len` bytes (zeros that take no
+/// space until written; NTFS needs to be asked for that).
+pub(crate) fn create_sparse(path: &Path, len: u64) -> Result<std::fs::File> {
+    let f = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    if let Err(e) = crate::platform::set_sparse(&f) {
+        warn!(
+            "{} is not sparse and takes its full size: {e}",
+            path.display()
+        );
+    }
+    f.set_len(len)
+        .with_context(|| format!("size {} to {len} bytes", path.display()))?;
+    Ok(f)
+}
+
 fn console_tail(dir: &Path) -> String {
-    let text = std::fs::read(dir.join("console.log")).unwrap_or_default();
-    let start = text.len().saturating_sub(CONSOLE_TAIL);
+    // The VMM's own output, then the guest console when QEMU writes that
+    // to a file (Windows).
+    let mut text = std::fs::read(dir.join("console.log")).unwrap_or_default();
+    if let Ok(serial) = std::fs::read(dir.join(vmm::SERIAL_LOG)) {
+        text.extend_from_slice(&serial);
+    }
+    // Debugging aid: PUMASI_VM_CONSOLE_TAIL=65536 keeps more of it.
+    let keep = std::env::var("PUMASI_VM_CONSOLE_TAIL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CONSOLE_TAIL);
+    let start = text.len().saturating_sub(keep);
     String::from_utf8_lossy(&text[start..]).trim().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Needs a VM directory set up with `pumasi vm setup`.
+    #[tokio::test]
+    async fn probe_vm_copies_its_input() {
+        let Some(dir) = std::env::var_os("PUMASI_TEST_VM_DIR") else {
+            eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+            return;
+        };
+        let config = MicrovmConfig {
+            dir: dir.into(),
+            backend: None,
+        };
+        let exec = MicrovmExecutor::detect(&config, "probe-test")
+            .await
+            .unwrap();
+        exec.probe().await.unwrap();
+    }
 
     #[test]
     fn limits_match_the_guest() {

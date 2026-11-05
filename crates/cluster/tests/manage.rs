@@ -483,6 +483,7 @@ async fn quotas_access_tickets_and_apply() {
         schedules: vec![],
         prune: false,
         dry_run: false,
+        ..Default::default()
     };
     let AdminResponse::Applied(first) = client
         .call(AdminOp::Apply(Box::new(spec.clone())))

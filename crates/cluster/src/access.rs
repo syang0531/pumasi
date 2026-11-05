@@ -57,6 +57,13 @@ fn op_name(op: &AdminOp) -> &'static str {
         Schedules => "list schedules",
         RunSchedule { .. } => "run schedules",
         Apply(_) => "apply cluster files",
+        Metrics { .. } => "read metrics",
+        Events { .. } => "read events",
+        Logs { .. } => "read task output",
+        Alerts => "read alerts",
+        SetAlertPolicy(_) => "change alert rules",
+        SetWebhook(_) | RemoveWebhook { .. } => "change webhooks",
+        TestWebhook { .. } => "test webhooks",
     }
 }
 
@@ -92,7 +99,11 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | StoreUsage
             | Quotas
             | Schedules
-            | WhoAmI => Ok(op),
+            | WhoAmI
+            | Metrics { .. }
+            | Events { .. }
+            | Logs { .. }
+            | Alerts => Ok(op),
             other => Err(denied(caller, &other)),
         },
         Caller::Submitter { account, .. } => submitter(st, caller, account, op),
@@ -143,9 +154,11 @@ fn own_mounts(st: &State, account: &str, sub: &JobSubmission) -> Result<()> {
 fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<AdminOp> {
     use AdminOp::*;
     match &op {
-        Cancel { id } | Receipts { id } | TaskFiles { id, .. } | Job { id, .. } => {
-            own_job(st, account, id)?
-        }
+        Cancel { id }
+        | Receipts { id }
+        | TaskFiles { id, .. }
+        | Job { id, .. }
+        | Logs { job: id, .. } => own_job(st, account, id)?,
         RemoveSchedule { name } | RunSchedule { name } => {
             if let Some(other) = st.schedule_account(name) {
                 ensure!(
@@ -162,7 +175,8 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
             own_mounts(st, account, &sub)?;
             Submit(sub)
         }
-        op @ (Cancel { .. } | Receipts { .. } | TaskFiles { .. } | Job { .. }) => op,
+        op @ (Cancel { .. } | Receipts { .. } | TaskFiles { .. } | Job { .. } | Logs { .. }) => op,
+        op @ (Metrics { .. } | Events { .. } | Alerts) => op,
         op @ (Status
         | Accounts
         | GetPolicy
@@ -278,6 +292,11 @@ pub fn scope(caller: &Caller, resp: AdminResponse) -> AdminResponse {
         AdminResponse::Schedules(mut v) => {
             v.retain(|s| s.account == *account);
             AdminResponse::Schedules(v)
+        }
+        // Events about nodes and the cluster, and its own jobs.
+        AdminResponse::Events(mut v) => {
+            v.retain(|e| e.account.as_ref().is_none_or(|a| a == account));
+            AdminResponse::Events(v)
         }
         other => other,
     }

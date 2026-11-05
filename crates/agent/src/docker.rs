@@ -41,7 +41,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    executor::{LocalImage, RunResult, TaskIo},
+    executor::{LiveOutput, LocalImage, RunResult, TaskIo},
     platform::ProcessJob,
 };
 
@@ -446,8 +446,13 @@ impl DockerExecutor {
         });
         let mut out = child.stdout.take().expect("piped");
         let mut err = child.stderr.take().expect("piped");
-        let out_task = tokio::spawn(async move { read_capped(&mut out, MAX_OUTPUT_BYTES).await });
-        let err_task = tokio::spawn(async move { read_capped(&mut err, MAX_OUTPUT_BYTES).await });
+        let (live_out, live_err) = (io.live.clone(), io.live.clone());
+        let out_task = tokio::spawn(async move {
+            read_capped_live(&mut out, MAX_OUTPUT_BYTES, live_out.as_ref(), false).await
+        });
+        let err_task = tokio::spawn(async move {
+            read_capped_live(&mut err, MAX_OUTPUT_BYTES, live_err.as_ref(), true).await
+        });
 
         let deadline = run_start + Duration::from_millis(limits.timeout_ms);
         let mut stopped: Option<Outcome> = None;
@@ -951,6 +956,32 @@ async fn read_capped<R: AsyncRead + Unpin>(r: &mut R, cap: usize) -> Vec<u8> {
             Ok(n) => {
                 let room = cap.saturating_sub(kept.len());
                 kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+        }
+    }
+    kept
+}
+
+/// Like [`read_capped`], and passes what it reads on to the task's live
+/// output as it comes.
+async fn read_capped_live<R: AsyncRead + Unpin>(
+    r: &mut R,
+    cap: usize,
+    live: Option<&LiveOutput>,
+    stderr: bool,
+) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(kept.len());
+                let take = &buf[..n.min(room)];
+                if let Some(l) = live {
+                    l.push(stderr, take);
+                }
+                kept.extend_from_slice(take);
             }
         }
     }

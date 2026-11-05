@@ -2,7 +2,7 @@
 
 이미 가진 여러 대의 기기를 하나의 사설 클러스터로 묶어 배치 작업을 나눠 돌립니다. 모든 기기에서 도는 안전한 WebAssembly 작업, 허용한 기기에서 도는 일반 Docker 이미지 작업(Python, 원하는 패키지, 선택적 네트워크), 그리고 같은 이미지를 태스크마다 자기 커널을 가진 microVM 안에서 돌리는 작업(남이 빌려준 기기에도 보낼 수 있을 만큼 격리됨)을 같은 방식으로 실행합니다. Linux, macOS, Windows와 x86_64, ARM64에서 같은 Rust 단일 바이너리 하나로 동작합니다.
 
-단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드, 5단계는 세 실행기 모두를 Windows에서 정식 지원하는 것, 6단계는 구형 Intel Mac과 가용 정책, 7단계는 성능 벤치마크와 컴퓨팅 유닛(CU), 8단계(이번 릴리스)는 클러스터 파일 저장소입니다. 이후 GPU, 클러스터 관리, 모니터링, 대시보드를 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
+단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드, 5단계는 세 실행기 모두를 Windows에서 정식 지원하는 것, 6단계는 구형 Intel Mac과 가용 정책, 7단계는 성능 벤치마크와 컴퓨팅 유닛(CU), 8단계는 클러스터 파일 저장소, 9단계는 GPU, 10단계는 클러스터 관리, 11단계(이번 릴리스)는 모니터링과 경보입니다. 이후 대시보드와 고가용성을 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
 
 ## 설치
 
@@ -326,7 +326,7 @@ pumasi schedule ls
 pumasi run merge.toml --after 작업ID         # 또는 job.toml에 after = ["작업ID"]
 ```
 
-**선언적 설정.** 라벨, 테인트, cordon, 쿼터, 스케줄을 파일 하나에 두고 적용합니다([`examples/cluster.toml`](examples/cluster.toml) 참고). 두 번 적용해도 두 번째에는 바뀌는 것이 없습니다. `--dry-run`은 바뀔 내용만 보여 주고, `--prune`은 파일에 없는 스케줄도 지웁니다.
+**선언적 설정.** 라벨, 테인트, cordon, 쿼터, 스케줄, 경보 규칙, 웹훅을 파일 하나에 두고 적용합니다([`examples/cluster.toml`](examples/cluster.toml) 참고). 두 번 적용해도 두 번째에는 바뀌는 것이 없습니다. `--dry-run`은 바뀔 내용만 보여 주고, `--prune`은 파일에 없는 스케줄과 웹훅도 지웁니다.
 
 ```sh
 pumasi apply -f cluster.toml --dry-run
@@ -335,11 +335,36 @@ pumasi apply -f cluster.toml
 
 `pumasi get nodes|jobs|accounts|schedules|access [-o json]`로 목록을, `pumasi describe node|job|account|schedule 이름`으로 하나의 자세한 내용을 봅니다.
 
+### 모니터링과 경보
+
+에이전트는 5초마다 CPU, 메모리, 데이터 디렉터리가 있는 디스크, 네트워크 트래픽, 가장 뜨거운 온도 센서, GPU별 사용률·VRAM·온도·전력을 보고합니다. 컨트롤 플레인은 이를 7일(`--metrics-retention`) 동안 보관하는데, 최근 1시간은 10초 단위, 하루까지는 1분 단위, 그 뒤는 10분 단위로 줄여 둡니다.
+
+```sh
+pumasi top                     # 모든 노드, 큐, 울리는 경보를 실시간으로
+pumasi metrics desktop --since 24h
+pumasi logs 작업ID -t 3 -f     # 실행 중인 태스크의 stdout·stderr
+pumasi events -f               # 노드 접속·이탈, 작업 종료, 경보
+```
+
+WASM·Docker 태스크의 출력은 1초도 안 되어 `pumasi logs -f`에 나타나고, microVM 태스크는 끝날 때 한꺼번에 보입니다.
+
+**Prometheus와 Grafana.** `pumasi cluster start --metrics-addr 127.0.0.1:9464`로 Prometheus 텍스트 형식의 `/metrics`를 엽니다. 노드 지표, 우선순위별 큐, 실행·선점 횟수, 검증 불일치, 울리는 경보, 계정 잔액, 파일 저장소 크기가 들어 있습니다. 주소를 주지 않으면 꺼져 있고, `--metrics-token`(또는 `PUMASI_METRICS_TOKEN`)을 주면 `Authorization: Bearer 토큰`을 요구합니다. [`examples/prometheus.yml`](examples/prometheus.yml)과 [`examples/grafana`](examples/grafana)의 대시보드를 참고하세요.
+
+**경보.** 노드 1분 이상 오프라인, 최근 15분 실행의 절반 실패, 디스크(노드 또는 컨트롤 플레인) 90% 사용, 센서 90 °C, 벤치마크가 이전보다 25% 느려짐, SMART 이상, 검증 실행과 제공자 결과 불일치를 감시합니다. 기준을 바꾸거나 규칙을 끌 수 있고, 경보는 Slack, Mattermost, Discord 또는 JSON을 받는 아무 URL로 보냅니다. 경보마다 시작될 때와 풀릴 때 한 번씩 보냅니다.
+
+```sh
+pumasi alert set --node-offline 2m --disk 85% --temperature off
+pumasi webhook add ops https://hooks.slack.com/services/...   # 시험 경보를 보냄
+pumasi alert ls
+```
+
+둘 다 `cluster.toml`의 `[alerts]`와 `[webhooks.이름]`에 둘 수도 있습니다(`url_env`로 URL을 파일 밖에 두기).
+
 ## 명령어
 
 | 명령 | 설명 |
 | --- | --- |
-| `pumasi cluster start` | 컨트롤 플레인 실행. 처음 실행하면 클러스터를 만들고, 상태는 `~/.pumasi/cluster`에 저장합니다. |
+| `pumasi cluster start [--metrics-addr ADDR]` | 컨트롤 플레인 실행. 처음 실행하면 클러스터를 만들고, 상태는 `~/.pumasi/cluster`에 저장합니다. `--metrics-addr`는 Prometheus 지표 제공 |
 | `pumasi token [--ttl 24h] [--uses N]` | 내 다른 기기용 참가 티켓 발급 |
 | `pumasi invite <계정> [--ttl 7d] [--uses 1] [--allow-docker]` | 다른 사람의 기기를 `계정` 몫으로 버는 제공자로 초대 |
 | `pumasi agent join <티켓> [--allow-docker] [--allow-microvm] [--no-gpus]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`). `--no-gpus`가 아니면 GPU도 제공 |
@@ -369,8 +394,14 @@ pumasi apply -f cluster.toml
 | `pumasi quota [계정 --slots N --gpus N --cu-per-day CU --max-priority N --storage 크기] [--clear]` | 모든 계정의 한도와 사용량 보기, 또는 한 계정 변경 (`none`은 한도 해제) |
 | `pumasi access create 이름 --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|이름` | 다른 사람에게 줄 역할 티켓. `pumasi whoami`는 지금 쓰는 티켓 표시 |
 | `pumasi schedule add 이름 job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm 이름` / `run 이름` | cron 일정으로 제출하는 작업 |
-| `pumasi apply -f cluster.toml [--dry-run] [--prune]` | 라벨·테인트·cordon·쿼터·스케줄을 파일과 같게 맞춤. 두 번 적용해도 결과 같음 |
+| `pumasi apply -f cluster.toml [--dry-run] [--prune]` | 라벨·테인트·cordon·쿼터·스케줄·경보 규칙·웹훅을 파일과 같게 맞춤. 두 번 적용해도 결과 같음 |
 | `pumasi get nodes\|jobs\|accounts\|schedules\|access [-l 셀렉터] [-o json]` / `describe node\|job\|account\|schedule 이름` | 목록 보기, 하나 자세히 보기 |
+| `pumasi top [--interval 2s] [--once]` | 노드별 CPU·메모리·디스크·네트워크·온도·GPU, 큐, 울리는 경보를 Ctrl-C까지 갱신 |
+| `pumasi metrics [노드] [--since 1h] [-o json]` | 모든 노드의 최신 지표, 또는 노드 하나의 기록 |
+| `pumasi logs <작업> [-t 태스크] [-f]` | 태스크의 stdout·stderr. `-f`면 실행 중에 따라감 |
+| `pumasi events [-f] [--since 1h] [-n 50] [-o json]` | 클러스터 이벤트: 노드, 작업, 검증, 선점, 경보 |
+| `pumasi alert ls` / `alert set [--node-offline 1m] [--failure-rate 50%] [--disk 90%] [--temperature 90] [--perf-drop 25%] [--smart on] [--check-mismatch on] [--defaults]` | 경보 규칙과 지금 울리는 경보. `off`는 규칙 끄기 |
+| `pumasi webhook add 이름 URL [--format slack\|discord\|json]` / `ls` / `rm 이름` / `test 이름` | 경보를 보낼 곳 |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [인자...]` | 에이전트와 같은 샌드박스로 로컬 실행 (`DIR`이 `/input`으로 보이고 `/output`은 `pumasi-out/exec`에 저장, `--seed`는 결정적 모드) |
 
 `--home DIR` 또는 `PUMASI_HOME`으로 상태 디렉터리를 바꾸면 한 기기에서 클러스터와 에이전트 여러 개를 띄워 시험할 수 있습니다.
@@ -481,8 +512,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 7 | 성능 벤치마크와 컴퓨팅 유닛(CU): 노드가 서명한 성능 프로필(CPU, 메모리 대역폭, fio로 디스크 종류·속도, SMART 마모도, 지연), 1 CU = 기준 vCPU 1개를 1시간 쓰는 값과 자원별 CU 단가, 정수 milli-CU 원장, 돈 없이 서로 빌려 쓰는 그룹 로컬 원장 | 완료 |
 | 8 | 클러스터 파일 저장소(iroh-blobs): 버전 있는 데이터셋, `store:` 마운트와 출력 데이터셋, 크기 제한 없는 입출력, 해시 검증 이어받기, 노드끼리 나누는 캐시, 참조 GC, 쿼터, 저장·이그레스 CU 과금, 비공개 레지스트리 이미지 | 완료 |
 | 9 | GPU·microVM 장치: NVIDIA(NVML, CUDA 벤치마크)·AMD 탐지, 서명된 장치 프로필, GPU 시간 CU 과금, GPU 단위 스케줄링, Docker GPU 작업, 제공자 GPU 검증, VFIO 패스스루(실험), 필터링되는 microVM 네트워크 | 완료 |
-| 10 | 클러스터 관리: 노드 라벨·테인트, 작업 selector·toleration, cordon·drain, 우선순위와 선점, 계정별 쿼터(슬롯, GPU, 하루 CU, 우선순위, 저장 용량), 역할 티켓(admin, submitter, viewer), 선언적 `apply`와 `get`·`describe`, cron 스케줄, 작업 의존성 | 이번 릴리스 |
-| 11 | 모니터링·경보: 노드 지표, Prometheus, 실시간 로그, 웹훅 | 예정 |
+| 10 | 클러스터 관리: 노드 라벨·테인트, 작업 selector·toleration, cordon·drain, 우선순위와 선점, 계정별 쿼터(슬롯, GPU, 하루 CU, 우선순위, 저장 용량), 역할 티켓(admin, submitter, viewer), 선언적 `apply`와 `get`·`describe`, cron 스케줄, 작업 의존성 | 완료 |
+| 11 | 모니터링·경보: 노드 지표(CPU, 메모리, 디스크, 네트워크, 온도, GPU)를 다운샘플링해 7일 보관, `top`, 실시간 `logs -f`, `events`, 선택형 Prometheus 엔드포인트와 Grafana 대시보드, 경보 규칙(노드 오프라인, 실패율, 디스크, 온도, 벤치마크 저하, SMART, 검증 불일치)을 Slack·Discord·JSON 웹훅으로 | 이번 릴리스 |
 | 12 | 웹 대시보드(바이너리 내장) | 예정 |
 | 13 | 컨트롤 플레인 고가용성(Raft) | 예정 |
 | 14 | WebGPU 실행기(실험) | 예정 |
@@ -491,7 +522,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 17 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
 | 18 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 표시만 합니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
+알려진 한계: CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 표시만 합니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. microVM 태스크 출력은 끝날 때에야 `pumasi logs`에 나타나고(게스트가 출력 디스크에 쓰기 때문), Intel·Apple GPU는 지표가 없고 Windows 노드는 온도를 보고하지 않으며, 최근 1시간의 10초 단위 지표는 컨트롤 플레인을 다시 시작하면 사라집니다.
 
 ## 라이선스
 

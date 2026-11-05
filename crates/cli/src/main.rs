@@ -3,6 +3,7 @@
 
 mod gpu_cmd;
 mod manage;
+mod monitor;
 mod service;
 mod upgrade;
 
@@ -300,7 +301,7 @@ enum Cmd {
     #[command(subcommand)]
     Schedule(manage::ScheduleCmd),
     /// Make the cluster match a cluster.toml: node labels, taints and
-    /// cordons, account quotas, schedules. Applying it twice changes
+    /// cordons, account quotas, schedules, alert rules and webhooks. Applying it twice changes
     /// nothing the second time.
     Apply {
         #[arg(short = 'f', long = "file")]
@@ -334,6 +335,67 @@ enum Cmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Nodes' CPU, memory, disk, network, temperature and GPUs, and the
+    /// queue, refreshed until Ctrl-C.
+    Top {
+        /// How often to refresh.
+        #[arg(long, default_value = "2s")]
+        interval: String,
+        /// Print once and exit.
+        #[arg(long)]
+        once: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Node metrics: the latest of every node, or one node's history.
+    Metrics {
+        /// Node name or id prefix.
+        node: Option<String>,
+        /// How far back, e.g. 1h, 24h, 7d (10 s steps up to 1h, 1 min up
+        /// to 24h, 10 min beyond).
+        #[arg(long, default_value = "1h")]
+        since: String,
+        #[arg(short = 'o', long, value_enum, default_value = "table")]
+        output: manage::Output,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// A task's output (stdout and stderr), also while it runs.
+    Logs {
+        job: String,
+        /// Task index.
+        #[arg(short = 't', long, default_value_t = 0)]
+        task: u32,
+        /// Keep printing until the task finishes.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Cluster events: nodes coming and going, jobs finishing, failed
+    /// checks, alerts.
+    Events {
+        /// Keep printing new events until Ctrl-C.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only events this recent, e.g. 1h.
+        #[arg(long)]
+        since: Option<String>,
+        /// How many recent events to show.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: u32,
+        #[arg(short = 'o', long, value_enum, default_value = "table")]
+        output: manage::Output,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Alert rules: node offline, failure rate, disk, temperature,
+    /// benchmark drops, SMART, check mismatches.
+    #[command(subcommand)]
+    Alert(monitor::AlertCmd),
+    /// Where alerts go: Slack, Discord or any URL that takes JSON.
+    #[command(subcommand)]
+    Webhook(monitor::WebhookCmd),
     /// Run the agent as a service that starts at boot (systemd, launchd,
     /// Windows service).
     #[command(subcommand)]
@@ -634,7 +696,23 @@ enum ClusterCmd {
         /// rate (`pumasi prices`).
         #[arg(long, value_enum)]
         storage_class: Option<StorageClassArg>,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
+}
+
+#[derive(Args, Clone, Default)]
+struct MetricsArgs {
+    /// Serve Prometheus metrics on this address, e.g. 127.0.0.1:9464
+    /// (`/metrics`). Off unless given.
+    #[arg(long, value_name = "ADDR")]
+    metrics_addr: Option<SocketAddr>,
+    /// Require `Authorization: Bearer TOKEN` on /metrics.
+    #[arg(long, env = "PUMASI_METRICS_TOKEN", hide_env_values = true)]
+    metrics_token: Option<String>,
+    /// How long node metrics and events are kept, e.g. 7d.
+    #[arg(long, default_value = "7d")]
+    metrics_retention: String,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -861,7 +939,34 @@ async fn run(cli: Cli) -> Result<i32> {
             net,
             no_token,
             storage_class,
-        }) => cluster_start(&home, name, net, no_token, storage_class).await,
+            metrics,
+        }) => cluster_start(&home, name, net, no_token, storage_class, metrics).await,
+        Cmd::Top {
+            interval,
+            once,
+            admin,
+        } => monitor::top(&home, &admin, &interval, once).await,
+        Cmd::Metrics {
+            node,
+            since,
+            output,
+            admin,
+        } => monitor::show_metrics(&home, &admin, node, &since, output).await,
+        Cmd::Logs {
+            job,
+            task,
+            follow,
+            admin,
+        } => monitor::logs(&home, &admin, job.parse()?, task, follow).await,
+        Cmd::Events {
+            follow,
+            since,
+            limit,
+            output,
+            admin,
+        } => monitor::events(&home, &admin, since.as_deref(), limit, follow, output).await,
+        Cmd::Alert(cmd) => monitor::alert(&home, cmd).await,
+        Cmd::Webhook(cmd) => monitor::webhook(&home, cmd).await,
         Cmd::Store(cmd) => store(&home, cmd).await,
         Cmd::Secret(cmd) => secret(&home, cmd).await,
         Cmd::Agent(cmd) => agent(&home, cmd, ctrl_c(), false).await,
@@ -1208,9 +1313,14 @@ async fn cluster_start(
     net: NetArgs,
     no_token: bool,
     storage_class: Option<StorageClassArg>,
+    metrics: MetricsArgs,
 ) -> Result<i32> {
     let mut config = ClusterConfig::new(home.join("cluster"));
     config.name = name;
+    config.metrics_addr = metrics.metrics_addr;
+    config.metrics_token = metrics.metrics_token.filter(|t| !t.is_empty());
+    config.metrics_retention =
+        Duration::from_millis(parse_duration_ms(&metrics.metrics_retention)?);
     config.disk_class = match storage_class {
         Some(StorageClassArg::Hdd) => DiskClass::Hdd,
         Some(StorageClassArg::Ssd) => DiskClass::Ssd,
@@ -1232,6 +1342,9 @@ async fn cluster_start(
         "admin ticket saved to {}",
         config.data_dir.join(ADMIN_TICKET_FILE).display()
     );
+    if let Some(addr) = cluster.metrics_addr() {
+        eprintln!("Prometheus metrics at http://{addr}/metrics");
+    }
     if !no_token {
         let ticket = cluster.create_join_ticket(Duration::from_secs(24 * 3600), None)?;
         eprintln!();

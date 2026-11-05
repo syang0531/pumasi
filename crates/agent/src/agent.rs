@@ -14,6 +14,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, protocol::Router};
 use pumasi_proto::{
     AGENT_ALPN, BLOBS_ALPN, ModuleHash, PROTOCOL_VERSION, Secret,
     job::{Executor, FileEntry, MAX_OUTPUT_FILES_BYTES, dir_files, read_files},
+    monitor::METRICS_EVERY_SECS,
     msg::{
         AgentHello, Availability, FromAgent, HelloReply, NodeInfo, Role, TaskAssignment, TaskRef,
         TaskReport, ToAgent,
@@ -33,7 +34,8 @@ use crate::{
     availability::AvailabilityConfig,
     bench::{self, BenchConfig, CpuKernel},
     docker::DockerExecutor,
-    executor::{LocalImage, RunResult, TaskIo, WasmExecutor},
+    executor::{LiveOutput, LocalImage, RunResult, TaskIo, WasmExecutor},
+    metrics::Sampler,
     microvm::{MicrovmConfig, MicrovmExecutor},
     store::{DEFAULT_CACHE_BYTES, InUse, NodeStore},
     tempdir::TempDir,
@@ -43,6 +45,8 @@ use crate::{
 const MEMBERSHIP_FILE: &str = "membership.json";
 const KEY_FILE: &str = "secret.key";
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How often a running task's new output goes to the cluster.
+const LIVE_OUTPUT_EVERY: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -124,6 +128,8 @@ pub struct Agent {
     node_store: NodeStore,
     /// GPUs and microVM networking, signed; sent after the welcome.
     devices: Option<pumasi_proto::gpu::SignedDevices>,
+    /// Samples the machine for the cluster's monitoring.
+    sampler: Arc<Mutex<Sampler>>,
     _router: Router,
 }
 
@@ -281,6 +287,16 @@ impl Agent {
         if microvm.is_some() {
             info.executors.push(Executor::Microvm);
         }
+        let sampler = {
+            let dir = config.data_dir.clone();
+            // Only GPUs the cluster may use are watched (NVML stays closed
+            // with --no-gpus).
+            let gpus = match &devices {
+                Some(d) if config.gpus => d.profile.gpus.clone(),
+                _ => Vec::new(),
+            };
+            tokio::task::spawn_blocking(move || Sampler::new(&dir, gpus)).await?
+        };
         Ok(Self {
             endpoint,
             key,
@@ -297,6 +313,7 @@ impl Agent {
             rebench: Arc::new(Notify::new()),
             node_store,
             devices,
+            sampler: Arc::new(Mutex::new(sampler)),
             _router: router,
         })
     }
@@ -517,6 +534,31 @@ impl Agent {
             })
         };
 
+        // Metrics every few seconds.
+        let metrics = {
+            let out_tx = out_tx.clone();
+            let running = running.clone();
+            let sampler = self.sampler.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(METRICS_EVERY_SECS));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let n = running.lock().unwrap().len() as u32;
+                    let sampler = sampler.clone();
+                    let Ok(m) =
+                        tokio::task::spawn_blocking(move || sampler.lock().unwrap().sample(n))
+                            .await
+                    else {
+                        continue;
+                    };
+                    if out_tx.send(FromAgent::Metrics(Box::new(m))).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
         // The profile, then a new one whenever the machine is measured again:
         // when the profile goes stale or the cluster asks, once no task runs.
         if let Some(p) = self.perf() {
@@ -598,6 +640,7 @@ impl Agent {
                     match res {
                         Ok(version) => {
                             heartbeat.abort();
+                            metrics.abort();
                             availability.abort();
                             if let Some(b) = &benchmarks {
                                 b.abort();
@@ -752,6 +795,7 @@ impl Agent {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         heartbeat.abort();
+        metrics.abort();
         availability.abort();
         if let Some(b) = &benchmarks {
             b.abort();
@@ -833,6 +877,34 @@ impl Agent {
                 }
             };
             io.gpus = gpus;
+            // What the task prints goes to the cluster as it comes (not for
+            // check runs: only the task's own run is shown).
+            let streamer = (!task.check).then(|| {
+                let live = LiveOutput::default();
+                // Stops with the run, however it ends.
+                io.live = Some(live.clone());
+                let out_tx = out_tx.clone();
+                AbortOnDrop(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(LIVE_OUTPUT_EVERY);
+                    loop {
+                        tick.tick().await;
+                        let (stdout, stderr) = live.take();
+                        if stdout.is_empty() && stderr.is_empty() {
+                            continue;
+                        }
+                        if out_tx
+                            .send(FromAgent::Logs {
+                                task,
+                                stdout,
+                                stderr,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }))
+            });
             let result: Result<RunResult> = match a.executor {
                 Executor::Wasm => {
                     let Some(hash) = a.module_hash else {
@@ -867,6 +939,7 @@ impl Agent {
                     (_, None) => Err(anyhow::anyhow!("microvm task without an image")),
                 },
             };
+            drop(streamer);
             // Output files kept on disk go in the report when they fit, or
             // to the file store.
             let result = match result {
@@ -1018,6 +1091,15 @@ async fn finish_output(
         "output files uploaded to the file store"
     );
     Ok((r, Some(stored)))
+}
+
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn error_report(task: TaskRef, msg: String) -> TaskReport {

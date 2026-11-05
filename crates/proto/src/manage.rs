@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     economy::{MilliCu, format_cu, parse_cu, validate_account},
     job::{JobFile, JobSubmission},
+    monitor::{AlertPolicy, WebhookFormat, WebhookSpec},
     store::{format_size, parse_size},
 };
 
@@ -752,10 +753,14 @@ pub struct ApplySpec {
     pub nodes: Vec<NodeSpec>,
     pub accounts: Vec<(String, AccountQuota)>,
     pub schedules: Vec<ScheduleSpec>,
-    /// Remove schedules the file does not list.
+    /// Remove schedules (and webhooks) the file does not list.
     pub prune: bool,
     /// Report what would change without changing it.
     pub dry_run: bool,
+    // Phase 11 from here.
+    /// The whole alert policy, when the file has an `[alerts]` table.
+    pub alerts: Option<AlertPolicy>,
+    pub webhooks: Vec<WebhookSpec>,
 }
 
 impl ApplySpec {
@@ -783,6 +788,15 @@ impl ApplySpec {
             s.validate()
                 .with_context(|| format!("schedule {}", s.name))?;
         }
+        if let Some(a) = &self.alerts {
+            a.validate().context("alerts")?;
+        }
+        let mut seen = BTreeSet::new();
+        for w in &self.webhooks {
+            ensure!(seen.insert(&w.name), "webhook {} is listed twice", w.name);
+            w.validate()
+                .with_context(|| format!("webhook {}", w.name))?;
+        }
         Ok(())
     }
 }
@@ -806,6 +820,13 @@ impl ApplySpec {
 /// cron = "0 3 * * *"
 /// job = "nightly/job.toml"
 /// account = "alice"
+///
+/// [alerts]                        # the whole policy; left-out rules
+/// node_offline = "2m"             # take their defaults, "off" disables
+/// disk = "85%"
+///
+/// [webhooks.ops]
+/// url_env = "PUMASI_SLACK_URL"    # or url = "https://hooks.slack.com/..."
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -816,6 +837,141 @@ pub struct ClusterFile {
     pub accounts: BTreeMap<String, AccountFile>,
     #[serde(default)]
     pub schedules: BTreeMap<String, ScheduleFile>,
+    pub alerts: Option<AlertsFile>,
+    #[serde(default)]
+    pub webhooks: BTreeMap<String, WebhookFile>,
+}
+
+/// `[alerts]`: each rule a duration, percentage or number as text or
+/// number, `"off"` or `false` to turn it off; left out, its default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertsFile {
+    pub node_offline: Option<Setting>,
+    pub failure_rate: Option<Setting>,
+    pub failure_window: Option<Setting>,
+    pub failure_min_runs: Option<u32>,
+    pub disk: Option<Setting>,
+    pub temperature: Option<Setting>,
+    pub perf_drop: Option<Setting>,
+    pub smart: Option<Setting>,
+    pub check_mismatch: Option<Setting>,
+}
+
+/// A value in `[alerts]`: `false`, `90`, `"90%"`, `"2m"`, `"off"`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum Setting {
+    Bool(bool),
+    Int(i64),
+    Text(String),
+}
+
+impl Setting {
+    fn text(&self) -> String {
+        match self {
+            Setting::Bool(false) => "off".into(),
+            Setting::Bool(true) => "on".into(),
+            Setting::Int(i) => i.to_string(),
+            Setting::Text(t) => t.clone(),
+        }
+    }
+}
+
+impl AlertsFile {
+    pub fn policy(&self) -> Result<AlertPolicy> {
+        use crate::monitor::{FailureRate, parse_opt_percent, parse_opt_secs, parse_switch};
+        let d = AlertPolicy::default();
+        let secs = |s: &Option<Setting>, def: Option<u64>, what: &str| -> Result<Option<u64>> {
+            match s {
+                None => Ok(def),
+                // A bare number of seconds.
+                Some(Setting::Int(n)) if *n > 0 => Ok(Some(*n as u64)),
+                Some(Setting::Bool(true)) => Ok(def),
+                Some(v) => parse_opt_secs(&v.text()).with_context(|| what.to_string()),
+            }
+        };
+        let percent = |s: &Option<Setting>, def: Option<u8>, what: &str| -> Result<Option<u8>> {
+            match s {
+                None | Some(Setting::Bool(true)) => Ok(def),
+                Some(v) => parse_opt_percent(&v.text()).with_context(|| what.to_string()),
+            }
+        };
+        let switch = |s: &Option<Setting>, def: bool, what: &str| -> Result<bool> {
+            match s {
+                None => Ok(def),
+                Some(v) => parse_switch(&v.text()).with_context(|| what.to_string()),
+            }
+        };
+        let base = d.failure_rate.unwrap_or_default();
+        let failure_rate = percent(
+            &self.failure_rate,
+            Some(base.percent),
+            "alerts.failure_rate",
+        )?
+        .map(|p| -> Result<FailureRate> {
+            Ok(FailureRate {
+                percent: p,
+                window_secs: secs(
+                    &self.failure_window,
+                    Some(base.window_secs),
+                    "alerts.failure_window",
+                )?
+                .unwrap_or(base.window_secs),
+                min_runs: self.failure_min_runs.unwrap_or(base.min_runs),
+            })
+        })
+        .transpose()?;
+        let temp_c = match &self.temperature {
+            None | Some(Setting::Bool(true)) => d.temp_c,
+            Some(v) => {
+                let t = v.text();
+                if crate::monitor::is_off(&t) {
+                    None
+                } else {
+                    Some(
+                        t.trim()
+                            .trim_end_matches('C')
+                            .trim_end_matches('°')
+                            .trim()
+                            .parse::<u16>()
+                            .context("alerts.temperature: degrees Celsius")?,
+                    )
+                }
+            }
+        };
+        let p = AlertPolicy {
+            node_offline_secs: secs(
+                &self.node_offline,
+                d.node_offline_secs,
+                "alerts.node_offline",
+            )?,
+            failure_rate,
+            disk_percent: percent(&self.disk, d.disk_percent, "alerts.disk")?,
+            temp_c,
+            perf_drop_percent: percent(&self.perf_drop, d.perf_drop_percent, "alerts.perf_drop")?,
+            smart: switch(&self.smart, d.smart, "alerts.smart")?,
+            check_mismatch: switch(
+                &self.check_mismatch,
+                d.check_mismatch,
+                "alerts.check_mismatch",
+            )?,
+        };
+        p.validate()?;
+        Ok(p)
+    }
+}
+
+/// `[webhooks.NAME]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookFile {
+    pub url: Option<String>,
+    /// An environment variable holding the URL, read where `apply` runs,
+    /// so the file need not hold the secret.
+    pub url_env: Option<String>,
+    /// `slack`, `discord` or `json` (default: guessed from the URL).
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -938,6 +1094,23 @@ impl ClusterFile {
                 job,
                 overlap: s.overlap,
             });
+        }
+        if let Some(a) = &self.alerts {
+            spec.alerts = Some(a.policy()?);
+        }
+        for (name, w) in self.webhooks {
+            let url = match (w.url, w.url_env) {
+                (Some(u), None) => u,
+                (None, Some(var)) => std::env::var(&var).with_context(|| {
+                    format!("webhook {name}: environment variable {var} is not set")
+                })?,
+                _ => bail!("webhook {name}: give url or url_env (one of them)"),
+            };
+            let format = match &w.format {
+                Some(f) => f.parse().with_context(|| format!("webhook {name}"))?,
+                None => WebhookFormat::detect(&url),
+            };
+            spec.webhooks.push(WebhookSpec { name, url, format });
         }
         spec.validate()?;
         Ok(spec)
@@ -1102,6 +1275,7 @@ mod tests {
         assert_eq!(spec.nodes.len(), 2);
         assert_eq!(spec.accounts.len(), 2);
         assert_eq!(spec.schedules[0].job.tasks.len(), 4);
+        assert_eq!(spec.alerts, Some(AlertPolicy::default()));
     }
 
     #[test]

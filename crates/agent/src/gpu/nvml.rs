@@ -214,6 +214,128 @@ unsafe fn query(lib: &Library, first: u32) -> Result<Vec<GpuInfo>> {
     }
 }
 
+#[repr(C)]
+struct Utilization {
+    gpu: c_uint,
+    memory: c_uint,
+}
+
+const NVML_TEMPERATURE_GPU: c_uint = 0;
+
+type DeviceFn<T> = unsafe extern "C" fn(Device, *mut T) -> Ret;
+
+/// NVML kept open between samples for the monitoring (phase 11).
+pub struct Sampler {
+    // The function pointers below point into this library.
+    _lib: Library,
+    shutdown: unsafe extern "C" fn() -> Ret,
+    count: unsafe extern "C" fn(*mut c_uint) -> Ret,
+    handle: unsafe extern "C" fn(c_uint, *mut Device) -> Ret,
+    memory: DeviceFn<Memory>,
+    pci: Option<DeviceFn<PciInfo>>,
+    util: Option<DeviceFn<Utilization>>,
+    temp: Option<unsafe extern "C" fn(Device, c_uint, *mut c_uint) -> Ret>,
+    power: Option<DeviceFn<c_uint>>,
+}
+
+// NVML is thread-safe; the pointers are into a library this owns.
+unsafe impl Send for Sampler {}
+
+impl Sampler {
+    /// `None` when NVML is missing or does not start.
+    pub fn open() -> Option<Self> {
+        let lib = candidates()
+            .into_iter()
+            .find_map(|name| unsafe { Library::new(&name) }.ok())?;
+        unsafe {
+            let init: unsafe extern "C" fn() -> Ret = *lib.get(b"nvmlInit_v2\0").ok()?;
+            let shutdown = *lib.get(b"nvmlShutdown\0").ok()?;
+            let count = *lib.get(b"nvmlDeviceGetCount_v2\0").ok()?;
+            let handle = *lib.get(b"nvmlDeviceGetHandleByIndex_v2\0").ok()?;
+            let memory = *lib.get(b"nvmlDeviceGetMemoryInfo\0").ok()?;
+            let pci = lib.get(b"nvmlDeviceGetPciInfo_v3\0").ok().map(|s| *s);
+            let util = lib.get(b"nvmlDeviceGetUtilizationRates\0").ok().map(|s| *s);
+            let temp = lib.get(b"nvmlDeviceGetTemperature\0").ok().map(|s| *s);
+            let power = lib.get(b"nvmlDeviceGetPowerUsage\0").ok().map(|s| *s);
+            if init() != 0 {
+                return None;
+            }
+            Some(Self {
+                _lib: lib,
+                shutdown,
+                count,
+                handle,
+                memory,
+                pci,
+                util,
+                temp,
+                power,
+            })
+        }
+    }
+
+    /// Each NVIDIA GPU by PCI address (`index` left 0).
+    pub fn sample(&mut self) -> Vec<(String, pumasi_proto::monitor::GpuMetrics)> {
+        let mut out = Vec::new();
+        unsafe {
+            let mut n: c_uint = 0;
+            if (self.count)(&mut n) != 0 {
+                return out;
+            }
+            for i in 0..n {
+                let mut d: Device = std::ptr::null_mut();
+                if (self.handle)(i, &mut d) != 0 {
+                    continue;
+                }
+                let Some(pci) = self.pci.and_then(|f| {
+                    let mut p: PciInfo = std::mem::zeroed();
+                    (f(d, &mut p) == 0).then(|| normalize_pci(&cstr(&p.bus_id)))
+                }) else {
+                    continue;
+                };
+                let mut m = Memory {
+                    total: 0,
+                    free: 0,
+                    used: 0,
+                };
+                let have_mem = (self.memory)(d, &mut m) == 0;
+                let util = self.util.and_then(|f| {
+                    let mut u = Utilization { gpu: 0, memory: 0 };
+                    (f(d, &mut u) == 0).then_some(u.gpu)
+                });
+                let temp_c = self.temp.and_then(|f| {
+                    let mut t: c_uint = 0;
+                    (f(d, NVML_TEMPERATURE_GPU, &mut t) == 0).then_some(t as f32)
+                });
+                let power_w = self.power.and_then(|f| {
+                    let mut mw: c_uint = 0;
+                    (f(d, &mut mw) == 0).then_some(mw as f32 / 1000.0)
+                });
+                out.push((
+                    pci,
+                    pumasi_proto::monitor::GpuMetrics {
+                        index: 0,
+                        util_percent: util.unwrap_or(0) as f32,
+                        mem_used_mib: if have_mem { m.used >> 20 } else { 0 },
+                        mem_total_mib: if have_mem { m.total >> 20 } else { 0 },
+                        temp_c,
+                        power_w,
+                    },
+                ));
+            }
+        }
+        out
+    }
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        unsafe {
+            (self.shutdown)();
+        }
+    }
+}
+
 /// NVML says `00000000:01:00.0`; sysfs and QEMU say `0000:01:00.0`.
 pub fn normalize_pci(s: &str) -> String {
     let s = s.trim().to_ascii_lowercase();

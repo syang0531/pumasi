@@ -1016,6 +1016,122 @@ untouched, schedules too unless `--prune`. A node the cluster does not
 know is reported as skipped. Applying the same file twice returns no
 changes the second time.
 
+## Phase 11: monitoring
+
+### Node metrics
+
+Agents of protocol 10 (`MONITOR_PROTOCOL`) sample their machine every
+`METRICS_EVERY_SECS` (5 s, `agent/src/metrics.rs`) and send
+`FromAgent::Metrics(NodeMetrics)`: CPU use and the one-minute load,
+memory used (total minus available), the disk holding the data directory
+(the longest mount point that is a prefix of it), network byte counters
+summed over non-loopback interfaces, the hottest plausible temperature
+sensor, the running task count, and for each GPU of the device profile its
+use, VRAM, temperature and power (NVML through the same `libloading`
+handle as detection for NVIDIA, the amdgpu sysfs files for AMD on Linux;
+GPUs bound to `vfio-pci` are skipped). sysinfo needs two refreshes to
+measure CPU, so the sampler lives as long as the agent.
+
+The control plane (`cluster/src/monitor.rs`) keeps per node the latest
+sample, the network rates derived from consecutive counters, and three
+tiers of averaged points: 10 s steps for the last hour (memory only),
+1 min steps for 24 hours and 10 min steps for the retention period
+(`--metrics-retention`, 7 days by default), each capped by the retention.
+A point averages its samples, except temperature, which keeps the
+maximum. Finished 1 min and 10 min points are written to the `metrics`
+table keyed by (node, tier, step start) every 15 s and pruned hourly.
+`AdminOp::Metrics { node, since_secs }` returns `MetricsView`: every node's
+latest sample, and with a node the finest tier that covers `since_secs`
+(`step_secs` says which), plus `ClusterMetrics` (queued runs per priority,
+running runs, waiting jobs, runs held by quotas, run outcomes, preemptions
+and check mismatches since start, firing alerts).
+
+### Events
+
+`Monitor::event` appends an `EventView` (sequence number, time, level,
+kind, node, job, account, message) to a ring of the last 10,000 and to the
+`events` table, flushed with the metrics and pruned by the same
+retention. Kinds: `node.joined`, `node.online`, `node.offline` (with the
+runs it lost), `node.paused`, `node.resumed`, `node.suspended`,
+`node.removed`, `job.submitted`, `job.succeeded`, `job.failed`,
+`job.cancelled`, `task.failed` (a run that will not be retried, or a
+failed attempt), `task.preempted`, `check.mismatch`, `upgrade.failed`,
+`alert.firing` and `alert.resolved`. Job ends are found by checking the
+jobs that were active once a second. `AdminOp::Events { after,
+since_unix, limit }` is cursor-based: `pumasi events -f` passes the last
+sequence number it printed.
+
+### Live output
+
+For WASM and Docker runs (not checks), the agent gives the executor a
+`LiveOutput` buffer: Docker's stdout and stderr readers copy into it as
+they read (`read_capped_live`), WASM attaches its memory pipes. A
+streamer task sends what is new every 200 ms as `FromAgent::Logs { task,
+stdout, stderr }`, up to the same cap as the final output. The control
+plane accepts it only from the node running that attempt (generation
+checked) and keeps it until the run's report arrives; then the stored
+output takes over. `AdminOp::Logs { job, index, attempt, stdout_from,
+stderr_from }` returns a `LogChunk` with the bytes from those offsets (at
+most 1 MiB each), the task state, `done` and `live` (false when the output
+comes only at the end, as for microVM runs, whose guest writes it to the
+output disk). `pumasi logs -f` polls every 200 ms, so output reaches the
+terminal within about 0.4 s plus one round trip.
+
+### Alerts and webhooks
+
+`AlertPolicy` holds the rules: node offline (not cordoned) for
+`node_offline_secs`, failure rate over a window with a minimum run count,
+disk percent (each node's and the control plane's own data directory,
+measured every minute), temperature, benchmark drop, SMART warnings from
+the node's profile and check mismatches. Each `Option` is a threshold or
+off. `evaluate_alerts` runs every tick; stateful rules are kept in
+`firing` keyed by (rule, subject) and send a notice when they start and
+when they clear; benchmark drops and check mismatches are one-off notices.
+A node counts as offline from its last heartbeat, or from the control
+plane's start for nodes that were already offline then, so a restart does
+not page for machines that were off.
+
+Webhooks (`webhooks` table) have a name, URL and format: Slack (also
+Mattermost) and Discord payloads with the message text, or JSON with
+every `Notice` field (`cluster`, `status`, `rule`, `subject`, `level`,
+`message`, `unix`, `since_unix`). Notices go through a channel to a worker
+that posts each one with up to three attempts (2 s and 10 s apart; a 4xx
+other than 429 stops), and records sent, failed and the last error per
+webhook. URLs are secrets in effect: views show only `scheme://host/…`,
+and errors are stripped of the URL. `pumasi webhook add` sends a test
+notice (`AdminOp::TestWebhook`) and reports the result. The policy is in
+`meta.alert_policy`; `apply` can set both from `[alerts]` and
+`[webhooks.NAME]` (`url_env` reads the URL from the environment of the
+machine running `apply`).
+
+### Prometheus
+
+`--metrics-addr` starts a small HTTP/1.1 server (`prometheus.rs`) that
+answers `GET /metrics` with the text exposition format 0.0.4, `/healthz`
+with `ok`, and anything else with 404 or 405; `--metrics-token` requires
+a bearer token (compared in constant time). Families: `pumasi_build_info`;
+per node (`node`, `node_id` labels) `node_up`, `node_slots`,
+`node_running_tasks`, `node_cpu_score`, `node_last_seen_timestamp_seconds`,
+`node_rtt_seconds`, `node_cpu_usage_ratio`, `node_load1`, memory and disk
+used and total bytes, network receive and transmit byte counters,
+`node_temperature_celsius`, `node_metrics_age_seconds`; per GPU (plus a
+`gpu` label) utilization, memory, temperature and power; and for the
+cluster `queued_runs{priority}`, `running_runs`, `waiting_jobs`,
+`quota_blocked_runs`, `jobs{state}`, `jobs_finished_total`,
+`runs_total{outcome}`, `preemptions_total`, `check_mismatches_total`,
+`events_total{level}`, `alerts_firing{rule}`, `account_balance_cu` and
+`account_held_cu`, `store_bytes` and the control plane's disk. Families
+with no samples are left out. A strict parser in
+`pumasi_proto::monitor::lint_exposition` checks the output in tests, and
+CI also runs `promtool check metrics` on it.
+
+### Roles
+
+Viewers may call `Metrics`, `Events`, `Logs` and `Alerts`. Submitters may
+read metrics and alerts, read `Logs` of their own account's jobs only, and
+see only events with no account or their own. Changing the policy and
+webhooks needs an admin.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -1069,7 +1185,12 @@ tolerations, dependencies and schedule, apart from job metadata like
 `JobSubmission` gained fields at the end, which matters for stored
 schedules: a later change to it needs a migration of `schedules`.
 
-`PROTOCOL_VERSION` is 9: protocol 5 (phase 4) added `UpgradeHello` and the
+Phase 11 adds tables and keeps layout 6: `events` keyed by sequence
+number, `metrics` keyed by (node, tier, step start), `webhooks` by name,
+and the meta key `alert_policy`. An older control plane opening the file
+ignores them.
+
+`PROTOCOL_VERSION` is 10: protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
 `BenchResult` and `ToAgent::Benchmark` and `Rebenchmark`, which the control
@@ -1079,7 +1200,9 @@ trailing fields, and only protocol 8 agents get store tasks) and adds
 `FromAgent::Report` and `StoreState`. Protocol 9 appends
 `TaskAssignment::gpus` and adds `FromAgent::Devices` and `GpuResult` and
 `ToAgent::GpuChallenge`; only protocol 9 agents get GPU or microVM network
-tasks and challenges. The hello is unchanged. The control plane accepts hellos from
+tasks and challenges. Protocol 10 adds `FromAgent::Metrics` and
+`FromAgent::Logs`; since the control plane refuses agents newer than
+itself, an agent sends them only to a control plane that knows them. The hello is unchanged. The control plane accepts hellos from
 `MIN_AGENT_PROTOCOL` (5) up: `AgentHello::decode` tries the current layout
 and falls back to the protocol 5 one (available), so phase 4 and 5 agents
 keep working and can take a rollout. Upgrade the control plane first; it
@@ -1106,7 +1229,13 @@ remotely; install a current binary on them once.
   quotas, quotas count tasks rather than CPU or memory, preemption stops a
   task instead of letting it checkpoint, and schedules use the control
   plane's time zone only.
-- Remaining roadmap phases (11 to 18): monitoring, a web dashboard, Raft, WebGPU, the confidential
+- Monitoring: microVM output is not streamed while the task runs; Intel
+  and Apple GPUs report no metrics; Windows nodes report no temperature
+  (sysinfo reads it through WMI, which is not safe across threads); the 10 s tier is lost on a control
+  plane restart; alert rules are cluster-wide (no per-node or per-label
+  thresholds, no silences or repeat notices); node-to-node latency is not
+  measured.
+- Remaining roadmap phases (12 to 18): a web dashboard, Raft, WebGPU, the confidential
   tier, self-hosting 1.0 (SSO, audit log, external security review), the
   hub, buying CU. See the roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker

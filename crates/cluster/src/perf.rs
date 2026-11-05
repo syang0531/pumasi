@@ -184,10 +184,19 @@ impl State {
             .as_ref()
             .is_some_and(|c| c.claimed_single == p.cpu.single);
         let trusted = m.trusted();
-        if m.perf.as_ref() != Some(&signed) {
+        let scores = |p: &pumasi_proto::perf::PerfProfile| (p.cpu.per_vcpu(), p.memory.copy_mb_s);
+        let new_scores = scores(p);
+        let old_scores = m
+            .perf
+            .as_ref()
+            .filter(|old| old.profile.measured_unix != p.measured_unix)
+            .map(|old| scores(&old.profile));
+        let changed = m.perf.as_ref() != Some(&signed);
+        if changed {
             m.perf = Some(signed);
             let m = m.clone();
             self.store.put_member(&m)?;
+            self.note_benchmark(id, old_scores, new_scores);
         }
         if !trusted
             && !checked

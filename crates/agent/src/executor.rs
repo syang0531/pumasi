@@ -79,6 +79,67 @@ pub struct TaskIo {
     pub image: Option<LocalImage>,
     /// The GPUs the cluster gave this task.
     pub gpus: Vec<pumasi_proto::gpu::GpuInfo>,
+    /// Where the task's output goes while it runs (phase 11).
+    pub live: Option<LiveOutput>,
+}
+
+/// What a running task printed that the agent has not sent on yet. The
+/// WASM executor hands over its output pipes; the Docker executor pushes
+/// what it reads. Either way no more than [`MAX_OUTPUT_BYTES`] per stream
+/// is passed on, as much as the final report keeps.
+#[derive(Clone, Default)]
+pub struct LiveOutput(Arc<Mutex<LiveState>>);
+
+#[derive(Default)]
+struct LiveState {
+    pipes: Option<(MemoryOutputPipe, MemoryOutputPipe)>,
+    /// Bytes of each stream taken so far.
+    taken: [usize; 2],
+    pending: [Vec<u8>; 2],
+}
+
+impl std::fmt::Debug for LiveOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LiveOutput")
+    }
+}
+
+impl LiveOutput {
+    /// Adds output read from the task (`stderr` or stdout).
+    pub fn push(&self, stderr: bool, bytes: &[u8]) {
+        let mut s = self.0.lock().unwrap();
+        let i = stderr as usize;
+        let room = MAX_OUTPUT_BYTES.saturating_sub(s.taken[i] + s.pending[i].len());
+        let take = &bytes[..bytes.len().min(room)];
+        s.pending[i].extend_from_slice(take);
+    }
+
+    fn attach_pipes(&self, stdout: MemoryOutputPipe, stderr: MemoryOutputPipe) {
+        self.0.lock().unwrap().pipes = Some((stdout, stderr));
+    }
+
+    /// What came since the last call: (stdout, stderr).
+    pub fn take(&self) -> (Vec<u8>, Vec<u8>) {
+        let mut s = self.0.lock().unwrap();
+        if let Some((out, err)) = s.pipes.clone() {
+            for (i, pipe) in [out, err].iter().enumerate() {
+                let all = pipe.contents();
+                if all.len() > s.taken[i] {
+                    let new = all[s.taken[i]..].to_vec();
+                    s.pending[i].extend_from_slice(&new);
+                }
+                s.taken[i] = all.len().max(s.taken[i]);
+            }
+            let out = std::mem::take(&mut s.pending[0]);
+            let err = std::mem::take(&mut s.pending[1]);
+            return (out, err);
+        }
+        let out = std::mem::take(&mut s.pending[0]);
+        let err = std::mem::take(&mut s.pending[1]);
+        s.taken[0] += out.len();
+        s.taken[1] += err.len();
+        (out, err)
+    }
 }
 
 impl TaskIo {
@@ -357,6 +418,9 @@ impl WasmExecutor {
 
         let stdout = MemoryOutputPipe::new(MAX_OUTPUT_BYTES);
         let stderr = MemoryOutputPipe::new(MAX_OUTPUT_BYTES);
+        if let Some(live) = &io.live {
+            live.attach_pipes(stdout.clone(), stderr.clone());
+        }
         let mut args = vec![program.to_string()];
         args.extend(input.args.iter().cloned());
         let env: Vec<(String, String)> = input

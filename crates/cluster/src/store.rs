@@ -24,6 +24,7 @@ use crate::{
     state::{DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord},
 };
 use pumasi_proto::manage::{AccountQuota, NodeConfig};
+use pumasi_proto::monitor::{AlertPolicy, EventView, MetricPoint, WebhookSpec};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("members");
@@ -79,6 +80,12 @@ const PREEMPTED: TableDefinition<(u128, u32, bool), u32> = TableDefinition::new(
 const ACCESS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("access");
 /// Schedules, by name.
 const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules");
+/// Monitoring (phase 11). Cluster events, by sequence number.
+const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
+/// Downsampled node metrics, by (node id, tier, step start).
+const METRICS: TableDefinition<(&str, u8, u64), &[u8]> = TableDefinition::new("metrics");
+/// Webhooks, by name.
+const WEBHOOKS: TableDefinition<&str, &[u8]> = TableDefinition::new("webhooks");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -86,6 +93,7 @@ const POLICY_META: &str = "policy";
 const CREDIT_RATE_META: &str = "credit_cpu_hour";
 /// Set once the credit receipts were countersigned again in CU.
 const CREDIT_RECEIPTS_DONE_META: &str = "credit_receipts_converted";
+const ALERT_POLICY_META: &str = "alert_policy";
 /// Layout version written by this build.
 const SCHEMA: u32 = 6;
 
@@ -179,6 +187,9 @@ impl Store {
         tx.open_table(PREEMPTED)?;
         tx.open_table(ACCESS)?;
         tx.open_table(SCHEDULES)?;
+        tx.open_table(EVENTS)?;
+        tx.open_table(METRICS)?;
+        tx.open_table(WEBHOOKS)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -221,6 +232,8 @@ impl Store {
             store.put_meta(SCHEMA_META, &6u32.to_le_bytes())?;
             info!("migrated state database to layout 6");
         }
+        // Phase 11 only adds tables (events, metrics, webhooks) and a meta
+        // key that older binaries ignore safely, so the layout stays 6.
         Ok(store)
     }
 
@@ -815,6 +828,139 @@ impl Store {
         tx.open_table(ACCESS)?.remove(secret.as_slice())?;
         tx.commit()?;
         Ok(())
+    }
+
+    // -- monitoring (phase 11) ---------------------------------------------
+
+    pub fn put_events(&self, events: &[EventView]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(EVENTS)?;
+            for e in events {
+                t.insert(e.seq, enc(e).as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest `limit` events, oldest first.
+    pub fn load_events(&self, limit: usize) -> Result<Vec<EventView>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(EVENTS)?.iter()?.rev().take(limit) {
+            let (_, v) = row?;
+            out.push(dec(v.value())?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    pub fn put_points(&self, points: &[(String, u8, MetricPoint)]) -> Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(METRICS)?;
+            for (node, tier, p) in points {
+                t.insert((node.as_str(), *tier, p.unix), enc(p).as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every stored point not older than `since[tier]`.
+    pub fn load_points(&self, since: &[u64]) -> Result<Vec<(String, u8, MetricPoint)>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(METRICS)?.iter()? {
+            let (k, v) = row?;
+            let (node, tier, unix) = k.value();
+            if since.get(tier as usize).is_some_and(|s| unix >= *s) {
+                out.push((node.to_string(), tier, dec(v.value())?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes events before `events_before` (and beyond the newest
+    /// `max_events`), points older than `points_before[tier]`, and every
+    /// point of nodes not in `nodes`.
+    pub fn prune_monitor(
+        &self,
+        events_before: u64,
+        max_events: usize,
+        points_before: &[u64],
+        nodes: &std::collections::HashSet<String>,
+    ) -> Result<(usize, usize)> {
+        let tx = self.db.begin_write()?;
+        let events;
+        let points;
+        {
+            let mut t = tx.open_table(EVENTS)?;
+            let total = t.len()? as usize;
+            let mut doomed = Vec::new();
+            for (i, row) in t.iter()?.enumerate() {
+                let (k, v) = row?;
+                let e: EventView = dec(v.value())?;
+                if e.unix < events_before || total - i > max_events {
+                    doomed.push(k.value());
+                } else {
+                    break;
+                }
+            }
+            for k in &doomed {
+                t.remove(k)?;
+            }
+            events = doomed.len();
+        }
+        {
+            let mut t = tx.open_table(METRICS)?;
+            let mut doomed: Vec<(String, u8, u64)> = Vec::new();
+            for row in t.iter()? {
+                let (k, _) = row?;
+                let (node, tier, unix) = k.value();
+                let old = points_before.get(tier as usize).is_none_or(|b| unix < *b);
+                if old || !nodes.contains(node) {
+                    doomed.push((node.to_string(), tier, unix));
+                }
+            }
+            for (node, tier, unix) in &doomed {
+                t.remove((node.as_str(), *tier, *unix))?;
+            }
+            points = doomed.len();
+        }
+        tx.commit()?;
+        Ok((events, points))
+    }
+
+    pub fn alert_policy(&self) -> Result<Option<AlertPolicy>> {
+        self.get_meta(ALERT_POLICY_META)?
+            .map(|b| dec(&b))
+            .transpose()
+    }
+
+    pub fn put_alert_policy(&self, p: &AlertPolicy) -> Result<()> {
+        self.put_meta(ALERT_POLICY_META, &enc(p))
+    }
+
+    pub fn webhooks(&self) -> Result<Vec<WebhookSpec>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(WEBHOOKS)?.iter()? {
+            let (_, v) = row?;
+            out.push(dec(v.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn put_webhook(&self, name: &str, w: Option<&WebhookSpec>) -> Result<()> {
+        self.put_str_row(WEBHOOKS, name, w.map(enc))
     }
 
     /// What each account spent (charges, storage, egress) since `since`:

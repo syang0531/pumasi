@@ -67,6 +67,12 @@ pub struct ClusterConfig {
     pub storage_bill_every: Duration,
     /// The control plane's disk, which picks the storage rate.
     pub disk_class: DiskClass,
+    /// Serve Prometheus metrics over HTTP on this address (opt-in).
+    pub metrics_addr: Option<SocketAddr>,
+    /// Require `Authorization: Bearer <token>` on `/metrics`.
+    pub metrics_token: Option<String>,
+    /// How long node metrics and events are kept.
+    pub metrics_retention: Duration,
 }
 
 impl ClusterConfig {
@@ -81,11 +87,14 @@ impl ClusterConfig {
             gc_interval: Duration::from_secs(600),
             storage_bill_every: Duration::from_secs(3600),
             disk_class: DiskClass::Unknown,
+            metrics_addr: None,
+            metrics_token: None,
+            metrics_retention: Duration::from_secs(7 * 86_400),
         }
     }
 }
 
-struct Inner {
+pub(crate) struct Inner {
     state: Mutex<State>,
     admin_secret: Secret,
     endpoint: Endpoint,
@@ -96,7 +105,7 @@ struct Inner {
 }
 
 impl Inner {
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+    pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("state lock poisoned")
     }
 
@@ -111,6 +120,8 @@ pub struct Cluster {
     router: Router,
     ticker: JoinHandle<()>,
     worker: JoinHandle<()>,
+    webhooks: JoinHandle<()>,
+    prometheus: Option<(JoinHandle<()>, SocketAddr)>,
 }
 
 impl Cluster {
@@ -151,7 +162,8 @@ impl Cluster {
             config.bind,
         )
         .await?;
-        let state = State::load(name.clone(), endpoint.id().to_string(), store, signing_key)?;
+        let mut state = State::load(name.clone(), endpoint.id().to_string(), store, signing_key)?;
+        state.set_metrics_retention(config.metrics_retention);
         let addr = dialable_addr(&endpoint, config.net).await;
 
         let inner = Arc::new(Inner {
@@ -169,6 +181,32 @@ impl Cluster {
             .state()
             .attach_store(store_tx, config.disk_class, config.storage_bill_every);
         let worker = tokio::spawn(store_worker(inner.clone(), store_rx));
+        let (hook_tx, hook_rx) = mpsc::unbounded_channel();
+        inner.state().attach_webhooks(hook_tx);
+        let webhooks = tokio::spawn(crate::prometheus::webhook_worker(inner.clone(), hook_rx));
+        let prometheus = match config.metrics_addr {
+            Some(addr) => {
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("bind the metrics address {addr}"))?;
+                let local = listener.local_addr()?;
+                if !local.ip().is_loopback() && config.metrics_token.is_none() {
+                    warn!(
+                        "metrics are served on {local} without a token; anyone who reaches it sees node names and usage"
+                    );
+                }
+                info!(addr = %local, "serving Prometheus metrics on /metrics");
+                Some((
+                    tokio::spawn(crate::prometheus::serve(
+                        inner.clone(),
+                        listener,
+                        config.metrics_token.clone(),
+                    )),
+                    local,
+                ))
+            }
+            None => None,
+        };
         let blobs_protocol = {
             let gate_inner = inner.clone();
             let egress_inner = inner.clone();
@@ -188,8 +226,20 @@ impl Cluster {
             let inner = inner.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(500));
+                let mut ticks: u64 = 0;
                 loop {
                     tick.tick().await;
+                    // The control plane's own disk, every 30 seconds.
+                    if ticks.is_multiple_of(60) {
+                        let dir = inner.config.data_dir.clone();
+                        if let Ok(disk) =
+                            tokio::task::spawn_blocking(move || crate::prometheus::disk_of(&dir))
+                                .await
+                        {
+                            inner.state().monitor_cp_disk(disk);
+                        }
+                    }
+                    ticks += 1;
                     inner.state().tick(inner.config.node_timeout);
                     // Keep the advertised address fresh (relay may change).
                     let fresh = inner.endpoint.addr();
@@ -205,6 +255,8 @@ impl Cluster {
             router,
             ticker,
             worker,
+            webhooks,
+            prometheus,
         };
         // The local CLI picks this up to talk to the cluster.
         write_private(
@@ -269,13 +321,37 @@ impl Cluster {
         self.inner.files.disk_bytes()
     }
 
+    /// Where `/metrics` is served, when it is.
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.prometheus.as_ref().map(|(_, a)| *a)
+    }
+
+    /// The Prometheus text `/metrics` serves.
+    pub fn prometheus_text(&self) -> String {
+        self.inner.state().prometheus()
+    }
+
+    /// Alerts sent to webhooks lately (for tests).
+    pub fn recent_notices(&self) -> Vec<crate::monitor::Notice> {
+        self.inner.state().recent_notices()
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         self.ticker.abort();
         self.worker.abort();
+        self.webhooks.abort();
+        if let Some((p, _)) = &self.prometheus {
+            p.abort();
+        }
         // Aborted tasks drop their state handles when they next yield;
         // wait for that so the database is closed when this returns.
         let _ = self.ticker.await;
         let _ = self.worker.await;
+        let _ = self.webhooks.await;
+        if let Some((p, _)) = self.prometheus {
+            let _ = p.await;
+        }
+        self.inner.state().flush_monitor();
         self.router.shutdown().await.context("router shutdown")?;
         self.inner.files.store.shutdown().await.ok();
         // Tasks of ended sessions let go of the state as their connections
@@ -489,6 +565,16 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
                     st.on_availability(&node_id, generation, a);
+                }
+                Ok(Some(FromAgent::Metrics(m))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_metrics(&node_id, generation, *m);
+                }
+                Ok(Some(FromAgent::Logs { task, stdout, stderr })) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_logs(&node_id, generation, task, stdout, stderr);
                 }
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),
@@ -751,6 +837,25 @@ async fn handle_store_admin(
                 AdminResponse::StoragePolicy { policy, class }
             })
         }
+        AdminOp::TestWebhook { name } => {
+            async {
+                let (url, body) = inner.state().test_delivery(&name)?;
+                let (tx, rx) = oneshot::channel();
+                let sent = crate::monitor::Delivery {
+                    webhook: name.clone(),
+                    url,
+                    body,
+                    reply: Some(tx),
+                };
+                crate::prometheus::deliver(inner.clone(), sent);
+                match rx.await {
+                    Ok(Ok(())) => Ok(AdminResponse::Ok),
+                    Ok(Err(e)) => Err(anyhow::anyhow!("webhook {name}: {e}")),
+                    Err(_) => Err(anyhow::anyhow!("webhook {name}: no answer")),
+                }
+            }
+            .await
+        }
         other => return Err(other),
     })
 }
@@ -899,6 +1004,43 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             id: inner.state().run_schedule(&name, true)?,
         }),
         AdminOp::Apply(spec) => Ok(AdminResponse::Applied(inner.state().apply(*spec)?)),
+        AdminOp::Metrics { node, since_secs } => Ok(AdminResponse::Metrics(Box::new(
+            inner.state().metrics_view(node.as_deref(), since_secs)?,
+        ))),
+        AdminOp::Events {
+            after,
+            since_unix,
+            limit,
+        } => Ok(AdminResponse::Events(
+            inner.state().events(after, since_unix, limit),
+        )),
+        AdminOp::Logs {
+            job,
+            index,
+            attempt,
+            stdout_from,
+            stderr_from,
+        } => Ok(AdminResponse::Logs(Box::new(inner.state().logs(
+            job,
+            index,
+            attempt,
+            stdout_from,
+            stderr_from,
+        )?))),
+        AdminOp::Alerts => Ok(AdminResponse::Alerts(Box::new(inner.state().alerts_view()))),
+        AdminOp::SetAlertPolicy(p) => {
+            let mut st = inner.state();
+            st.set_alert_policy(*p)?;
+            Ok(AdminResponse::Alerts(Box::new(st.alerts_view())))
+        }
+        AdminOp::SetWebhook(w) => {
+            inner.state().set_webhook(*w)?;
+            Ok(AdminResponse::Ok)
+        }
+        AdminOp::RemoveWebhook { name } => {
+            inner.state().remove_webhook(&name)?;
+            Ok(AdminResponse::Ok)
+        }
         other => anyhow::bail!("unexpected admin call {other:?}"),
     })();
     result.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))

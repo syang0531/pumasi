@@ -169,6 +169,14 @@ impl State {
         warn!(node = %node, sha256 = %hex(&sha256), "upgrade failed: {reason}");
         n.draining = false;
         self.upgrading.remove(node);
+        let name = self.node_name(node);
+        self.event(
+            pumasi_proto::monitor::EventLevel::Warning,
+            "upgrade.failed",
+            Some(node),
+            None,
+            format!("upgrade of {name} failed: {reason}"),
+        );
         self.upgrade_failures
             .insert(node.to_string(), (sha256, reason));
         self.schedule();

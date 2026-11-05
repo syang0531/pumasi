@@ -1,14 +1,19 @@
-//! Accounts and settlement: prepaid credit, charges from receipts, held
-//! provider earnings, release after the hold period, forfeits.
+//! Accounts and settlement in milli-CU: grants (prepaid mode), charges from
+//! receipts, held provider earnings, release after the hold period,
+//! forfeits.
 //!
-//! Every money movement is a pair of ledger entries written in the same
-//! redb transaction as the balances (and the receipt that caused it).
+//! Every movement is a pair of ledger entries written in the same redb
+//! transaction as the balances (and the receipt that caused it).
 
 use anyhow::{Result, bail, ensure};
 use pumasi_proto::{
-    economy::{Micros, format_credits, validate_account},
+    economy::{
+        LedgerMode, MICRO_PER_MILLI, MicroCu, MilliCu, credits_to_milli_cu_num, format_cu,
+        validate_account,
+    },
     msg::{AccountView, LedgerEntry, LedgerKind, TaskRef},
-    receipt::Receipt,
+    perf::REFERENCE_SCORE,
+    receipt::{Billing, Receipt, SignedUsage},
 };
 use tracing::{info, warn};
 
@@ -24,6 +29,7 @@ struct Batch {
     touched: Vec<String>,
     put_holds: Vec<Hold>,
     del_holds: Vec<TaskRef>,
+    carries: Vec<(String, String, i64)>,
 }
 
 impl State {
@@ -64,7 +70,7 @@ impl State {
         b: &mut Batch,
         account: &str,
         kind: LedgerKind,
-        amount: Micros,
+        amount: MilliCu,
         task: Option<TaskRef>,
         memo: String,
     ) {
@@ -95,6 +101,7 @@ impl State {
             entries: &b.entries,
             put_holds: &b.put_holds,
             del_holds: &b.del_holds,
+            carries: &b.carries,
             receipt,
         });
         if let Err(e) = res {
@@ -102,10 +109,34 @@ impl State {
         }
     }
 
+    /// Adds a run's exact price to what the consumer already owed the
+    /// provider below one milli-CU, and returns the whole milli-CU to move
+    /// now. The rest waits for their next run.
+    pub(crate) fn carry_forward(
+        &mut self,
+        consumer: &str,
+        provider: &str,
+        exact: MicroCu,
+    ) -> MilliCu {
+        if consumer == provider || exact <= 0 {
+            return 0;
+        }
+        let key = (consumer.to_string(), provider.to_string());
+        let total = self.carry.get(&key).copied().unwrap_or(0) + exact;
+        self.carry.insert(key, total % MICRO_PER_MILLI);
+        total / MICRO_PER_MILLI
+    }
+
     /// Stores a countersigned receipt and, when it carries a charge, debits
     /// the consumer and puts the provider's earning on hold.
     pub(crate) fn charge(&mut self, receipt: &Receipt) {
         let mut b = Batch::default();
+        let Billing {
+            consumer, provider, ..
+        } = &receipt.billing;
+        if let Some(c) = self.carry.get(&(consumer.clone(), provider.clone())) {
+            b.carries.push((consumer.clone(), provider.clone(), *c));
+        }
         let billing = &receipt.billing;
         let t = receipt.usage.task;
         if billing.amount > 0 {
@@ -226,12 +257,13 @@ impl State {
             task.cost -= h.amount;
         }
         b.del_holds.push(t);
-        info!(task = %t, provider = %h.provider, amount = %format_credits(h.amount), "earning forfeited: {reason}");
+        info!(task = %t, provider = %h.provider, amount = %format_cu(h.amount), "earning forfeited: {reason}");
         self.commit(b, None);
     }
 
-    pub fn deposit(&mut self, account: &str, amount: Micros, memo: &str) -> Result<AccountView> {
+    pub fn deposit(&mut self, account: &str, amount: MilliCu, memo: &str) -> Result<AccountView> {
         ensure!(amount > 0, "amount must be positive");
+        self.ensure_prepaid("granted")?;
         self.ensure_account(account)?;
         let mut b = Batch::default();
         self.account(account).balance += amount;
@@ -249,15 +281,16 @@ impl State {
         Ok(self.accounts[account].clone())
     }
 
-    pub fn payout(&mut self, account: &str, amount: Micros, memo: &str) -> Result<AccountView> {
+    pub fn payout(&mut self, account: &str, amount: MilliCu, memo: &str) -> Result<AccountView> {
         ensure!(amount > 0, "amount must be positive");
+        self.ensure_prepaid("paid out")?;
         let Some(a) = self.accounts.get(account) else {
             bail!("no account {account:?}");
         };
         if a.balance < amount {
             bail!(
-                "{account} has {} credits available (held earnings are not available until released)",
-                format_credits(a.balance)
+                "{account} has {} CU available (held earnings are not available until released)",
+                format_cu(a.balance)
             );
         }
         let mut b = Batch::default();
@@ -274,6 +307,15 @@ impl State {
         Ok(self.accounts[account].clone())
     }
 
+    fn ensure_prepaid(&self, what: &str) -> Result<()> {
+        if let LedgerMode::Mutual { .. } = self.policy.ledger {
+            bail!(
+                "the cluster is in mutual mode: CU are earned by lending machines and spent by using them, not {what}"
+            );
+        }
+        Ok(())
+    }
+
     pub fn accounts(&self) -> Vec<AccountView> {
         let mut v: Vec<AccountView> = self.accounts.values().cloned().collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
@@ -282,5 +324,45 @@ impl State {
 
     pub fn ledger(&self, account: Option<&str>, limit: usize) -> Result<Vec<LedgerEntry>> {
         self.store.ledger(account, limit)
+    }
+}
+
+impl State {
+    /// Countersigns the receipts of the credit ledger again, in CU, once
+    /// after the database moved to compute units. The node signatures stay
+    /// valid: what a node signed (its usage) did not change.
+    pub(crate) fn convert_credit_receipts(&mut self) -> Result<()> {
+        let Some((cpu_hour, old)) = self.store.credit_receipts()? else {
+            return Ok(());
+        };
+        let receipts: Vec<Receipt> = old
+            .into_iter()
+            .map(|o| {
+                let (n, d) = credits_to_milli_cu_num(o.billing.amount, cpu_hour);
+                let billing = Billing {
+                    consumer: o.billing.consumer,
+                    provider: o.billing.provider,
+                    billed_wall_ms: o.billing.billed_wall_ms,
+                    cpu_score: REFERENCE_SCORE,
+                    exact_ucu: (n * MICRO_PER_MILLI as i128).div_euclid(d) as i64,
+                    amount: n.div_euclid(d) as i64,
+                    check: o.billing.check,
+                    recorded_unix: o.billing.recorded_unix,
+                };
+                let signed = SignedUsage {
+                    usage: o.usage,
+                    node_sig: o.node_sig,
+                };
+                Receipt::countersign(signed, billing, &self.key)
+            })
+            .collect();
+        self.store.finish_credit_receipts(&receipts)?;
+        if !receipts.is_empty() {
+            info!(
+                receipts = receipts.len(),
+                "countersigned the credit receipts again in CU"
+            );
+        }
+        Ok(())
     }
 }

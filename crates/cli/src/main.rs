@@ -15,22 +15,26 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use pumasi_agent::{
-    Agent, AgentConfig, AgentExit, MicrovmConfig, MicrovmExecutor, UpgradeConfig, WasmExecutor,
-    default_node_name,
+    Agent, AgentConfig, AgentExit, BenchConfig, MicrovmConfig, MicrovmExecutor, UpgradeConfig,
+    WasmExecutor, default_node_name,
     microvm::{Assets, Backend},
 };
 use pumasi_cluster::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
-    economy::{Policy, format_credits, parse_credits, parse_rate_permille, validate_account},
+    economy::{
+        LedgerMode, Policy, format_cu, format_rate, parse_cu, parse_rate, parse_rate_permille,
+        validate_account,
+    },
     job::{
         Executor, JobFile, JobId, Limits, MAX_INPUT_FILES_BYTES, TaskInput, parse_duration_ms,
         read_files, write_files,
     },
     msg::{
         AccountView, AdminOp, AdminResponse, ClusterStatus, Invite, JobView, LedgerEntry,
-        LedgerKind, Outcome, Role, TaskState, Verification,
+        LedgerKind, NodeView, Outcome, Role, TaskState, Verification,
     },
     net::NetMode,
+    perf::PerfProfile,
     receipt::Receipt,
     ticket::{AdminTicket, JoinTicket},
 };
@@ -70,7 +74,7 @@ enum Cmd {
     },
     /// Invite someone else's machine to join as a provider. It runs WASM
     /// tasks and, if it opts in with --allow-microvm, image jobs in microVMs
-    /// (Docker only with --allow-docker), earns credits for ACCOUNT, and has
+    /// (Docker only with --allow-docker), earns CU for ACCOUNT, and has
     /// a sample of its WASM results checked.
     Invite {
         /// Account the machine earns for, usually its owner's name
@@ -90,13 +94,38 @@ enum Cmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
-    /// Prepaid credit: balances, deposits, payouts and the ledger.
-    #[command(subcommand)]
-    Credit(CreditCmd),
-    /// Show the price list and settlement policy, or change it.
+    /// Compute units (CU): balances, grants, payouts and the ledger.
+    #[command(subcommand, alias = "credit")]
+    Cu(CuCmd),
+    /// Show the CU rates and settlement policy, or change them.
     Prices {
         #[command(subcommand)]
         cmd: Option<PricesCmd>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Benchmark this machine the way the agent does (CPU, memory, the disk
+    /// under DIR, SMART) and print the profile.
+    Bench {
+        /// Directory whose drive to measure (default: the agent's).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// A short run (about a second) instead of the full one.
+        #[arg(long)]
+        quick: bool,
+        /// Print the profile as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Measure only this many CPUs (default: all).
+        #[arg(long)]
+        cpus: Option<u32>,
+    },
+    /// Show one node: its benchmark profile, billed CPU score, latency and
+    /// checks. With --rebenchmark, ask it to measure itself again.
+    Node {
+        id: String,
+        #[arg(long)]
+        rebenchmark: bool,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -274,23 +303,23 @@ impl VmArgs {
 }
 
 #[derive(Subcommand)]
-enum CreditCmd {
+enum CuCmd {
     /// Show every account's balance.
     List {
         #[command(flatten)]
         admin: AdminArgs,
     },
-    /// Add prepaid credit to an account (bookkeeping only; no money moves).
+    /// Grant CU to an account (prepaid mode; bookkeeping, no money moves).
     Add {
         account: String,
-        /// Credits, e.g. 50 or 12.5.
+        /// CU, e.g. 50 or 12.5.
         amount: String,
         #[arg(long, default_value = "")]
         memo: String,
         #[command(flatten)]
         admin: AdminArgs,
     },
-    /// Record a payout from an account's available balance.
+    /// Record CU leaving an account's available balance (prepaid mode).
     Payout {
         account: String,
         amount: String,
@@ -313,20 +342,25 @@ enum CreditCmd {
 
 #[derive(Subcommand)]
 enum PricesCmd {
-    /// Change prices or policy; options left out keep their value.
+    /// Change rates or policy; options left out keep their value. CPU time
+    /// has no rate: one reference vCPU-hour is one CU.
     Set {
-        /// Credits per billion fuel units of a WASM task.
-        #[arg(long)]
-        wasm_per_gfuel: Option<String>,
-        /// Credits per core-hour of a Docker task.
-        #[arg(long)]
-        docker_cpu_hour: Option<String>,
-        /// Credits per vCPU-hour of a microVM task.
-        #[arg(long)]
-        microvm_cpu_hour: Option<String>,
-        /// Credits per GiB-hour of reserved memory.
+        /// CU per GiB-hour of reserved memory, e.g. 0.25.
         #[arg(long)]
         memory_gib_hour: Option<String>,
+        /// CU per GiB-month of stored data.
+        #[arg(long)]
+        storage_gib_month: Option<String>,
+        /// CU per GiB sent out of the cluster.
+        #[arg(long)]
+        egress_gib: Option<String>,
+        /// `prepaid` (the owner grants CU) or `mutual` (품앗이: lending
+        /// earns CU, using spends them, nobody grants any).
+        #[arg(long)]
+        ledger: Option<LedgerArg>,
+        /// Mutual mode: how far below zero an account may go, in CU.
+        #[arg(long)]
+        credit_limit: Option<String>,
         /// How long provider earnings stay held, e.g. 1h, 1d.
         #[arg(long)]
         hold: Option<String>,
@@ -367,6 +401,12 @@ enum AgentCmd {
         #[command(flatten)]
         opts: AgentOpts,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LedgerArg {
+    Prepaid,
+    Mutual,
 }
 
 #[derive(Args, Clone)]
@@ -416,6 +456,13 @@ struct AgentOpts {
     /// Never let the cluster replace this agent's binary.
     #[arg(long)]
     no_auto_upgrade: bool,
+    /// Do not benchmark this machine. Its runs are then billed at the
+    /// reference CPU score (1000).
+    #[arg(long)]
+    no_benchmark: bool,
+    /// How often to benchmark again (while idle), e.g. 24h or 7d.
+    #[arg(long, default_value = "24h")]
+    bench_interval: String,
     #[command(flatten)]
     net: NetArgs,
 }
@@ -606,8 +653,44 @@ async fn run(cli: Cli) -> Result<i32> {
             println!("pumasi agent join {ticket}");
             Ok(0)
         }
-        Cmd::Credit(cmd) => credit(&home, cmd).await,
+        Cmd::Cu(cmd) => cu(&home, cmd).await,
         Cmd::Prices { cmd, admin } => prices(&home, cmd, &admin).await,
+        Cmd::Bench {
+            dir,
+            quick,
+            json,
+            cpus,
+        } => bench(&home, dir, quick, json, cpus).await,
+        Cmd::Node {
+            id,
+            rebenchmark,
+            admin,
+        } => {
+            let client = connect_admin(&home, &admin).await?;
+            let AdminResponse::Status(s) = client.call(AdminOp::Status).await? else {
+                bail!("unexpected response");
+            };
+            let matches: Vec<&NodeView> = s
+                .nodes
+                .iter()
+                .filter(|n| n.id.starts_with(id.trim()))
+                .collect();
+            let n = match matches.as_slice() {
+                [one] => *one,
+                [] => bail!("no such node"),
+                _ => bail!("node id prefix {id:?} is ambiguous; give more characters"),
+            };
+            if rebenchmark {
+                client.call(AdminOp::Benchmark { id: n.id.clone() }).await?;
+                eprintln!(
+                    "asked {} to benchmark again; check back in a minute",
+                    n.info.name
+                );
+            }
+            client.close().await;
+            print_node(n);
+            Ok(0)
+        }
         Cmd::Receipts { id, export, admin } => {
             let id: JobId = id.parse()?;
             let client = connect_admin(&home, &admin).await?;
@@ -827,6 +910,14 @@ async fn agent(
             }
         }
     };
+    // The drive measured is the one under the agent's data directory.
+    let bench = if opts.no_benchmark {
+        None
+    } else {
+        let mut b = BenchConfig::standard(data_dir.clone());
+        b.interval = Duration::from_millis(parse_duration_ms(&opts.bench_interval)?);
+        Some(b)
+    };
     let config = AgentConfig {
         data_dir,
         name: opts.name.unwrap_or_else(default_node_name),
@@ -846,6 +937,7 @@ async fn agent(
         bind: opts.net.bind,
         docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
         microvm: opts.allow_microvm.then(|| opts.vm.config(home)),
+        bench,
         upgrade: own_exe().map(|exe| UpgradeConfig {
             exe,
             auto: if opts.auto_upgrade {
@@ -1060,7 +1152,7 @@ fn print_status(s: &ClusterStatus) {
     println!("cluster {} ({})", s.cluster_name, short(&s.cluster_id));
     println!();
     println!(
-        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8}",
+        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
         "NODE",
         "NAME",
         "STATE",
@@ -1071,7 +1163,10 @@ fn print_status(s: &ClusterStatus) {
         "SLOTS",
         "RUNNING",
         "COMPLETED",
-        "CHECKS"
+        "CHECKS",
+        "SCORE",
+        "DISK",
+        "RTT ms"
     );
     for n in &s.nodes {
         let role = match n.role {
@@ -1092,8 +1187,23 @@ fn print_status(s: &ClusterStatus) {
         } else {
             format!("{}/{}", n.checks_passed, n.strikes)
         };
+        let disk = n
+            .perf
+            .as_ref()
+            .and_then(|p| p.disk.as_ref())
+            .map(|d| d.class.to_string())
+            .unwrap_or_else(|| "-".into());
+        let rtt = n
+            .rtt_us
+            .map(|r| format!("{:.1}", r as f64 / 1000.0))
+            .unwrap_or_else(|| "-".into());
+        let score = format!(
+            "{}{}",
+            n.cpu_score,
+            if n.perf_note.is_some() { "*" } else { "" }
+        );
         println!(
-            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8}",
+            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
             short(&n.id),
             truncate(&n.info.name, 16),
             state,
@@ -1104,8 +1214,14 @@ fn print_status(s: &ClusterStatus) {
             n.info.slots,
             n.running,
             n.completed,
-            checks
+            checks,
+            score,
+            disk,
+            rtt
         );
+    }
+    if s.nodes.iter().any(|n| n.perf_note.is_some()) {
+        println!("(SCORE: billed CPU score, 1000 = reference vCPU; * see `pumasi node <id>`)");
     }
     for n in s.nodes.iter().filter(|n| n.online) {
         if let Some(reason) = &n.paused {
@@ -1135,7 +1251,7 @@ fn print_status(s: &ClusterStatus) {
             j.succeeded,
             j.failed,
             truncate(&j.account, 10),
-            format_credits(j.cost)
+            format_cu(j.cost)
         );
     }
     if s.jobs.is_empty() {
@@ -1151,9 +1267,9 @@ fn print_job(v: &JobView, output: bool) {
         None => println!("  executor {}", v.executor),
     }
     println!(
-        "  account {}  cost {} credits{}",
+        "  account {}  cost {} CU{}",
         s.account,
-        format_credits(s.cost),
+        format_cu(s.cost),
         if v.deterministic {
             "  deterministic"
         } else {
@@ -1194,7 +1310,7 @@ fn print_job(v: &JobView, output: bool) {
             Verification::Skipped(why) => format!(" check=skipped ({why})"),
         };
         let cost = if t.cost > 0 {
-            format!(" cost={}", format_credits(t.cost))
+            format!(" cost={}", format_cu(t.cost))
         } else {
             String::new()
         };
@@ -1538,27 +1654,36 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Credit, prices and receipts
+// Compute units, rates, benchmarks and receipts
 // ---------------------------------------------------------------------------
 
-async fn credit(home: &Path, cmd: CreditCmd) -> Result<i32> {
+async fn cu(home: &Path, cmd: CuCmd) -> Result<i32> {
     match cmd {
-        CreditCmd::List { admin } => {
+        CuCmd::List { admin } => {
             let client = connect_admin(home, &admin).await?;
             let AdminResponse::Accounts(accounts) = client.call(AdminOp::Accounts).await? else {
                 bail!("unexpected response");
             };
+            let AdminResponse::Policy(p) = client.call(AdminOp::GetPolicy).await? else {
+                bail!("unexpected response");
+            };
             client.close().await;
             print_accounts(&accounts);
+            if let LedgerMode::Mutual { credit_limit } = p.ledger {
+                println!(
+                    "(mutual mode: lending earns CU, using spends them; an account may go down to -{} CU)",
+                    format_cu(credit_limit)
+                );
+            }
         }
-        CreditCmd::Add {
+        CuCmd::Add {
             account,
             amount,
             memo,
             admin,
         } => {
             validate_account(&account)?;
-            let amount = parse_credits(&amount)?;
+            let amount = parse_cu(&amount)?;
             let client = connect_admin(home, &admin).await?;
             let AdminResponse::Accounts(a) = client
                 .call(AdminOp::Deposit {
@@ -1573,13 +1698,13 @@ async fn credit(home: &Path, cmd: CreditCmd) -> Result<i32> {
             client.close().await;
             print_accounts(&a);
         }
-        CreditCmd::Payout {
+        CuCmd::Payout {
             account,
             amount,
             memo,
             admin,
         } => {
-            let amount = parse_credits(&amount)?;
+            let amount = parse_cu(&amount)?;
             let client = connect_admin(home, &admin).await?;
             let AdminResponse::Accounts(a) = client
                 .call(AdminOp::Payout {
@@ -1594,7 +1719,7 @@ async fn credit(home: &Path, cmd: CreditCmd) -> Result<i32> {
             client.close().await;
             print_accounts(&a);
         }
-        CreditCmd::Ledger {
+        CuCmd::Ledger {
             account,
             limit,
             admin,
@@ -1615,16 +1740,16 @@ async fn credit(home: &Path, cmd: CreditCmd) -> Result<i32> {
 fn print_accounts(accounts: &[AccountView]) {
     println!(
         "{:<16} {:>14} {:>14} {:>14} {:>14}",
-        "ACCOUNT", "AVAILABLE", "HELD", "SPENT", "EARNED"
+        "ACCOUNT", "AVAILABLE CU", "HELD", "SPENT", "EARNED"
     );
     for a in accounts {
         println!(
             "{:<16} {:>14} {:>14} {:>14} {:>14}",
             truncate(&a.name, 16),
-            format_credits(a.balance),
-            format_credits(a.held),
-            format_credits(a.spent),
-            format_credits(a.earned)
+            format_cu(a.balance),
+            format_cu(a.held),
+            format_cu(a.spent),
+            format_cu(a.earned)
         );
     }
 }
@@ -1632,13 +1757,13 @@ fn print_accounts(accounts: &[AccountView]) {
 fn print_ledger(entries: &[LedgerEntry]) {
     println!(
         "{:>6} {:<20} {:<12} {:<9} {:>14}  DETAIL",
-        "SEQ", "TIME (UTC)", "ACCOUNT", "KIND", "AMOUNT"
+        "SEQ", "TIME (UTC)", "ACCOUNT", "KIND", "CU"
     );
     for e in entries {
         let amount = match e.kind {
-            // These move held money, not the spendable balance.
-            LedgerKind::Hold | LedgerKind::Forfeit => format!("({})", format_credits(e.amount)),
-            _ => format_credits(e.amount),
+            // These move held CU, not the spendable balance.
+            LedgerKind::Hold | LedgerKind::Forfeit => format!("({})", format_cu(e.amount)),
+            _ => format_cu(e.amount),
         };
         let mut detail = e.task.map(|t| t.to_string()).unwrap_or_default();
         if !e.memo.is_empty() {
@@ -1670,27 +1795,48 @@ async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Resul
         bail!("unexpected response");
     };
     if let Some(PricesCmd::Set {
-        wasm_per_gfuel,
-        docker_cpu_hour,
-        microvm_cpu_hour,
         memory_gib_hour,
+        storage_gib_month,
+        egress_gib,
+        ledger,
+        credit_limit,
         hold,
         verify_rate,
         max_strikes,
     }) = cmd
     {
-        if let Some(v) = wasm_per_gfuel {
-            p.prices.wasm_per_gfuel = parse_credits(&v)?;
-        }
-        if let Some(v) = docker_cpu_hour {
-            p.prices.docker_cpu_hour = parse_credits(&v)?;
-        }
-        if let Some(v) = microvm_cpu_hour {
-            p.prices.microvm_cpu_hour = parse_credits(&v)?;
-        }
         if let Some(v) = memory_gib_hour {
-            p.prices.memory_gib_hour = parse_credits(&v)?;
+            p.rates.memory_gib_hour = parse_rate(&v)?;
         }
+        if let Some(v) = storage_gib_month {
+            p.rates.storage_gib_month = parse_rate(&v)?;
+        }
+        if let Some(v) = egress_gib {
+            p.rates.egress_gib = parse_rate(&v)?;
+        }
+        let limit = credit_limit.as_deref().map(parse_cu).transpose()?;
+        p.ledger = match (ledger, p.ledger) {
+            (Some(LedgerArg::Prepaid), _) => {
+                anyhow::ensure!(limit.is_none(), "--credit-limit is for mutual mode");
+                LedgerMode::Prepaid
+            }
+            (Some(LedgerArg::Mutual), old) => LedgerMode::Mutual {
+                credit_limit: limit.unwrap_or(match old {
+                    LedgerMode::Mutual { credit_limit } => credit_limit,
+                    LedgerMode::Prepaid => 20_000,
+                }),
+            },
+            (None, LedgerMode::Mutual { credit_limit }) => LedgerMode::Mutual {
+                credit_limit: limit.unwrap_or(credit_limit),
+            },
+            (None, LedgerMode::Prepaid) => {
+                anyhow::ensure!(
+                    limit.is_none(),
+                    "--credit-limit is for mutual mode (add --ledger mutual)"
+                );
+                LedgerMode::Prepaid
+            }
+        };
         if let Some(v) = hold {
             p.hold_secs = parse_duration_ms(&v)? / 1000;
         }
@@ -1712,23 +1858,42 @@ async fn prices(home: &Path, cmd: Option<PricesCmd>, admin: &AdminArgs) -> Resul
 }
 
 fn print_policy(p: &Policy) {
-    println!("price list (credits)");
+    let r = &p.rates;
+    println!("compute units: 1 CU = one reference vCPU (CPU score 1000) for one hour");
     println!(
-        "  wasm-per-gfuel   {:>12}  per billion fuel units",
-        format_credits(p.prices.wasm_per_gfuel)
+        "  cpu                       1  per vCPU-hour at score 1000 (runs are billed for wall time x score / 1000)"
     );
     println!(
-        "  docker-cpu-hour  {:>12}  per core-hour of wall time",
-        format_credits(p.prices.docker_cpu_hour)
+        "  wasm                      1  per hour of reference time its fuel stands for ({} Gfuel)",
+        pumasi_proto::perf::REFERENCE_FUEL_PER_SEC * 3600 / 1_000_000_000
     );
     println!(
-        "  microvm-cpu-hour {:>12}  per vCPU-hour of wall time",
-        format_credits(p.prices.microvm_cpu_hour)
+        "  memory-gib-hour {:>10}  per GiB-hour of reserved memory",
+        format_rate(r.memory_gib_hour)
     );
     println!(
-        "  memory-gib-hour  {:>12}  per GiB-hour of reserved memory",
-        format_credits(p.prices.memory_gib_hour)
+        "  storage-gib-month {:>8}  per GiB-month stored (cluster file store)",
+        format_rate(r.storage_gib_month)
     );
+    println!(
+        "  egress-gib {:>15}  per GiB sent out of the cluster",
+        format_rate(r.egress_gib)
+    );
+    println!(
+        "  e.g. 1 vCPU + 2 GiB for an hour = {} CU, 1 vCPU + 4 GiB = {} CU",
+        format_rate(r.per_hour(1, 2)),
+        format_rate(r.per_hour(1, 4))
+    );
+    println!("ledger");
+    match p.ledger {
+        LedgerMode::Prepaid => println!(
+            "  prepaid: the owner grants CU (`pumasi cu add`); a job's account needs a positive balance"
+        ),
+        LedgerMode::Mutual { credit_limit } => println!(
+            "  mutual (품앗이): lending earns CU, using spends them; accounts may go down to -{} CU",
+            format_cu(credit_limit)
+        ),
+    }
     println!("settlement");
     println!(
         "  hold             {:>12}  before provider earnings become available",
@@ -1743,6 +1908,157 @@ fn print_policy(p: &Policy) {
         p.max_strikes
     );
     println!("runs on machines of the job's own account are free.");
+}
+
+async fn bench(
+    home: &Path,
+    dir: Option<PathBuf>,
+    quick: bool,
+    json: bool,
+    cpus: Option<u32>,
+) -> Result<i32> {
+    let dir = dir.unwrap_or_else(|| home.join("agent"));
+    let config = if quick {
+        BenchConfig::quick(dir)
+    } else {
+        BenchConfig::standard(dir)
+    };
+    let cpus = cpus.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1)
+    });
+    if !json {
+        eprintln!("benchmarking (about {} s)...", if quick { 2 } else { 12 });
+    }
+    let p = tokio::task::spawn_blocking(move || -> Result<PerfProfile> {
+        let kernel = pumasi_agent::bench::CpuKernel::new()?;
+        pumasi_agent::bench::measure(&config, &kernel, &iroh::SecretKey::generate(), cpus)
+    })
+    .await??;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&p)?);
+    } else {
+        print_profile(&p);
+    }
+    Ok(0)
+}
+
+fn print_profile(p: &PerfProfile) {
+    let c = &p.cpu;
+    println!("cpu      {} ({} threads)", c.model, c.threads);
+    println!(
+        "         score {} single-thread, {} all threads, {} per vCPU (reference vCPU = 1000)",
+        c.single,
+        c.multi,
+        c.per_vcpu()
+    );
+    println!(
+        "memory   {:.1} GiB, copy {} MB/s",
+        p.memory.total_bytes as f64 / (1u64 << 30) as f64,
+        p.memory.copy_mb_s
+    );
+    match &p.disk {
+        Some(d) => {
+            let os = d
+                .os_class
+                .map(|c| format!(" (the OS says {c})"))
+                .unwrap_or_default();
+            println!("disk     {}{}", d.class, os);
+            println!(
+                "         sequential {} MB/s read, {} MB/s write; 4 KiB random read {} us median, {} us p99, {} IOPS (8 in flight)",
+                d.seq_read_mb_s,
+                d.seq_write_mb_s,
+                d.rand_read_p50_us,
+                d.rand_read_p99_us,
+                d.rand_read_iops
+            );
+            if d.total_bytes > 0 {
+                println!(
+                    "         {:.0} GiB free of {:.0} GiB",
+                    d.free_bytes as f64 / (1u64 << 30) as f64,
+                    d.total_bytes as f64 / (1u64 << 30) as f64
+                );
+            }
+            if let Some(s) = &d.smart {
+                let mut parts = vec![s.model.clone()];
+                if let Some(ok) = s.passed {
+                    parts.push(if ok {
+                        "health ok".into()
+                    } else {
+                        "HEALTH FAILING".into()
+                    });
+                }
+                if let Some(u) = s.percent_used {
+                    parts.push(format!("{u}% of endurance used"));
+                }
+                if let Some(h) = s.power_on_hours {
+                    parts.push(format!("{h} h powered on"));
+                }
+                if let Some(e) = s.media_errors {
+                    parts.push(format!("{e} media errors"));
+                }
+                if let Some(t) = s.temperature_c {
+                    parts.push(format!("{t} C"));
+                }
+                println!("smart    {}", parts.join(", "));
+            }
+        }
+        None => println!("disk     not measured"),
+    }
+    for n in &p.notes {
+        println!("note     {n}");
+    }
+}
+
+fn print_node(n: &NodeView) {
+    println!("node {} \"{}\"", n.id, n.info.name);
+    let state = if n.suspended {
+        "suspended"
+    } else if n.online && n.paused.is_some() {
+        "paused"
+    } else if n.online {
+        "online"
+    } else {
+        "offline"
+    };
+    println!(
+        "  {state}, {} {}/{}, agent {}, {} slots, {}",
+        n.role,
+        n.info.os,
+        n.info.arch,
+        n.info.agent_version,
+        n.info.slots,
+        executor_list(&n.executors)
+    );
+    if let Some(reason) = &n.paused {
+        println!("  paused: {reason}");
+    }
+    if let Some(rtt) = n.rtt_us {
+        println!(
+            "  latency {:.1} ms round trip to the control plane{}",
+            rtt as f64 / 1000.0,
+            if n.relayed {
+                " (through a relay)"
+            } else {
+                " (direct)"
+            }
+        );
+    }
+    println!("  billed cpu score {}", n.cpu_score);
+    if let Some(note) = &n.perf_note {
+        println!("    {note}");
+    }
+    if n.role == Role::Provider {
+        println!("  checks passed {}, strikes {}", n.checks_passed, n.strikes);
+    }
+    match &n.perf {
+        Some(p) => {
+            println!("benchmark of {} UTC", utc(p.measured_unix));
+            print_profile(p);
+        }
+        None => println!("no benchmark profile"),
+    }
 }
 
 fn human_secs(s: u64) -> String {
@@ -1776,7 +2092,10 @@ struct ReceiptRow {
     peak_memory_bytes: Option<u64>,
     consumer: String,
     provider: String,
-    amount: String,
+    cpu_score: u32,
+    /// The exact price in CU, and the CU moved (see `Billing::amount`).
+    exact_cu: String,
+    cu: String,
     recorded_unix: u64,
     receipt: String,
 }
@@ -1802,7 +2121,9 @@ impl From<&Receipt> for ReceiptRow {
             peak_memory_bytes: u.peak_memory_bytes,
             consumer: b.consumer.clone(),
             provider: b.provider.clone(),
-            amount: format_credits(b.amount),
+            cpu_score: b.cpu_score,
+            exact_cu: format_rate(b.exact_ucu),
+            cu: format_cu(b.amount),
             recorded_unix: b.recorded_unix,
             receipt: r.to_blob(),
         }
@@ -1816,7 +2137,7 @@ fn data_hex(b: &[u8]) -> String {
 fn print_receipts(receipts: &[Receipt]) {
     println!(
         "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12}",
-        "RECEIPT", "RUN", "NODE", "OUTCOME", "FUEL", "WALL ms", "PEAK MiB", "PROVIDER", "AMOUNT"
+        "RECEIPT", "RUN", "NODE", "OUTCOME", "FUEL", "WALL ms", "PEAK MiB", "PROVIDER", "CU"
     );
     for r in receipts {
         let u = &r.usage;
@@ -1838,7 +2159,7 @@ fn print_receipts(receipts: &[Receipt]) {
                 .map(|b| format!("{:.1}", b as f64 / (1 << 20) as f64))
                 .unwrap_or_else(|| "-".into()),
             truncate(&r.billing.provider, 10),
-            format_credits(r.billing.amount)
+            format_cu(r.billing.amount)
         );
     }
     if receipts.is_empty() {

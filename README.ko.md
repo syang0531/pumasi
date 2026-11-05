@@ -2,7 +2,7 @@
 
 이미 가진 여러 대의 기기를 하나의 사설 클러스터로 묶어 배치 작업을 나눠 돌립니다. 모든 기기에서 도는 안전한 WebAssembly 작업, 허용한 기기에서 도는 일반 Docker 이미지 작업(Python, 원하는 패키지, 선택적 네트워크), 그리고 같은 이미지를 태스크마다 자기 커널을 가진 microVM 안에서 돌리는 작업(남이 빌려준 기기에도 보낼 수 있을 만큼 격리됨)을 같은 방식으로 실행합니다. Linux, macOS, Windows와 x86_64, ARM64에서 같은 Rust 단일 바이너리 하나로 동작합니다.
 
-단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 크레딧 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드, 5단계(이번 릴리스)는 세 실행기 모두를 Windows에서 정식 지원하는 것입니다. 이후 구형 Mac, 저장소, GPU, 클러스터 관리, 모니터링, 대시보드를 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
+단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드, 5단계는 세 실행기 모두를 Windows에서 정식 지원하는 것, 6단계는 구형 Intel Mac과 가용 정책, 7단계(이번 릴리스)는 성능 벤치마크와 컴퓨팅 유닛(CU)입니다. 이후 저장소, GPU, 클러스터 관리, 모니터링, 대시보드를 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
 
 ## 설치
 
@@ -124,22 +124,60 @@ sudo pumasi service install --ticket pumasijoin... -- --allow-microvm --only-on-
 
 일시 정지된 기기는 새 작업을 받지 않고, 돌던 작업은 끝까지 마칩니다. `pumasi status`에 `paused`와 이유(예: "on battery power")가 나옵니다. 유휴 시간은 macOS에서는 기기 전체 기준이라 LaunchDaemon에서도 보이고, Linux에서는 터미널과 데스크톱 세션 기준입니다. Windows에서는 에이전트가 사용자 세션에서 돌아야 입력을 볼 수 있습니다(서비스로 돌면 알 수 없다고 보고하고 정지 상태로 둡니다).
 
-### 다른 사람의 기기: 초대, 크레딧, 검증
+### 다른 사람의 기기: 초대, 컴퓨팅 유닛, 검증
 
 친구가 자기 PC를 내 클러스터에 빌려줄 수 있습니다. 그 사람의 계정 이름으로 초대합니다.
 
 ```sh
 pumasi invite bob                  # bob이 자기 기기에서 실행할 `pumasi agent join pumasijoin...` 출력
-pumasi credit add owner 100        # 남의 기기에서 돌린 작업에 쓸 선불 크레딧
+pumasi cu add owner 100            # 남의 기기에서 돌린 작업에 쓸 100 CU
 pumasi run examples/montecarlo/job.toml
 ```
 
-- bob의 기기는 **제공자**로 참가합니다. WASM 작업과, bob이 에이전트를 `--allow-microvm`으로 띄웠다면 microVM 작업을 받고(Docker는 초대할 때 `--allow-docker`를 주고 bob도 에이전트를 `--allow-docker`로 띄운 경우에만), 크레딧이 있는 계정의 작업만 받습니다.
-- 내 기기를 먼저 쓰고 비용은 없습니다. 넘치는 작업이 제공자에게 갑니다. 제공자 실행은 고정 요금표(`pumasi prices`)로 값을 매겨 작업 계정에서 차감하고, 제공자 수익은 **보류**(기본 1시간)했다가 사용 가능 잔액으로 옮깁니다.
-- 실행마다 **사용 영수증**(fuel, 실행 시간, 메모리, 실행기, 결과 해시)이 나오고, 노드가 서명하고 컨트롤 플레인이 맞서명합니다. `pumasi receipts <작업 ID> --export r.json`으로 내보내고 `pumasi verify-receipts r.json`으로 오프라인 검증합니다.
+- bob의 기기는 **제공자**로 참가합니다. WASM 작업과, bob이 에이전트를 `--allow-microvm`으로 띄웠다면 microVM 작업을 받고(Docker는 초대할 때 `--allow-docker`를 주고 bob도 에이전트를 `--allow-docker`로 띄운 경우에만), CU가 있는 계정의 작업만 받습니다.
+- 내 기기를 먼저 쓰고 비용은 없습니다. 넘치는 작업이 제공자에게 갑니다. 제공자 실행은 **컴퓨팅 유닛(CU)**으로 값을 매겨(아래) 작업 계정에서 차감하고, 제공자 수익은 **보류**(기본 1시간)했다가 사용 가능 잔액으로 옮깁니다.
+- 실행마다 **사용 영수증**(fuel, 실행 시간, 메모리, 실행기, 결과 해시, 과금한 CPU 점수와 CU)이 나오고, 노드가 서명하고 컨트롤 플레인이 맞서명합니다. `pumasi receipts <작업 ID> --export r.json`으로 내보내고 `pumasi verify-receipts r.json`으로 오프라인 검증합니다.
 - WASM 작업은 기본으로 **결정적 모드**(가상 시계, 시드 고정 난수)로 돌아 정직한 노드라면 같은 결과를 냅니다. 제공자가 돌린 태스크 일부(10%, 새 제공자는 50%, 검증에 한 번 걸린 제공자는 전부)를 **다른 노드에서 다시 돌려** 비교하고, 가능하면 내 기기에서 돌립니다. 결과가 다르면 그 수익은 몰수(작업 계정에 환불)되고 스트라이크가 쌓이며, 3번이면 더는 작업을 받지 못합니다. 검증 실행의 결과가 맞으면 그 결과로 바꿔 줍니다.
 
-크레딧은 장부일 뿐 실제 돈은 오가지 않습니다. `pumasi credit payout bob 10`은 Pumasi 밖에서 bob에게 정산했다는 기록입니다.
+CU는 장부일 뿐이고 엔진은 돈을 모릅니다. `pumasi cu payout bob 10`은 10 CU가 장부에서 빠졌다는(Pumasi 밖에서 bob에게 정산했다는) 기록입니다.
+
+### 컴퓨팅 유닛과 벤치마크
+
+**1 CU는 기준 vCPU 1개를 1시간 쓰는 값**입니다. 기준 vCPU는 CPU 점수 1000(2.5 GHz Skylake급 서버 코어의 하드웨어 스레드 1개)입니다. 다른 자원은 따로 단가가 있고 `pumasi prices set`으로 바꿉니다.
+
+| 자원 | 기본 단가 |
+| --- | --- |
+| CPU (Docker, microVM) | 점수 1000 기준 vCPU-시간당 1 CU |
+| WASM | fuel이 나타내는 기준 시간 1시간당 1 CU |
+| 메모리 | 예약한 GiB-시간당 0.25 CU |
+| 저장소(클러스터 파일 저장소) | GiB-월당 0.5 CU |
+| 이그레스 | GiB당 0.1 CU |
+
+그래서 1 vCPU + 2 GiB를 1시간 쓰면 1.5 CU, 1 vCPU + 4 GiB면 2 CU입니다. 원장은 정수 milli-CU이고, 실행 한 번의 값 중 1 milli-CU가 안 되는 부분은 같은 두 계정 사이의 다음 실행으로 넘어가서 짧은 실행이 많아도 합계가 정확히 맞습니다.
+
+에이전트는 시작할 때(저장된 프로필이 오래됐으면) 그리고 하루마다 한가할 때 기기를 **벤치마크**하고(`--bench-interval`, `--no-benchmark`), 노드 키로 서명해 보냅니다.
+
+- **CPU**: 작업이 도는 것과 같은 WASM 샌드박스에서 고정 정수 커널을 스레드 1개와 제공하는 CPU 전부로 돌려 점수로 냅니다.
+- **메모리**: 복사 대역폭.
+- **디스크**(에이전트 디렉터리가 있는 드라이브): 페이지 캐시를 우회한 fio 방식으로 순차 읽기·쓰기, 4 KiB 랜덤 읽기를 하나씩(지연)과 8개씩(IOPS). 탐색 지연과 속도로 HDD(`hdd`), SATA SSD(`ssd`), `nvme`를 구분합니다.
+- **SMART**: `smartctl`이 있으면 건강 상태, 마모도(정격 수명 중 쓴 비율), 사용 시간, 매체 오류.
+- **지연**: 컨트롤 플레인이 노드마다 연결의 왕복 시간을 직접 잽니다(직접 연결인지 릴레이인지도).
+
+CPU 시간은 **실행 시간 × 점수 / 1000**으로 과금하므로, 느린 기기에서 오래 걸려도 빠른 기기와 CU가 거의 같습니다. WASM은 어디서나 같은 fuel로 과금합니다. 제공자가 CPU를 부풀려 신고해도 소용없습니다. 컨트롤 플레인이 직접 재기 전에는 최대 1000으로 과금하고, 제공자가 한가할 때 벤치마크 커널용 새 시드를 보내 응답 시간을 직접 재고 답을 다시 계산합니다. 과금 점수는 잰 값의 1.25배를 넘지 않고, 잰 값의 2배가 넘는 신고나 틀린 답은 스트라이크입니다. 빨라 보이려고 실행 시간을 짧게 보고해도 이득이 없습니다. 과금이 시간 × 점수이기 때문입니다.
+
+```
+$ pumasi bench
+cpu      Intel(R) Core(TM) i5-4250U CPU @ 1.30GHz (4 threads)
+         score 811 single-thread, 2035 all threads, 508 per vCPU (reference vCPU = 1000)
+memory   4.0 GiB, copy 9120 MB/s
+disk     ssd (the OS says ssd)
+         sequential 512 MB/s read, 431 MB/s write; 4 KiB random read 96 us median, 180 us p99, 31150 IOPS (8 in flight)
+smart    APPLE SSD SM0128F, health ok, 7% of endurance used, 21530 h powered on, 0 media errors
+```
+
+`pumasi status`에 노드별 과금 점수, 디스크 종류, 지연이 나오고, `pumasi node <ID>`에 전체 프로필과 클러스터가 잰 결과가 나오며, `pumasi node <ID> --rebenchmark`로 다시 재게 할 수 있습니다.
+
+**품앗이(mutual) 모드.** 돈 없이 기기를 서로 빌려 쓰는 그룹용입니다. `pumasi prices set --ledger mutual --credit-limit 20`. 아무도 CU를 지급하지 않고, 내 기기를 빌려주면 CU를 벌고 남의 기기를 쓰면 씁니다. 잔액은 신용 한도만큼 마이너스까지 갈 수 있고, 모든 잔액의 합은 항상 0입니다.
 
 ### 에이전트를 서비스로 실행
 
@@ -184,10 +222,12 @@ pumasi upgrade status
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
 | `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
 | `pumasi run job.toml [--account A] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
-| `pumasi status` | 노드(역할, 온라인 여부, 실행기, 슬롯, 실행 중, 검증 기록)와 최근 작업 및 비용 |
+| `pumasi status` | 노드(역할, 온라인 여부, 실행기, 슬롯, 실행 중, 검증 기록, 과금 CPU 점수, 디스크 종류, 지연)와 최근 작업 및 CU 비용 |
+| `pumasi node <ID> [--rebenchmark]` | 노드 하나의 벤치마크 프로필, 과금 점수, 지연, 검증 기록. `--rebenchmark`면 다시 재게 함 |
+| `pumasi bench [--quick] [--json] [--dir DIR]` | 에이전트와 같은 방식으로 이 기기를 벤치마크해 프로필 출력 |
 | `pumasi job <ID> [--output] [--out DIR]` | 태스크별 상태, 노드, 시도 횟수, 시간, 비용, 검증 결과, 출력. `--out`이면 결과 파일 다운로드 |
-| `pumasi credit list \| add <계정> <금액> \| payout <계정> <금액> \| ledger` | 잔액(사용 가능, 보류, 지출, 수익), 선불 충전, 지급 기록, 원장 |
-| `pumasi prices [set ...]` | 요금표(`--microvm-cpu-hour` 포함)와 정산 정책(보류 시간, 검증 비율, 최대 스트라이크) 조회·변경 |
+| `pumasi cu list \| add <계정> <CU> \| payout <계정> <CU> \| ledger` | CU 잔액(사용 가능, 보류, 지출, 수익), 지급, 지급 기록, 원장 (`pumasi credit`도 그대로 동작) |
+| `pumasi prices [set ...]` | CU 단가(`--memory-gib-hour`, `--storage-gib-month`, `--egress-gib`), 원장 모드(`--ledger prepaid\|mutual`, `--credit-limit`), 정산 정책(보류 시간, 검증 비율, 최대 스트라이크) 조회·변경 |
 | `pumasi receipts <ID> [--export FILE]` | 작업의 서명된 사용 영수증 |
 | `pumasi verify-receipts FILE [--cluster ID]` | 내보낸 영수증을 오프라인으로 검증 |
 | `pumasi cancel <ID>` | 작업 취소 |
@@ -283,6 +323,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
+개인이나 조직이 자기 장비에서 쓰는 데는 1~15단계면 충분합니다(핵심은 13단계까지). 16단계는 조직 도입에 필요한 마무리이고, 17·18단계는 다른 클러스터와 거래할 때만 필요합니다.
+
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
 | 1 | 사설 클러스터: 에이전트, 컨트롤 플레인, iroh 연결, WASM·Docker 실행기, 파일 입출력, CLI | 완료 |
@@ -290,8 +332,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 3 | microVM 실행기: Docker 작업과 같은 OCI 이미지를 Firecracker·QEMU VM에서, 같은 작업 명세로, 제공자에게도 | 완료 |
 | 4 | 배포·설치: 6개 플랫폼 릴리스 바이너리와 SHA256SUMS, 설치 스크립트, OS 서비스, 클러스터 서명 업그레이드와 롤백 | 완료 |
 | 5 | Windows 정식 지원: Docker Desktop(WSL 2), QEMU + WHPX microVM(없으면 TCG), 고정 버전 QEMU 설치, Job Object, 내장 ext4 포맷터와 게스트 init | 완료 |
-| 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대, CPU 상한, 메모리에 맞춘 슬롯) | 이번 릴리스 |
-| 7 | 성능 벤치마크와 컴퓨팅 유닛(CU): 노드가 서명한 성능 프로필(CPU, 메모리 대역폭, fio로 디스크 종류·속도, SMART 마모도, 지연), 1 CU = 기준 vCPU 1개를 1시간 쓰는 값과 자원별 CU 단가, 정수 milli-CU 원장, 돈 없이 서로 빌려 쓰는 그룹 로컬 원장 | 예정 |
+| 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대, CPU 상한, 메모리에 맞춘 슬롯) | 완료 |
+| 7 | 성능 벤치마크와 컴퓨팅 유닛(CU): 노드가 서명한 성능 프로필(CPU, 메모리 대역폭, fio로 디스크 종류·속도, SMART 마모도, 지연), 1 CU = 기준 vCPU 1개를 1시간 쓰는 값과 자원별 CU 단가, 정수 milli-CU 원장, 돈 없이 서로 빌려 쓰는 그룹 로컬 원장 | 이번 릴리스 |
 | 8 | 클러스터 파일 저장소(iroh-blobs): 데이터셋, 대용량 입출력, 이어받기, 저장 용량 CU 과금, 비공개 레지스트리 이미지 | 예정 |
 | 9 | GPU·microVM 장치: 탐지, GPU 벤치마크와 CU 환산, 스케줄링, Docker GPU 작업, VFIO 패스스루, microVM 네트워크 | 예정 |
 | 10 | 클러스터 관리: 라벨·selector, drain, 우선순위, 쿼터, 역할 티켓, `apply` | 예정 |
@@ -300,10 +342,11 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 13 | 컨트롤 플레인 고가용성(Raft) | 예정 |
 | 14 | WebGPU 실행기(실험) | 예정 |
 | 15 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
-| 16 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
-| 17 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
+| 16 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델, CI에 cargo-audit·cargo-deny·퍼징, 외부 보안 점검, 운영 문서, 72시간 장기 안정성 테스트 뒤 1.0 태그 | 예정 |
+| 17 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
+| 18 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
+알려진 한계: CU는 실제 결제와 연결되어 있지 않고, GPU 단가는 9단계, 저장소·이그레스 계량은 8단계부터입니다. 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM은 공개 이미지만 받고, 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
 
 ## 라이선스
 

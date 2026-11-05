@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod availability;
+pub mod bench;
 pub mod docker;
 pub mod executor;
 pub mod microvm;
@@ -12,6 +13,7 @@ pub mod upgrade;
 
 pub use agent::{Agent, AgentConfig, Membership, default_node_name};
 pub use availability::AvailabilityConfig;
+pub use bench::BenchConfig;
 pub use executor::{RunResult, WasmExecutor};
 pub use microvm::{MicrovmConfig, MicrovmExecutor};
 pub use upgrade::{AgentExit, UpgradeConfig};

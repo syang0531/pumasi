@@ -12,14 +12,16 @@ use iroh::{PublicKey, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    economy::Micros,
+    economy::{MicroCu, MilliCu},
     job::{Executor, FileEntry},
     msg::{Outcome, TaskRef},
 };
 
 const NODE_DOMAIN: &[u8] = b"pumasi/receipt/node/v1\0";
-const CLUSTER_DOMAIN: &[u8] = b"pumasi/receipt/cluster/v1\0";
-const BLOB_PREFIX: &str = "pumasireceipt";
+const CLUSTER_DOMAIN: &[u8] = b"pumasi/receipt/cluster/v2\0";
+const BLOB_PREFIX: &str = "pumasicureceipt";
+/// Receipts from before compute units (pumasi 0.6 and older).
+const OLD_BLOB_PREFIX: &str = "pumasireceipt";
 
 /// Metered usage of one run, as the node reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,9 +83,14 @@ pub struct Billing {
     /// Wall time used for pricing: the node's figure, capped by how long
     /// the control plane itself saw the task running.
     pub billed_wall_ms: u64,
-    /// Price from the cluster's price list. Zero when consumer and provider
-    /// are the same account.
-    pub amount: Micros,
+    /// CPU score the run was billed at (1000 = the reference vCPU).
+    pub cpu_score: u32,
+    /// The run's exact price from the cluster's CU rates, in micro-CU.
+    /// Zero when consumer and provider are the same account.
+    pub exact_ucu: MicroCu,
+    /// Milli-CU moved: the exact price plus what earlier runs between the
+    /// same accounts left over, in whole milli-CU.
+    pub amount: MilliCu,
     /// True for a check run (a replica of a task already run elsewhere).
     pub check: bool,
     pub recorded_unix: u64,
@@ -165,8 +172,13 @@ impl Receipt {
     }
 
     pub fn from_blob(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if !s.starts_with(BLOB_PREFIX) && s.starts_with(OLD_BLOB_PREFIX) {
+            anyhow::bail!(
+                "a receipt from before compute units (pumasi 0.6 or older); check it with that version"
+            );
+        }
         let body = s
-            .trim()
             .strip_prefix(BLOB_PREFIX)
             .context("not a pumasi receipt")?;
         let bytes = data_encoding::BASE32_NOPAD
@@ -279,6 +291,8 @@ mod tests {
             consumer: "owner".into(),
             provider: "bob".into(),
             billed_wall_ms: 10,
+            cpu_score: 1000,
+            exact_ucu: 5_400,
             amount: 5,
             check: false,
             recorded_unix: 2,
@@ -287,6 +301,7 @@ mod tests {
         receipt.verify().unwrap();
         let back = Receipt::from_blob(&receipt.to_blob()).unwrap();
         assert_eq!(back, receipt);
+        assert!(Receipt::from_blob("pumasireceiptaaaa").is_err());
         assert_eq!(receipt.node_id(), node.public().to_string());
 
         // Any change breaks a signature.

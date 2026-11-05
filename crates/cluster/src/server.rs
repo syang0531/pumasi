@@ -21,6 +21,7 @@ use pumasi_proto::{
         FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, ToAgent,
     },
     net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key, write_private},
+    perf::kernel_native,
     release::SignedRelease,
     secrets_eq,
     ticket::{AdminTicket, JoinTicket},
@@ -311,6 +312,7 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
     let (kill_tx, mut kill_rx) = oneshot::channel();
     let generation = inner.state().on_connect(
         &node_id,
+        hello.protocol_version,
         hello.node.clone(),
         hello.upgrade.clone(),
         hello.availability.clone(),
@@ -333,7 +335,47 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
     let result: Result<()> = loop {
         tokio::select! {
             msg = read_msg::<_, FromAgent>(&mut recv) => match msg {
-                Ok(Some(FromAgent::Heartbeat { .. })) => inner.state().on_heartbeat(&node_id, generation),
+                Ok(Some(FromAgent::Heartbeat { .. })) => {
+                    let (rtt, relayed) = path_rtt(&conn);
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_rtt(&node_id, generation, rtt, relayed);
+                }
+                Ok(Some(FromAgent::Perf(p))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    if let Err(e) = st.on_perf(&node_id, generation, *p) {
+                        warn!(node = %node_id, "rejected performance profile: {e:#}");
+                    }
+                }
+                Ok(Some(FromAgent::BenchResult { nonce, result })) => {
+                    let taken = {
+                        let mut st = inner.state();
+                        st.on_heartbeat(&node_id, generation);
+                        st.take_challenge(&node_id, generation, nonce)
+                    };
+                    if let Some((challenge, took)) = taken {
+                        // Recompute the answer off the state lock: it takes
+                        // about as long as the node's run.
+                        let inner = inner.clone();
+                        let node_id = node_id.clone();
+                        tokio::spawn(async move {
+                            let b = challenge.bench;
+                            let expect = tokio::task::spawn_blocking(move || {
+                                kernel_native(b.seed, b.iters)
+                            })
+                            .await;
+                            if let Ok(expect) = expect {
+                                inner.state().apply_challenge(
+                                    &node_id,
+                                    &challenge,
+                                    took,
+                                    expect == result,
+                                );
+                            }
+                        });
+                    }
+                }
                 Ok(Some(FromAgent::Done(report))) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
@@ -362,6 +404,17 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
     fetcher.abort();
     conn.close(0u32.into(), b"session ended");
     result
+}
+
+/// Round-trip time of the connection's selected path, and whether that
+/// path goes through a relay.
+fn path_rtt(conn: &Connection) -> (Option<Duration>, bool) {
+    let paths = conn.paths();
+    paths
+        .iter()
+        .find(|p| p.is_selected())
+        .map(|p| (Some(p.rtt()), p.is_relay()))
+        .unwrap_or((None, false))
 }
 
 /// Serves chunks of release binaries to an agent: one [`FetchRequest`] and
@@ -506,6 +559,10 @@ fn handle_admin(inner: &Inner, op: AdminOp) -> AdminResponse {
         } => {
             let a = inner.state().payout(&account, amount, &memo)?;
             Ok(AdminResponse::Accounts(vec![a]))
+        }
+        AdminOp::Benchmark { id } => {
+            inner.state().request_benchmark(&id)?;
+            Ok(AdminResponse::Ok)
         }
         AdminOp::GetPolicy => Ok(AdminResponse::Policy(inner.state().policy())),
         AdminOp::SetPolicy(p) => {

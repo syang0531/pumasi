@@ -7,7 +7,7 @@ use anyhow::Result;
 use pumasi_agent::{Agent, AgentConfig, AgentExit, UpgradeConfig};
 use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
-    economy::{Policy, PriceList},
+    economy::{CuRates, Metered, Policy},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{
         AccountView, AdminOp, AdminResponse, Invite, JobState, JobView, LedgerKind,
@@ -113,6 +113,7 @@ fn agent_config(name: &str, slots: u32, dir: PathBuf) -> AgentConfig {
         corrupt_results: false,
         max_cpu_percent: None,
         availability: None,
+        bench: None,
     }
 }
 
@@ -542,6 +543,7 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         corrupt_results: corrupt,
         max_cpu_percent: None,
         availability: None,
+        bench: None,
     })
     .await
     .unwrap()
@@ -560,19 +562,18 @@ fn invite(cluster: &Cluster, account: &str) -> JoinTicket {
         .unwrap()
 }
 
-/// Prices that make the echo task cost a visible amount: one credit per
-/// million fuel units.
+/// Rates that make the tiny echo task cost a visible amount: memory so
+/// expensive that its few microseconds of reference time cost CU.
 fn test_policy(hold_secs: u64, verify_permille: u32, max_strikes: u32) -> Policy {
     Policy {
-        prices: PriceList {
-            wasm_per_gfuel: 1_000_000_000,
-            docker_cpu_hour: 0,
-            microvm_cpu_hour: 0,
-            memory_gib_hour: 0,
+        rates: CuRates {
+            memory_gib_hour: 100_000_000_000_000_000,
+            ..CuRates::default()
         },
         hold_secs,
         verify_permille,
         max_strikes,
+        ..Policy::default()
     }
 }
 
@@ -595,11 +596,11 @@ async fn account(client: &AdminClient, name: &str) -> AccountView {
         .unwrap_or_else(|| panic!("no account {name}"))
 }
 
-async fn deposit(client: &AdminClient, name: &str, credits: i64) {
+async fn deposit(client: &AdminClient, name: &str, cu: i64) {
     client
         .call(AdminOp::Deposit {
             account: name.into(),
-            amount: credits * 1_000_000,
+            amount: cu * 1000,
             memo: "test".into(),
         })
         .await
@@ -677,13 +678,27 @@ async fn invited_provider_is_paid_from_prepaid_credit() {
         assert!(r.usage.fuel_used > 0);
         assert!(r.usage.peak_memory_bytes.unwrap() >= 65536);
         assert!(r.billing.billed_wall_ms <= r.usage.wall_ms);
-        // One credit per million fuel.
-        assert_eq!(r.billing.amount, r.usage.fuel_used as i64);
+        // Priced from the CU rates by fuel; the provider has no benchmark
+        // here, so the reference score.
+        assert_eq!(r.billing.cpu_score, 1000);
+        let exact = test_policy(1, 0, 3).rates.charge(&Metered {
+            executor: Executor::Wasm,
+            fuel_used: r.usage.fuel_used,
+            wall_ms: r.billing.billed_wall_ms,
+            memory_bytes: r.usage.memory_limit_bytes,
+            cpu_millis: None,
+            cpu_score: 1000,
+        });
+        assert_eq!(r.billing.exact_ucu, exact);
+        assert!(r.billing.amount > 0);
     }
+    // Whole milli-CU move; the remainder carries over to the next run.
+    let exact: i64 = rs.iter().map(|r| r.billing.exact_ucu).sum();
     assert_eq!(rs.iter().map(|r| r.billing.amount).sum::<i64>(), cost);
+    assert_eq!(cost, exact / 1000);
 
     let owner = account(&client, "owner").await;
-    assert_eq!(owner.balance, 1000 * 1_000_000 - cost);
+    assert_eq!(owner.balance, 1000 * 1000 - cost);
     assert_eq!(owner.spent, cost);
 
     // After the hold period bob's earnings become available.
@@ -832,7 +847,7 @@ async fn checks_catch_a_dishonest_provider() {
         owner.spent, alice.held,
         "owner pays only for accepted provider runs"
     );
-    assert_eq!(owner.balance, 1000 * 1_000_000 - owner.spent);
+    assert_eq!(owner.balance, 1000 * 1000 - owner.spent);
     let AdminResponse::Ledger(entries) = client
         .call(AdminOp::Ledger {
             account: None,
@@ -876,6 +891,183 @@ async fn checks_catch_a_dishonest_provider() {
     o.kill().await;
     h.kill().await;
     m.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: benchmarks and compute units
+// ---------------------------------------------------------------------------
+
+async fn benched(name: &str, dir: PathBuf, inflate: u32) -> Agent {
+    let mut config = agent_config(name, 1, dir.clone());
+    let mut bench = pumasi_agent::BenchConfig::quick(dir);
+    bench.inflate = inflate;
+    config.bench = Some(bench);
+    Agent::new(config).await.unwrap()
+}
+
+fn node_named(cluster: &Cluster, name: &str) -> pumasi_proto::msg::NodeView {
+    cluster
+        .status()
+        .nodes
+        .into_iter()
+        .find(|n| n.info.name == name)
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let own = benched("own", tempdir("o"), 1).await;
+    let honest = benched("honest", tempdir("h"), 1).await;
+    // Claims a CPU eight times faster than it is.
+    let liar = benched("liar", tempdir("l"), 8).await;
+    let claimed = liar.perf().unwrap().profile.cpu.single;
+    let o = spawn_join(own, ticket);
+    let h = spawn_join(honest, invite(&cluster, "alice"));
+    let l = spawn_join(liar, invite(&cluster, "mallory"));
+    wait_online(&cluster, 3).await;
+
+    // Every node sends its signed profile; the cluster times the
+    // providers' CPU benchmark itself.
+    wait_for("profiles and checks", || {
+        let s = cluster.status();
+        s.nodes.iter().all(|n| n.perf.is_some())
+            && node_named(&cluster, "liar").strikes > 0
+            // Timed, or slow enough not to need it. Under load the
+            // cluster's timing can differ from the agent's a little, which
+            // caps the billed score but is no strike.
+            && !node_named(&cluster, "honest")
+                .perf_note
+                .is_some_and(|n| n.contains("not confirmed"))
+    })
+    .await;
+    let own = node_named(&cluster, "own");
+    let p = own.perf.as_ref().unwrap();
+    assert!(p.cpu.single > 0 && p.memory.copy_mb_s > 0);
+    let disk = p.disk.as_ref().expect("disk measured");
+    assert!(
+        disk.seq_read_mb_s > 0 && disk.rand_read_iops > 0,
+        "{disk:?}"
+    );
+    // Owner machines are billed at their own score, unchecked.
+    assert_eq!(
+        own.cpu_score,
+        pumasi_proto::economy::billing_score(p.cpu.per_vcpu())
+    );
+    assert!(own.rtt_us.is_some(), "the cluster measures latency");
+
+    let honest = node_named(&cluster, "honest");
+    assert_eq!(honest.strikes, 0, "{:?}", honest.perf_note);
+    let liar = node_named(&cluster, "liar");
+    assert_eq!(liar.perf.as_ref().unwrap().cpu.single, claimed);
+    assert!(
+        liar.perf_note.as_deref().unwrap_or("").contains("capped"),
+        "{:?}",
+        liar.perf_note
+    );
+    // Billed at about what the cluster timed, not what it claimed.
+    assert!(
+        (liar.cpu_score as u64) * 3 < liar.perf.as_ref().unwrap().cpu.per_vcpu() as u64,
+        "billed {} for a claim of {}",
+        liar.cpu_score,
+        liar.perf.as_ref().unwrap().cpu.per_vcpu()
+    );
+
+    // The owner can ask a node to measure again.
+    let before = node_named(&cluster, "honest").perf.unwrap();
+    client
+        .call(AdminOp::Benchmark {
+            id: node_named(&cluster, "honest").id,
+        })
+        .await
+        .unwrap();
+    wait_for("a new profile", || {
+        node_named(&cluster, "honest").perf.as_ref() != Some(&before)
+    })
+    .await;
+
+    client.close().await;
+    o.kill().await;
+    h.kill().await;
+    l.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutual_mode_lends_and_borrows_without_grants() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    set_policy(
+        &client,
+        Policy {
+            ledger: pumasi_proto::economy::LedgerMode::Mutual {
+                credit_limit: 1_000_000,
+            },
+            ..test_policy(0, 0, 3)
+        },
+    )
+    .await;
+    // Nobody grants CU in mutual mode.
+    assert!(
+        client
+            .call(AdminOp::Deposit {
+                account: "owner".into(),
+                amount: 1000,
+                memo: String::new(),
+            })
+            .await
+            .is_err()
+    );
+    // Bob lends his machine: the owner's job runs there on credit.
+    let b = spawn_join(
+        provider("bobs-pc", 2, tempdir("b"), false).await,
+        invite(&cluster, "bob"),
+    );
+    wait_online(&cluster, 1).await;
+    let id = submit(&client, deterministic_echo(3)).await;
+    let view = wait_job(&client, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    let cost = view.summary.cost;
+    assert!(cost > 0);
+    // Then bob borrows the owner's machine with what he earned.
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let o = spawn_join(agent("own", 2, tempdir("o")).await, ticket);
+    wait_online(&cluster, 2).await;
+    b.kill().await;
+    let mut sub = deterministic_echo(2);
+    sub.account = Some("bob".into());
+    let id = submit(&client, sub).await;
+    let view = wait_job(&client, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    let borrowed = view.summary.cost;
+    assert!(borrowed > 0);
+    // Zero-sum: what one account is down, the other is up.
+    let mut total = 0;
+    for _ in 0..50 {
+        let a = accounts(&client).await;
+        if a.iter().all(|a| a.held == 0) {
+            total = a.iter().map(|a| a.balance).sum::<i64>();
+            let owner = a.iter().find(|a| a.name == "owner").unwrap();
+            let bob = a.iter().find(|a| a.name == "bob").unwrap();
+            assert_eq!(owner.balance, borrowed - cost);
+            assert_eq!(bob.balance, cost - borrowed);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(total, 0);
+
+    client.close().await;
+    o.kill().await;
     cluster.shutdown().await.unwrap();
 }
 
@@ -946,6 +1138,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         corrupt_results: false,
         max_cpu_percent: None,
         availability: None,
+        bench: None,
     })
     .await
     .unwrap();
@@ -1073,10 +1266,17 @@ async fn microvm_jobs_run_on_an_invited_provider() {
     init_tracing();
     let cluster = start_cluster(tempdir("c")).await.unwrap();
     let client = admin(&cluster).await;
-    let mut policy = test_policy(1, 0, 3);
-    // One credit per vCPU-second, so a run costs a visible amount.
-    policy.prices.microvm_cpu_hour = 3600 * 1_000_000;
-    set_policy(&client, policy).await;
+    // The default rates: a microVM run of a few seconds costs about a
+    // milli-CU per second of vCPU.
+    set_policy(
+        &client,
+        Policy {
+            hold_secs: 1,
+            verify_permille: 0,
+            ..Policy::default()
+        },
+    )
+    .await;
     deposit(&client, "owner", 100_000).await;
 
     // A plain owner machine (WASM only) and a provider that opted into
@@ -1097,6 +1297,7 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         corrupt_results: false,
         max_cpu_percent: None,
         availability: None,
+        bench: None,
     })
     .await
     .unwrap();
@@ -1176,7 +1377,7 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         r.verify().unwrap();
         assert_eq!(r.usage.executor, Executor::Microvm);
         assert_eq!(r.billing.provider, "bob");
-        assert!(r.billing.amount > 0);
+        assert!(r.billing.exact_ucu > 0);
     }
 
     // Timeout kills the VM; exit codes and signals come through.
@@ -1256,6 +1457,7 @@ async fn upgradable(name: &str, dir: PathBuf, exe: PathBuf, auto: Option<bool>) 
         corrupt_results: false,
         max_cpu_percent: None,
         availability: None,
+        bench: None,
     })
     .await
     .unwrap()

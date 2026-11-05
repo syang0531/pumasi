@@ -19,16 +19,18 @@ use pumasi_proto::{
         TaskReport, ToAgent,
     },
     net::{NetMode, bind_endpoint, load_or_create_key},
+    perf::SignedPerf,
     receipt::{SignedUsage, Usage, result_digest},
     ticket::JoinTicket,
     wire::{read_msg, write_msg},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::{
     availability::AvailabilityConfig,
+    bench::{self, BenchConfig, CpuKernel},
     docker::DockerExecutor,
     executor::WasmExecutor,
     microvm::{MicrovmConfig, MicrovmExecutor},
@@ -61,6 +63,10 @@ pub struct AgentConfig {
     pub microvm: Option<MicrovmConfig>,
     /// Let the cluster replace this agent's binary. `None`: never.
     pub upgrade: Option<UpgradeConfig>,
+    /// Benchmark this machine (at start when the saved profile is stale,
+    /// then every `interval` while idle). `None`: never; the node is then
+    /// billed at the reference score.
+    pub bench: Option<BenchConfig>,
     /// Test hook: tamper with every successful result before reporting it,
     /// like a provider that skips the work. Never set this in real use.
     #[doc(hidden)]
@@ -95,6 +101,12 @@ pub struct Agent {
     /// What the availability policy says now, kept current by a
     /// background check.
     available: watch::Receiver<Availability>,
+    /// The CPU benchmark kernel, also used to answer challenges.
+    kernel: CpuKernel,
+    /// The latest signed performance profile.
+    perf: Arc<Mutex<Option<SignedPerf>>>,
+    /// Wakes the benchmark loop to measure again now.
+    rebench: Arc<Notify>,
 }
 
 /// Why a session ended.
@@ -169,6 +181,30 @@ impl Agent {
             }
             _ => watch::channel(Availability::Available).1,
         };
+        let kernel = CpuKernel::new()?;
+        let perf = match &config.bench {
+            Some(b) => {
+                let (b, dir, k, key, cpus) = (
+                    b.clone(),
+                    config.data_dir.clone(),
+                    kernel.clone(),
+                    key.clone(),
+                    info.cpus,
+                );
+                match tokio::task::spawn_blocking(move || {
+                    bench::profile(&b, &dir, &k, &key, cpus, false)
+                })
+                .await?
+                {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        warn!("benchmark failed: {e:#}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         if docker.is_some() {
             info.executors.push(Executor::Docker);
         }
@@ -186,7 +222,15 @@ impl Agent {
             info,
             upgrader,
             available,
+            kernel,
+            perf: Arc::new(Mutex::new(perf)),
+            rebench: Arc::new(Notify::new()),
         })
+    }
+
+    /// The latest signed performance profile, if the machine was measured.
+    pub fn perf(&self) -> Option<SignedPerf> {
+        self.perf.lock().unwrap().clone()
     }
 
     pub fn id(&self) -> EndpointId {
@@ -381,6 +425,57 @@ impl Agent {
             })
         };
 
+        // The profile, then a new one whenever the machine is measured again:
+        // when the profile goes stale or the cluster asks, once no task runs.
+        if let Some(p) = self.perf() {
+            let _ = out_tx.send(FromAgent::Perf(Box::new(p)));
+        }
+        let benchmarks = self.config.bench.clone().map(|config| {
+            let out_tx = out_tx.clone();
+            let running = running.clone();
+            let perf = self.perf.clone();
+            let rebench = self.rebench.clone();
+            let (dir, kernel, key, cpus) = (
+                self.config.data_dir.clone(),
+                self.kernel.clone(),
+                self.key.clone(),
+                self.info.cpus,
+            );
+            tokio::spawn(async move {
+                loop {
+                    let age = perf
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|p| now_unix().saturating_sub(p.profile.measured_unix))
+                        .unwrap_or(u64::MAX);
+                    let wait = config.interval.saturating_sub(Duration::from_secs(age));
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait.max(Duration::from_secs(60))) => {}
+                        _ = rebench.notified() => {}
+                    }
+                    while !running.lock().unwrap().is_empty() {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    let (c, d, k, key) = (config.clone(), dir.clone(), kernel.clone(), key.clone());
+                    let res = tokio::task::spawn_blocking(move || {
+                        bench::profile(&c, &d, &k, &key, cpus, true)
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(p)) => {
+                            *perf.lock().unwrap() = Some(p.clone());
+                            if out_tx.send(FromAgent::Perf(Box::new(p))).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => warn!("benchmark failed: {e:#}"),
+                        Err(e) => warn!("benchmark panicked: {e}"),
+                    }
+                }
+            })
+        });
+
         // Availability changes, as they happen (the hello carried the
         // state at connect time).
         let availability = {
@@ -409,6 +504,9 @@ impl Agent {
                         Ok(version) => {
                             heartbeat.abort();
                             availability.abort();
+                            if let Some(b) = &benchmarks {
+                                b.abort();
+                            }
                             writer.abort();
                             conn.close(0u32.into(), b"upgrading");
                             return SessionEnd::Upgraded(version);
@@ -496,6 +594,32 @@ impl Agent {
                         }
                     }
                 }
+                Ok(Some(ToAgent::Benchmark(ch))) => {
+                    // As fast as possible: the cluster times the answer.
+                    let kernel = self.kernel.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let res =
+                            tokio::task::spawn_blocking(move || kernel.run(ch.seed, ch.iters))
+                                .await;
+                        match res {
+                            Ok(Ok((result, _))) => {
+                                let _ = out_tx.send(FromAgent::BenchResult {
+                                    nonce: ch.nonce,
+                                    result,
+                                });
+                            }
+                            Ok(Err(e)) => warn!("benchmark check failed: {e:#}"),
+                            Err(e) => warn!("benchmark check panicked: {e}"),
+                        }
+                    });
+                }
+                Ok(Some(ToAgent::Rebenchmark)) => {
+                    if self.config.bench.is_some() {
+                        info!("the cluster asked for a new benchmark");
+                        self.rebench.notify_one();
+                    }
+                }
                 Ok(Some(ToAgent::Cancel(task))) => {
                     if let Some(flag) = running.lock().unwrap().get(&task) {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -512,6 +636,9 @@ impl Agent {
         }
         heartbeat.abort();
         availability.abort();
+        if let Some(b) = &benchmarks {
+            b.abort();
+        }
         writer.abort();
         conn.close(0u32.into(), b"bye");
         SessionEnd::Lost(end)

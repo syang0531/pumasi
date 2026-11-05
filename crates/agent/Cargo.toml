@@ -50,4 +50,7 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
+
+# Direct I/O and cache hints for the disk benchmark.
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true

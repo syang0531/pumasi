@@ -116,3 +116,30 @@ pub fn module_hash(bytes: &[u8]) -> ModuleHash {
 pub fn short_hex(bytes: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(&bytes[..bytes.len().min(6)])
 }
+
+/// Windows' `canonicalize` gives `\\?\C:\...`, which no mount point
+/// (`C:\`) prefixes; drop the `\\?\` of a drive path.
+pub fn without_verbatim(p: &std::path::Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => std::path::PathBuf::from(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn verbatim_drive_paths() {
+        assert_eq!(
+            without_verbatim(Path::new(r"\\?\C:\Users\a")),
+            PathBuf::from(r"C:\Users\a")
+        );
+        let unc = Path::new(r"\\?\UNC\server\share");
+        assert_eq!(without_verbatim(unc), unc);
+        assert_eq!(without_verbatim(Path::new("/tmp")), PathBuf::from("/tmp"));
+    }
+}

@@ -166,7 +166,10 @@ async fn post(url: &str, body: &str) -> Result<(), String> {
 
 /// Used and total bytes of the disk holding `dir`.
 pub(crate) fn disk_of(dir: &Path) -> Option<(u64, u64)> {
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let dir = dir
+        .canonicalize()
+        .map(|d| pumasi_proto::without_verbatim(&d))
+        .unwrap_or_else(|_| dir.to_path_buf());
     let disks = sysinfo::Disks::new_with_refreshed_list();
     disks
         .iter()

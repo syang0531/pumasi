@@ -142,7 +142,10 @@ fn is_loopback(name: &str) -> bool {
 /// Used and total bytes of the disk holding `dir`: the one with the
 /// longest mount point that is a prefix of it.
 fn disk_of(disks: &Disks, dir: &Path) -> (u64, u64) {
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let dir = dir
+        .canonicalize()
+        .map(|d| pumasi_proto::without_verbatim(&d))
+        .unwrap_or_else(|_| dir.to_path_buf());
     disks
         .iter()
         .filter(|d| dir.starts_with(d.mount_point()))

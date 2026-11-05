@@ -5,7 +5,8 @@ cluster of phase 1, the invited providers, receipts, ledger and
 result checks of phase 2, the microVM executor of phase 3, the
 releases, OS services and signed agent upgrades of phase 4, the
 Windows support of phase 5, the Mac support and availability policy of
-phase 6, and the benchmarks and compute units of phase 7. The
+phase 6, the benchmarks and compute units of phase 7, and the cluster
+file store of phase 8. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -14,10 +15,10 @@ the project; this file covers the code.
 
 | Crate | Role |
 | --- | --- |
-| `pumasi-proto` | Job spec (`job.toml`), wire messages, framing, tickets, endpoint helpers, receipts (signing and verification), price list and policy. No business logic. |
+| `pumasi-proto` | Job spec (`job.toml`), wire messages, framing, tickets, endpoint helpers, receipts (signing and verification), price list and policy, the OCI registry client, and `blobs.rs` (iroh-blobs helpers: collections from files and back, resumable push and fetch). No business logic. |
 | `pumasi-guest` | `pumasi-guest`, the init process inside every microVM (a static musl binary), and the disk protocol the agent shares with it. |
-| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `MicrovmExecutor` (registry client, ext4 formatter, Firecracker/QEMU/Virtualization.framework), `availability` (power, idle and hours policy), `platform` (sparse files, Windows Job Objects, the WHPX check) and the `Agent` session loop, which signs usage. |
-| `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
+| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `NodeStore` (the node's file store cache), `MicrovmExecutor` (ext4 formatter, Firecracker/QEMU/Virtualization.framework), `availability` (power, idle and hours policy), `platform` (sparse files, Windows Job Objects, the WHPX check) and the `Agent` session loop, which signs usage. |
+| `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `datasets.rs` (datasets, quotas, secrets, storage billing), `files.rs` (the blob store, its access rules and tags), `transfer.rs` (the CLI's uploads and downloads), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
 | `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. `service.rs` installs the agent as an OS service, `upgrade.rs` drives rollouts. |
 
 The marketplace hub, Madang (마당), is not in this repository; it is a
@@ -31,7 +32,7 @@ encrypted and mutually authenticated by key, with hole punching and relay
 fallback in `public` mode. `local` mode disables relays and address lookup
 for LANs and tests.
 
-Two ALPNs:
+Three ALPNs:
 
 - `pumasi/agent/0`: the agent dials the control plane and opens one
   bidirectional stream. Handshake: `AgentHello` -> `HelloReply` (which tells
@@ -43,6 +44,9 @@ Two ALPNs:
   so they work from behind NAT without port forwarding.
 - `pumasi/admin/0`: one `AdminRequest` / `AdminResponse` per stream, each
   request carrying the admin secret.
+- `/iroh-bytes/4` (iroh-blobs): the file store, served by the control
+  plane and, read-only, by every agent of protocol 8 for its cache (see
+  phase 8 below).
 
 Frames are a 4-byte big-endian length plus a postcard body, capped at 64 MiB.
 
@@ -676,6 +680,126 @@ image job's vCPUs (and Docker containers of jobs without a CPU limit get
 one per GiB of memory beyond the first two, so a 4 GiB laptop runs two
 tasks at once.
 
+## Phase 8: the cluster file store
+
+### Store and tags
+
+The control plane runs an iroh-blobs file store in `<cluster dir>/blobs`.
+Everything in it is content-addressed by BLAKE3 and verified in 16 KiB
+chunk groups on the way in, so a transfer can stop anywhere and resume
+from what the receiver already has. A set of files is a *collection* (a
+hash sequence of the names blob and the files), and a dataset version,
+a task's output, a job input and a private image are each one collection.
+
+Tags are the references garbage collection keeps; everything without a
+tag is deleted by the store's GC (every `gc_interval`, 10 minutes):
+
+| Tag | Keeps |
+| --- | --- |
+| `ds/<name>/<version>` | a dataset version |
+| `out/<job>/<index>`, `chk/<job>/<index>/<attempt>` | a task's (or check run's) stored output until the job's output dataset is made |
+| `in/<job>/<root>` | a collection an unfinished job mounts |
+| `up/<root>` | a committed upload no job has used yet (24 hours) |
+| `img/<job>/<arch>/<digest>` | a private image an unfinished job runs |
+| `job/<id>` | a job's combined outputs while they become a dataset |
+
+The control plane's state (redb) is the source of truth; a worker task
+applies tag changes the state machine sends it, and on start it reconciles
+the store's tags with what the state says should exist. Data pushed but not
+yet named by a report or commit is kept for two hours by a protect
+callback, so the GC cannot delete an upload between its push and its
+commit. Removing a dataset deletes its tag; the space comes back at the
+next GC once no other tag shares the blobs.
+
+### Datasets, uploads and downloads
+
+`pumasi store put` imports the files into a temporary local store (by
+reference, so nothing is copied), asks the control plane what it lacks of
+the collection (`StoreUpload`, which also lets the CLI's endpoint push that
+one collection for an hour), pushes only the missing chunk ranges and then
+commits (`StoreCommit`): a new version of the dataset, unless the root is
+the same as the latest version's. The quota check (account quota or the
+default) happens at commit. An iroh-blobs push returns once the data is
+written to the stream, so the pusher then observes the receiver's bitfield
+of the last blob it sent until it is complete before closing the
+connection.
+
+`pumasi store get` (`StoreOpen`) lets the CLI's endpoint read the named
+collections for an hour, fetches them into `<dest>/.pumasi-partial` (an
+iroh-blobs store, so a second run continues where the first stopped) and
+then moves the files out. Bytes the control plane serves to the CLI are
+charged as egress to the dataset's (or job's) account.
+
+### Jobs
+
+`files = ["store:NAME[@VERSION][/PATH]"]` becomes a `MountRequest`; at
+submission the control plane resolves it to a `Mount` (collection root,
+selected path, place under `/input`) and fixes the version, so a job reads
+the same data on every retry. `{shard}` in a reference makes per-task
+mounts. Local `files` over 16 MiB are uploaded first and mounted from the
+upload. `output = "store:NAME"` sets the job's output dataset.
+
+Tasks with mounts, an output dataset or a private image go only to agents
+of protocol 8 or later. The assignment carries the mounts, the output mode
+(`Inline` for old agents, `Auto`: in the report up to 32 MiB, else stored,
+or `Store`), the private image and up to four peers that have the
+collections cached. The agent fetches each mount into its cache from the
+peers first and from the control plane otherwise (four attempts, keeping
+partial data), places the selected files in a staging directory that
+becomes `/input` (preopened for WASM, streamed as a tar into Docker,
+written to the input disk of a microVM), and pushes a stored output as a
+collection before it reports `FromAgent::Report { report, stored }`. The
+control plane checks that the collection is complete in its store and that
+its size matches before it accepts the result; `output_digest` (result
+digest v2) includes the stored root, so a check run that stored different
+bytes disagrees. Leases of store tasks get 10 minutes plus one second per
+4 MiB mounted on top of the task timeout.
+
+When a job ends, the stored outputs of its tasks are combined into one
+collection (`task-<index>/...`) and become a version of the output dataset,
+or of `job-<id>`; the per-task tags are then dropped.
+
+### Node caches
+
+Each agent of protocol 8 keeps its own iroh-blobs store in
+`<agent dir>/store` with a `cache/<root>` tag per cached collection and a
+size cap (`--store-cache`, 20 GiB). Least recently used collections not in
+use by a running task are untagged when it is over the cap, and the
+store's GC reclaims them. The agent tells the control plane what it has
+(`FromAgent::StoreState`, a full list at connect and changes after), which
+the scheduler uses for the peer list. Agents serve their cache read-only
+on the blobs ALPN; a collection's hash works as the read capability, and
+nodes learn only the hashes of what they are given.
+
+### Private images
+
+`pumasi secret set registry/<host> user:password` stores a login in the
+`secrets` table (it is never sent to nodes and `secret ls` shows only
+names). A Docker or microVM job whose image's registry has a login is
+*private*: before its tasks can run, the control plane resolves the image
+for each architecture among the nodes that could run it, downloads the
+manifest, config and layers with the login, and imports them as one
+collection (`image.json`, `config.json`, `layers/<digest>`). Nodes fetch it
+like a mount, from peers or the control plane. Docker nodes turn it into a
+`docker save` archive streamed into `docker load` as
+`pumasi-image:<digest>`; microVM nodes build their read-only root disk from
+the layer files the same way as from a registry pull. A node that already
+has the digest loaded skips the download. If the image cannot be pulled
+on any architecture, the job's pending tasks fail with the reason, shown in
+`pumasi job` as *preparing*.
+
+### Billing and quotas
+
+Every `storage_bill_every` (an hour) the control plane charges each
+account `bytes x seconds x rate / (GiB x 30 days)` for its dataset
+versions, uploads and the stored outputs of unfinished jobs, as `Storage`
+ledger entries paid to the owner. The rate depends on the control plane's
+disk class (`cluster start --storage-class`): `StoragePolicy` holds the
+HDD and NVMe rates, and `CuRates::storage_gib_month` is the SSD (and
+unknown) rate. Sub-milli-CU amounts carry over like task charges.
+Downloads are `Egress` entries at `CuRates::egress_gib`. Accounts have an
+optional quota in bytes, with a default in the storage policy.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -708,11 +832,20 @@ next start the control plane re-countersigns each credit receipt as a CU
 receipt at score 1000 (the node signature still holds because `Usage` is
 unchanged) and marks it done in `meta.credit_receipts_converted`.
 
-`PROTOCOL_VERSION` is 7: protocol 5 (phase 4) added `UpgradeHello` and the
+Phase 8 adds tables without changing a layout (still 4): `job_ext` and
+`task_ext` (a job's mounts, output dataset, private image state; a task's
+mounts and stored outputs, including check runs), `datasets` keyed by
+(name, version), `quotas`, `secrets` and `uploads`, and the meta keys
+`storage_policy` and `storage_billed`. Blob data lives in `blobs/`.
+
+`PROTOCOL_VERSION` is 8: protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
 `BenchResult` and `ToAgent::Benchmark` and `Rebenchmark`, which the control
-plane sends only to agents of protocol 7 or later. The hello is unchanged. The control plane accepts hellos from
+plane sends only to agents of protocol 7 or later. Protocol 8 appends the
+mount, output, image and peer fields to `TaskAssignment` (postcard ignores
+trailing fields, and only protocol 8 agents get store tasks) and adds
+`FromAgent::Report` and `StoreState`. The hello is unchanged. The control plane accepts hellos from
 `MIN_AGENT_PROTOCOL` (5) up: `AgentHello::decode` tries the current layout
 and falls back to the protocol 5 one (available), so phase 4 and 5 agents
 keep working and can take a rollout. Upgrade the control plane first; it
@@ -721,7 +854,12 @@ remotely; install a current binary on them once.
 
 ## Not yet
 
-- Remaining roadmap phases (8 to 18): a cluster file store, GPUs, cluster
+- File store: replicas on owner nodes (the control plane is the only full
+  copy, so back up `<cluster dir>/blobs`), an S3-compatible gateway, and
+  per-node quotas for caches beyond the size cap. Private images are pulled
+  from the registry again for each job (nodes that already loaded the
+  digest skip the download from the store).
+- Remaining roadmap phases (9 to 18): GPUs, cluster
   management, monitoring, a web dashboard, Raft, WebGPU, the confidential
   tier, self-hosting 1.0 (SSO, audit log, external security review), the
   hub, buying CU. See the roadmap in the README.
@@ -738,11 +876,8 @@ remotely; install a current binary on them once.
   and microVM work, which checks cannot cover). The CPU benchmark
   challenge keeps the billed speed honest, not the results. Disk and
   memory figures are not challenged yet, and no scheduling uses them.
-- MicroVM: private registries, network (a tap device with egress rules),
+- MicroVM: network (a tap device with egress rules),
   GPU passthrough (VFIO), a snapshot pool for faster boots.
 - Availability: running tasks are not stopped when a node pauses, and
   idle detection under a Windows service is not possible yet.
 - WASI preview 2 components, job garbage collection.
-- Large files: inputs and outputs travel through the control plane and are
-  capped (48 MiB in per job, 32 MiB out per task). Direct node-to-node
-  transfer with iroh-blobs would lift that.

@@ -8,7 +8,8 @@ pub mod docker;
 pub mod executor;
 pub mod microvm;
 pub mod platform;
-mod tempdir;
+pub mod store;
+pub mod tempdir;
 pub mod upgrade;
 
 pub use agent::{Agent, AgentConfig, Membership, default_node_name};

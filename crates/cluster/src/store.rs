@@ -18,7 +18,9 @@ use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, Tab
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::info;
 
-use crate::state::{Hold, JobMeta, Member, TaskRecord, TokenRecord};
+use crate::state::{
+    DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord,
+};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("members");
@@ -40,6 +42,21 @@ const CARRY: TableDefinition<(&str, &str), i64> = TableDefinition::new("carry");
 /// database moved to compute units (layout 4).
 const CREDIT_LEDGER: TableDefinition<u64, &[u8]> = TableDefinition::new("credit_ledger");
 const CREDIT_RECEIPTS: TableDefinition<RunKey, &[u8]> = TableDefinition::new("credit_receipts");
+/// File store records (phase 8). New tables rather than new fields, so the
+/// existing record layouts stay as they are.
+/// Key: job id. What a job mounts and where its outputs go.
+const JOB_EXT: TableDefinition<u128, &[u8]> = TableDefinition::new("job_ext");
+/// Key: (job id, task index). A task's mounts and stored output.
+const TASK_EXT: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_ext");
+/// Key: (dataset name, version).
+const DATASETS: TableDefinition<(&str, u32), &[u8]> = TableDefinition::new("datasets");
+/// Key: account. Storage quota in bytes.
+const QUOTAS: TableDefinition<&str, u64> = TableDefinition::new("quotas");
+/// Key: secret name. Value: (set unix time, value).
+const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
+/// Key: collection root. Committed job inputs not yet used by a job:
+/// (account, size, files, committed unix).
+const UPLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("uploads");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -61,6 +78,12 @@ pub struct Store {
 /// Everything loaded at startup.
 #[derive(Default)]
 pub struct Snapshot {
+    pub job_ext: Vec<(u128, JobExt)>,
+    pub task_ext: Vec<((u128, u32), TaskExt)>,
+    pub datasets: Vec<DatasetRecord>,
+    pub quotas: Vec<(String, u64)>,
+    pub secrets: Vec<(String, u64, String)>,
+    pub uploads: Vec<([u8; 32], crate::state::UploadRecord)>,
     pub members: Vec<Member>,
     pub tokens: Vec<TokenRecord>,
     pub jobs: Vec<(JobMeta, Vec<TaskRecord>)>,
@@ -112,6 +135,12 @@ impl Store {
         tx.open_table(HOLDS)?;
         tx.open_table(RECEIPTS)?;
         tx.open_table(CARRY)?;
+        tx.open_table(JOB_EXT)?;
+        tx.open_table(TASK_EXT)?;
+        tx.open_table(DATASETS)?;
+        tx.open_table(QUOTAS)?;
+        tx.open_table(SECRETS)?;
+        tx.open_table(UPLOADS)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -467,6 +496,32 @@ impl Store {
             let (c, p) = k.value();
             snap.carry.push(((c.to_string(), p.to_string()), v.value()));
         }
+        for row in tx.open_table(JOB_EXT)?.iter()? {
+            let (k, v) = row?;
+            snap.job_ext.push((k.value(), dec(v.value())?));
+        }
+        for row in tx.open_table(TASK_EXT)?.iter()? {
+            let (k, v) = row?;
+            snap.task_ext.push((k.value(), dec(v.value())?));
+        }
+        for row in tx.open_table(DATASETS)?.iter()? {
+            let (_, v) = row?;
+            snap.datasets.push(dec(v.value())?);
+        }
+        for row in tx.open_table(QUOTAS)?.iter()? {
+            let (k, v) = row?;
+            snap.quotas.push((k.value().to_string(), v.value()));
+        }
+        for row in tx.open_table(SECRETS)?.iter()? {
+            let (k, v) = row?;
+            let (set, value): (u64, String) = dec(v.value())?;
+            snap.secrets.push((k.value().to_string(), set, value));
+        }
+        for row in tx.open_table(UPLOADS)?.iter()? {
+            let (k, v) = row?;
+            let root: [u8; 32] = k.value().try_into().context("bad upload key")?;
+            snap.uploads.push((root, dec(v.value())?));
+        }
         snap.next_ledger_seq = tx
             .open_table(LEDGER)?
             .last()?
@@ -510,12 +565,14 @@ impl Store {
     }
 
     /// Writes a new job with all its tasks and any new content blobs
-    /// (module, shared file bundle) in one transaction.
+    /// (module, shared file bundle) in one transaction. A job's file store
+    /// details go to their own tables; a used upload is forgotten.
     pub fn put_new_job(
         &self,
         meta: &JobMeta,
         tasks: &[TaskRecord],
         blobs: &[(ModuleHash, &[u8])],
+        used_uploads: &[[u8; 32]],
     ) -> Result<()> {
         let tx = self.db.begin_write()?;
         {
@@ -526,9 +583,21 @@ impl Store {
             drop(t);
             tx.open_table(JOBS)?
                 .insert(meta.id.0, enc(meta).as_slice())?;
+            if !meta.ext.is_empty() {
+                tx.open_table(JOB_EXT)?
+                    .insert(meta.id.0, enc(&meta.ext).as_slice())?;
+            }
             let mut t = tx.open_table(TASKS)?;
+            let mut ext = tx.open_table(TASK_EXT)?;
             for (i, task) in tasks.iter().enumerate() {
                 t.insert((meta.id.0, i as u32), enc(task).as_slice())?;
+                if !task.ext.is_empty() {
+                    ext.insert((meta.id.0, i as u32), enc(&task.ext).as_slice())?;
+                }
+            }
+            let mut up = tx.open_table(UPLOADS)?;
+            for root in used_uploads {
+                up.remove(root.as_slice())?;
             }
         }
         tx.commit()?;
@@ -537,8 +606,16 @@ impl Store {
 
     pub fn put_job_meta(&self, meta: &JobMeta) -> Result<()> {
         let tx = self.db.begin_write()?;
-        tx.open_table(JOBS)?
-            .insert(meta.id.0, enc(meta).as_slice())?;
+        {
+            tx.open_table(JOBS)?
+                .insert(meta.id.0, enc(meta).as_slice())?;
+            let mut ext = tx.open_table(JOB_EXT)?;
+            if meta.ext.is_empty() {
+                ext.remove(meta.id.0)?;
+            } else {
+                ext.insert(meta.id.0, enc(&meta.ext).as_slice())?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -550,8 +627,89 @@ impl Store {
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(TASKS)?;
+            let mut ext = tx.open_table(TASK_EXT)?;
             for (i, task) in tasks {
                 t.insert((job, *i), enc(*task).as_slice())?;
+                if task.ext.is_empty() {
+                    ext.remove((job, *i))?;
+                } else {
+                    ext.insert((job, *i), enc(&task.ext).as_slice())?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_dataset(&self, d: &DatasetRecord) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(DATASETS)?
+            .insert((d.name.as_str(), d.version), enc(d).as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_datasets(&self, keys: &[(String, u32)]) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(DATASETS)?;
+            for (n, v) in keys {
+                t.remove((n.as_str(), *v))?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_quota(&self, account: &str, bytes: Option<u64>) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(QUOTAS)?;
+            match bytes {
+                Some(b) => {
+                    t.insert(account, b)?;
+                }
+                None => {
+                    t.remove(account)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_secret(&self, name: &str, set_unix: u64, value: Option<&str>) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(SECRETS)?;
+            match value {
+                Some(v) => {
+                    t.insert(name, enc(&(set_unix, v.to_string())).as_slice())?;
+                }
+                None => {
+                    t.remove(name)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_upload(
+        &self,
+        root: &[u8; 32],
+        u: Option<&crate::state::UploadRecord>,
+    ) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(UPLOADS)?;
+            match u {
+                Some(u) => {
+                    t.insert(root.as_slice(), enc(u).as_slice())?;
+                }
+                None => {
+                    t.remove(root.as_slice())?;
+                }
             }
         }
         tx.commit()?;
@@ -915,6 +1073,7 @@ pub(crate) mod legacy {
                 seq: m.seq,
                 account: OWNER_ACCOUNT.into(),
                 deterministic: false,
+                ext: Default::default(),
             }
         }
     }
@@ -946,6 +1105,7 @@ pub(crate) mod legacy {
                 output_files: t.output_files,
                 check: None,
                 cost: 0,
+                ext: Default::default(),
             }
         }
     }

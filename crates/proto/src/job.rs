@@ -14,6 +14,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::store::{
+    MountRequest, MountSource, STORE_PREFIX, StoreRef, expand_shard, validate_dataset_name,
+};
+
 /// Default per-task memory limit.
 pub const DEFAULT_MEMORY_MB: u64 = 256;
 /// Default per-task wall-clock timeout.
@@ -262,6 +266,13 @@ pub struct JobSubmission {
     /// so any honest node computes the same result. Needed for checking
     /// provider results by re-running them.
     pub deterministic: bool,
+    /// Datasets (or uploaded collections) in every task's `/input`.
+    pub mounts: Vec<MountRequest>,
+    /// Each task's own mounts: empty, or one list per task.
+    pub task_mounts: Vec<Vec<MountRequest>>,
+    /// Write every task's `/output` to the store and, when the job ends,
+    /// make a new version of this dataset from them (`task-<i>/...`).
+    pub output_dataset: Option<String>,
 }
 
 impl JobSubmission {
@@ -305,6 +316,24 @@ impl JobSubmission {
             .chain(self.tasks.iter().flat_map(|t| t.files.iter()))
         {
             validate_rel_path(&f.path)?;
+        }
+        ensure!(
+            self.task_mounts.is_empty() || self.task_mounts.len() == self.tasks.len(),
+            "task mounts do not match the tasks"
+        );
+        for m in self.mounts.iter().chain(self.task_mounts.iter().flatten()) {
+            if let MountSource::Dataset { name, .. } = &m.source {
+                validate_dataset_name(name)?;
+            }
+            if let Some(sel) = &m.select {
+                validate_rel_path(sel)?;
+            }
+            if !m.at.is_empty() {
+                validate_rel_path(&m.at)?;
+            }
+        }
+        if let Some(name) = &self.output_dataset {
+            validate_dataset_name(name)?;
         }
         // The whole submission travels in one frame, so cap all files together.
         let total: usize = self
@@ -371,6 +400,9 @@ impl JobSubmission {
 #[serde(deny_unknown_fields)]
 pub struct JobFile {
     pub name: Option<String>,
+    /// `store:NAME`: write every task's `/output` to the file store and
+    /// make a new version of dataset NAME from them when the job ends.
+    pub output: Option<String>,
     /// WASM module path (wasm executor).
     pub module: Option<PathBuf>,
     /// OCI image (docker and microvm executors).
@@ -387,7 +419,9 @@ pub struct JobFile {
     pub env: BTreeMap<String, String>,
     /// Path to a file fed to every task's stdin.
     pub stdin: Option<PathBuf>,
-    /// Files and directories copied into every task's `/input`.
+    /// Files and directories copied into every task's `/input`, and
+    /// datasets from the file store (`store:NAME[@VERSION][/PATH]`, placed
+    /// under `/input/NAME/`; `{shard}` in it picks one per task).
     #[serde(default)]
     pub files: Vec<PathBuf>,
     /// Allow network access (docker executor only).
@@ -435,36 +469,95 @@ pub struct ResourcesFile {
 
 /// Collects files and directories (recursively) relative to `base`. A file
 /// `data/a.csv` keeps that path; a directory `data/` contributes every file
-/// under it with its path relative to `base`.
+/// under it with its path relative to `base`. `store:` entries are not
+/// files and are skipped (see [`store_refs`]).
 pub fn collect_files(base: &Path, paths: &[PathBuf]) -> Result<Vec<FileEntry>> {
-    let mut out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for p in paths {
+    collect_paths(base, paths)?
+        .into_iter()
+        .map(|(path, full, _)| {
+            let data = std::fs::read(&full).with_context(|| format!("read {}", full.display()))?;
+            Ok(FileEntry { path, data })
+        })
+        .collect()
+}
+
+/// Like [`collect_files`], but only lists the files: their path in
+/// `/input`, where they are, and their size.
+pub fn collect_paths(base: &Path, paths: &[PathBuf]) -> Result<Vec<(String, PathBuf, u64)>> {
+    let mut out: BTreeMap<String, (PathBuf, u64)> = BTreeMap::new();
+    for p in paths.iter().filter(|p| store_ref_of(p).is_none()) {
         let full = base.join(p);
         let meta = std::fs::metadata(&full).with_context(|| format!("read {}", full.display()))?;
         let root_rel = rel_string(p)?;
         if meta.is_dir() {
-            let (entries, _) = read_files(&full, usize::MAX)?;
-            for e in entries {
-                let path = if root_rel.is_empty() {
-                    e.path
-                } else {
-                    format!("{root_rel}/{}", e.path)
-                };
-                out.insert(path, e.data);
+            let mut stack = vec![full.clone()];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).with_context(|| format!("read {}", d.display()))? {
+                    let e = e?;
+                    let ft = e.file_type()?;
+                    if ft.is_dir() {
+                        stack.push(e.path());
+                    } else if ft.is_file() {
+                        let rel = e.path();
+                        let rel = rel.strip_prefix(&full).expect("under dir");
+                        let rel: Vec<String> = rel
+                            .components()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                            .collect();
+                        let rel = rel.join("/");
+                        let path = if root_rel.is_empty() {
+                            rel
+                        } else {
+                            format!("{root_rel}/{rel}")
+                        };
+                        out.insert(path, (e.path(), e.metadata()?.len()));
+                    }
+                }
             }
         } else {
             ensure!(!root_rel.is_empty(), "invalid file path {}", p.display());
-            out.insert(root_rel, std::fs::read(&full)?);
+            out.insert(root_rel, (full, meta.len()));
         }
     }
-    let files: Vec<FileEntry> = out
-        .into_iter()
-        .map(|(path, data)| FileEntry { path, data })
-        .collect();
-    for f in &files {
-        validate_rel_path(&f.path)?;
+    let files: Vec<(String, PathBuf, u64)> =
+        out.into_iter().map(|(p, (full, n))| (p, full, n)).collect();
+    for (p, _, _) in &files {
+        validate_rel_path(p)?;
     }
     Ok(files)
+}
+
+/// Every regular file under `dir`: its path relative to `dir`, where it
+/// is, and its size.
+pub fn dir_files(dir: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
+    collect_paths(dir, &[PathBuf::from(".")])
+}
+
+/// The `store:` reference a `files` entry stands for, if it is one.
+fn store_ref_of(p: &Path) -> Option<&str> {
+    p.to_str().filter(|s| s.starts_with(STORE_PREFIX))
+}
+
+/// The `store:` references among `files` entries, as written.
+pub fn store_refs(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|p| store_ref_of(p).map(String::from))
+        .collect()
+}
+
+/// Mounts for `store:` references, after expanding shard placeholders.
+fn mounts_for(refs: &[String], shard: Option<(u32, u32)>) -> Result<Vec<MountRequest>> {
+    refs.iter()
+        .map(|r| {
+            let r = match shard {
+                Some((i, n)) => expand_shard(r, i, n),
+                None => r.clone(),
+            };
+            let parsed: StoreRef = r.parse().with_context(|| format!("bad file entry {r:?}"))?;
+            Ok(MountRequest::from_ref(&parsed))
+        })
+        .collect()
 }
 
 /// Turns a user-given relative path into `a/b/c` form.
@@ -499,6 +592,29 @@ impl JobFile {
     }
 
     pub fn resolve(self, base: &Path) -> Result<JobSubmission> {
+        Ok(self.resolve_with(base, None)?.0)
+    }
+
+    /// Like [`Self::load`], but when the shared `files` add up to more than
+    /// `inline_limit` bytes they are not read: they come back as (path in
+    /// `/input`, file) for uploading to the file store, and the
+    /// submission's `files` is empty.
+    pub fn load_split(
+        path: &Path,
+        inline_limit: u64,
+    ) -> Result<(JobSubmission, Vec<(String, PathBuf)>)> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let file = Self::parse(&text)?;
+        let base = path.parent().unwrap_or(Path::new("."));
+        file.resolve_with(base, Some(inline_limit))
+    }
+
+    fn resolve_with(
+        self,
+        base: &Path,
+        inline_limit: Option<u64>,
+    ) -> Result<(JobSubmission, Vec<(String, PathBuf)>)> {
         let read = |p: &Path| -> Result<Vec<u8>> {
             let full = base.join(p);
             std::fs::read(&full).with_context(|| format!("read {}", full.display()))
@@ -539,12 +655,38 @@ impl JobFile {
             Some(p) => read(p)?,
             None => Vec::new(),
         };
-        let files = collect_files(base, &self.files)?;
+        let listed = collect_paths(base, &self.files)?;
+        let total: u64 = listed.iter().map(|(_, _, n)| n).sum();
+        let (files, upload) = match inline_limit {
+            Some(limit) if total > limit => (
+                Vec::new(),
+                listed.into_iter().map(|(p, f, _)| (p, f)).collect(),
+            ),
+            _ => (collect_files(base, &self.files)?, Vec::new()),
+        };
+        let refs = store_refs(&self.files);
+        // `{shard}` in a reference picks something per task.
+        let (shared_refs, shard_refs): (Vec<String>, Vec<String>) =
+            refs.into_iter().partition(|r| !r.contains("{shard"));
+        let mounts = mounts_for(&shared_refs, None)?;
+        let mut task_mounts: Vec<Vec<MountRequest>> = Vec::new();
 
         let mut command = self.command.clone();
         let tasks = if !self.tasks.is_empty() {
             if self.shards.is_some() {
                 bail!("use either `shards` or `[[task]]`, not both");
+            }
+            ensure!(
+                shard_refs.is_empty(),
+                "`{{shard}}` in `files` needs `shards`; give each `[[task]]` its own `files`"
+            );
+            task_mounts = self
+                .tasks
+                .iter()
+                .map(|t| mounts_for(&store_refs(&t.files), None))
+                .collect::<Result<_>>()?;
+            if task_mounts.iter().all(|m| m.is_empty()) {
+                task_mounts.clear();
             }
             self.tasks
                 .iter()
@@ -569,6 +711,11 @@ impl JobFile {
         } else {
             let n = self.shards.unwrap_or(1);
             ensure!(n >= 1, "shards must be at least 1");
+            if !shard_refs.is_empty() {
+                task_mounts = (0..n)
+                    .map(|i| mounts_for(&shard_refs, Some((i, n))))
+                    .collect::<Result<_>>()?;
+            }
             // `{shard}` in the command is per task, so move the command into
             // the task args when it uses placeholders.
             let templated = command.iter().any(|c| c.contains("{shard"));
@@ -630,7 +777,20 @@ impl JobFile {
             network: self.network,
             gpus: self.gpus.clone(),
         });
+        let output_dataset = match &self.output {
+            Some(o) => {
+                let name = o
+                    .strip_prefix(STORE_PREFIX)
+                    .context("`output` must be `store:NAME`")?;
+                validate_dataset_name(name)?;
+                Some(name.to_string())
+            }
+            None => None,
+        };
         let sub = JobSubmission {
+            mounts,
+            task_mounts,
+            output_dataset,
             name,
             executor,
             module,
@@ -654,13 +814,12 @@ impl JobFile {
             },
         };
         sub.validate()?;
-        Ok(sub)
+        Ok((sub, upload))
     }
 }
 
 fn expand(s: &str, shard: u32, shards: u32) -> String {
-    s.replace("{shard}", &shard.to_string())
-        .replace("{shards}", &shards.to_string())
+    expand_shard(s, shard, shards)
 }
 
 /// Parses "250ms", "90s", "5m", "1h", "7d" or a bare number of seconds.

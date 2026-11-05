@@ -10,17 +10,18 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, protocol::Router};
 use pumasi_proto::{
-    AGENT_ALPN, ModuleHash, PROTOCOL_VERSION, Secret,
-    job::{Executor, FileEntry},
+    AGENT_ALPN, BLOBS_ALPN, ModuleHash, PROTOCOL_VERSION, Secret,
+    job::{Executor, FileEntry, MAX_OUTPUT_FILES_BYTES, dir_files, read_files},
     msg::{
         AgentHello, Availability, FromAgent, HelloReply, NodeInfo, Role, TaskAssignment, TaskRef,
         TaskReport, ToAgent,
     },
-    net::{NetMode, bind_endpoint, load_or_create_key},
+    net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key},
     perf::SignedPerf,
-    receipt::{SignedUsage, Usage, result_digest},
+    receipt::{SignedUsage, Usage, output_digest},
+    store::{OutputMode, StoredOutput},
     ticket::JoinTicket,
     wire::{read_msg, write_msg},
 };
@@ -32,8 +33,10 @@ use crate::{
     availability::AvailabilityConfig,
     bench::{self, BenchConfig, CpuKernel},
     docker::DockerExecutor,
-    executor::WasmExecutor,
+    executor::{LocalImage, RunResult, TaskIo, WasmExecutor},
     microvm::{MicrovmConfig, MicrovmExecutor},
+    store::{DEFAULT_CACHE_BYTES, InUse, NodeStore},
+    tempdir::TempDir,
     upgrade::{AgentExit, Startup, TRIAL_TIMEOUT, UpgradeConfig, Upgrader},
 };
 
@@ -71,6 +74,9 @@ pub struct AgentConfig {
     /// like a provider that skips the work. Never set this in real use.
     #[doc(hidden)]
     pub corrupt_results: bool,
+    /// Size of the file store cache (datasets and private images this
+    /// node fetched). `None`: [`DEFAULT_CACHE_BYTES`].
+    pub store_cache_bytes: Option<u64>,
 }
 
 /// What the agent remembers about the cluster it joined.
@@ -107,6 +113,9 @@ pub struct Agent {
     perf: Arc<Mutex<Option<SignedPerf>>>,
     /// Wakes the benchmark loop to measure again now.
     rebench: Arc<Notify>,
+    /// The file store cache, which other nodes may fetch from.
+    node_store: NodeStore,
+    _router: Router,
 }
 
 /// Why a session ended.
@@ -124,7 +133,22 @@ enum SessionEnd {
 impl Agent {
     pub async fn new(config: AgentConfig) -> Result<Self> {
         let key = load_or_create_key(&config.data_dir.join(KEY_FILE))?;
-        let endpoint = bind_endpoint(key.clone(), config.net, vec![], config.bind).await?;
+        let endpoint = bind_endpoint(
+            key.clone(),
+            config.net,
+            vec![BLOBS_ALPN.to_vec()],
+            config.bind,
+        )
+        .await?;
+        let node_store = NodeStore::open(
+            &config.data_dir.join("store"),
+            config.store_cache_bytes.unwrap_or(DEFAULT_CACHE_BYTES),
+            endpoint.clone(),
+        )
+        .await?;
+        let router = Router::builder(endpoint.clone())
+            .accept(BLOBS_ALPN, node_store.protocol())
+            .spawn();
         let executor = WasmExecutor::new()?;
         let docker =
             match &config.docker {
@@ -225,6 +249,8 @@ impl Agent {
             kernel,
             perf: Arc::new(Mutex::new(perf)),
             rebench: Arc::new(Notify::new()),
+            node_store,
+            _router: router,
         })
     }
 
@@ -284,6 +310,17 @@ impl Agent {
     /// previous) binary.
     pub async fn serve(
         self,
+        cluster: EndpointAddr,
+        join_secret: Option<Secret>,
+    ) -> Result<AgentExit> {
+        let exit = self.serve_inner(cluster, join_secret).await;
+        // Let go of the file store so a restarted agent can open it.
+        self.node_store.shutdown().await;
+        exit
+    }
+
+    async fn serve_inner(
+        &self,
         cluster: EndpointAddr,
         mut join_secret: Option<Secret>,
     ) -> Result<AgentExit> {
@@ -395,6 +432,9 @@ impl Agent {
 
         let running: Arc<Mutex<HashMap<TaskRef, Arc<AtomicBool>>>> = Default::default();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<FromAgent>();
+        // Other nodes fetch cached collections from this address.
+        let addr = dialable_addr(&self.endpoint, self.config.net).await;
+        self.node_store.attach(out_tx.clone(), Some(addr));
 
         // Writer: the only task that touches the send stream.
         let writer = tokio::spawn(async move {
@@ -585,7 +625,7 @@ impl Agent {
                         _ => None,
                     };
                     match load_error {
-                        None => self.start_task(*a, *cluster.id.as_bytes(), &running, &out_tx),
+                        None => self.start_task(*a, cluster, &running, &out_tx),
                         Some(e) => {
                             let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
                                 a.task,
@@ -647,7 +687,7 @@ impl Agent {
     fn start_task(
         &self,
         a: TaskAssignment,
-        cluster: [u8; 32],
+        cluster_addr: &EndpointAddr,
         running: &Arc<Mutex<HashMap<TaskRef, Arc<AtomicBool>>>>,
         out_tx: &mpsc::UnboundedSender<FromAgent>,
     ) {
@@ -674,10 +714,28 @@ impl Agent {
         let out_tx = out_tx.clone();
         let key = self.key.clone();
         let corrupt = self.config.corrupt_results;
+        let node_store = self.node_store.clone();
+        let cluster_addr = cluster_addr.clone();
+        let cluster = *cluster_addr.id.as_bytes();
         debug!(task = %a.task, executor = %a.executor, "starting task");
         tokio::spawn(async move {
             let task = a.task;
-            let result: Result<crate::executor::RunResult> = match a.executor {
+            // Mounted datasets and a private image come from the file store
+            // first; the run's timeout starts after.
+            let prepared =
+                prepare_io(&node_store, &a, &cluster_addr, &docker, &microvm, &cancel).await;
+            let (io, _held, _dirs) = match prepared {
+                Ok(p) => p,
+                Err(e) => {
+                    running.lock().unwrap().remove(&task);
+                    let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
+                        task,
+                        format!("{e:#}"),
+                    ))));
+                    return;
+                }
+            };
+            let result: Result<RunResult> = match a.executor {
                 Executor::Wasm => {
                     let Some(hash) = a.module_hash else {
                         let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
@@ -687,9 +745,10 @@ impl Agent {
                         return;
                     };
                     let a = a.clone();
+                    let io = io.clone();
                     tokio::task::spawn_blocking(move || {
-                        executor.run(
-                            &hash, &a.program, &a.input, &shared, &a.limits, a.seed, cancel,
+                        executor.run_io(
+                            &hash, &a.program, &a.input, &shared, &a.limits, a.seed, cancel, &io,
                         )
                     })
                     .await
@@ -697,22 +756,30 @@ impl Agent {
                 }
                 Executor::Docker => match (docker, a.docker.as_ref()) {
                     (Some(d), Some(spec)) => Ok(d
-                        .run(task, spec, &a.input, &shared, &a.limits, cancel)
+                        .run_io(task, spec, &a.input, &shared, &a.limits, cancel, &io)
                         .await),
                     (None, _) => Err(anyhow::anyhow!("docker is not enabled on this node")),
                     (_, None) => Err(anyhow::anyhow!("docker task without an image")),
                 },
                 Executor::Microvm => match (microvm, a.docker.as_ref()) {
                     (Some(vm), Some(spec)) => Ok(vm
-                        .run(task, spec, &a.input, &shared, &a.limits, cancel)
+                        .run_io(task, spec, &a.input, &shared, &a.limits, cancel, &io)
                         .await),
                     (None, _) => Err(anyhow::anyhow!("microVMs are not enabled on this node")),
                     (_, None) => Err(anyhow::anyhow!("microvm task without an image")),
                 },
             };
+            // Output files kept on disk go in the report when they fit, or
+            // to the file store.
+            let result = match result {
+                Ok(r) => finish_output(r, a.output, &node_store, &cluster_addr).await,
+                Err(e) => Err(e),
+            };
             running.lock().unwrap().remove(&task);
+            let mut stored: Option<StoredOutput> = None;
             let report = match result {
-                Ok(mut r) => {
+                Ok((mut r, s)) => {
+                    stored = s;
                     if corrupt && r.outcome.is_success() {
                         r.stdout = b"made up".to_vec();
                     }
@@ -730,7 +797,12 @@ impl Agent {
                                 memory_limit_bytes: a.limits.memory_bytes,
                                 peak_memory_bytes: r.peak_memory_bytes,
                                 cpu_millis: a.limits.cpu_millis,
-                                result_digest: result_digest(&r.outcome, &r.stdout, &r.files),
+                                result_digest: output_digest(
+                                    &r.outcome,
+                                    &r.stdout,
+                                    &r.files,
+                                    stored.as_ref(),
+                                ),
                                 finished_unix: now_unix(),
                             };
                             SignedUsage::sign(usage, &key)
@@ -749,9 +821,105 @@ impl Agent {
                 Err(e) => error_report(task, format!("{e:#}")),
             };
             debug!(task = %task, outcome = %report.outcome, "task finished");
-            let _ = out_tx.send(FromAgent::Done(Box::new(report)));
+            let _ = out_tx.send(FromAgent::Report {
+                report: Box::new(report),
+                stored,
+            });
         });
     }
+}
+
+/// Fetches what a task mounts (and its private image) from the file store
+/// and places it for the executor. Returns the executor's view, the
+/// collections held in the cache while the task runs, and the scratch
+/// directories to remove afterwards.
+async fn prepare_io(
+    store: &NodeStore,
+    a: &TaskAssignment,
+    cluster: &EndpointAddr,
+    docker: &Option<DockerExecutor>,
+    microvm: &Option<MicrovmExecutor>,
+    cancel: &AtomicBool,
+) -> Result<(TaskIo, Vec<InUse>, Vec<TempDir>)> {
+    let mut held = Vec::new();
+    let mut dirs = Vec::new();
+    let scratch = store.scratch("io")?;
+    let mut io = TaskIo {
+        output: a.output,
+        scratch: Some(scratch.path().to_path_buf()),
+        ..Default::default()
+    };
+    dirs.push(scratch);
+    if !a.mounts.is_empty() {
+        let mut mounts = Vec::new();
+        for m in &a.mounts {
+            let used = store
+                .ensure(m.root, &m.label, &a.peers, cluster, cancel)
+                .await?;
+            mounts.push((m.clone(), used));
+        }
+        let dir = store.scratch("input")?;
+        let bytes = store.stage(&mounts, dir.path()).await?;
+        debug!(task = %a.task, bytes, "placed mounted files");
+        io.staged = Some(dir.path().to_path_buf());
+        dirs.push(dir);
+        held.extend(mounts.into_iter().map(|(_, u)| u));
+    }
+    if let Some(img) = &a.image {
+        let loaded = match a.executor {
+            Executor::Docker => match docker {
+                Some(d) => d.has_local_image(&img.digest).await,
+                None => false,
+            },
+            Executor::Microvm => microvm.as_ref().is_some_and(|vm| vm.has_image(&img.digest)),
+            Executor::Wasm => true,
+        };
+        let dir = store.scratch("image")?;
+        if !loaded {
+            let label = format!("image {}", img.reference);
+            let used = store
+                .ensure(img.root, &label, &a.peers, cluster, cancel)
+                .await?;
+            store.export_all(&used, dir.path()).await?;
+            held.push(used);
+        }
+        io.image = Some(LocalImage {
+            digest: img.digest.clone(),
+            dir: dir.path().to_path_buf(),
+        });
+        dirs.push(dir);
+    }
+    Ok((io, held, dirs))
+}
+
+/// Decides where a run's output files go: in the report when they fit
+/// (and the job allows it), else to the file store.
+async fn finish_output(
+    mut r: RunResult,
+    mode: OutputMode,
+    store: &NodeStore,
+    cluster: &EndpointAddr,
+) -> Result<(RunResult, Option<StoredOutput>)> {
+    let Some(dir) = r.out_dir.take() else {
+        return Ok((r, None));
+    };
+    let files = dir_files(dir.path())?;
+    if files.is_empty() {
+        return Ok((r, None));
+    }
+    let total: u64 = files.iter().map(|(_, _, n)| n).sum();
+    if mode == OutputMode::Auto && total <= MAX_OUTPUT_FILES_BYTES as u64 {
+        let (files, _) = read_files(dir.path(), MAX_OUTPUT_FILES_BYTES)?;
+        r.files = files;
+        return Ok((r, None));
+    }
+    let stored = store.push_output(dir.path(), cluster).await?;
+    info!(
+        files = stored.files,
+        bytes = stored.size,
+        "output files uploaded to the file store"
+    );
+    Ok((r, Some(stored)))
 }
 
 fn error_report(task: TaskRef, msg: String) -> TaskReport {

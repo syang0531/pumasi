@@ -38,6 +38,9 @@ jobs:
           workspaces: |
             .
             examples/montecarlo
+      - name: Private registry for the private image tests
+        if: runner.os == 'Linux'
+        run: scripts/ci/private-registry.sh
       - name: Unit and end-to-end tests
         run: cargo test --workspace
       - name: Build sample module
@@ -86,7 +89,9 @@ jobs:
           cargo run -p pumasi-cli -- vm setup --vm-dir "$VM_DIR" \
             --guest target/x86_64-unknown-linux-musl/release/pumasi-guest
           cargo run -p pumasi-cli -- vm status --vm-dir "$VM_DIR" --vm-backend ${{ matrix.backend }}
-      - name: End-to-end test (cluster, invited provider, microVM jobs)
+      - name: Private registry for the private image test
+        run: scripts/ci/private-registry.sh
+      - name: End-to-end test (cluster, invited provider, microVM jobs, private image)
         env:
           PUMASI_TEST_VM_DIR: ${{ env.VM_DIR }}
           PUMASI_TEST_VM_BACKEND: ${{ matrix.backend }}

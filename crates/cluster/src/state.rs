@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{PublicKey, SecretKey};
 use pumasi_proto::{
-    ModuleHash, Secret,
+    ModuleHash, STORE_PROTOCOL, Secret,
     economy::{Metered, MilliCu, Policy, validate_account, vcpus},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{
@@ -23,14 +23,17 @@ use pumasi_proto::{
         TaskView, ToAgent, UpgradeHello, Verification,
     },
     perf::SignedPerf,
-    receipt::{Billing, Receipt, check_usage, result_digest},
+    receipt::{Billing, Receipt, check_usage, output_digest},
     secrets_eq,
+    store::{BlobHash, OutputMode, StoredOutput},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+pub use crate::datasets::{DatasetRecord, ImageState, JobExt, TaskExt, UploadRecord};
 use crate::{
+    datasets::{FileState, oci_arch_of},
     perf::{PerfCheck, PerfRuntime, cpu_score},
     rollout::RolloutRecord,
     store::Store,
@@ -39,6 +42,10 @@ use crate::{
 /// Extra time past a task's own timeout before the control plane assumes
 /// the node hung and reschedules the task elsewhere.
 const LEASE_GRACE: Duration = Duration::from_secs(30);
+/// Extra lease for a run on a node that uses the file store (uploading a
+/// large output), plus one second per this many bytes it mounts.
+const STORE_LEASE_EXTRA: Duration = Duration::from_secs(600);
+const STORE_LEASE_RATE: u64 = 4 << 20;
 
 pub fn now_unix() -> u64 {
     SystemTime::now()
@@ -119,6 +126,9 @@ pub struct JobMeta {
     /// Account paying for runs on other accounts' machines.
     pub account: String,
     pub deterministic: bool,
+    /// File store details, persisted in their own table.
+    #[serde(skip)]
+    pub ext: JobExt,
 }
 
 /// What a run produced, kept for a check run until the check settles in
@@ -173,6 +183,9 @@ pub struct TaskRecord {
     pub check: Option<CheckRecord>,
     /// Milli-CU charged for this task's runs.
     pub cost: MilliCu,
+    /// File store details, persisted in their own table.
+    #[serde(skip)]
+    pub ext: TaskExt,
 }
 
 /// A provider earning waiting out the hold period.
@@ -270,6 +283,8 @@ pub struct State {
     /// Nodes sent a release (its SHA-256) and when. They get no tasks
     /// until they come back; kept across the restart's disconnect.
     pub(crate) upgrading: HashMap<String, ([u8; 32], Instant)>,
+    /// Datasets, quotas, secrets and the rest of the file store.
+    pub(crate) files: FileState,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -340,14 +355,21 @@ impl State {
             rollout: None,
             upgrade_failures: HashMap::new(),
             upgrading: HashMap::new(),
+            files: FileState::default(),
         };
+        let mut job_ext: HashMap<u128, JobExt> = snap.job_ext.into_iter().collect();
+        let mut task_ext: HashMap<(u128, u32), TaskExt> = snap.task_ext.into_iter().collect();
         state.rollout = state.load_rollout()?;
         state.convert_credit_receipts()?;
         state.ensure_account(OWNER_ACCOUNT)?;
         let mut jobs = snap.jobs;
         jobs.sort_by_key(|(m, _)| m.seq);
-        for (meta, mut tasks) in jobs {
+        for (mut meta, mut tasks) in jobs {
             state.next_seq = state.next_seq.max(meta.seq + 1);
+            meta.ext = job_ext.remove(&meta.id.0).unwrap_or_default();
+            for (i, t) in tasks.iter_mut().enumerate() {
+                t.ext = task_ext.remove(&(meta.id.0, i as u32)).unwrap_or_default();
+            }
             let mut changed = Vec::new();
             for (i, t) in tasks.iter_mut().enumerate() {
                 let index = i as u32;
@@ -386,6 +408,7 @@ impl State {
             state.store.put_tasks(meta.id.0, &refs)?;
             state.jobs.insert(meta.id, Job { meta, tasks });
         }
+        state.load_files(snap.datasets, snap.quotas, snap.secrets, snap.uploads)?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(
@@ -648,6 +671,7 @@ impl State {
         }
         node.online = false;
         node.tx = None;
+        self.files.caches.remove(id);
         node.perf.challenge = None;
         if let Some(kill) = node.kill.take() {
             let _ = kill.send(());
@@ -692,7 +716,29 @@ impl State {
                 let limit = self
                     .jobs
                     .get(&t.job)
-                    .map(|j| Duration::from_millis(j.meta.limits.timeout_ms))
+                    .map(|j| {
+                        let mut d = Duration::from_millis(j.meta.limits.timeout_ms);
+                        // Nodes that use the file store also download what
+                        // the task mounts and upload large outputs.
+                        if n.perf.protocol >= STORE_PROTOCOL {
+                            let mounted: u64 = j
+                                .meta
+                                .ext
+                                .mounts
+                                .iter()
+                                .chain(
+                                    j.tasks
+                                        .get(t.index as usize)
+                                        .map(|t| t.ext.mounts.as_slice())
+                                        .unwrap_or_default(),
+                                )
+                                .map(|m| m.size)
+                                .sum();
+                            d +=
+                                STORE_LEASE_EXTRA + Duration::from_secs(mounted / STORE_LEASE_RATE);
+                        }
+                        d
+                    })
                     .unwrap_or_default()
                     + LEASE_GRACE;
                 if now.duration_since(*started) > limit {
@@ -711,6 +757,7 @@ impl State {
             self.requeue(t, "task lease expired");
         }
         self.release_holds(now_unix());
+        self.tick_files();
         self.expire_upgrades();
         self.expire_challenges();
         if !self.queue.is_empty() || self.rollout.is_some() {
@@ -724,6 +771,7 @@ impl State {
         sub.validate()?;
         let account = sub.account.take().unwrap_or_else(|| OWNER_ACCOUNT.into());
         self.ensure_account(&account)?;
+        let (ext, task_exts) = self.prepare_store(&sub, &account)?;
         let mut blobs: Vec<(ModuleHash, Vec<u8>)> = Vec::new();
         let module_hash = match sub.executor {
             Executor::Wasm => {
@@ -764,12 +812,14 @@ impl State {
             seq: self.next_seq,
             account,
             deterministic: sub.deterministic,
+            ext,
         };
         self.next_seq += 1;
         let tasks: Vec<TaskRecord> = sub
             .tasks
             .into_iter()
-            .map(|input| TaskRecord {
+            .zip(task_exts)
+            .map(|(input, ext)| TaskRecord {
                 input,
                 state: TaskState::Pending,
                 attempts: 0,
@@ -781,11 +831,12 @@ impl State {
                 output_files: Vec::new(),
                 check: None,
                 cost: 0,
+                ext,
             })
             .collect();
         let blob_refs: Vec<(ModuleHash, &[u8])> =
             blobs.iter().map(|(h, b)| (*h, b.as_slice())).collect();
-        self.store.put_new_job(&meta, &tasks, &blob_refs)?;
+        self.store.put_new_job(&meta, &tasks, &blob_refs, &[])?;
         for (h, b) in blobs {
             self.modules.insert(h, Arc::new(b));
         }
@@ -798,6 +849,7 @@ impl State {
         }
         info!(job = %id, name = %meta.name, tasks = tasks.len(), account = %meta.account, "job submitted");
         self.jobs.insert(id, Job { meta, tasks });
+        self.after_submit(id);
         self.schedule();
         Ok(id)
     }
@@ -866,6 +918,18 @@ impl State {
     /// usage receipt, settles the charge, records the result and decides
     /// whether to check it.
     pub fn on_report(&mut self, node_id: &str, generation: u64, report: TaskReport) {
+        self.on_report_stored(node_id, generation, report, None)
+    }
+
+    /// [`Self::on_report`] for a run whose output files may be in the
+    /// store (checked complete there by the caller).
+    pub fn on_report_stored(
+        &mut self,
+        node_id: &str,
+        generation: u64,
+        report: TaskReport,
+        stored: Option<StoredOutput>,
+    ) {
         let Some(node) = self.nodes.get_mut(node_id) else {
             return;
         };
@@ -896,7 +960,12 @@ impl State {
 
         // The receipt must be the node's own, for this run, and describe
         // exactly the result it sent.
-        let digest = result_digest(&report.outcome, &report.stdout, &report.files);
+        let digest = output_digest(
+            &report.outcome,
+            &report.stdout,
+            &report.files,
+            stored.as_ref(),
+        );
         let receipt_check = self.check_receipt(node_id, &job.meta, &report, &digest);
         if let Err(e) = receipt_check {
             warn!(node = %node_id, task = %r, "rejected report: {e:#}");
@@ -910,10 +979,28 @@ impl State {
         }
 
         if r.check {
+            if let Some(s) = stored {
+                self.add_check_stored(r.job, r.index, r.attempt, s);
+            }
             self.on_check_report(node_id, report, digest);
         } else {
+            self.set_stored(r.job, r.index, stored);
             self.on_primary_report(node_id, report, digest);
         }
+        self.schedule();
+    }
+
+    /// A report whose stored output is not (completely) in the store: the
+    /// run is done again, without counting against the node.
+    pub fn on_report_rejected(&mut self, node_id: &str, generation: u64, task: TaskRef, why: &str) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        if node.generation != generation || node.running.remove(&task).is_none() {
+            return;
+        }
+        warn!(node = %node_id, task = %task, "report rejected: {why}");
+        self.requeue_run(task, why);
         self.schedule();
     }
 
@@ -1172,6 +1259,13 @@ impl State {
         let mut skipped = VecDeque::new();
         let mut dirty: Vec<(JobId, u32)> = Vec::new();
         while let Some(item) = self.queue.pop_front() {
+            // A private image is pulled into the store per architecture;
+            // only nodes of an architecture it is ready for can run it.
+            let ready_images = self
+                .jobs
+                .get(&item.job)
+                .is_some_and(|j| j.meta.ext.private_image)
+                .then(|| self.want_images(item.job));
             let Some(job) = self.jobs.get_mut(&item.job) else {
                 continue;
             };
@@ -1201,6 +1295,7 @@ impl State {
             }
             let need = job.meta.limits.memory_bytes;
             let executor = job.meta.executor;
+            let store_job = job.meta.ext.needs_store;
             // Image jobs get their CPUs (a WASM task uses one): a node
             // offers as many as it reports, which its CPU cap lowers.
             let need_cpus = match executor {
@@ -1233,6 +1328,11 @@ impl State {
                         && (n.account == consumer || can_pay)
                         && !exclude_nodes.contains(&id.as_str())
                         && !exclude_accounts.contains(&n.account.as_str())
+                        && (!store_job || n.perf.protocol >= STORE_PROTOCOL)
+                        && ready_images.as_ref().is_none_or(|imgs| {
+                            let arch = oci_arch_of(&n.info.arch);
+                            imgs.iter().any(|(a, _)| *a == arch)
+                        })
                 })
                 .max_by_key(|(_, n)| {
                     let pref = if item.check {
@@ -1278,6 +1378,31 @@ impl State {
                 .filter(|h| !node.sent_modules.contains(h))
                 .and_then(|h| self.modules.get(&h))
                 .and_then(|b| postcard::from_bytes::<Vec<FileEntry>>(b).ok());
+            let speaks_store = node.perf.protocol >= STORE_PROTOCOL;
+            let mounts: Vec<_> = job
+                .meta
+                .ext
+                .mounts
+                .iter()
+                .chain(task.ext.mounts.iter())
+                .cloned()
+                .collect();
+            let image = ready_images.as_ref().and_then(|imgs| {
+                let arch = oci_arch_of(&node.info.arch);
+                imgs.iter()
+                    .find(|(a, _)| *a == arch)
+                    .map(|(_, i)| i.clone())
+            });
+            let mut roots: Vec<BlobHash> = mounts.iter().map(|m| m.root).collect();
+            roots.extend(image.as_ref().map(|i| i.root));
+            let peers = crate::datasets::peers_for(&self.files.caches, node_id, &roots);
+            let output = if !speaks_store {
+                OutputMode::Inline
+            } else if job.meta.ext.output_dataset.is_some() {
+                OutputMode::Store
+            } else {
+                OutputMode::Auto
+            };
             let assignment = TaskAssignment {
                 task: r,
                 program: job.meta.name.clone(),
@@ -1293,6 +1418,10 @@ impl State {
                     .meta
                     .deterministic
                     .then(|| task_seed(item.job, item.index)),
+                mounts,
+                output,
+                image,
+                peers,
             };
             if tx.send(ToAgent::Assign(Box::new(assignment))).is_err() {
                 skipped.push_back(item);
@@ -1333,7 +1462,7 @@ impl State {
 
     // -- views ------------------------------------------------------------------
 
-    fn summary(job: &Job) -> JobSummary {
+    pub(crate) fn summary(job: &Job) -> JobSummary {
         let mut s = JobSummary {
             id: job.meta.id,
             name: job.meta.name.clone(),
@@ -1451,8 +1580,25 @@ impl State {
                     .map(|c| c.status.clone())
                     .unwrap_or(Verification::NotChecked),
                 cost: t.cost,
+                stored: t.ext.stored,
             })
             .collect();
+        let ext = &job.meta.ext;
+        let mut mounts: Vec<String> = ext
+            .mounts
+            .iter()
+            .chain(job.tasks.iter().flat_map(|t| t.ext.mounts.iter()))
+            .map(|m| m.label.clone())
+            .collect();
+        mounts.sort();
+        mounts.dedup();
+        let preparing = ext.images.iter().find_map(|(arch, s)| match s {
+            ImageState::Pulling => Some(format!("pulling the private image ({arch})")),
+            ImageState::Failed(e) => {
+                Some(format!("pulling the private image ({arch}) failed: {e}"))
+            }
+            ImageState::Ready(_) => None,
+        });
         Some(JobView {
             summary: Self::summary(job),
             executor: job.meta.executor,
@@ -1461,6 +1607,9 @@ impl State {
             total_fuel: job.tasks.iter().map(|t| t.fuel_used).sum(),
             deterministic: job.meta.deterministic,
             tasks,
+            mounts,
+            output_dataset: ext.finished.clone().filter(|f| !f.is_empty()),
+            preparing,
         })
     }
 
@@ -1547,6 +1696,9 @@ mod tests {
             max_price_per_hour: None,
             account: None,
             deterministic: executor == Executor::Wasm,
+            mounts: vec![],
+            task_mounts: vec![],
+            output_dataset: None,
         }
     }
 

@@ -127,6 +127,45 @@ impl State {
         total / MICRO_PER_MILLI
     }
 
+    /// Moves `exact` micro-CU from one account straight to another's
+    /// balance (storage and egress, which have no receipt or hold), with
+    /// the part below one milli-CU carried to the next transfer.
+    pub(crate) fn transfer(
+        &mut self,
+        from: &str,
+        to: &str,
+        kind: LedgerKind,
+        exact: MicroCu,
+        memo: String,
+    ) -> MilliCu {
+        if from == to || exact <= 0 {
+            return 0;
+        }
+        let _ = self.ensure_account(from);
+        let _ = self.ensure_account(to);
+        let amount = self.carry_forward(from, to, exact);
+        let mut b = Batch::default();
+        if let Some(c) = self.carry.get(&(from.to_string(), to.to_string())) {
+            b.carries.push((from.to_string(), to.to_string(), *c));
+        }
+        if amount > 0 {
+            {
+                let a = self.account(from);
+                a.balance -= amount;
+                a.spent += amount;
+            }
+            self.entry(&mut b, from, kind, -amount, None, memo.clone());
+            {
+                let a = self.account(to);
+                a.balance += amount;
+                a.earned += amount;
+            }
+            self.entry(&mut b, to, kind, amount, None, memo);
+        }
+        self.commit(b, None);
+        amount
+    }
+
     /// Stores a countersigned receipt and, when it carries a charge, debits
     /// the consumer and puts the provider's earning on hold.
     pub(crate) fn charge(&mut self, receipt: &Receipt) {

@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/syang0531/pumasi"
-rust-version = "1.90"
+rust-version = "1.91"
 
 [workspace.dependencies]
 pumasi-proto = { path = "crates/proto" }
@@ -25,6 +25,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 iroh = "1.4"
+iroh-blobs = { version = "0.104", default-features = false, features = ["fs-store"] }
+n0-future = "0.3"
+tokio-util = { version = "0.7", features = ["io-util"] }
 wasmtime = "50"
 wasmtime-wasi = "50"
 wat = "1"

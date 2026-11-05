@@ -699,8 +699,10 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // The command future is large: keep it on the heap, not the stack
+    // (the main thread has only 1 MiB on Windows; see build.rs).
     let runtime = tokio::runtime::Runtime::new().expect("start the async runtime");
-    let code = runtime.block_on(run(cli));
+    let code = runtime.block_on(Box::pin(run(cli)));
     match code {
         Ok(code) => std::process::exit(code),
         Err(e) => {

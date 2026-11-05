@@ -179,16 +179,20 @@ jobs:
           try() {
             echo "::group::$1"
             shift
-            env "$@" timeout 150 ./target/debug/pumasi vm run --vm-dir "$VM_DIR" busybox:1.36 -- echo vm-ok < /dev/null
-            echo "exit $?"
-            for f in $(find "$VM_DIR/run" -type f -name '*.log' 2>/dev/null); do echo "--- $f"; tail -c 3000 "$f"; echo; done
+            env "$@" timeout 150 ./target/debug/pumasi vm run --vm-dir "$VM_DIR" busybox:1.36 -- echo vm-ok < /dev/null || echo "failed: $?"
+            for f in $(find "$VM_DIR/run" -type f -name '*.log' 2>/dev/null); do echo "--- $f"; tail -c 6000 "$f"; echo; done
             echo "::endgroup::"
           }
-          try "default" PUMASI_VM_KERNEL_ARGS=loglevel=6
-          try "whpx irqchip on, Nehalem" PUMASI_QEMU_ACCEL=whpx PUMASI_VM_KERNEL_ARGS=loglevel=6
-          try "whpx irqchip off, max" PUMASI_QEMU_ACCEL=whpx,kernel-irqchip=off PUMASI_QEMU_CPU=max PUMASI_VM_KERNEL_ARGS=loglevel=6
-          try "whpx irqchip off, Nehalem, reboot=t" PUMASI_QEMU_ACCEL=whpx,kernel-irqchip=off "PUMASI_VM_KERNEL_ARGS=loglevel=6 reboot=t"
-          try "tcg" PUMASI_QEMU_ACCEL=tcg PUMASI_VM_KERNEL_ARGS=loglevel=6
+          export PUMASI_VM_CONSOLE_TAIL=20000
+          K="PUMASI_VM_KERNEL_ARGS=loglevel=7"
+          try "default" $K
+          try "legacy virtio-mmio" $K "PUMASI_QEMU_ARGS=-global virtio-mmio.force-legacy=on"
+          try "no ioeventfd" $K "PUMASI_QEMU_ARGS=-global virtio-mmio.ioeventfd=off"
+          try "whpx irqchip on" $K PUMASI_QEMU_ACCEL=whpx
+          try "cpu max" $K PUMASI_QEMU_CPU=max
+          try "cpu qemu64" $K PUMASI_QEMU_CPU=qemu64
+          try "microvm acpi=off" $K "PUMASI_QEMU_ARGS=-M microvm,acpi=off"
+          try "tcg" $K PUMASI_QEMU_ACCEL=tcg
       - name: Run an image in a microVM
         shell: bash
         timeout-minutes: 20

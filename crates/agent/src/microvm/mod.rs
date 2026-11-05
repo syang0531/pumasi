@@ -920,7 +920,12 @@ fn console_tail(dir: &Path) -> String {
     if let Ok(serial) = std::fs::read(dir.join(vmm::SERIAL_LOG)) {
         text.extend_from_slice(&serial);
     }
-    let start = text.len().saturating_sub(CONSOLE_TAIL);
+    // Debugging aid: PUMASI_VM_CONSOLE_TAIL=65536 keeps more of it.
+    let keep = std::env::var("PUMASI_VM_CONSOLE_TAIL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CONSOLE_TAIL);
+    let start = text.len().saturating_sub(keep);
     String::from_utf8_lossy(&text[start..]).trim().to_string()
 }
 

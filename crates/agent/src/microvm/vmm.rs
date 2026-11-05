@@ -248,6 +248,10 @@ impl Vmm {
                 .arg("-device")
                 .arg(format!("virtio-blk-device,drive=d{i}"));
         }
+        // More QEMU arguments, for trying settings on a new machine.
+        if let Ok(extra) = std::env::var("PUMASI_QEMU_ARGS") {
+            cmd.args(extra.split_whitespace());
+        }
         cmd
     }
 }

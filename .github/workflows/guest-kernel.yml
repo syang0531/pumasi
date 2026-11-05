@@ -32,7 +32,7 @@ jobs:
         run: scripts/kernel/build.sh out
       - name: Compare with the pinned SHA-256
         run: |
-          pinned=$(grep -o 'VZ_KERNEL_X86_64_SHA256: &str = "[0-9a-f]*"' crates/agent/src/microvm/setup.rs | grep -o '[0-9a-f]\{64\}' || true)
+          pinned=$(grep -A1 'const VZ_KERNEL_X86_64_SHA256' crates/agent/src/microvm/setup.rs | grep -o '[0-9a-f]\{64\}' | head -n1)
           built=$(awk '$2 == "bzImage-x86_64" { print $1 }' out/SHA256SUMS)
           echo "pinned: ${pinned:-none}"; echo "built:  $built"
           if [ "$pinned" = "$built" ]; then echo "MATCH=1" >> "$GITHUB_ENV"; else echo "::warning::bzImage SHA-256 $built is not the pinned one"; fi
@@ -57,7 +57,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pinned=$(grep -o 'VZ_KERNEL_X86_64_SHA256: &str = "[0-9a-f]*"' crates/agent/src/microvm/setup.rs | grep -o '[0-9a-f]\{64\}')
+          pinned=$(grep -A1 'const VZ_KERNEL_X86_64_SHA256' crates/agent/src/microvm/setup.rs | grep -o '[0-9a-f]\{64\}' | head -n1)
           built=$(awk '$2 == "bzImage-x86_64" { print $1 }' out/SHA256SUMS)
           if gh release view "$KERNEL_TAG" >/dev/null 2>&1; then
             gh release download "$KERNEL_TAG" -p SHA256SUMS -O published.txt

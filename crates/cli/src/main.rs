@@ -886,7 +886,7 @@ fn main() {
         Cmd::Cluster(_) | Cmd::Agent(_) | Cmd::Service(service::ServiceCmd::Run { .. })
     );
     let default_filter = if long_running {
-        "pumasi=info,warn"
+        "pumasi=info,openraft=error,warn"
     } else {
         "warn"
     };

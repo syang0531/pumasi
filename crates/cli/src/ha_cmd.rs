@@ -110,7 +110,10 @@ fn print_status(v: &HaView) {
         println!("note: with fewer than 3 voting replicas, losing one stops the cluster");
     }
     println!();
-    println!("{:<12} {:<9} {:>9} {:>10}", "REPLICA", "ROLE", "LOG", "SEEN");
+    println!(
+        "{:<12} {:<9} {:>9} {:>10}",
+        "REPLICA", "ROLE", "LOG", "SEEN"
+    );
     for r in &v.replicas {
         let role = if r.leader {
             "leader"
@@ -183,8 +186,8 @@ pub async fn backup(home: &Path, admin: &AdminArgs, file: &PathBuf) -> Result<i3
     );
     let tmp = file.with_extension("partial");
     {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(&out)?;
         f.sync_all()?;
     }

@@ -1230,6 +1230,88 @@ ticket and check it cannot drain (in the page or the API), upload and
 download a dataset, call the JSON API with a bearer ticket, and switch to
 Korean.
 
+## Phase 13: control plane replicas
+
+`crates/cluster/src/ha.rs` replicates the control plane over Raft
+([openraft](https://github.com/databendlabs/openraft) 0.9, `storage-v2`).
+What is replicated is the state database itself, not commands:
+
+- Every write `Store` makes is a `Batch` of `Op::Put` and `Op::Del`
+  (table number, key and value in redb's own encoding; the 30 tables are
+  listed in a fixed order by the `tables!` macro in `store.rs`). A single
+  control plane applies a batch in one transaction (`Sink::Direct`); with
+  replicas, the leader's store sends it to Raft (`Sink::Replicate`), which
+  packs pending batches into entries of up to 16 MiB.
+- Every replica's state machine applies committed entries to its own
+  `state.redb`, writing the applied log id and the membership (table
+  `raft_sm`) in the same transaction. So the database holds exactly a
+  committed prefix, and a ledger move (`write_ledger`, one batch) is on
+  every replica or on none: a failover cannot pay twice.
+- The log, vote and purge point are in `raft.redb`. A snapshot is a
+  `store::Dump` of every row (`snapshot.bin`), taken after 5000 entries,
+  keeping 1000; installing one wipes and reloads the tables. Migrations
+  run outside the log, on every replica, when it opens the database.
+
+Only the leader runs the cluster. `server::lead` follows the Raft metrics:
+on becoming leader it waits for `ensure_linearizable` (everything
+committed is applied), loads `State` from the database and starts the
+services of that term (agent and admin handling, the scheduler, timers),
+held in `Inner`; on losing leadership, or when `get_read_log_id` (a quorum
+round) has failed for `LEASE` (3 s), it stops them, which ends every agent
+and admin session. The in-memory state runs ahead of the database by the
+batches not committed yet; whatever a dead leader had not committed is
+lost exactly as on a single control plane's crash (running tasks are
+placed again; their receipts never existed).
+
+Followers answer agents with `HelloReply::NotLeader { leader, replicas }`
+and admin calls with `AdminResponse::NotLeader { leader }`. `AdminClient`
+keeps the candidate list from the ticket, follows the hint, and retries
+for up to 30 s a call that was refused or never sent; a call whose answer
+was lost is not resent (it may have run). The dashboard uses it, so it
+follows the leader too. Agents rotate through their candidates, follow
+hints, and back off only after a full round; the leader sends protocol 11
+agents `ToAgent::Replicas` whenever the set changes, and they save it with
+their membership.
+
+Identity: the cluster key (`secret.key`) is the same on every replica:
+receipts and releases are signed with it and agents know the cluster by
+its public key. The replica that created the cluster also uses it as its
+endpoint key, so agents from before phase 13 keep reaching it; every
+other replica has its own `endpoint.key`. Tickets append `replicas` to the
+payload (`PayloadV2`); a ticket without it decodes as before.
+
+Joining: `pumasi ha invite` turns replication on the first time
+(`enable_ha`: initialize Raft with this replica alone, switch the store's
+sink, snapshot and purge so newcomers start from a snapshot) and returns a
+`ReplicaTicket` (prefix `pumasireplica`) with a one-use secret. `pumasi
+cluster replica` binds its endpoint, sends `RaftReq::Join` over
+`pumasi/raft/0` (redirected to the leader if needed), gets the cluster key
+back, starts Raft empty, and the leader adds it as a learner, waits for it
+to catch up, then makes it a voter. `ha remove` takes a replica out of the
+membership. Raft traffic is length-prefixed postcard frames, one stream
+per call; only members (and a peer holding a valid invite) are served.
+
+The file store's data is not in the log: every `mirror_every` (30 s by
+default) a follower asks the leader for its blob tags (`RaftReq::Tags`)
+and fetches what it lacks over the blobs protocol, so after a failover
+outputs and datasets are there up to that lag. Uploaded release binaries
+are not mirrored.
+
+`pumasi backup` (`AdminOp::Backup { offset }`, chunked with a BLAKE3
+digest of the whole file, made in one read transaction and cached for 10
+minutes) writes `PUMASI-BACKUP` + postcard of the version, time, cluster
+key and `Dump`. `pumasi cluster restore` writes `state.redb` and
+`secret.key` into an empty cluster directory; replication starts off.
+
+`crates/cluster/tests/ha.rs` runs three control planes in one process with
+a WASM agent: it checks that a replica ticket works once, runs a job,
+kills the leader without a clean shutdown in the middle of a 6-task job,
+and checks that a new leader finishes it with every task paid once, the
+sum of all balances and held amounts unchanged and the owner charged
+exactly the job's cost; then the old leader returns as a follower, catches
+up, and a third job runs. A second test restores a backup and compares
+every row.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -1288,7 +1370,11 @@ number, `metrics` keyed by (node, tier, step start), `webhooks` by name,
 and the meta key `alert_policy`. An older control plane opening the file
 ignores them.
 
-`PROTOCOL_VERSION` is 10: protocol 5 (phase 4) added `UpgradeHello` and the
+Phase 13 keeps layout 6 and adds the table `raft_sm` (applied log id and
+membership) to `state.redb`, and `raft.redb`, `snapshot.bin`,
+`endpoint.key` and `join.peers` beside it on replicas.
+
+`PROTOCOL_VERSION` is 11: protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
 `BenchResult` and `ToAgent::Benchmark` and `Rebenchmark`, which the control
@@ -1300,7 +1386,10 @@ trailing fields, and only protocol 8 agents get store tasks) and adds
 `ToAgent::GpuChallenge`; only protocol 9 agents get GPU or microVM network
 tasks and challenges. Protocol 10 adds `FromAgent::Metrics` and
 `FromAgent::Logs`; since the control plane refuses agents newer than
-itself, an agent sends them only to a control plane that knows them. The hello is unchanged. The control plane accepts hellos from
+itself, an agent sends them only to a control plane that knows them. The hello is unchanged. Protocol 11 adds `HelloReply::NotLeader` and
+`ToAgent::Replicas`; a protocol 10 agent talking to a follower sees an
+unknown reply and retries, so it reaches the cluster only while the replica
+it joined leads. The control plane accepts hellos from
 `MIN_AGENT_PROTOCOL` (5) up: `AgentHello::decode` tries the current layout
 and falls back to the protocol 5 one (available), so phase 4 and 5 agents
 keep working and can take a rollout. Upgrade the control plane first; it
@@ -1338,14 +1427,18 @@ remotely; install a current binary on them once.
   sessions are in memory only; there is no TLS of its own (use a reverse
   proxy when serving other machines); charts are server-drawn snapshots
   that refresh every 10 seconds rather than streaming.
-- Remaining roadmap phases (13 to 18): Raft, WebGPU, the confidential
+- Remaining roadmap phases (14 to 18): WebGPU, the confidential
   tier, self-hosting 1.0 (SSO, audit log, external security review), the
   hub, buying CU. See the roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node
   selection yet, and the control plane does not upgrade itself.
-- High availability: one control plane; Raft (openraft) planned.
+- High availability: release binaries are not mirrored to followers, the
+  file store's data reaches them only every 30 seconds, a replica's
+  address in the membership is the one it joined with (a replica that
+  moves must be removed and invited again), and replicas take no reads
+  (followers serve nothing; the leader does all the work).
 - Access tickets are handed out by the admin; signing in with SSO and
   mapping groups to roles is phase 16.
 - CU cannot be bought or exchanged, and there is no platform fee; both

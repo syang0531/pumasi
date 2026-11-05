@@ -75,8 +75,7 @@ pub fn restore(bytes: &[u8], data_dir: &Path) -> Result<Restored> {
             data_dir.display()
         );
     }
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("create {}", data_dir.display()))?;
+    std::fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
     let store = Store::open(&db_path)?;
     {
         let tx = store.db().begin_write()?;

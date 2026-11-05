@@ -127,7 +127,7 @@ pub(crate) struct Shared {
     /// The services of the current term, on the leader.
     active: RwLock<Option<Arc<Inner>>>,
     /// The last backup made, and when.
-    backup: Mutex<Option<(Instant, Arc<Vec<u8>>, [u8; 32])>>,
+    backup: Mutex<Option<CachedBackup>>,
     /// Follows Raft: starts and stops the services (replicas only).
     lead: Mutex<Option<JoinHandle<()>>>,
 }
@@ -600,7 +600,8 @@ impl Cluster {
         if let Some(inner) = self.shared.active.write().unwrap().take() {
             inner.stop();
         }
-        if let Some(ha) = self.shared.ha.write().unwrap().take() {
+        let ha = self.shared.ha.write().unwrap().take();
+        if let Some(ha) = ha {
             ha.shutdown().await;
         }
         self.shared.endpoint.close().await;
@@ -635,7 +636,8 @@ impl Cluster {
             }
             drop(inner);
         }
-        if let Some(ha) = self.shared.ha.write().unwrap().take() {
+        let ha = self.shared.ha.write().unwrap().take();
+        if let Some(ha) = ha {
             ha.shutdown().await;
         }
         self.router.shutdown().await.context("router shutdown")?;
@@ -730,10 +732,14 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
             (true, None) => {
                 // Everything committed must be applied before the state
                 // machine loads.
-                match tokio::time::timeout(Duration::from_secs(10), ha.raft.ensure_linearizable()).await {
+                match tokio::time::timeout(Duration::from_secs(10), ha.raft.ensure_linearizable())
+                    .await
+                {
                     Ok(Ok(_)) => {
                         let (tx, rx) = mpsc::unbounded_channel();
-                        match start_services(&shared, shared.store.with_sink(Sink::Replicate(tx))).await {
+                        match start_services(&shared, shared.store.with_sink(Sink::Replicate(tx)))
+                            .await
+                        {
                             Ok(inner) => {
                                 inner
                                     .tasks
@@ -741,7 +747,10 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
                                     .unwrap()
                                     .push(tokio::spawn(ha.clone().replicate(rx)));
                                 replicas.clear();
-                                info!(term = ha.metrics().current_term, "this replica leads the control plane");
+                                info!(
+                                    term = ha.metrics().current_term,
+                                    "this replica leads the control plane"
+                                );
                             }
                             Err(e) => warn!("could not start the control plane: {e:#}"),
                         }
@@ -1397,9 +1406,7 @@ async fn handle_store_admin(
         }
         AdminOp::HaRemove { id } => {
             async {
-                let ha = inner
-                    .ha()
-                    .context("this control plane has no replicas")?;
+                let ha = inner.ha().context("this control plane has no replicas")?;
                 ha.remove(&id).await?;
                 Ok(AdminResponse::Ha(Box::new(ha.view())))
             }
@@ -1671,11 +1678,14 @@ async fn connect_any(endpoint: &Endpoint, candidates: &[EndpointAddr]) -> Result
     Err(last)
 }
 
+/// A backup made, when, and its digest.
+type CachedBackup = (Instant, Arc<Vec<u8>>, [u8; 32]);
+
 /// How sending one call went.
 enum Sent {
     Answered(AdminResponse),
     /// The call never left: safe to send elsewhere.
-    NotSent(anyhow::Error),
+    Unsent(anyhow::Error),
     /// It may have run; the answer was lost.
     Lost(anyhow::Error),
 }
@@ -1683,17 +1693,19 @@ enum Sent {
 async fn send_call(conn: &Connection, req: &AdminRequest) -> Sent {
     let (mut send, mut recv) = match conn.open_bi().await {
         Ok(s) => s,
-        Err(e) => return Sent::NotSent(e.into()),
+        Err(e) => return Sent::Unsent(e.into()),
     };
     if let Err(e) = write_msg(&mut send, req).await {
-        return Sent::NotSent(e);
+        return Sent::Unsent(e);
     }
     if let Err(e) = send.finish() {
         return Sent::Lost(e.into());
     }
     match read_msg::<_, AdminResponse>(&mut recv).await {
         Ok(Some(r)) => Sent::Answered(r),
-        Ok(None) => Sent::Lost(anyhow::anyhow!("cluster closed the stream without replying")),
+        Ok(None) => Sent::Lost(anyhow::anyhow!(
+            "cluster closed the stream without replying"
+        )),
         Err(e) => Sent::Lost(e),
     }
 }
@@ -1818,7 +1830,7 @@ impl AdminClient {
                     }
                 }
                 Sent::Answered(resp) => return Ok(resp),
-                Sent::NotSent(e) => {
+                Sent::Unsent(e) => {
                     last = e;
                     if tokio::time::Instant::now() > deadline
                         || self.candidates.lock().unwrap().len() < 2

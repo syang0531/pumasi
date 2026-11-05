@@ -407,7 +407,8 @@ impl Agent {
         cluster: EndpointAddr,
         join_secret: Option<Secret>,
     ) -> Result<AgentExit> {
-        self.serve_replicated(cluster, Vec::new(), join_secret).await
+        self.serve_replicated(cluster, Vec::new(), join_secret)
+            .await
     }
 
     /// [`Self::serve`] for a cluster with control plane replicas: tries

@@ -62,7 +62,7 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pumasi=info,openraft=warn,warn".into()),
+                .unwrap_or_else(|_| "pumasi=info,openraft=error,warn".into()),
         )
         .with_test_writer()
         .try_init();
@@ -125,6 +125,9 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         after: vec![],
     }
 }
+
+/// What the owner starts with: enough for every job in the test.
+const DEPOSIT: i64 = 1_000_000_000_000;
 
 /// Rates that make the tiny echo task cost a visible amount.
 fn policy() -> Policy {
@@ -284,7 +287,9 @@ async fn three_replicas_survive_losing_the_leader() {
     init_tracing();
     let (dir_a, dir_b, dir_c) = (tempdir("a"), tempdir("b"), tempdir("c"));
     let bind_a = free_port();
-    let a = Cluster::start(config(dir_a.clone(), &bind_a)).await.unwrap();
+    let a = Cluster::start(config(dir_a.clone(), &bind_a))
+        .await
+        .unwrap();
     let cluster_id = a.endpoint_id();
     let client = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
         .await
@@ -295,7 +300,7 @@ async fn three_replicas_survive_losing_the_leader() {
         &client,
         AdminOp::Deposit {
             account: "owner".into(),
-            amount: 1_000_000,
+            amount: DEPOSIT,
             memo: "test".into(),
         },
     )
@@ -303,12 +308,18 @@ async fn three_replicas_survive_losing_the_leader() {
     assert!(!ha_view(&client).await.enabled);
 
     // Two more replicas.
-    let b = Cluster::join_replica(config(dir_b.clone(), "127.0.0.1:0"), &invite_replica(&client).await)
-        .await
-        .unwrap();
-    let c = Cluster::join_replica(config(dir_c.clone(), "127.0.0.1:0"), &invite_replica(&client).await)
-        .await
-        .unwrap();
+    let b = Cluster::join_replica(
+        config(dir_b.clone(), "127.0.0.1:0"),
+        &invite_replica(&client).await,
+    )
+    .await
+    .unwrap();
+    let c = Cluster::join_replica(
+        config(dir_c.clone(), "127.0.0.1:0"),
+        &invite_replica(&client).await,
+    )
+    .await
+    .unwrap();
     let v = wait_replicated(&client, 3).await;
     assert!(v.enabled);
     assert!(a.is_leader() && !b.is_leader() && !c.is_leader());
@@ -327,9 +338,11 @@ async fn three_replicas_survive_losing_the_leader() {
     let d = v
         .replicas
         .iter()
-        .find(|r| ![a.endpoint_id(), b.endpoint_id(), c.endpoint_id()]
-            .iter()
-            .any(|id| id.to_string() == r.id))
+        .find(|r| {
+            ![a.endpoint_id(), b.endpoint_id(), c.endpoint_id()]
+                .iter()
+                .any(|id| id.to_string() == r.id)
+        })
         .unwrap()
         .id
         .clone();
@@ -371,7 +384,7 @@ async fn three_replicas_survive_losing_the_leader() {
     let first = wait_job(&client, first, 60).await;
     assert_eq!(first.summary.state, JobState::Succeeded, "{first:#?}");
     paid_once(&first, &receipts(&client, first.summary.id).await);
-    assert_eq!(total(&accounts(&client).await), 1_000_000);
+    assert_eq!(total(&accounts(&client).await), DEPOSIT);
 
     // A slow job, and the leader dies in the middle of it.
     let slow = submit(
@@ -393,14 +406,16 @@ async fn three_replicas_survive_losing_the_leader() {
     paid_once(&slow, &receipts(&client, slow.summary.id).await);
     paid_once(&first, &receipts(&client, first.summary.id).await);
     let accs = accounts(&client).await;
-    assert_eq!(total(&accs), 1_000_000, "{accs:#?}");
+    assert_eq!(total(&accs), DEPOSIT, "{accs:#?}");
     let owner = accs.iter().find(|a| a.name == "owner").unwrap();
     assert_eq!(owner.spent, first.summary.cost + slow.summary.cost);
     let v = ha_view(&client).await;
     assert_eq!(v.voters_up(5_000), 2, "{v:#?}");
 
     // The old leader comes back as a follower and catches up.
-    let a = Cluster::start(config(dir_a.clone(), &bind_a)).await.unwrap();
+    let a = Cluster::start(config(dir_a.clone(), &bind_a))
+        .await
+        .unwrap();
     let v = wait_replicated(&client, 3).await;
     assert_eq!(v.voters_up(5_000), 3, "{v:#?}");
     assert!(!a.is_leader());
@@ -418,7 +433,7 @@ async fn three_replicas_survive_losing_the_leader() {
     let third = submit(&client, submission(vec![vec!["three"]])).await;
     let third = wait_job(&client, third, 60).await;
     assert_eq!(third.summary.state, JobState::Succeeded, "{third:#?}");
-    assert_eq!(total(&accounts(&client).await), 1_000_000);
+    assert_eq!(total(&accounts(&client).await), DEPOSIT);
 
     client.close().await;
     bob.handle.abort();
@@ -432,7 +447,9 @@ async fn three_replicas_survive_losing_the_leader() {
 async fn a_backup_restores_the_cluster() {
     init_tracing();
     let dir = tempdir("orig");
-    let cluster = Cluster::start(config(dir.clone(), "127.0.0.1:0")).await.unwrap();
+    let cluster = Cluster::start(config(dir.clone(), "127.0.0.1:0"))
+        .await
+        .unwrap();
     let client = AdminClient::connect(&cluster.admin_ticket(), NetMode::Local)
         .await
         .unwrap();
@@ -479,7 +496,9 @@ async fn a_backup_restores_the_cluster() {
     let restored = tempdir("restored");
     let r = pumasi_cluster::backup::restore(&bytes, &restored).unwrap();
     assert_eq!(r.cluster_name, "ha-cluster");
-    let again = Cluster::start(config(restored, "127.0.0.1:0")).await.unwrap();
+    let again = Cluster::start(config(restored, "127.0.0.1:0"))
+        .await
+        .unwrap();
     let client = AdminClient::connect(&again.admin_ticket(), NetMode::Local)
         .await
         .unwrap();

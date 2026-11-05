@@ -37,7 +37,12 @@ struct PayloadV2 {
     replicas: Vec<EndpointAddr>,
 }
 
-fn encode(prefix: &str, cluster: &EndpointAddr, secret: &Secret, replicas: &[EndpointAddr]) -> String {
+fn encode(
+    prefix: &str,
+    cluster: &EndpointAddr,
+    secret: &Secret,
+    replicas: &[EndpointAddr],
+) -> String {
     let bytes = if replicas.is_empty() {
         postcard::to_stdvec(&Payload {
             cluster: cluster.clone(),
@@ -70,7 +75,7 @@ fn decode(prefix: &str, s: &str) -> Result<PayloadV2> {
     // A phase 1 payload is a prefix of the phase 13 one: if the list is
     // not there (or does not decode), it is the old layout.
     match postcard::take_from_bytes::<PayloadV2>(&bytes) {
-        Ok((p, rest)) if rest.is_empty() => Ok(p),
+        Ok((p, [])) => Ok(p),
         _ => {
             let p: Payload = postcard::from_bytes(&bytes).context("ticket payload is corrupt")?;
             Ok(PayloadV2 {
@@ -110,7 +115,12 @@ pub struct JoinTicket {
 
 impl fmt::Display for JoinTicket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&encode(JOIN_PREFIX, &self.cluster, &self.secret, &self.replicas))
+        f.write_str(&encode(
+            JOIN_PREFIX,
+            &self.cluster,
+            &self.secret,
+            &self.replicas,
+        ))
     }
 }
 
@@ -137,7 +147,12 @@ pub struct AdminTicket {
 
 impl fmt::Display for AdminTicket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&encode(ADMIN_PREFIX, &self.cluster, &self.secret, &self.replicas))
+        f.write_str(&encode(
+            ADMIN_PREFIX,
+            &self.cluster,
+            &self.secret,
+            &self.replicas,
+        ))
     }
 }
 
@@ -185,7 +200,12 @@ impl ReplicaTicket {
 
 impl fmt::Display for ReplicaTicket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&encode(REPLICA_PREFIX, &self.cluster, &self.secret, &self.replicas))
+        f.write_str(&encode(
+            REPLICA_PREFIX,
+            &self.cluster,
+            &self.secret,
+            &self.replicas,
+        ))
     }
 }
 
@@ -243,7 +263,12 @@ mod tests {
         assert_eq!(s.parse::<AdminTicket>().unwrap(), t);
         // An older binary decodes the phase 1 payload and ignores the rest.
         let body = data_encoding::BASE32_NOPAD
-            .decode(s.strip_prefix(ADMIN_PREFIX).unwrap().to_ascii_uppercase().as_bytes())
+            .decode(
+                s.strip_prefix(ADMIN_PREFIX)
+                    .unwrap()
+                    .to_ascii_uppercase()
+                    .as_bytes(),
+            )
             .unwrap();
         let old: Payload = postcard::from_bytes(&body).unwrap();
         assert_eq!(old.cluster, cluster);

@@ -30,6 +30,9 @@
 //! The file store's data is not in the log: followers copy the leader's
 //! tagged collections in the background ([`mirror`]).
 
+// openraft's own error type is large; the storage traits return it.
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
@@ -293,7 +296,8 @@ impl RaftLogStorage<C> for LogStore {
         let tx = self.db.begin_write().map_err(io_write)?;
         {
             let mut t = tx.open_table(LOG).map_err(io_write)?;
-            t.retain_in(log_id.index.., |_, _| false).map_err(io_write)?;
+            t.retain_in(log_id.index.., |_, _| false)
+                .map_err(io_write)?;
         }
         tx.commit().map_err(io_write)
     }
@@ -424,7 +428,10 @@ impl RaftStateMachine<C> for StateMachine {
                 match e.payload {
                     EntryPayload::Blank => {}
                     EntryPayload::Normal(req) => store::apply_ops(&tx, &req.0).map_err(|err| {
-                        SErr::from(StorageIOError::apply(e.log_id, AnyError::error(format!("{err:#}"))))
+                        SErr::from(StorageIOError::apply(
+                            e.log_id,
+                            AnyError::error(format!("{err:#}")),
+                        ))
                     })?,
                     EntryPayload::Membership(m) => {
                         membership = Some(StoredMembership::new(Some(e.log_id), m));
@@ -514,7 +521,10 @@ pub enum RaftReq {
     Vote(VoteRequest<NodeId>),
     Snapshot(InstallSnapshotRequest<C>),
     /// A new replica with a replica ticket's secret.
-    Join { secret: Secret, addr: EndpointAddr },
+    Join {
+        secret: Secret,
+        addr: EndpointAddr,
+    },
     /// The leader's file store tags, for followers' copies.
     Tags,
 }
@@ -636,15 +646,21 @@ impl Peer {
         };
         let conn = match self.conn.take() {
             Some(c) if c.close_reason().is_none() => c,
-            _ => tokio::time::timeout(ttl.max(Duration::from_secs(2)), self.endpoint.connect(addr, RAFT_ALPN))
-                .await
-                .map_err(|_| CallError::Unreachable(anyhow::anyhow!("timed out connecting")))?
-                .map_err(|e| CallError::Unreachable(e.into()))?,
+            _ => tokio::time::timeout(
+                ttl.max(Duration::from_secs(2)),
+                self.endpoint.connect(addr, RAFT_ALPN),
+            )
+            .await
+            .map_err(|_| CallError::Unreachable(anyhow::anyhow!("timed out connecting")))?
+            .map_err(|e| CallError::Unreachable(e.into()))?,
         };
         match tokio::time::timeout(ttl, call(&conn, &req)).await {
             Ok(Ok(resp)) => {
                 self.conn = Some(conn);
-                self.seen.lock().unwrap().insert(self.target, Instant::now());
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .insert(self.target, Instant::now());
                 Ok(resp)
             }
             Ok(Err(e)) => Err(CallError::Network(e)),
@@ -672,7 +688,9 @@ impl RaftNetwork<C> for Peer {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Replica, RaftError<NodeId>>> {
         match self.rpc(RaftReq::Append(rpc), option.hard_ttl()).await {
-            Ok(RaftResp::Append(r)) => r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e))),
+            Ok(RaftResp::Append(r)) => {
+                r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            }
             Ok(other) => Err(unexpected(other)),
             Err(e) => Err(e.rpc()),
         }
@@ -687,7 +705,9 @@ impl RaftNetwork<C> for Peer {
         RPCError<NodeId, Replica, RaftError<NodeId, InstallSnapshotError>>,
     > {
         match self.rpc(RaftReq::Snapshot(rpc), option.hard_ttl()).await {
-            Ok(RaftResp::Snapshot(r)) => r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e))),
+            Ok(RaftResp::Snapshot(r)) => {
+                r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            }
             Ok(other) => Err(unexpected(other)),
             Err(e) => Err(e.rpc()),
         }
@@ -699,7 +719,9 @@ impl RaftNetwork<C> for Peer {
         option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, Replica, RaftError<NodeId>>> {
         match self.rpc(RaftReq::Vote(rpc), option.hard_ttl()).await {
-            Ok(RaftResp::Vote(r)) => r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e))),
+            Ok(RaftResp::Vote(r)) => {
+                r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            }
             Ok(other) => Err(unexpected(other)),
             Err(e) => Err(e.rpc()),
         }
@@ -813,7 +835,13 @@ impl Ha {
         let me = self.endpoint.addr();
         self.members()
             .into_iter()
-            .filter_map(|(id, n)| if id == self.id { Some(me.clone()) } else { n.addr })
+            .filter_map(|(id, n)| {
+                if id == self.id {
+                    Some(me.clone())
+                } else {
+                    n.addr
+                }
+            })
             .collect()
     }
 
@@ -833,7 +861,10 @@ impl Ha {
     pub fn is_replica(&self, peer: &EndpointId) -> bool {
         let id = node_id(peer);
         let members = self.members();
-        if members.iter().any(|(m, n)| *m == id && n.addr.as_ref().is_none_or(|a| a.id == *peer)) {
+        if members
+            .iter()
+            .any(|(m, n)| *m == id && n.addr.as_ref().is_none_or(|a| a.id == *peer))
+        {
             return true;
         }
         members.is_empty() && self.join_peers.lock().unwrap().contains(peer)
@@ -848,7 +879,11 @@ impl Ha {
         let mut replicas: Vec<ReplicaView> = membership
             .nodes()
             .map(|(id, n)| ReplicaView {
-                id: n.addr.as_ref().map(|a| a.id.to_string()).unwrap_or_else(|| id.to_string()),
+                id: n
+                    .addr
+                    .as_ref()
+                    .map(|a| a.id.to_string())
+                    .unwrap_or_else(|| id.to_string()),
                 voter: voters.contains(id),
                 leader: m.current_leader == Some(*id),
                 matched: if *id == self.id {
@@ -904,11 +939,7 @@ impl Ha {
     /// so a new replica starts from the snapshot (needed right after
     /// replication is turned on: the state from before is in no entry).
     pub async fn compact(&self) -> Result<()> {
-        let applied = self
-            .metrics()
-            .last_applied
-            .map(|l| l.index)
-            .unwrap_or(0);
+        let applied = self.metrics().last_applied.map(|l| l.index).unwrap_or(0);
         self.raft
             .trigger()
             .snapshot()
@@ -943,7 +974,13 @@ impl Ha {
         loop {
             match self
                 .raft
-                .add_learner(id, Replica { addr: Some(addr.clone()) }, true)
+                .add_learner(
+                    id,
+                    Replica {
+                        addr: Some(addr.clone()),
+                    },
+                    true,
+                )
                 .await
             {
                 Ok(_) => break,
@@ -1220,7 +1257,11 @@ pub mod mirror {
     use pumasi_proto::{BLOBS_ALPN, blobs};
 
     /// One pass: fetch what is missing from the leader at `leader`.
-    pub async fn sync(endpoint: &Endpoint, files: &FileStore, leader: EndpointAddr) -> Result<usize> {
+    pub async fn sync(
+        endpoint: &Endpoint,
+        files: &FileStore,
+        leader: EndpointAddr,
+    ) -> Result<usize> {
         let conn = tokio::time::timeout(
             Duration::from_secs(15),
             endpoint.connect(leader.clone(), RAFT_ALPN),

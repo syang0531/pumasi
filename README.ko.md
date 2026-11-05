@@ -360,6 +360,29 @@ pumasi alert ls
 
 둘 다 `cluster.toml`의 `[alerts]`와 `[webhooks.이름]`에 둘 수도 있습니다(`url_env`로 URL을 파일 밖에 두기).
 
+### 컨트롤 플레인 복제본과 백업
+
+컨트롤 플레인이 하나면 그것이 멈출 때 클러스터 전체가 멈춥니다. 스케줄도 CU 이동도 없습니다. 기기 3대(또는 5대)에서 돌리면 그중 1대(5대 중 2대)가 죽어도 클러스터는 계속 돕니다.
+
+```sh
+pumasi ha invite                  # 컨트롤 플레인에서: 복제본 티켓 출력
+pumasi cluster replica <티켓>     # 새 컨트롤 플레인 기기마다
+pumasi ha status                  # 누가 리더인지, 누가 투표하는지, 각자 로그를 어디까지 가졌는지
+```
+
+복제본들은 컨트롤 플레인의 상태 전체(멤버, 큐, 작업과 태스크, CU 원장, 영수증, 파일 저장소 메타데이터, 설정)를 Raft로 똑같이 유지합니다. 하나가 리더로 일하고 나머지는 따라가다가, 리더가 죽으면 몇 초 안에 새 리더를 뽑습니다. 새 리더는 모두가 합의한 상태를 불러와 이어서 일합니다. 노드와 CLI는 알아서 새 리더에 다시 붙고, 돌던 태스크는 다시 배치되며, 정산은 두 번 일어나지 않습니다. 청구와 지급 하나하나가 모든 복제본에 적용되거나 어디에도 적용되지 않는 한 항목이기 때문입니다. 돌아온 복제본은 다른 복제본에게서 따라잡습니다. 과반과 연락이 끊긴 리더는 3초 안에 스케줄을 멈추므로 리더 둘이 동시에 일하는 일은 없습니다.
+
+`ha invite` 뒤에 만든 참가·관리자 티켓에는 복제본이 모두 들어 있으니, 복제본을 다 띄운 뒤 새로 나눠 주세요(`pumasi token`, `pumasi access create`). 에이전트는 새 복제본을 리더에게서 알아서 배웁니다. 복제본은 `pumasi cluster start`로 다시 시작하고, `pumasi ha remove ID`로 아예 뺍니다. 과반이 살아 있어야 하므로 2대나 4대가 아니라 3대나 5대를 쓰세요.
+
+상태는 관리자 티켓이 통하는 곳 어디서든 언제든 백업할 수 있습니다.
+
+```sh
+pumasi backup pumasi-2026-11-05.backup
+pumasi cluster restore pumasi-2026-11-05.backup   # 새 기기에서, 그다음 `pumasi cluster start`
+```
+
+파일은 상태(한 트랜잭션으로 뜬 일관된 사본)와 클러스터 키를 담으므로, 복원한 컨트롤 플레인이 예전 자리에서 닿으면 노드들이 다시 붙습니다. 클러스터 키, 관리자 비밀, 클러스터 비밀이 들어 있으니 관리자 티켓처럼 보관하세요. 파일 저장소의 데이터(`~/.pumasi/cluster/blobs`)는 들어 있지 않으니 그 디렉터리도 따로 복사하세요. 복원하면 컨트롤 플레인 하나가 생기고, 복제본은 `pumasi ha invite`로 다시 붙입니다.
+
 ### 웹 대시보드
 
 ```sh
@@ -429,6 +452,9 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi events [-f] [--since 1h] [-n 50] [-o json]` | 클러스터 이벤트: 노드, 작업, 검증, 선점, 경보 |
 | `pumasi alert ls` / `alert set [--node-offline 1m] [--failure-rate 50%] [--disk 90%] [--temperature 90] [--perf-drop 25%] [--smart on] [--check-mismatch on] [--defaults]` | 경보 규칙과 지금 울리는 경보. `off`는 규칙 끄기 |
 | `pumasi webhook add 이름 URL [--format slack\|discord\|json]` / `ls` / `rm 이름` / `test 이름` | 경보를 보낼 곳 |
+| `pumasi ha status [-o json]` / `ha invite [--ttl 1h]` / `ha remove ID` | 컨트롤 플레인 복제본: 리더와 각자의 로그 진행, 복제본 하나 더 붙일 티켓, 복제본 빼기 |
+| `pumasi cluster replica <티켓> [--net public\|local] [--bind ADDR]` | 이 기기를 컨트롤 플레인 복제본으로 실행 (나중에는 `pumasi cluster start`로 다시 시작) |
+| `pumasi backup FILE` / `pumasi cluster restore FILE` | 컨트롤 플레인 상태와 클러스터 키의 일관된 사본, 그리고 그 사본으로 컨트롤 플레인 만들기 |
 | `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB]` | 이 기기에서 웹 대시보드와 JSON API 제공(기본 127.0.0.1:7400) |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [인자...]` | 에이전트와 같은 샌드박스로 로컬 실행 (`DIR`이 `/input`으로 보이고 `/output`은 `pumasi-out/exec`에 저장, `--seed`는 결정적 모드) |
 
@@ -527,7 +553,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-개인이나 조직이 자기 장비에서 쓰는 데는 1~15단계면 충분합니다(핵심은 13단계까지). 16단계는 조직 도입에 필요한 마무리이고, 17·18단계는 다른 클러스터와 거래할 때만 필요합니다.
+개인이나 조직이 자기 장비에서 쓰는 데는 1~15단계면 충분합니다. 16단계는 조직 도입에 필요한 마무리이고, 17·18단계는 다른 클러스터와 거래할 때만 필요합니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -542,15 +568,15 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 9 | GPU·microVM 장치: NVIDIA(NVML, CUDA 벤치마크)·AMD 탐지, 서명된 장치 프로필, GPU 시간 CU 과금, GPU 단위 스케줄링, Docker GPU 작업, 제공자 GPU 검증, VFIO 패스스루(실험), 필터링되는 microVM 네트워크 | 완료 |
 | 10 | 클러스터 관리: 노드 라벨·테인트, 작업 selector·toleration, cordon·drain, 우선순위와 선점, 계정별 쿼터(슬롯, GPU, 하루 CU, 우선순위, 저장 용량), 역할 티켓(admin, submitter, viewer), 선언적 `apply`와 `get`·`describe`, cron 스케줄, 작업 의존성 | 완료 |
 | 11 | 모니터링·경보: 노드 지표(CPU, 메모리, 디스크, 네트워크, 온도, GPU)를 다운샘플링해 7일 보관, `top`, 실시간 `logs -f`, `events`, 선택형 Prometheus 엔드포인트와 Grafana 대시보드, 경보 규칙(노드 오프라인, 실패율, 디스크, 온도, 벤치마크 저하, SMART, 검증 불일치)을 Slack·Discord·JSON 웹훅으로 | 완료 |
-| 12 | 바이너리에 내장한 웹 대시보드(`pumasi ui`): 개요, 차트·cordon·drain이 있는 노드, 제출·실시간 출력·취소·출력 다운로드가 되는 작업, 업로드·다운로드가 되는 저장소, CU와 원장, 초대와 액세스 티켓, 요금, 이벤트와 경보. 액세스 티켓과 역할로 로그인, 한국어·영어, OpenAPI가 있는 JSON API, CI의 Playwright 테스트 | 이번 릴리스 |
-| 13 | 컨트롤 플레인 고가용성(Raft) | 예정 |
+| 12 | 바이너리에 내장한 웹 대시보드(`pumasi ui`): 개요, 차트·cordon·drain이 있는 노드, 제출·실시간 출력·취소·출력 다운로드가 되는 작업, 업로드·다운로드가 되는 저장소, CU와 원장, 초대와 액세스 티켓, 요금, 이벤트와 경보. 액세스 티켓과 역할로 로그인, 한국어·영어, OpenAPI가 있는 JSON API, CI의 Playwright 테스트 | 완료 |
+| 13 | 컨트롤 플레인 고가용성: 상태를 Raft(openraft)로 3대 또는 5대에 복제, 자동 장애 전환과 리더를 따라가는 노드·CLI·대시보드, 모든 복제본이 담긴 티켓, 스냅숏으로 따라잡는 복제본, `pumasi backup`과 `cluster restore` | 이번 릴리스 |
 | 14 | WebGPU 실행기(실험) | 예정 |
 | 15 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
 | 16 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델, CI에 cargo-audit·cargo-deny·퍼징, 외부 보안 점검, 운영 문서, 72시간 장기 안정성 테스트 뒤 1.0 태그 | 예정 |
 | 17 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
 | 18 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 표시만 합니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. microVM 태스크 출력은 끝날 때에야 `pumasi logs`에 나타나고(게스트가 출력 디스크에 쓰기 때문), Intel·Apple GPU는 지표가 없고 Windows 노드는 온도를 보고하지 않으며, 최근 1시간의 10초 단위 지표는 컨트롤 플레인을 다시 시작하면 사라집니다. 대시보드는 요금과 경보 규칙을 보여 주기만 하고 바꾸지는 않으며(CLI와 `apply`로 바꿈), 로그인 세션을 메모리에만 두므로 `pumasi ui`를 다시 시작하면 모두 로그아웃됩니다.
+알려진 한계: 파일 저장소의 데이터는 쓰기마다가 아니라 30초마다 다른 컨트롤 플레인 복제본에 복사되므로, 리더가 죽기 직전에 올린 파일은 그 리더가 돌아올 때까지 없을 수 있습니다. `pumasi upgrade rollout`으로 올린 에이전트 바이너리는 받은 복제본에만 있습니다(장애 전환 뒤에는 다시 배포). 이번 릴리스보다 오래된 에이전트는 처음 참가한 복제본만 따라갑니다. CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 표시만 합니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. microVM 태스크 출력은 끝날 때에야 `pumasi logs`에 나타나고(게스트가 출력 디스크에 쓰기 때문), Intel·Apple GPU는 지표가 없고 Windows 노드는 온도를 보고하지 않으며, 최근 1시간의 10초 단위 지표는 컨트롤 플레인을 다시 시작하면 사라집니다. 대시보드는 요금과 경보 규칙을 보여 주기만 하고 바꾸지는 않으며(CLI와 `apply`로 바꿈), 로그인 세션을 메모리에만 두므로 `pumasi ui`를 다시 시작하면 모두 로그아웃됩니다.
 
 ## 라이선스
 

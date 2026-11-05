@@ -1,6 +1,15 @@
 //! Tickets: copy-pasteable strings that carry a cluster address plus a
 //! secret. A join ticket lets a new node join; an admin ticket lets the CLI
-//! manage the cluster from any machine.
+//! manage the cluster from any machine; a replica ticket lets another
+//! machine become a control plane replica (phase 13).
+//!
+//! `cluster` is the cluster's key (the endpoint id of the control plane
+//! that created the cluster, which signs releases and receipts) with that
+//! machine's addresses. A cluster with replicas also lists every control
+//! plane replica in `replicas`; clients try them in turn and follow the
+//! one that answers to the leader. Tickets without replicas keep the
+//! phase 1 layout, and older binaries read the `cluster` of newer tickets
+//! (postcard leaves the trailing list alone).
 
 use std::{fmt, str::FromStr};
 
@@ -12,6 +21,7 @@ use crate::Secret;
 
 const JOIN_PREFIX: &str = "pumasijoin";
 const ADMIN_PREFIX: &str = "pumasiadmin";
+const REPLICA_PREFIX: &str = "pumasireplica";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Payload {
@@ -19,12 +29,33 @@ struct Payload {
     secret: Secret,
 }
 
-fn encode(prefix: &str, cluster: &EndpointAddr, secret: &Secret) -> String {
-    let payload = Payload {
-        cluster: cluster.clone(),
-        secret: *secret,
-    };
-    let bytes = postcard::to_stdvec(&payload).expect("ticket encodes");
+/// Phase 13 layout: the control plane replicas follow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PayloadV2 {
+    cluster: EndpointAddr,
+    secret: Secret,
+    replicas: Vec<EndpointAddr>,
+}
+
+fn encode(
+    prefix: &str,
+    cluster: &EndpointAddr,
+    secret: &Secret,
+    replicas: &[EndpointAddr],
+) -> String {
+    let bytes = if replicas.is_empty() {
+        postcard::to_stdvec(&Payload {
+            cluster: cluster.clone(),
+            secret: *secret,
+        })
+    } else {
+        postcard::to_stdvec(&PayloadV2 {
+            cluster: cluster.clone(),
+            secret: *secret,
+            replicas: replicas.to_vec(),
+        })
+    }
+    .expect("ticket encodes");
     format!(
         "{prefix}{}",
         data_encoding::BASE32_NOPAD
@@ -33,7 +64,7 @@ fn encode(prefix: &str, cluster: &EndpointAddr, secret: &Secret) -> String {
     )
 }
 
-fn decode(prefix: &str, s: &str) -> Result<Payload> {
+fn decode(prefix: &str, s: &str) -> Result<PayloadV2> {
     let s = s.trim();
     let Some(body) = s.strip_prefix(prefix) else {
         bail!("not a {prefix} ticket");
@@ -41,7 +72,36 @@ fn decode(prefix: &str, s: &str) -> Result<Payload> {
     let bytes = data_encoding::BASE32_NOPAD
         .decode(body.to_ascii_uppercase().as_bytes())
         .context("ticket is not valid base32")?;
-    postcard::from_bytes(&bytes).context("ticket payload is corrupt")
+    // A phase 1 payload is a prefix of the phase 13 one: if the list is
+    // not there (or does not decode), it is the old layout.
+    match postcard::take_from_bytes::<PayloadV2>(&bytes) {
+        Ok((p, [])) => Ok(p),
+        _ => {
+            let p: Payload = postcard::from_bytes(&bytes).context("ticket payload is corrupt")?;
+            Ok(PayloadV2 {
+                cluster: p.cluster,
+                secret: p.secret,
+                replicas: Vec::new(),
+            })
+        }
+    }
+}
+
+/// Every address worth trying for a cluster: the replicas (when it has
+/// them) and the cluster's own, without duplicates.
+pub fn candidates(cluster: &EndpointAddr, replicas: &[EndpointAddr]) -> Vec<EndpointAddr> {
+    let mut out: Vec<EndpointAddr> = Vec::new();
+    for a in std::iter::once(cluster).chain(replicas) {
+        match out.iter_mut().find(|o| o.id == a.id) {
+            Some(o) => {
+                if o.addrs.is_empty() {
+                    o.addrs = a.addrs.clone();
+                }
+            }
+            None => out.push(a.clone()),
+        }
+    }
+    out
 }
 
 /// Grants one node the right to join a cluster.
@@ -49,11 +109,18 @@ fn decode(prefix: &str, s: &str) -> Result<Payload> {
 pub struct JoinTicket {
     pub cluster: EndpointAddr,
     pub secret: Secret,
+    /// The control plane replicas (empty for a single control plane).
+    pub replicas: Vec<EndpointAddr>,
 }
 
 impl fmt::Display for JoinTicket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&encode(JOIN_PREFIX, &self.cluster, &self.secret))
+        f.write_str(&encode(
+            JOIN_PREFIX,
+            &self.cluster,
+            &self.secret,
+            &self.replicas,
+        ))
     }
 }
 
@@ -64,6 +131,7 @@ impl FromStr for JoinTicket {
         Ok(Self {
             cluster: p.cluster,
             secret: p.secret,
+            replicas: p.replicas,
         })
     }
 }
@@ -73,11 +141,18 @@ impl FromStr for JoinTicket {
 pub struct AdminTicket {
     pub cluster: EndpointAddr,
     pub secret: Secret,
+    /// The control plane replicas (empty for a single control plane).
+    pub replicas: Vec<EndpointAddr>,
 }
 
 impl fmt::Display for AdminTicket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&encode(ADMIN_PREFIX, &self.cluster, &self.secret))
+        f.write_str(&encode(
+            ADMIN_PREFIX,
+            &self.cluster,
+            &self.secret,
+            &self.replicas,
+        ))
     }
 }
 
@@ -88,6 +163,60 @@ impl FromStr for AdminTicket {
         Ok(Self {
             cluster: p.cluster,
             secret: p.secret,
+            replicas: p.replicas,
+        })
+    }
+}
+
+impl JoinTicket {
+    /// The addresses to try, see [`candidates`].
+    pub fn candidates(&self) -> Vec<EndpointAddr> {
+        candidates(&self.cluster, &self.replicas)
+    }
+}
+
+impl AdminTicket {
+    /// The addresses to try, see [`candidates`].
+    pub fn candidates(&self) -> Vec<EndpointAddr> {
+        candidates(&self.cluster, &self.replicas)
+    }
+}
+
+/// Lets one machine join the control plane as a replica (phase 13). Valid
+/// once, for a limited time, on the leader that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaTicket {
+    pub cluster: EndpointAddr,
+    pub secret: Secret,
+    pub replicas: Vec<EndpointAddr>,
+}
+
+impl ReplicaTicket {
+    /// The addresses to try, see [`candidates`].
+    pub fn candidates(&self) -> Vec<EndpointAddr> {
+        candidates(&self.cluster, &self.replicas)
+    }
+}
+
+impl fmt::Display for ReplicaTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&encode(
+            REPLICA_PREFIX,
+            &self.cluster,
+            &self.secret,
+            &self.replicas,
+        ))
+    }
+}
+
+impl FromStr for ReplicaTicket {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let p = decode(REPLICA_PREFIX, s)?;
+        Ok(Self {
+            cluster: p.cluster,
+            secret: p.secret,
+            replicas: p.replicas,
         })
     }
 }
@@ -104,6 +233,7 @@ mod tests {
         let join = JoinTicket {
             cluster: addr.clone(),
             secret: crate::new_secret(),
+            replicas: vec![],
         };
         let s = join.to_string();
         assert!(s.starts_with("pumasijoin"));
@@ -111,9 +241,49 @@ mod tests {
         assert!(s.parse::<AdminTicket>().is_err());
 
         let admin = AdminTicket {
-            cluster: addr,
+            cluster: addr.clone(),
             secret: crate::new_secret(),
+            replicas: vec![],
         };
         assert_eq!(admin.to_string().parse::<AdminTicket>().unwrap(), admin);
+    }
+
+    #[test]
+    fn replicas_roundtrip_and_old_layout_still_reads() {
+        let cluster = EndpointAddr::new(SecretKey::generate().public())
+            .with_ip_addr("127.0.0.1:4433".parse().unwrap());
+        let other = EndpointAddr::new(SecretKey::generate().public())
+            .with_ip_addr("127.0.0.1:4434".parse().unwrap());
+        let t = AdminTicket {
+            cluster: cluster.clone(),
+            secret: crate::new_secret(),
+            replicas: vec![cluster.clone(), other.clone()],
+        };
+        let s = t.to_string();
+        assert_eq!(s.parse::<AdminTicket>().unwrap(), t);
+        // An older binary decodes the phase 1 payload and ignores the rest.
+        let body = data_encoding::BASE32_NOPAD
+            .decode(
+                s.strip_prefix(ADMIN_PREFIX)
+                    .unwrap()
+                    .to_ascii_uppercase()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let old: Payload = postcard::from_bytes(&body).unwrap();
+        assert_eq!(old.cluster, cluster);
+        assert_eq!(old.secret, t.secret);
+        // Candidates: no duplicates, the cluster first.
+        let c = t.candidates();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].id, cluster.id);
+        assert_eq!(c[1].id, other.id);
+        let r = ReplicaTicket {
+            cluster,
+            secret: crate::new_secret(),
+            replicas: vec![other],
+        };
+        assert_eq!(r.to_string().parse::<ReplicaTicket>().unwrap(), r);
+        assert!(r.to_string().parse::<AdminTicket>().is_err());
     }
 }

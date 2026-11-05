@@ -420,6 +420,29 @@ impl FileStore {
             .map(|t| blobs::from_hash(t.hash)))
     }
 
+    /// Every tag (name, root collection), for control plane replicas that
+    /// copy the store.
+    pub async fn tags(&self) -> Result<Vec<(String, BlobHash)>> {
+        use n0_future::StreamExt;
+        let mut out = Vec::new();
+        for prefix in TAG_PREFIXES {
+            let mut tags = self
+                .store
+                .tags()
+                .list_prefix(prefix.as_bytes())
+                .await
+                .map_err(|e| anyhow::anyhow!("list tags: {e}"))?;
+            while let Some(t) = tags.next().await {
+                let t = t.map_err(|e| anyhow::anyhow!("list tags: {e}"))?;
+                out.push((
+                    String::from_utf8_lossy(t.name.as_ref()).into_owned(),
+                    blobs::from_hash(t.hash),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// Makes the store's tags exactly `desired` (at startup).
     pub async fn reconcile(&self, desired: &[(String, BlobHash)]) -> Result<()> {
         let desired: Vec<(String, Hash)> = desired

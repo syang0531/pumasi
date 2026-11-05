@@ -93,12 +93,17 @@ pub struct AgentConfig {
 /// What the agent remembers about the cluster it joined.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Membership {
+    /// The cluster's key (the id releases and receipts are checked
+    /// against) with the address it was joined at.
     pub cluster: EndpointAddr,
     pub cluster_name: String,
     #[serde(default)]
     pub role: Role,
     #[serde(default)]
     pub account: String,
+    /// The control plane replicas, when the cluster has them (phase 13).
+    #[serde(default)]
+    pub replicas: Vec<EndpointAddr>,
 }
 
 type FileCache = Arc<Mutex<HashMap<ModuleHash, Arc<Vec<FileEntry>>>>>;
@@ -141,8 +146,27 @@ enum SessionEnd {
     Lost(anyhow::Error),
     /// Could not connect or handshake.
     Failed(anyhow::Error),
+    /// A control plane replica that is not the leader: try `leader` (when
+    /// it knows) or another replica.
+    NotLeader(Option<EndpointAddr>),
     /// Installed a new binary; the process must restart.
     Upgraded(String),
+}
+
+/// Adds control plane replicas a replica told us about to the addresses
+/// tried (fresh addresses replace old ones of the same replica).
+fn merge_replicas(candidates: &Arc<Mutex<Vec<EndpointAddr>>>, replicas: &[EndpointAddr]) {
+    let mut c = candidates.lock().unwrap();
+    for r in replicas {
+        match c.iter_mut().find(|a| a.id == r.id) {
+            Some(a) => {
+                if !r.addrs.is_empty() {
+                    *a = r.clone();
+                }
+            }
+            None => c.push(r.clone()),
+        }
+    }
 }
 
 impl Agent {
@@ -362,7 +386,8 @@ impl Agent {
     /// Joins with a ticket, then serves the cluster until a fatal error or
     /// an upgrade.
     pub async fn join(self, ticket: JoinTicket) -> Result<AgentExit> {
-        self.serve(ticket.cluster, Some(ticket.secret)).await
+        self.serve_replicated(ticket.cluster, ticket.replicas, Some(ticket.secret))
+            .await
     }
 
     /// Reconnects to the cluster this agent joined before.
@@ -370,7 +395,7 @@ impl Agent {
         let Some(m) = self.membership()? else {
             bail!("this agent has not joined a cluster yet; run `pumasi agent join <TICKET>`");
         };
-        self.serve(m.cluster, None).await
+        self.serve_replicated(m.cluster, m.replicas, None).await
     }
 
     /// Serves the cluster, reconnecting with backoff when the connection
@@ -382,7 +407,19 @@ impl Agent {
         cluster: EndpointAddr,
         join_secret: Option<Secret>,
     ) -> Result<AgentExit> {
-        let exit = self.serve_inner(cluster, join_secret).await;
+        self.serve_replicated(cluster, Vec::new(), join_secret)
+            .await
+    }
+
+    /// [`Self::serve`] for a cluster with control plane replicas: tries
+    /// them in turn and follows the one that answers to the leader.
+    pub async fn serve_replicated(
+        self,
+        cluster: EndpointAddr,
+        replicas: Vec<EndpointAddr>,
+        join_secret: Option<Secret>,
+    ) -> Result<AgentExit> {
+        let exit = self.serve_inner(cluster, replicas, join_secret).await;
         // Let go of the file store so a restarted agent can open it.
         self.node_store.shutdown().await;
         exit
@@ -391,8 +428,17 @@ impl Agent {
     async fn serve_inner(
         &self,
         cluster: EndpointAddr,
+        replicas: Vec<EndpointAddr>,
         mut join_secret: Option<Secret>,
     ) -> Result<AgentExit> {
+        let candidates = Arc::new(Mutex::new(pumasi_proto::ticket::candidates(
+            &cluster, &replicas,
+        )));
+        // Where to connect next: a leader a replica named, or the next
+        // candidate in turn.
+        let mut hint: Option<EndpointAddr> = None;
+        let mut next = 0usize;
+        let mut failed_in_row = 0usize;
         // On trial: running a freshly installed binary not yet welcomed.
         let mut trial: Option<Instant> = None;
         if let Some(up) = &self.upgrader {
@@ -412,7 +458,32 @@ impl Agent {
         };
         let mut backoff = Duration::from_millis(500);
         loop {
-            match self.session(&cluster, &mut join_secret).await {
+            let (target, count) = {
+                let c = candidates.lock().unwrap();
+                let t = hint.take().unwrap_or_else(|| c[next % c.len()].clone());
+                (t, c.len())
+            };
+            match self
+                .session(&cluster, &target, count, &candidates, &mut join_secret)
+                .await
+            {
+                SessionEnd::NotLeader(leader) => {
+                    debug!(replica = %target.id.fmt_short(), "not the leader");
+                    match leader {
+                        Some(l) if l.id != target.id => {
+                            hint = Some(l);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        _ => next += 1,
+                    }
+                    failed_in_row += 1;
+                    if failed_in_row < count {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    failed_in_row = 0;
+                }
                 SessionEnd::Rejected(reason) => {
                     if trial.is_some() {
                         return rollback(format!("cluster rejected the new binary: {reason}"));
@@ -425,9 +496,19 @@ impl Agent {
                     trial = None;
                     warn!("lost connection to cluster: {e:#}");
                     backoff = Duration::from_millis(500);
+                    failed_in_row = 0;
+                    // The same replica first: it may just have restarted.
+                    hint = Some(target);
                 }
                 SessionEnd::Failed(e) => {
                     warn!("could not reach cluster: {e:#}");
+                    next += 1;
+                    failed_in_row += 1;
+                    if failed_in_row < count {
+                        // Try the other replicas before backing off.
+                        continue;
+                    }
+                    failed_in_row = 0;
                     if let Some(since) = trial
                         && since.elapsed() > TRIAL_TIMEOUT
                     {
@@ -446,11 +527,29 @@ impl Agent {
     async fn session(
         &self,
         cluster: &EndpointAddr,
+        target: &EndpointAddr,
+        replicas: usize,
+        candidates: &Arc<Mutex<Vec<EndpointAddr>>>,
         join_secret: &mut Option<Secret>,
     ) -> SessionEnd {
-        let conn = match self.endpoint.connect(cluster.clone(), AGENT_ALPN).await {
-            Ok(c) => c,
-            Err(e) => return SessionEnd::Failed(e.into()),
+        let connect = self.endpoint.connect(target.clone(), AGENT_ALPN);
+        let conn = if replicas > 1 {
+            // Others to try: do not wait long on a replica that is down.
+            match tokio::time::timeout(Duration::from_secs(10), connect).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return SessionEnd::Failed(e.into()),
+                Err(_) => {
+                    return SessionEnd::Failed(anyhow::anyhow!(
+                        "timed out connecting to {}",
+                        target.id.fmt_short()
+                    ));
+                }
+            }
+        } else {
+            match connect.await {
+                Ok(c) => c,
+                Err(e) => return SessionEnd::Failed(e.into()),
+            }
         };
         let (mut send, mut recv) = match conn.open_bi().await {
             Ok(s) => s,
@@ -477,6 +576,10 @@ impl Agent {
                 account,
             })) => (cluster_name, heartbeat_ms, role, account),
             Ok(Some(HelloReply::Rejected { reason })) => return SessionEnd::Rejected(reason),
+            Ok(Some(HelloReply::NotLeader { leader, replicas })) => {
+                merge_replicas(candidates, &replicas);
+                return SessionEnd::NotLeader(leader);
+            }
             Ok(None) => return SessionEnd::Failed(anyhow::anyhow!("cluster closed the stream")),
             Err(e) => return SessionEnd::Failed(e),
         };
@@ -493,6 +596,7 @@ impl Agent {
                 cluster_name: cluster_name.clone(),
                 role,
                 account: account.clone(),
+                replicas: candidates.lock().unwrap().clone(),
             };
             if let Err(e) = self.save_membership(&m) {
                 warn!("could not save membership: {e:#}");
@@ -723,7 +827,7 @@ impl Agent {
                         _ => None,
                     };
                     match load_error {
-                        None => self.start_task(*a, cluster, &running, &out_tx),
+                        None => self.start_task(*a, target, cluster, &running, &out_tx),
                         Some(e) => {
                             let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
                                 a.task,
@@ -780,6 +884,15 @@ impl Agent {
                         self.rebench.notify_one();
                     }
                 }
+                Ok(Some(ToAgent::Replicas(list))) => {
+                    merge_replicas(candidates, &list);
+                    if let Ok(Some(mut m)) = self.membership() {
+                        m.replicas = candidates.lock().unwrap().clone();
+                        if let Err(e) = self.save_membership(&m) {
+                            warn!("could not save the control plane replicas: {e:#}");
+                        }
+                    }
+                }
                 Ok(Some(ToAgent::Cancel(task))) => {
                     if let Some(flag) = running.lock().unwrap().get(&task) {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -805,10 +918,13 @@ impl Agent {
         SessionEnd::Lost(end)
     }
 
+    /// `cluster_addr` is the control plane replica serving us (the file
+    /// store), `cluster_key` the cluster's key (for receipts).
     fn start_task(
         &self,
         a: TaskAssignment,
         cluster_addr: &EndpointAddr,
+        cluster_key: &EndpointAddr,
         running: &Arc<Mutex<HashMap<TaskRef, Arc<AtomicBool>>>>,
         out_tx: &mpsc::UnboundedSender<FromAgent>,
     ) {
@@ -857,7 +973,7 @@ impl Agent {
         }
         let node_store = self.node_store.clone();
         let cluster_addr = cluster_addr.clone();
-        let cluster = *cluster_addr.id.as_bytes();
+        let cluster = *cluster_key.id.as_bytes();
         debug!(task = %a.task, executor = %a.executor, "starting task");
         tokio::spawn(async move {
             let task = a.task;

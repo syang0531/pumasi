@@ -89,6 +89,14 @@ pub fn load_or_create_key(path: &Path) -> Result<SecretKey> {
     }
 }
 
+/// Saves a key the way [`load_or_create_key`] reads it.
+pub fn save_key(path: &Path, key: &SecretKey) -> Result<()> {
+    write_private(
+        path,
+        data_encoding::HEXLOWER.encode(&key.to_bytes()).as_bytes(),
+    )
+}
+
 /// Writes a file readable only by the current user (on Unix).
 pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {

@@ -824,6 +824,19 @@ impl State {
 
     /// Periodic housekeeping: drop silent nodes, reclaim hung tasks,
     /// release held earnings.
+    /// Tells connected agents that follow replicas (protocol 11) which
+    /// control plane replicas there are.
+    pub fn send_replicas(&self, replicas: &[iroh::EndpointAddr]) {
+        for n in self.nodes.values() {
+            if n.online
+                && n.perf.protocol >= pumasi_proto::HA_PROTOCOL
+                && let Some(tx) = &n.tx
+            {
+                let _ = tx.send(ToAgent::Replicas(replicas.to_vec()));
+            }
+        }
+    }
+
     pub fn tick(&mut self, node_timeout: Duration) {
         let now = Instant::now();
         let silent: Vec<(String, u64)> = self

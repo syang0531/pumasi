@@ -664,6 +664,51 @@ pumasi alert ls
 Both can also live in `cluster.toml` (`[alerts]` and `[webhooks.NAME]`,
 with `url_env` to keep the URL out of the file).
 
+### Control plane replicas and backups
+
+One control plane is a single point of failure: while it is down, nothing
+is scheduled and no CU move. Run it on three machines (or five) instead,
+and the cluster keeps going when any one of them (two of five) dies:
+
+```sh
+pumasi ha invite                  # on the control plane: prints a replica ticket
+pumasi cluster replica <TICKET>   # on each new control plane machine
+pumasi ha status                  # who leads, who votes, how far each has the log
+```
+
+The replicas keep the control plane's whole state (members, the queue,
+jobs and tasks, the CU ledger, receipts, the file store's metadata,
+settings) in step over Raft. One of them leads and does the work; the
+others follow, and when the leader dies they elect a new one within a few
+seconds. It loads the state everything agreed on and carries on: nodes
+and the CLI reconnect to it on their own, tasks that were running are
+placed again, and nothing is paid twice, because a charge or a payout is
+one entry that every replica applies or none does. A replica that comes
+back catches up from the others. A leader cut off from the majority
+stops scheduling within 3 seconds, so two leaders never run at once.
+
+Join and admin tickets made after `ha invite` list every replica, so hand
+out new ones (`pumasi token`, `pumasi access create`) once the replicas
+are up. Agents learn about new replicas from the leader by themselves.
+Restart a replica with `pumasi cluster start`; `pumasi ha remove ID`
+takes one out for good. A majority must be up, so use 3 or 5 replicas,
+not 2 or 4.
+
+Back up the state at any time, from anywhere your admin ticket works:
+
+```sh
+pumasi backup pumasi-2026-11-05.backup
+pumasi cluster restore pumasi-2026-11-05.backup   # on a fresh machine, then `pumasi cluster start`
+```
+
+The file is a consistent copy (taken in one transaction) of the state and
+the cluster key, so nodes reconnect to the restored control plane when it
+is reachable where the old one was. It holds the cluster key, the admin
+secret and the cluster's secrets: keep it like the admin ticket. The
+file store's data (`~/.pumasi/cluster/blobs`) is not in it; copy that
+directory too. A restore makes one control plane; add replicas again with
+`pumasi ha invite`.
+
 ### Web dashboard
 
 ```sh
@@ -754,6 +799,9 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi events [-f] [--since 1h] [-n 50] [-o json]` | Cluster events: nodes, jobs, checks, preemptions, alerts. |
 | `pumasi alert ls` / `alert set [--node-offline 1m] [--failure-rate 50%] [--disk 90%] [--temperature 90] [--perf-drop 25%] [--smart on] [--check-mismatch on] [--defaults]` | Alert rules and what fires now; `off` turns a rule off. |
 | `pumasi webhook add NAME URL [--format slack\|discord\|json]` / `ls` / `rm NAME` / `test NAME` | Where alerts go. |
+| `pumasi ha status [-o json]` / `ha invite [--ttl 1h]` / `ha remove ID` | Control plane replicas: who leads and how far each has the log, a ticket for one more replica, take one out. |
+| `pumasi cluster replica <TICKET> [--net public\|local] [--bind ADDR]` | Run this machine as a control plane replica (restart it later with `pumasi cluster start`). |
+| `pumasi backup FILE` / `pumasi cluster restore FILE` | A consistent copy of the control plane's state and cluster key, and a control plane made from one. |
 | `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB]` | The web dashboard and its JSON API, served from this machine (default 127.0.0.1:7400). |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode). |
 
@@ -969,7 +1017,7 @@ checked.
 ## Roadmap
 
 Phases 1 to 15 are enough to run Pumasi on your own machines, alone or as
-an organization (phase 13 covers the essentials). Phase 16 finishes what an
+an organization. Phase 16 finishes what an
 organization needs to adopt it, and phases 17 and 18 are only for trading
 with other clusters.
 
@@ -986,15 +1034,20 @@ with other clusters.
 | 9 | GPUs and microVM devices: NVIDIA (NVML, CUDA benchmark) and AMD detection, signed device profiles, GPU time billed in CU, per-GPU scheduling, Docker GPU jobs, GPU checks for providers, VFIO passthrough (experimental), filtered microVM networking | done |
 | 10 | Cluster management: node labels and taints, job selectors and tolerations, cordon and drain, priorities with preemption, per-account quotas (slots, GPUs, CU per day, priority, storage), role tickets (admin, submitter, viewer), declarative `apply` with `get` and `describe`, cron schedules, job dependencies | done |
 | 11 | Monitoring and alerts: node metrics (CPU, memory, disk, network, temperature, GPUs) kept 7 days with downsampling, `top`, live `logs -f`, `events`, opt-in Prometheus endpoint with a Grafana dashboard, alert rules (node offline, failure rate, disk, temperature, benchmark drop, SMART, check mismatch) sent to Slack, Discord or JSON webhooks | done |
-| 12 | Web dashboard built into the binary (`pumasi ui`): overview, nodes with charts, cordon and drain, jobs with submit, live output, cancel and output downloads, storage with uploads and downloads, CU and ledger, invites and access tickets, prices, events and alerts; sign-in with access tickets and their roles, Korean and English, JSON API with OpenAPI, Playwright tests in CI | this release |
-| 13 | Control plane high availability (Raft) | planned |
+| 12 | Web dashboard built into the binary (`pumasi ui`): overview, nodes with charts, cordon and drain, jobs with submit, live output, cancel and output downloads, storage with uploads and downloads, CU and ledger, invites and access tickets, prices, events and alerts; sign-in with access tickets and their roles, Korean and English, JSON API with OpenAPI, Playwright tests in CI | done |
+| 13 | Control plane high availability: state replicated over Raft (openraft) to 3 or 5 control planes, automatic failover with nodes, CLI and dashboard following the leader, tickets listing every replica, replicas catching up from snapshots, `pumasi backup` and `cluster restore` | this release |
 | 14 | WebGPU executor (experimental) | planned |
 | 15 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
 | 16 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model, cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag | planned |
 | 17 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
 | 18 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
-Known gaps: single control plane (no Raft yet), accounts
+Known gaps: the file store's data is copied to the other control plane
+replicas every 30 seconds rather than as part of each write (a file
+uploaded just before the leader dies may be missing until it comes back),
+agent binaries uploaded with `pumasi upgrade rollout` stay on the replica
+that took them (roll out again after a failover), and agents older than
+this release follow only the replica they joined. Accounts
 exist only inside one cluster (no SSO yet: access tickets are handed out
 by the admin), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
 (only each node's round trip to the control plane), the file store lives

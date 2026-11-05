@@ -219,7 +219,7 @@ After=network-online.target
 
 [Service]
 ExecStart={exec}
-Environment=PUMASI_LOG=pumasi=info,warn
+Environment=PUMASI_LOG=pumasi=info,openraft=error,warn
 Restart=always
 RestartSec=5
 # Stopping the service also stops its tasks (containers, microVMs).
@@ -400,7 +400,7 @@ fn launchd_plist(spec: &Spec) -> String {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PUMASI_LOG</key>
-        <string>pumasi=info,warn</string>
+        <string>pumasi=info,openraft=error,warn</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

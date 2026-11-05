@@ -7,6 +7,7 @@
 pub mod blobs;
 pub mod economy;
 pub mod gpu;
+pub mod ha;
 pub mod job;
 pub mod manage;
 pub mod monitor;
@@ -27,6 +28,9 @@ pub const ADMIN_ALPN: &[u8] = b"pumasi/admin/0";
 /// ALPN of the file store: iroh-blobs' own protocol, served by the control
 /// plane (and by agents, for blobs they cache).
 pub const BLOBS_ALPN: &[u8] = iroh_blobs::ALPN;
+/// ALPN between control plane replicas: Raft and replicas joining
+/// (phase 13).
+pub const RAFT_ALPN: &[u8] = b"pumasi/raft/0";
 /// The first agent protocol with the file store.
 pub const STORE_PROTOCOL: u32 = 8;
 /// The first agent protocol with devices: GPUs, GPU challenges and microVM
@@ -35,11 +39,15 @@ pub const DEVICES_PROTOCOL: u32 = 9;
 /// The first agent protocol with monitoring: node metrics and live task
 /// output.
 pub const MONITOR_PROTOCOL: u32 = 10;
+/// The first agent protocol that follows control plane replicas: it is
+/// told where the leader is ([`msg::HelloReply::NotLeader`]) and which
+/// replicas there are ([`msg::ToAgent::Replicas`]).
+pub const HA_PROTOCOL: u32 = 11;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        10
+        11
     };
 }
 
@@ -54,6 +62,9 @@ pub const PROTOCOL_VERSION: u32 = protocol_version!();
 /// datasets, write outputs to the store or use private images. Protocol 8
 /// agents lack devices (9): they get no GPU jobs and no microVM jobs with
 /// a network. Protocol 9 agents send no metrics and no live output.
+/// Protocol 10 agents know only the control plane they joined: a replica
+/// that is not the leader closes their connection, and they keep retrying
+/// it.
 pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi

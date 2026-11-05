@@ -2,6 +2,7 @@
 //! admin CLI.
 
 mod gpu_cmd;
+mod ha_cmd;
 mod manage;
 mod monitor;
 mod service;
@@ -392,6 +393,17 @@ enum Cmd {
     /// Nodes, jobs (submit, live output, downloads), storage, CU, invites,
     /// prices and events, plus a JSON API under /api/v1.
     Ui(ui::UiArgs),
+    /// Control plane replicas (high availability): status, invite, remove.
+    #[command(subcommand)]
+    Ha(ha_cmd::HaCmd),
+    /// Copy the control plane's state (jobs, ledger, accounts, receipts,
+    /// datasets, settings) and the cluster key into FILE, for `pumasi
+    /// cluster restore`.
+    Backup {
+        file: PathBuf,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
     /// Alert rules: node offline, failure rate, disk, temperature,
     /// benchmark drops, SMART, check mismatches.
     #[command(subcommand)]
@@ -702,6 +714,22 @@ enum ClusterCmd {
         #[command(flatten)]
         metrics: MetricsArgs,
     },
+    /// Join an existing cluster's control plane as a replica, with a
+    /// ticket from `pumasi ha invite`, and run it (restart it later with
+    /// `pumasi cluster start`).
+    Replica {
+        ticket: String,
+        #[command(flatten)]
+        net: NetArgs,
+        /// The kind of disk the file store is on.
+        #[arg(long, value_enum)]
+        storage_class: Option<StorageClassArg>,
+        #[command(flatten)]
+        metrics: MetricsArgs,
+    },
+    /// Make a control plane from a `pumasi backup` file (into an empty
+    /// cluster directory).
+    Restore { file: PathBuf },
 }
 
 #[derive(Args, Clone, Default)]
@@ -858,7 +886,7 @@ fn main() {
         Cmd::Cluster(_) | Cmd::Agent(_) | Cmd::Service(service::ServiceCmd::Run { .. })
     );
     let default_filter = if long_running {
-        "pumasi=info,warn"
+        "pumasi=info,openraft=error,warn"
     } else {
         "warn"
     };
@@ -924,6 +952,17 @@ fn home_dir(cli_home: &Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// Picks local mode for tickets that carry only IP addresses.
+/// [`net_for`] over every address of a cluster: public if any has a relay.
+fn net_for_all(addrs: &[iroh::EndpointAddr], explicit: Option<NetMode>) -> NetMode {
+    explicit.unwrap_or_else(|| {
+        if addrs.iter().any(|a| a.relay_urls().next().is_some()) {
+            NetMode::Public
+        } else {
+            NetMode::Local
+        }
+    })
+}
+
 fn net_for(addr: &iroh::EndpointAddr, explicit: Option<NetMode>) -> NetMode {
     explicit.unwrap_or_else(|| {
         if addr.relay_urls().next().is_some() {
@@ -943,7 +982,28 @@ async fn run(cli: Cli) -> Result<i32> {
             no_token,
             storage_class,
             metrics,
-        }) => cluster_start(&home, name, net, no_token, storage_class, metrics).await,
+        }) => cluster_start(&home, name, net, no_token, storage_class, metrics, None).await,
+        Cmd::Cluster(ClusterCmd::Replica {
+            ticket,
+            net,
+            storage_class,
+            metrics,
+        }) => {
+            let ticket: pumasi_proto::ticket::ReplicaTicket = ticket.parse()?;
+            cluster_start(
+                &home,
+                String::new(),
+                net,
+                true,
+                storage_class,
+                metrics,
+                Some(ticket),
+            )
+            .await
+        }
+        Cmd::Cluster(ClusterCmd::Restore { file }) => ha_cmd::restore(&home, &file),
+        Cmd::Ha(cmd) => ha_cmd::run(&home, cmd).await,
+        Cmd::Backup { file, admin } => ha_cmd::backup(&home, &admin, &file).await,
         Cmd::Top {
             interval,
             once,
@@ -1301,6 +1361,7 @@ async fn cluster_start(
     no_token: bool,
     storage_class: Option<StorageClassArg>,
     metrics: MetricsArgs,
+    replica: Option<pumasi_proto::ticket::ReplicaTicket>,
 ) -> Result<i32> {
     let mut config = ClusterConfig::new(home.join("cluster"));
     config.name = name;
@@ -1314,12 +1375,31 @@ async fn cluster_start(
         Some(StorageClassArg::Nvme) => DiskClass::Nvme,
         None => DiskClass::Unknown,
     };
-    config.net = net.net.unwrap_or_default();
+    config.net = match (&replica, net.net) {
+        (_, Some(n)) => n,
+        (Some(t), None) => net_for_all(&t.candidates(), None),
+        (None, None) => NetMode::default(),
+    };
     // A fixed port lets agents reconnect after a restart in local mode.
     config.bind = Some(net.bind.unwrap_or_else(|| "0.0.0.0:7480".parse().unwrap()));
-    let cluster = Cluster::start(config.clone()).await?;
-    let status = cluster.status();
+    let cluster = match &replica {
+        Some(t) => Cluster::join_replica(config.clone(), t).await?,
+        None => Cluster::start(config.clone()).await?,
+    };
     eprintln!();
+    if !cluster.is_leader() {
+        eprintln!(
+            "control plane replica {} is running and follows the leader",
+            short(&cluster.endpoint_id().to_string())
+        );
+        eprintln!("`pumasi ha status` shows the replicas; this one takes over if the leader fails");
+        eprintln!();
+        tokio::signal::ctrl_c().await?;
+        eprintln!("shutting down");
+        cluster.shutdown().await?;
+        return Ok(0);
+    }
+    let status = cluster.status();
     eprintln!(
         "cluster \"{}\" is running ({} known nodes)",
         status.cluster_name,
@@ -1382,13 +1462,16 @@ async fn agent(
         }
     };
     let net = match &ticket {
-        Some(t) => net_for(&t.cluster, opts.net.net),
+        Some(t) => net_for_all(&t.candidates(), opts.net.net),
         None => {
             let saved = std::fs::read_to_string(data_dir.join("membership.json"))
                 .ok()
                 .and_then(|s| serde_json::from_str::<pumasi_agent::Membership>(&s).ok());
             match saved {
-                Some(m) => net_for(&m.cluster, opts.net.net),
+                Some(m) => net_for_all(
+                    &pumasi_proto::ticket::candidates(&m.cluster, &m.replicas),
+                    opts.net.net,
+                ),
                 None => opts.net.net.unwrap_or_default(),
             }
         }
@@ -1576,7 +1659,7 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
 
 async fn connect_admin(home: &Path, args: &AdminArgs) -> Result<AdminClient> {
     let ticket = load_ticket(home, args)?;
-    let net = net_for(&ticket.cluster, None);
+    let net = net_for_all(&ticket.candidates(), None);
     AdminClient::connect(&ticket, net).await
 }
 

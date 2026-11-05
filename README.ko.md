@@ -274,6 +274,67 @@ pumasi secret ls                                    # 이름만, 값은 안 보�
 
 컨트롤 플레인이 이미지를 저장소로 받고 노드는 거기서 불러오므로, 로그인 정보는 컨트롤 플레인 밖으로 나가지 않고, 이미지 레이어는 노드끼리 나눠 받습니다.
 
+### 클러스터 관리
+
+작업을 어디서 돌릴지, 무엇을 먼저 돌릴지, 계정마다 얼마나 쓰게 할지를 Kubernetes처럼 CLI에서 정합니다.
+
+**라벨과 selector.** 노드마다 내장 라벨(`name`, `os`, `arch`, `role`, `account`, `executor`, `gpu`, `gpus`, `disk`)과 직접 붙인 라벨이 있습니다. 작업의 `selector`에 맞는 노드에서만 돕니다.
+
+```sh
+pumasi label desktop zone=home tier=fast      # `zone-`는 라벨 삭제
+pumasi get nodes -l 'os=linux,disk=nvme|ssd'
+```
+
+```toml
+# job.toml
+[selector]
+os = "linux"
+disk = ["nvme", "ssd"]           # 이 중 하나
+gpu = "!amd"                     # 이것만 아니면
+zone = true                      # 라벨이 있기만 하면 (false: 없어야 함)
+```
+
+**테인트.** 테인트가 붙은 노드는 그 테인트를 허용(toleration)하는 작업만 받습니다. GPU 기기를 GPU 작업 전용으로 둘 때 씁니다(`pumasi taint desktop gpu-only` 후, 거기 가도 되는 작업에 `tolerations = ["gpu-only"]`; `key-`는 삭제).
+
+**cordon과 drain.** `pumasi cordon 노드`는 새 작업을 보내지 않고, `pumasi drain 노드`는 실행 중인 태스크까지 다른 노드로 옮기며(작업의 시도 횟수에 세지 않음), `pumasi uncordon 노드`로 되돌립니다. 점검 전에 씁니다.
+
+**우선순위와 선점.** job.toml의 `priority = 10`(또는 `pumasi run --priority 10`, -1000~1000, 기본 0)은 큐에서 낮은 작업보다 앞섭니다. 자리가 없으면 높은 태스크가 필요한 만큼 가장 적고 가장 덜 중요한 실행 중 태스크를 멈추고, 멈춘 태스크는 시도 횟수를 잃지 않고 큐로 돌아갑니다.
+
+**쿼터.** 계정마다 동시 태스크 수, GPU 수, 24시간 동안 쓰는 CU, 쓸 수 있는 최고 우선순위, 파일 저장소 용량을 제한합니다. 쿼터를 넘는 작업은 계정이 다시 쿼터 안으로 들어올 때까지 큐에서 기다립니다.
+
+```sh
+pumasi quota alice --slots 8 --gpus 1 --cu-per-day 50 --max-priority 10 --storage 100G
+pumasi quota                                   # 모든 계정의 한도와 사용량
+```
+
+**역할 티켓.** 관리자 티켓 대신 사람마다 티켓을 줍니다. `submitter` 티켓은 한 계정의 작업·스케줄·데이터셋만 다루고 그것만 보며, `viewer` 티켓은 읽기만 합니다. 만료 기간을 줄 수 있고 언제든 회수할 수 있으며, 받은 사람은 `pumasi login`으로 저장합니다.
+
+```sh
+pumasi access create "alice laptop" --role submitter --account alice --ttl 90d
+pumasi access ls
+pumasi access revoke "alice laptop"
+pumasi whoami
+```
+
+submitter는 노드 퇴출, 단가·쿼터 변경, 다른 계정의 작업 보기나 데이터셋 마운트를 할 수 없고, 계정의 `max_priority`가 허용하지 않으면 우선순위 0으로만 제출합니다.
+
+**스케줄과 의존성.** 작업을 cron 일정(컨트롤 플레인의 현지 시간)으로 돌릴 수 있고, 이전 실행이 아직 끝나지 않았으면 그 회차는 건너뜁니다(`--overlap`이면 겹쳐 실행). `after`는 지정한 작업들이 성공할 때까지 작업을 붙잡아 두고, 하나라도 실패하면 함께 실패시킵니다.
+
+```sh
+pumasi schedule add nightly job.toml --cron "0 3 * * *" --account alice
+pumasi schedule ls
+pumasi run merge.toml --after 작업ID         # 또는 job.toml에 after = ["작업ID"]
+```
+
+**선언적 설정.** 라벨, 테인트, cordon, 쿼터, 스케줄을 파일 하나에 두고 적용합니다([`examples/cluster.toml`](examples/cluster.toml) 참고). 두 번 적용해도 두 번째에는 바뀌는 것이 없습니다. `--dry-run`은 바뀔 내용만 보여 주고, `--prune`은 파일에 없는 스케줄도 지웁니다.
+
+```sh
+pumasi apply -f cluster.toml --dry-run
+pumasi apply -f cluster.toml
+```
+
+`pumasi get nodes|jobs|accounts|schedules|access [-o json]`로 목록을, `pumasi describe node|job|account|schedule 이름`으로 하나의 자세한 내용을 봅니다.
+
 ## 명령어
 
 | 명령 | 설명 |
@@ -291,7 +352,7 @@ pumasi secret ls                                    # 이름만, 값은 안 보�
 | `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄 |
 | `pumasi store put 이름 경로... [--account A]` / `get 이름[@버전] \| --job ID [-o DIR]` / `ls [이름]` / `rm 이름[@버전]` / `usage` / `quota 계정 크기\|none` | 클러스터 파일 저장소: 버전 있는 데이터셋, 작업 출력, 이어받기, 쿼터 |
 | `pumasi secret set 이름 [값]` / `ls` / `rm 이름` | 클러스터 비밀. `registry/<호스트>`는 비공개 레지스트리 로그인 |
-| `pumasi run job.toml [--account A] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
+| `pumasi run job.toml [--account A] [--priority N] [--after 작업] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
 | `pumasi status` | 노드(역할, 온라인 여부, 실행기, 슬롯, 실행 중, 검증 기록, 과금 CPU 점수, 디스크 종류, 지연, GPU)와 최근 작업 및 CU 비용 |
 | `pumasi node <ID> [--rebenchmark]` | 노드 하나의 벤치마크 프로필, 과금 점수, GPU, 지연, 검증 기록. `--rebenchmark`면 다시 재게 함 |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | 에이전트와 같은 방식으로 이 기기를 벤치마크해 프로필 출력 |
@@ -302,7 +363,14 @@ pumasi secret ls                                    # 이름만, 값은 안 보�
 | `pumasi verify-receipts FILE [--cluster ID]` | 내보낸 영수증을 오프라인으로 검증 |
 | `pumasi cancel <ID>` | 작업 취소 |
 | `pumasi remove-node <ID>` | 노드 퇴출(다시 오려면 새 티켓 필요) |
-| `pumasi login <관리자 티켓>` | 다른 기기에서 원격 클러스터 관리 |
+| `pumasi login <티켓>` | 다른 기기에서 관리자 티켓이나 접근 티켓으로 원격 클러스터 관리 |
+| `pumasi cordon \| uncordon \| drain <노드>` | 노드에 새 작업 중단, 재개, 또는 실행 중인 태스크까지 다른 노드로 이동 |
+| `pumasi label <노드> k=v... \| k-` / `taint <노드> key[=value]... \| key-` | selector용 노드 라벨, 허용하지 않는 작업을 막는 테인트 |
+| `pumasi quota [계정 --slots N --gpus N --cu-per-day CU --max-priority N --storage 크기] [--clear]` | 모든 계정의 한도와 사용량 보기, 또는 한 계정 변경 (`none`은 한도 해제) |
+| `pumasi access create 이름 --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|이름` | 다른 사람에게 줄 역할 티켓. `pumasi whoami`는 지금 쓰는 티켓 표시 |
+| `pumasi schedule add 이름 job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm 이름` / `run 이름` | cron 일정으로 제출하는 작업 |
+| `pumasi apply -f cluster.toml [--dry-run] [--prune]` | 라벨·테인트·cordon·쿼터·스케줄을 파일과 같게 맞춤. 두 번 적용해도 결과 같음 |
+| `pumasi get nodes\|jobs\|accounts\|schedules\|access [-l 셀렉터] [-o json]` / `describe node\|job\|account\|schedule 이름` | 목록 보기, 하나 자세히 보기 |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [인자...]` | 에이전트와 같은 샌드박스로 로컬 실행 (`DIR`이 `/input`으로 보이고 `/output`은 `pumasi-out/exec`에 저장, `--seed`는 결정적 모드) |
 
 `--home DIR` 또는 `PUMASI_HOME`으로 상태 디렉터리를 바꾸면 한 기기에서 클러스터와 에이전트 여러 개를 띄워 시험할 수 있습니다.
@@ -329,6 +397,12 @@ shards = 16                           # 태스크 N개, {shard}·{shards} 치환
 args = ["sample", "{shard}", "5000000"]
 files = ["data/"]                     # 선택, /input 아래에 보임
 deterministic = true                  # 기본값: 가상 시계 + 시드 고정 난수, 결과 검증 가능
+priority = 0                          # -1000~1000, 높을수록 먼저 돌고 낮은 것을 선점할 수 있음
+after = []                            # 먼저 성공해야 하는 작업 ID
+tolerations = []                      # 허용하는 노드 테인트, 예: ["gpu-only"]
+
+[selector]                            # 라벨이 맞는 노드에서만 (클러스터 관리 참고)
+os = "linux"
 
 [resources]
 memory_mb = 32                        # 태스크당 메모리 상한 (기본 256)
@@ -383,7 +457,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 ## 보안 모델
 
 - 참가 티켓은 만료 시간과 사용 횟수를 가진 비밀값입니다. 한 번 참가한 노드는 공개키로 기억되어 다시 티켓이 필요 없고, `remove-node`로 퇴출합니다.
-- `~/.pumasi/cluster/admin.ticket`은 전체 권한이므로 비밀번호처럼 다뤄야 합니다.
+- `~/.pumasi/cluster/admin.ticket`은 전체 권한이므로 비밀번호처럼 다뤄야 합니다. 다른 사람에게는 접근 티켓(`pumasi access create`)을 줍니다. `submitter` 티켓은 한 계정의 작업·스케줄·데이터셋만 다루고 그것만 보며, `viewer` 티켓은 읽기만 합니다. 모든 요청은 컨트롤 플레인에서 티켓의 역할로 검사하고, 회수하거나 만료된 티켓은 바로 막힙니다.
 - WASM 태스크는 실행 기기로부터 격리(자기 `/input`·`/output`만 보임, 네트워크 차단, 메모리·CPU 상한)됩니다.
 - Docker 태스크는 컨테이너 수준의 격리라 호스트 커널을 공유합니다. 그래서 기기 주인이 `--allow-docker`를 줘야만 실행합니다. 내 기기나 믿을 수 있는 사람끼리의 클러스터에서 씁니다.
 - microVM 태스크는 작업으로부터 제공자의 기기를 보호합니다. 태스크마다 KVM 위에서 자기 커널을 쓰고(Firecracker는 seccomp로 자신도 가둠), 자기 디스크만 보이며, 메모리와 vCPU 상한이 걸립니다. 작업이 `network = true`를 쓰지 않으면 네트워크 장치가 없고, 쓰더라도 에이전트가 공인 주소로만 넘겨 주는 카드뿐이라 제공자의 기기나 내부망에는 닿지 않습니다. 패스스루한 GPU는 IOMMU 뒤에 있고, IOMMU 그룹 전체를 함께 넘길 수 있는 GPU만 패스스루합니다. 이미지 레이어도 호스트가 아니라 VM 안에서 풉니다. 다만 제공자는 태스크가 하는 일을 볼 수 있습니다(오픈 등급).
@@ -406,8 +480,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대, CPU 상한, 메모리에 맞춘 슬롯) | 완료 |
 | 7 | 성능 벤치마크와 컴퓨팅 유닛(CU): 노드가 서명한 성능 프로필(CPU, 메모리 대역폭, fio로 디스크 종류·속도, SMART 마모도, 지연), 1 CU = 기준 vCPU 1개를 1시간 쓰는 값과 자원별 CU 단가, 정수 milli-CU 원장, 돈 없이 서로 빌려 쓰는 그룹 로컬 원장 | 완료 |
 | 8 | 클러스터 파일 저장소(iroh-blobs): 버전 있는 데이터셋, `store:` 마운트와 출력 데이터셋, 크기 제한 없는 입출력, 해시 검증 이어받기, 노드끼리 나누는 캐시, 참조 GC, 쿼터, 저장·이그레스 CU 과금, 비공개 레지스트리 이미지 | 완료 |
-| 9 | GPU·microVM 장치: NVIDIA(NVML, CUDA 벤치마크)·AMD 탐지, 서명된 장치 프로필, GPU 시간 CU 과금, GPU 단위 스케줄링, Docker GPU 작업, 제공자 GPU 검증, VFIO 패스스루(실험), 필터링되는 microVM 네트워크 | 이번 릴리스 |
-| 10 | 클러스터 관리: 라벨·selector, drain, 우선순위, 쿼터, 역할 티켓, `apply` | 예정 |
+| 9 | GPU·microVM 장치: NVIDIA(NVML, CUDA 벤치마크)·AMD 탐지, 서명된 장치 프로필, GPU 시간 CU 과금, GPU 단위 스케줄링, Docker GPU 작업, 제공자 GPU 검증, VFIO 패스스루(실험), 필터링되는 microVM 네트워크 | 완료 |
+| 10 | 클러스터 관리: 노드 라벨·테인트, 작업 selector·toleration, cordon·drain, 우선순위와 선점, 계정별 쿼터(슬롯, GPU, 하루 CU, 우선순위, 저장 용량), 역할 티켓(admin, submitter, viewer), 선언적 `apply`와 `get`·`describe`, cron 스케줄, 작업 의존성 | 이번 릴리스 |
 | 11 | 모니터링·경보: 노드 지표, Prometheus, 실시간 로그, 웹훅 | 예정 |
 | 12 | 웹 대시보드(바이너리 내장) | 예정 |
 | 13 | 컨트롤 플레인 고가용성(Raft) | 예정 |
@@ -417,7 +491,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 17 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
 | 18 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: CU는 실제 결제와 연결되어 있지 않습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 표시만 합니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
+알려진 한계: CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 표시만 합니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
 
 ## 라이선스
 

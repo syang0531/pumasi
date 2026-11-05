@@ -22,6 +22,10 @@ use crate::{
     economy::{MilliCu, Policy},
     gpu::{GpuChallenge, GpuInfo, GpuRequest, SignedDevices},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput},
+    manage::{
+        AccessRole, AccessView, AccountQuota, ApplySpec, LabelSet, NodeConfig, NodeEdit, QuotaView,
+        ScheduleSpec, ScheduleView, Selector, Toleration,
+    },
     perf::{BenchChallenge, PerfProfile, SignedPerf},
     receipt::{Receipt, SignedUsage},
     release::{ReleaseFile, SignedRelease, Target},
@@ -515,6 +519,49 @@ pub enum AdminOp {
     },
     GetStoragePolicy,
     SetStoragePolicy(StoragePolicy),
+    // Phase 10 from here.
+    /// Changes a node's labels, taints or cordon (`node`: name or id
+    /// prefix).
+    EditNode {
+        node: String,
+        edit: NodeEdit,
+    },
+    /// Cordons a node and moves its running tasks to other nodes.
+    Drain {
+        node: String,
+    },
+    /// Sets (replaces) an account's quota.
+    SetQuota {
+        account: String,
+        quota: AccountQuota,
+    },
+    /// Every account's quota and usage.
+    Quotas,
+    /// Makes an access ticket with this role.
+    CreateAccess {
+        name: String,
+        role: AccessRole,
+        ttl_secs: Option<u64>,
+    },
+    ListAccess,
+    /// Revokes access tickets by id (or unique prefix) or name.
+    RevokeAccess {
+        id: String,
+    },
+    /// The role of the ticket making the call.
+    WhoAmI,
+    /// Creates or replaces a schedule.
+    SetSchedule(Box<ScheduleSpec>),
+    Schedules,
+    RemoveSchedule {
+        name: String,
+    },
+    /// Submits a schedule's job now.
+    RunSchedule {
+        name: String,
+    },
+    /// Makes the cluster match a `cluster.toml`.
+    Apply(Box<ApplySpec>),
 }
 
 /// Terms of an invite for someone else's machine.
@@ -571,6 +618,25 @@ pub enum AdminResponse {
         policy: StoragePolicy,
         /// The control plane's disk class, which picks the rate.
         class: crate::perf::DiskClass,
+    },
+    // Phase 10 from here.
+    Quotas(Vec<QuotaView>),
+    /// A new access ticket (the only time its secret is shown).
+    AccessTicket {
+        ticket: String,
+        view: AccessView,
+    },
+    AccessList(Vec<AccessView>),
+    WhoAmI {
+        name: String,
+        role: AccessRole,
+    },
+    Schedules(Vec<ScheduleView>),
+    /// What `apply` changed (or would change), one line each.
+    Applied(Vec<String>),
+    /// Runs a drain moved off the node.
+    Drained {
+        moved: u32,
     },
 }
 
@@ -804,6 +870,11 @@ pub struct NodeView {
     pub gpus: Vec<GpuView>,
     /// MicroVMs on this node can have a network.
     pub microvm_network: bool,
+    // Phase 10 from here.
+    /// Labels, taints and cordon an admin set.
+    pub config: NodeConfig,
+    /// Every label: the built-in ones and the admin's.
+    pub labels: LabelSet,
 }
 
 /// A GPU in the cluster status.
@@ -831,6 +902,8 @@ pub struct JobSummary {
     pub account: String,
     /// Milli-CU charged so far.
     pub cost: MilliCu,
+    // Phase 10 from here.
+    pub priority: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -859,6 +932,10 @@ pub struct TaskView {
     pub cost: MilliCu,
     /// Output files kept in the store instead of inline.
     pub stored: Option<StoredOutput>,
+    // Phase 10 from here.
+    /// Times a run was stopped to make room (preemption, drain); these do
+    /// not count against the job's attempts.
+    pub preempted: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -881,6 +958,14 @@ pub struct JobView {
     pub gpu: Option<GpuRequest>,
     /// Image jobs: the tasks may reach the internet.
     pub network: bool,
+    // Phase 10 from here.
+    pub selector: Selector,
+    pub tolerations: Vec<Toleration>,
+    pub after: Vec<JobId>,
+    /// Why its tasks are not in the queue yet (waiting for other jobs).
+    pub waiting: Option<String>,
+    /// The schedule that submitted it.
+    pub schedule: Option<String>,
 }
 
 #[cfg(test)]

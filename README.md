@@ -516,6 +516,100 @@ The control plane pulls the image into the file store and nodes load it
 from there, so the login never leaves the control plane, and nodes share
 image layers with each other instead of each pulling them.
 
+### Cluster management
+
+Tell the scheduler where jobs may run, what matters most, and how much each
+account may use, the way you would in Kubernetes, without leaving the CLI.
+
+**Labels and selectors.** Every node has built-in labels (`name`, `os`,
+`arch`, `role`, `account`, `executor`, `gpu`, `gpus`, `disk`) and any you
+give it. A job's `selector` keeps it on nodes that match:
+
+```sh
+pumasi label desktop zone=home tier=fast      # `zone-` removes a label
+pumasi get nodes -l 'os=linux,disk=nvme|ssd'
+```
+
+```toml
+# job.toml
+[selector]
+os = "linux"
+disk = ["nvme", "ssd"]           # any of these
+gpu = "!amd"                     # anything but
+zone = true                      # has the label at all (false: does not)
+```
+
+**Taints.** A tainted node takes only jobs that tolerate the taint, so you
+can keep the GPU box for GPU work (`pumasi taint desktop gpu-only`, then
+`tolerations = ["gpu-only"]` in the jobs that may go there; `key-`
+removes a taint).
+
+**Cordon and drain.** `pumasi cordon NODE` stops new work from going to a
+node, `pumasi drain NODE` also moves its running tasks elsewhere (they do
+not count against the job's attempts), and `pumasi uncordon NODE` brings it
+back, for example after maintenance.
+
+**Priorities and preemption.** `priority = 10` in job.toml (or `pumasi run
+--priority 10`, from -1000 to 1000, default 0) puts a job ahead of lower
+ones in the queue. When no node has room, a higher-priority task stops the
+fewest and least important running tasks it needs; they go back to the
+queue without losing an attempt.
+
+**Quotas.** Each account can be capped in running tasks, GPUs, CU spent in
+any 24 hours, the highest priority it may use and file store space. Work
+over a quota waits in the queue until the account is back under it.
+
+```sh
+pumasi quota alice --slots 8 --gpus 1 --cu-per-day 50 --max-priority 10 --storage 100G
+pumasi quota                                   # every account's limits and usage
+```
+
+**Role tickets.** Give people their own tickets instead of the admin one.
+A `submitter` ticket works with one account's jobs, schedules and datasets
+and sees only those; a `viewer` ticket only reads. Tickets can expire and
+be revoked; they save it with `pumasi login`.
+
+```sh
+pumasi access create "alice laptop" --role submitter --account alice --ttl 90d
+pumasi access ls
+pumasi access revoke "alice laptop"
+pumasi whoami
+```
+
+A submitter cannot remove nodes, change prices or quotas, read other
+accounts' jobs or mount their datasets, and its jobs run at priority 0
+unless its account's `max_priority` allows more.
+
+**Schedules and dependencies.** A job can run on a cron schedule, in the
+control plane's local time, and skips a run while the previous one is
+still going (`--overlap` allows it). `after` holds a job until the jobs it
+names have succeeded, and fails it if one of them fails.
+
+```sh
+pumasi schedule add nightly job.toml --cron "0 3 * * *" --account alice
+pumasi schedule ls
+pumasi run merge.toml --after JOB_ID      # or after = ["JOB_ID"] in job.toml
+```
+
+**Declarative config.** Keep labels, taints, cordons, quotas and schedules
+in one file (see [`examples/cluster.toml`](examples/cluster.toml)) and apply
+it; applying it again changes nothing. `--dry-run` shows the changes first,
+`--prune` also removes schedules the file does not list.
+
+```sh
+pumasi apply -f cluster.toml --dry-run
+pumasi apply -f cluster.toml
+```
+
+```
+node desktop: labels {} -> {tier=fast,zone=home}, taints [] -> [gpu-only]
+account alice: quota none -> slots 8, gpus 1, 50 CU/day, priority <= 10, storage 100.0 GiB
+schedule nightly-wordcount: created (0 3 * * *)
+```
+
+`pumasi get nodes|jobs|accounts|schedules|access [-o json]` lists them and
+`pumasi describe node|job|account|schedule NAME` shows one in detail.
+
 ## Commands
 
 | Command | What it does |
@@ -533,7 +627,7 @@ image layers with each other instead of each pulling them.
 | `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally. |
 | `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
 | `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
-| `pumasi run job.toml [--account A] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
+| `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
 | `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency, GPUs) and recent jobs with their cost in CU. |
 | `pumasi node <ID> [--rebenchmark]` | One node's benchmark profile, billed score, GPUs, latency and checks; `--rebenchmark` asks it to measure again. |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | Benchmark this machine the way the agent does and print the profile. |
@@ -544,7 +638,14 @@ image layers with each other instead of each pulling them.
 | `pumasi verify-receipts FILE [--cluster ID]` | Check exported receipts offline. |
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
 | `pumasi remove-node <ID>` | Revoke a node. It needs a new ticket to come back. |
-| `pumasi login <ADMIN_TICKET>` | Manage a remote cluster from this machine. |
+| `pumasi login <TICKET>` | Manage a remote cluster from this machine, with the admin ticket or an access ticket. |
+| `pumasi cordon \| uncordon \| drain <NODE>` | Stop new tasks going to a node, take it back, or also move its running tasks elsewhere. |
+| `pumasi label <NODE> k=v... \| k-` / `taint <NODE> key[=value]... \| key-` | Node labels for job selectors; taints keep away jobs that do not tolerate them. |
+| `pumasi quota [ACCOUNT --slots N --gpus N --cu-per-day CU --max-priority N --storage SIZE] [--clear]` | Show every account's limits and usage, or change one (`none` lifts a limit). |
+| `pumasi access create NAME --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|NAME` | Tickets with a role for other people; `pumasi whoami` shows the one in use. |
+| `pumasi schedule add NAME job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm NAME` / `run NAME` | Jobs submitted on a cron schedule. |
+| `pumasi apply -f cluster.toml [--dry-run] [--prune]` | Make labels, taints, cordons, quotas and schedules match a file; applying twice changes nothing. |
+| `pumasi get nodes\|jobs\|accounts\|schedules\|access [-l SELECTOR] [-o json]` / `describe node\|job\|account\|schedule NAME` | List things, or show one in detail. |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode). |
 
 `--home DIR` or `PUMASI_HOME` changes the state directory, which lets you run
@@ -576,6 +677,12 @@ stdin = "input.txt"                   # optional, fed to every task
 files = ["data/", "lookup.csv"]       # optional, appear under /input; "store:NAME" mounts a dataset
 max_attempts = 3                      # placements before giving up on lost nodes
 deterministic = true                  # default: virtual clock + seeded random, so results can be checked
+priority = 0                          # -1000..1000; higher runs first and may preempt lower
+after = []                            # job ids that must succeed before this job starts
+tolerations = []                      # taints of nodes it may run on, e.g. ["gpu-only"]
+
+[selector]                            # only nodes whose labels match (see Cluster management)
+os = "linux"
 
 [resources]
 memory_mb = 32                        # memory cap per task (default 256)
@@ -669,9 +776,12 @@ checked.
                   all links: iroh QUIC, dialed by public key, NAT traversal + relay fallback
 ```
 
-- **Control plane** (`crates/cluster`): membership, join tokens, a FIFO task
-  queue and a scheduler that places tasks on the node with the most free
-  slots among those that offer the job's executor and enough memory. State
+- **Control plane** (`crates/cluster`): membership, join tokens, a task
+  queue ordered by priority (first in, first out within one) and a
+  scheduler that places tasks on the node with the most free slots among
+  those that offer the job's executor, enough memory and GPUs, match its
+  selector and tolerations and are not cordoned, within the account's
+  quota, preempting lower-priority tasks when nothing has room. State
   (members, jobs, task results and output files, modules and input bundles)
   is persisted in redb, so a restart resumes queued and interrupted work.
 - **Agent** (`crates/agent`): connects out to the control plane, so it works
@@ -707,7 +817,11 @@ checked.
   Once a node joins, its public key is remembered; the ticket is not needed
   again. `remove-node` revokes it.
 - The admin ticket in `~/.pumasi/cluster/admin.ticket` grants full control.
-  Treat it like a password.
+  Treat it like a password. Give other people access tickets instead
+  (`pumasi access create`): `submitter` tickets work with one account's
+  jobs, schedules and datasets and see only those, `viewer` tickets only
+  read. Every request is checked against the ticket's role on the control
+  plane; revoked and expired tickets stop working at once.
 - WASM tasks are sandboxed from the machine running them (only their own
   `/input` and `/output`, no network, memory and CPU caps).
 - Docker tasks are only as isolated as a container: they share the host
@@ -760,8 +874,8 @@ with other clusters.
 | 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours, CPU cap, memory-aware slots) | done |
 | 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | done |
 | 8 | Cluster file store (iroh-blobs): versioned datasets, `store:` mounts and output datasets, inputs and outputs of any size, resumable hash-checked transfers, node caches shared between nodes, reference GC, quotas, storage and egress billed in CU, private registry images | done |
-| 9 | GPUs and microVM devices: NVIDIA (NVML, CUDA benchmark) and AMD detection, signed device profiles, GPU time billed in CU, per-GPU scheduling, Docker GPU jobs, GPU checks for providers, VFIO passthrough (experimental), filtered microVM networking | this release |
-| 10 | Cluster management: labels and selectors, drain, priorities, quotas, role tickets, `apply` | planned |
+| 9 | GPUs and microVM devices: NVIDIA (NVML, CUDA benchmark) and AMD detection, signed device profiles, GPU time billed in CU, per-GPU scheduling, Docker GPU jobs, GPU checks for providers, VFIO passthrough (experimental), filtered microVM networking | done |
+| 10 | Cluster management: node labels and taints, job selectors and tolerations, cordon and drain, priorities with preemption, per-account quotas (slots, GPUs, CU per day, priority, storage), role tickets (admin, submitter, viewer), declarative `apply` with `get` and `describe`, cron schedules, job dependencies | this release |
 | 11 | Monitoring and alerts: node metrics, Prometheus endpoint, live logs, webhooks | planned |
 | 12 | Web dashboard (built into the binary) | planned |
 | 13 | Control plane high availability (Raft) | planned |
@@ -772,8 +886,8 @@ with other clusters.
 | 18 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
 Known gaps: single control plane (no Raft yet), no web console, accounts
-exist only inside one cluster and only the admin can submit (with
-`--account`), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
+exist only inside one cluster (no SSO yet: access tickets are handed out
+by the admin), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
 (only each node's round trip to the control plane), the file store lives
 only on the control plane (no replicas on owner nodes yet, no S3-compatible
 gateway). GPUs are checked on real hardware by hand, not in CI (hosted
@@ -812,7 +926,9 @@ provider caught by check runs, refunded and suspended, signed benchmark
 profiles and a provider with an inflated CPU score caught by the
 cluster's timing, mutual-mode lending and borrowing that adds up to zero, microVM
 jobs on an invited provider, and an agent upgrade rollout (opt-in, forged
-signature and tampered binary refused). The microVM test runs when `PUMASI_TEST_VM_DIR`
+signature and tampered binary refused). `crates/cluster/tests/manage.rs`
+covers selectors, drain and preemption, quotas, access tickets, `apply`
+twice, and dependent jobs across a control plane restart. The microVM test runs when `PUMASI_TEST_VM_DIR`
 points at a directory prepared with `pumasi vm setup` (CI does this on Linux
 with KVM, for Firecracker and for QEMU, and on Windows with QEMU in software
 emulation, using a binary built with the guest init embedded through

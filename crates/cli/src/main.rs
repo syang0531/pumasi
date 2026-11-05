@@ -2,6 +2,7 @@
 //! admin CLI.
 
 mod gpu_cmd;
+mod manage;
 mod service;
 mod upgrade;
 
@@ -180,6 +181,13 @@ enum Cmd {
         /// (default: ./pumasi-out/<job id>).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Priority (-1000 to 1000; overrides job.toml). Higher runs first
+        /// and may stop lower-priority tasks to get room.
+        #[arg(long, allow_hyphen_values = true)]
+        priority: Option<i32>,
+        /// Start only after this job succeeded (repeat for several).
+        #[arg(long)]
+        after: Vec<String>,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -212,8 +220,120 @@ enum Cmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
-    /// Save an admin ticket so this machine can manage a remote cluster.
+    /// Save an admin ticket (or an access ticket from `pumasi access
+    /// create`) so this machine can manage a remote cluster.
     Login { ticket: String },
+    /// Stop giving a node new tasks (NODE: name or id prefix). Running
+    /// tasks finish.
+    Cordon {
+        node: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Give a cordoned or drained node tasks again.
+    Uncordon {
+        node: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Cordon a node and move its running tasks to other nodes (they do
+    /// not count against the jobs' attempts), e.g. before maintenance.
+    Drain {
+        node: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Set (`key=value`) or remove (`key-`) labels on a node, for job
+    /// selectors (`[selector]` in job.toml).
+    Label {
+        node: String,
+        #[arg(required = true)]
+        labels: Vec<String>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Add (`key` or `key=value`) or remove (`key-`) taints on a node: only
+    /// jobs that tolerate them (`tolerations` in job.toml) run there.
+    Taint {
+        node: String,
+        #[arg(required = true)]
+        taints: Vec<String>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Show every account's quota and usage, or change one account's.
+    /// Give a value, or `none` to lift that limit.
+    Quota {
+        account: Option<String>,
+        /// Tasks running at once.
+        #[arg(long)]
+        slots: Option<String>,
+        /// GPUs in use at once.
+        #[arg(long)]
+        gpus: Option<String>,
+        /// CU it may spend in any 24 hours on other accounts' machines and
+        /// storage.
+        #[arg(long)]
+        cu_per_day: Option<String>,
+        /// Highest job priority (submitter tickets stay at 0 without it).
+        #[arg(long, allow_hyphen_values = true)]
+        max_priority: Option<String>,
+        /// File store space, e.g. 50G.
+        #[arg(long)]
+        storage: Option<String>,
+        /// Start from no limits instead of the current quota.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Access tickets with a role: admin, submitter (one account) or
+    /// viewer.
+    #[command(subcommand)]
+    Access(manage::AccessCmd),
+    /// Show which ticket this machine uses and what it may do.
+    Whoami {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Jobs submitted on a cron schedule.
+    #[command(subcommand)]
+    Schedule(manage::ScheduleCmd),
+    /// Make the cluster match a cluster.toml: node labels, taints and
+    /// cordons, account quotas, schedules. Applying it twice changes
+    /// nothing the second time.
+    Apply {
+        #[arg(short = 'f', long = "file")]
+        file: PathBuf,
+        /// Show what would change without changing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove schedules the file does not list.
+        #[arg(long)]
+        prune: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// List nodes, jobs, accounts, schedules or access tickets.
+    Get {
+        #[arg(value_enum)]
+        kind: manage::GetKind,
+        /// Only nodes whose labels match, e.g. `os=linux,disk=nvme|ssd`.
+        #[arg(short = 'l', long)]
+        selector: Option<String>,
+        #[arg(short = 'o', long, value_enum, default_value = "table")]
+        output: manage::Output,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Show one node, job, account or schedule in detail.
+    Describe {
+        #[arg(value_enum)]
+        kind: manage::DescribeKind,
+        name: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
     /// Run the agent as a service that starts at boot (systemd, launchd,
     /// Windows service).
     #[command(subcommand)]
@@ -868,6 +988,8 @@ async fn run(cli: Cli) -> Result<i32> {
             detach,
             output,
             out,
+            priority,
+            after,
             admin,
         } => {
             let (mut sub, upload) = JobFile::load_split(&job_file, INLINE_INPUT_BYTES)?;
@@ -875,6 +997,13 @@ async fn run(cli: Cli) -> Result<i32> {
                 validate_account(a)?;
             }
             sub.account = account.clone();
+            if let Some(p) = priority {
+                sub.priority = p;
+            }
+            for a in &after {
+                sub.after.push(a.parse()?);
+            }
+            sub.validate()?;
             let tasks = sub.tasks.len();
             let client = connect_admin(&home, &admin).await?;
             if !upload.is_empty() {
@@ -967,9 +1096,86 @@ async fn run(cli: Cli) -> Result<i32> {
             let t: AdminTicket = ticket.parse()?;
             let path = home.join(ADMIN_TICKET_FILE);
             pumasi_proto::net::write_private(&path, t.to_string().as_bytes())?;
-            eprintln!("saved admin ticket to {}", path.display());
+            eprintln!(
+                "saved the ticket to {} (`pumasi whoami` shows what it may do)",
+                path.display()
+            );
             Ok(0)
         }
+        Cmd::Cordon { node, admin } => {
+            let edit = pumasi_proto::manage::NodeEdit {
+                cordon: Some(true),
+                ..Default::default()
+            };
+            manage::edit_node(&home, &admin, &node, edit).await?;
+            eprintln!("cordoned {node}: it takes no new tasks; running ones finish");
+            Ok(0)
+        }
+        Cmd::Uncordon { node, admin } => {
+            let edit = pumasi_proto::manage::NodeEdit {
+                cordon: Some(false),
+                ..Default::default()
+            };
+            manage::edit_node(&home, &admin, &node, edit).await?;
+            eprintln!("uncordoned {node}");
+            Ok(0)
+        }
+        Cmd::Drain { node, admin } => manage::drain(&home, &admin, &node).await,
+        Cmd::Label {
+            node,
+            labels,
+            admin,
+        } => {
+            let edit = manage::label_edit(&labels)?;
+            manage::edit_node(&home, &admin, &node, edit).await
+        }
+        Cmd::Taint {
+            node,
+            taints,
+            admin,
+        } => {
+            let edit = manage::taint_edit(&taints)?;
+            manage::edit_node(&home, &admin, &node, edit).await
+        }
+        Cmd::Quota {
+            account,
+            slots,
+            gpus,
+            cu_per_day,
+            max_priority,
+            storage,
+            clear,
+            admin,
+        } => {
+            manage::quota(
+                &home,
+                &admin,
+                account,
+                slots,
+                gpus,
+                cu_per_day,
+                max_priority,
+                storage,
+                clear,
+            )
+            .await
+        }
+        Cmd::Access(cmd) => manage::access(&home, cmd).await,
+        Cmd::Whoami { admin } => manage::whoami(&home, &admin).await,
+        Cmd::Schedule(cmd) => manage::schedule(&home, cmd).await,
+        Cmd::Apply {
+            file,
+            dry_run,
+            prune,
+            admin,
+        } => manage::apply(&home, &admin, &file, dry_run, prune).await,
+        Cmd::Get {
+            kind,
+            selector,
+            output,
+            admin,
+        } => manage::get(&home, &admin, kind, selector, output).await,
+        Cmd::Describe { kind, name, admin } => manage::describe(&home, &admin, kind, &name).await,
         Cmd::Vm(cmd) => vm(&home, cmd).await,
         Cmd::Exec {
             module,
@@ -1355,6 +1561,8 @@ fn print_status(s: &ClusterStatus) {
         };
         let state = if n.suspended {
             "suspended"
+        } else if n.online && n.config.cordoned {
+            "cordoned"
         } else if n.online && n.paused.is_some() {
             "paused"
         } else if n.online {
@@ -1457,6 +1665,26 @@ fn print_job(v: &JobView, output: bool) {
     if v.network {
         println!("  network: on");
     }
+    if s.priority != 0 {
+        println!("  priority {}", s.priority);
+    }
+    if !v.selector.is_empty() {
+        println!("  selector {}", v.selector);
+    }
+    if !v.tolerations.is_empty() {
+        let t: Vec<String> = v.tolerations.iter().map(|t| t.to_string()).collect();
+        println!("  tolerates {}", t.join(","));
+    }
+    if !v.after.is_empty() {
+        let a: Vec<String> = v.after.iter().map(|j| j.to_string()).collect();
+        println!("  after {}", a.join(","));
+    }
+    if let Some(w) = &v.waiting {
+        println!("  {w}");
+    }
+    if let Some(name) = &v.schedule {
+        println!("  submitted by schedule {name}");
+    }
     println!(
         "  account {}  cost {} CU{}",
         s.account,
@@ -1504,6 +1732,11 @@ fn print_job(v: &JobView, output: bool) {
             format!(" cost={}", format_cu(t.cost))
         } else {
             String::new()
+        };
+        let cost = if t.preempted > 0 {
+            format!("{cost} moved={}", t.preempted)
+        } else {
+            cost
         };
         let show_line = output || !matches!(t.state, TaskState::Succeeded) || v.tasks.len() <= 20;
         if show_line {
@@ -2641,6 +2874,19 @@ fn print_node(n: &NodeView) {
     );
     if let Some(reason) = &n.paused {
         println!("  paused: {reason}");
+    }
+    if n.config.cordoned {
+        println!("  cordoned: takes no new tasks (`pumasi uncordon` to undo)");
+    }
+    let labels: Vec<String> = n
+        .labels
+        .iter()
+        .map(|(k, v)| format!("{k}={}", v.join("|")))
+        .collect();
+    println!("  labels {}", labels.join(","));
+    if !n.config.taints.is_empty() {
+        let taints: Vec<String> = n.config.taints.iter().map(|t| t.to_string()).collect();
+        println!("  taints {}", taints.join(","));
     }
     if let Some(rtt) = n.rtt_us {
         println!(

@@ -19,8 +19,8 @@ the project; this file covers the code.
 | `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
 | `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. `service.rs` installs the agent as an OS service, `upgrade.rs` drives rollouts. |
 
-The marketplace hub is not in this repository; it will be a separate,
-closed-source service. The agent and control plane stay Apache-2.0.
+The marketplace hub, Madang (마당), is not in this repository; it is a
+separate, closed-source service in the private `madang` repository. The agent and control plane stay Apache-2.0.
 
 ## Networking
 

@@ -18,7 +18,10 @@ pub struct Sampler {
     system: System,
     disks: Disks,
     networks: Networks,
-    components: Components,
+    /// None on Windows: sysinfo reads sensors there through WMI (COM),
+    /// which crashes when the sampler moves between threads, and the
+    /// sensors usually need administrator rights anyway.
+    components: Option<Components>,
     gpus: Vec<GpuInfo>,
     nvml: Option<crate::gpu::nvml::Sampler>,
     samples: u64,
@@ -39,7 +42,7 @@ impl Sampler {
             system,
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
-            components: Components::new_with_refreshed_list(),
+            components: (!cfg!(windows)).then(Components::new_with_refreshed_list),
             gpus,
             nvml,
             samples: 0,
@@ -54,11 +57,15 @@ impl Sampler {
         if self.samples.is_multiple_of(60) {
             self.disks.refresh(true);
             self.networks.refresh(true);
-            self.components.refresh(true);
+            if let Some(c) = &mut self.components {
+                c.refresh(true);
+            }
         } else {
             self.disks.refresh(false);
             self.networks.refresh(false);
-            self.components.refresh(false);
+            if let Some(c) = &mut self.components {
+                c.refresh(false);
+            }
         }
         let (disk_used, disk_total) = disk_of(&self.disks, &self.data_dir);
         let (mut net_rx, mut net_tx) = (0u64, 0u64);
@@ -72,6 +79,7 @@ impl Sampler {
         let temp_c = self
             .components
             .iter()
+            .flat_map(|c| c.iter())
             .filter_map(|c| c.temperature())
             // Sensors that are not there read 0 or nonsense.
             .filter(|t| t.is_finite() && *t > 1.0 && *t < 150.0)

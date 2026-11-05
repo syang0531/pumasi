@@ -963,7 +963,7 @@ falls back to emulation, and hosted Mac runners cannot virtualize at all.
 macOS 10.15 and 11 themselves have no CI runners either.
 MicroVM task output reaches `pumasi logs` only when the task ends (the
 guest writes it to its output disk), Intel and Apple GPUs report no
-metrics, and the 10-second metric steps of the last hour are not kept
+metrics, Windows nodes report no temperature, and the 10-second metric steps of the last hour are not kept
 across a control plane restart.
 
 ## Development

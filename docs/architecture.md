@@ -1230,7 +1230,8 @@ remotely; install a current binary on them once.
   task instead of letting it checkpoint, and schedules use the control
   plane's time zone only.
 - Monitoring: microVM output is not streamed while the task runs; Intel
-  and Apple GPUs report no metrics; the 10 s tier is lost on a control
+  and Apple GPUs report no metrics; Windows nodes report no temperature
+  (sysinfo reads it through WMI, which is not safe across threads); the 10 s tier is lost on a control
   plane restart; alert rules are cluster-wide (no per-node or per-label
   thresholds, no silences or repeat notices); node-to-node latency is not
   measured.

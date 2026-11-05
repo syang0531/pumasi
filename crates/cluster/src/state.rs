@@ -762,6 +762,10 @@ impl State {
         self.expire_challenges();
         if !self.queue.is_empty() || self.rollout.is_some() {
             self.schedule();
+        } else {
+            // A re-timing asked for within the gap between two challenges
+            // waits for a tick, not for the next job.
+            self.drive_challenges();
         }
     }
 

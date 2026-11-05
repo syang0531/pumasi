@@ -373,7 +373,15 @@ impl MicrovmExecutor {
             &blake3::hash(&cpio).to_hex()[..16]
         ));
         if !initrd.exists() {
-            let tmp = initrd.with_extension(format!("tmp{}", std::process::id()));
+            // Unique per executor: several can start at once in a process.
+            let tmp = initrd.with_extension(format!(
+                "tmp{}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
             std::fs::write(&tmp, &cpio)?;
             std::fs::rename(&tmp, &initrd)?;
         }

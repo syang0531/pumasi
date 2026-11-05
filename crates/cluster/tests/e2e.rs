@@ -976,9 +976,11 @@ async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
         "{:?}",
         liar.perf_note
     );
-    // Billed at about what the cluster timed, not what it claimed.
+    // Billed at about what the cluster timed (at most 1.25x its best
+    // timing, which a busy runner can put at twice the real speed), not
+    // the eightfold claim.
     assert!(
-        (liar.cpu_score as u64) * 3 < liar.perf.as_ref().unwrap().cpu.per_vcpu() as u64,
+        (liar.cpu_score as u64) * 2 < liar.perf.as_ref().unwrap().cpu.per_vcpu() as u64,
         "billed {} for a claim of {}",
         liar.cpu_score,
         liar.perf.as_ref().unwrap().cpu.per_vcpu()

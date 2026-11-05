@@ -499,15 +499,17 @@ checked.
 | 4 | Distribution and install: release binaries for six platforms with SHA256SUMS, install scripts, OS services, signed cluster-driven upgrades with rollback | done |
 | 5 | Windows: Docker Desktop (WSL 2), microVMs with QEMU + WHPX (TCG fallback), pinned QEMU install, Job Objects, built-in ext4 formatter and guest init | this release |
 | 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours) | planned |
-| 7 | Cluster file store (iroh-blobs): datasets, large inputs and outputs, resumable transfers | planned |
-| 8 | GPUs: detection, scheduling, Docker GPU jobs, VFIO passthrough for microVMs | planned |
-| 9 | Cluster management: labels and selectors, drain, priorities, quotas, role tickets, `apply` | planned |
-| 10 | Monitoring and alerts: node metrics, Prometheus endpoint, live logs, webhooks | planned |
-| 11 | Web dashboard (built into the binary) | planned |
-| 12 | Control plane high availability (Raft) | planned |
-| 13 | WebGPU executor (experimental) | planned |
-| 14 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
-| 15 | Marketplace hub and real payments | planned |
+| 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | planned |
+| 8 | Cluster file store (iroh-blobs): datasets, large inputs and outputs, resumable transfers, storage billed in CU, private registry images | planned |
+| 9 | GPUs and microVM devices: detection, GPU benchmarks in CU, scheduling, Docker GPU jobs, VFIO passthrough, microVM networking | planned |
+| 10 | Cluster management: labels and selectors, drain, priorities, quotas, role tickets, `apply` | planned |
+| 11 | Monitoring and alerts: node metrics, Prometheus endpoint, live logs, webhooks | planned |
+| 12 | Web dashboard (built into the binary) | planned |
+| 13 | Control plane high availability (Raft) | planned |
+| 14 | WebGPU executor (experimental) | planned |
+| 15 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
+| 16 | Hub (separate private service): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
+| 17 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
 Known gaps: single control plane (no Raft yet), no web console, accounts
 exist only inside one cluster and only the admin can submit (with

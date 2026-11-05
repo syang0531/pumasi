@@ -835,7 +835,7 @@ impl JobFile {
                 let min_vram_mib = match which.min_vram_gb {
                     Some(gb) => {
                         ensure!(
-                            gb >= 0.0 && gb <= 1024.0,
+                            (0.0..=1024.0).contains(&gb),
                             "gpu.min_vram_gb must be between 0 and 1024"
                         );
                         (gb * 1024.0).round() as u64
@@ -1059,6 +1059,21 @@ mod tests {
         assert_eq!(gpu.resolve(&dir).unwrap().gpu.unwrap().count, 0);
         let none = JobFile::parse("executor = \"microvm\"").unwrap();
         assert!(none.resolve(&dir).is_err(), "needs an image");
+    }
+
+    #[test]
+    fn gpu_examples_resolve() {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/pytorch-cuda");
+        for (file, executor, count) in [
+            ("job.toml", Executor::Docker, 1),
+            ("job-microvm.toml", Executor::Microvm, 1),
+        ] {
+            let text = std::fs::read_to_string(examples.join(file)).unwrap();
+            let sub = JobFile::parse(&text).unwrap().resolve(&examples).unwrap();
+            assert_eq!(sub.executor, executor, "{file}");
+            assert_eq!(sub.gpu.as_ref().map(|g| g.count), Some(count), "{file}");
+            sub.validate().unwrap();
+        }
     }
 
     #[test]

@@ -1920,4 +1920,231 @@ mod tests {
         );
         assert!(!to_bob[0].task.check);
     }
+
+    // -----------------------------------------------------------------------
+    // GPUs (phase 9)
+    // -----------------------------------------------------------------------
+
+    fn gpu(index: u32, gflops: u32, hash_rate: u64) -> pumasi_proto::gpu::GpuInfo {
+        pumasi_proto::gpu::GpuInfo {
+            index,
+            vendor: GpuVendor::Nvidia,
+            name: format!("Test GPU {index}"),
+            uuid: String::new(),
+            pci: format!("0000:0{}:00.0", index + 1),
+            vram_mib: 12 * 1024,
+            driver: "570.86".into(),
+            compute: "8.6".into(),
+            display: false,
+            fp32_gflops: gflops,
+            measured: true,
+            mem_bw_gb_s: 360,
+            hash_rate,
+            docker: true,
+            vfio: false,
+            render_node: String::new(),
+        }
+    }
+
+    /// Joins a Docker node and sends its signed device profile.
+    fn join_gpus(
+        st: &mut State,
+        name: &str,
+        gpus: Vec<pumasi_proto::gpu::GpuInfo>,
+        invite: Option<Invite>,
+    ) -> (String, SecretKey, mpsc::UnboundedReceiver<ToAgent>) {
+        let key = SecretKey::generate();
+        let id = key.public().to_string();
+        let token = st
+            .create_token(Duration::from_secs(60), Some(1), invite)
+            .unwrap();
+        let info = info(name, vec![Executor::Wasm, Executor::Docker]);
+        st.authorize(&id, &info, Some(&token.secret)).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (kill, _) = oneshot::channel();
+        st.on_connect(
+            &id,
+            pumasi_proto::PROTOCOL_VERSION,
+            info,
+            None,
+            Availability::Available,
+            tx,
+            kill,
+        );
+        let generation = st.nodes[&id].generation;
+        let profile = pumasi_proto::gpu::DeviceProfile {
+            bench_version: pumasi_proto::gpu::GPU_BENCH_VERSION,
+            node: *key.public().as_bytes(),
+            measured_unix: 0,
+            gpus,
+            microvm_network: false,
+            notes: vec![],
+        };
+        st.on_devices(
+            &id,
+            generation,
+            pumasi_proto::gpu::SignedDevices::sign(profile, &key),
+        )
+        .unwrap();
+        (id, key, rx)
+    }
+
+    fn gpu_job(count: u32, tasks: usize) -> JobSubmission {
+        JobSubmission {
+            gpu: Some(GpuRequest {
+                count,
+                vendor: None,
+                min_vram_mib: 0,
+            }),
+            ..job(Executor::Docker, tasks)
+        }
+    }
+
+    #[test]
+    fn gpu_jobs_go_only_to_nodes_with_enough_free_gpus() {
+        let mut st = state();
+        let (_, _, mut one_rx) = join_gpus(&mut st, "one-gpu", vec![gpu(0, 12_700, 0)], None);
+        let (_, _, mut none_rx) = join_gpus(&mut st, "no-gpu", vec![], None);
+        let two = st.submit(gpu_job(2, 1)).unwrap();
+        assert!(assigned(&mut one_rx).is_empty(), "2 GPUs asked, 1 there");
+        assert!(assigned(&mut none_rx).is_empty(), "no GPUs there");
+
+        let one = st.submit(gpu_job(1, 2)).unwrap();
+        let got = assigned(&mut one_rx);
+        assert_eq!(got.len(), 1, "one task per free GPU");
+        assert_eq!(got[0].gpus, vec![0]);
+        assert_eq!(got[0].task.job, one);
+        assert!(assigned(&mut none_rx).is_empty());
+        let view = st.status();
+        let busy = view
+            .nodes
+            .iter()
+            .find(|n| n.info.name == "one-gpu")
+            .unwrap();
+        assert_eq!(busy.gpus[0].busy, Some(got[0].task));
+
+        // A node with two GPUs takes the two-GPU job.
+        let (_, _, mut two_rx) = join_gpus(
+            &mut st,
+            "two-gpus",
+            vec![gpu(0, 12_700, 0), gpu(1, 12_700, 0)],
+            None,
+        );
+        let got = assigned(&mut two_rx);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].task.job, two);
+        assert_eq!(got[0].gpus, vec![0, 1]);
+
+        // Plain jobs still run on the GPU-less node.
+        st.submit(job(Executor::Docker, 1)).unwrap();
+        assert_eq!(assigned(&mut none_rx).len(), 1);
+
+        // Asking for more memory than any GPU has never matches.
+        let mut big = gpu_job(1, 1);
+        big.gpu.as_mut().unwrap().min_vram_mib = 80 * 1024;
+        let id = st.submit(big).unwrap();
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+    }
+
+    #[test]
+    fn gpu_runs_are_billed_and_receipts_record_them() {
+        let mut st = state();
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        // A provider whose GPU cannot run the cluster's check: billed at
+        // the reference throughput at most.
+        let (bob_id, bob_key, mut rx) =
+            join_gpus(&mut st, "bob", vec![gpu(0, 20_000, 0)], bob(true));
+        let id = st.submit(gpu_job(1, 1)).unwrap();
+        let a = assigned(&mut rx).pop().expect("assigned to bob");
+        assert_eq!(a.gpus, vec![0]);
+        std::thread::sleep(Duration::from_millis(200));
+        let outcome = Outcome::Exited(0);
+        let digest = pumasi_proto::receipt::result_digest(&outcome, b"ok", &[]);
+        let usage = pumasi_proto::receipt::Usage {
+            cluster: *st.key.public().as_bytes(),
+            node: *bob_key.public().as_bytes(),
+            task: a.task,
+            executor: Executor::Docker,
+            outcome: outcome.clone(),
+            fuel_used: 0,
+            wall_ms: 200,
+            memory_limit_bytes: a.limits.memory_bytes,
+            peak_memory_bytes: None,
+            cpu_millis: a.limits.cpu_millis,
+            result_digest: digest,
+            finished_unix: now_unix(),
+        };
+        let generation = st.nodes[&bob_id].generation;
+        st.on_report(
+            &bob_id,
+            generation,
+            TaskReport {
+                task: a.task,
+                outcome,
+                stdout: b"ok".to_vec(),
+                stderr: vec![],
+                files: vec![],
+                fuel_used: 0,
+                wall_ms: 200,
+                usage: Some(pumasi_proto::receipt::SignedUsage::sign(usage, &bob_key)),
+            },
+        );
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Succeeded);
+        let receipts = st.receipts(id).unwrap();
+        assert_eq!(receipts.len(), 1);
+        let r = &receipts[0];
+        r.verify().unwrap();
+        let g = r.gpu.as_ref().expect("GPU billing on the receipt");
+        assert_eq!(g.names, vec!["Test GPU 0".to_string()]);
+        assert_eq!(g.gflops, pumasi_proto::gpu::REFERENCE_GPU_GFLOPS as u64);
+        assert_eq!(g.vram_mib, 12 * 1024);
+        assert!(g.exact_ucu > 0, "{g:?}");
+        assert!(r.billing.exact_ucu > g.exact_ucu, "CPU and memory on top");
+        let view = st.status();
+        let node = view.nodes.iter().find(|n| n.id == bob_id).unwrap();
+        assert_eq!(node.gpus[0].busy, None, "freed after the run");
+        assert_eq!(
+            node.gpus[0].billed_gflops,
+            pumasi_proto::gpu::REFERENCE_GPU_GFLOPS
+        );
+        assert!(node.gpus[0].note.is_some());
+    }
+
+    #[test]
+    fn untrusted_gpus_are_timed_before_they_get_work() {
+        for honest in [true, false] {
+            let mut st = state();
+            st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+            let (bob_id, _, mut rx) =
+                join_gpus(&mut st, "bob", vec![gpu(0, 12_700, 2_000_000)], bob(true));
+            let challenge = loop {
+                match rx.try_recv() {
+                    Ok(ToAgent::GpuChallenge(c)) => break c,
+                    Ok(_) => continue,
+                    Err(_) => panic!("no GPU challenge"),
+                }
+            };
+            st.submit(gpu_job(1, 1)).unwrap();
+            assert!(assigned(&mut rx).is_empty(), "no GPU work while timing");
+            let mut answer =
+                pumasi_proto::gpu::solve_cpu(challenge.seed, challenge.target, challenge.solutions);
+            if !honest {
+                answer[0] ^= 1;
+            }
+            let generation = st.nodes[&bob_id].generation;
+            st.on_gpu_result(&bob_id, generation, challenge.nonce, answer);
+            let view = st.status();
+            let node = view.nodes.iter().find(|n| n.id == bob_id).unwrap();
+            if honest {
+                assert_eq!(node.gpus[0].billed_gflops, 12_700);
+                assert_eq!(node.strikes, 0);
+                let got = assigned(&mut rx);
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0].gpus, vec![0]);
+            } else {
+                assert_eq!(node.gpus[0].billed_gflops, 0, "wrong answers bill nothing");
+                assert_eq!(node.strikes, 1);
+            }
+        }
+    }
 }

@@ -1895,3 +1895,52 @@ async fn rollout_upgrades_opted_in_agents_and_refuses_forged_binaries() {
     client.close().await;
     cluster.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9: device profiles
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn device_profiles_reach_the_control_plane() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let mut config = agent_config("gpu-box", 2, tempdir("g"));
+    config.fake_gpus = Some(vec![pumasi_proto::gpu::GpuInfo {
+        index: 0,
+        vendor: pumasi_proto::gpu::GpuVendor::Nvidia,
+        name: "NVIDIA GeForce RTX 3060".into(),
+        uuid: "GPU-test".into(),
+        pci: "0000:01:00.0".into(),
+        vram_mib: 12 * 1024,
+        driver: "570.86.15".into(),
+        compute: "8.6".into(),
+        display: false,
+        fp32_gflops: 12_700,
+        measured: true,
+        mem_bw_gb_s: 360,
+        hash_rate: 0,
+        docker: true,
+        vfio: false,
+        render_node: String::new(),
+    }]);
+    let node = spawn_join(Agent::new(config).await.unwrap(), ticket);
+    wait_online(&cluster, 1).await;
+    let mut gpus = Vec::new();
+    for _ in 0..100 {
+        gpus = node_named(&cluster, "gpu-box").gpus;
+        if !gpus.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(gpus.len(), 1, "the signed device profile arrived");
+    assert_eq!(gpus[0].info.name, "NVIDIA GeForce RTX 3060");
+    assert_eq!(gpus[0].billed_gflops, 12_700, "owner machines are trusted");
+    assert_eq!(gpus[0].busy, None);
+    assert!(!node_named(&cluster, "gpu-box").microvm_network);
+    node.kill().await;
+    cluster.shutdown().await.unwrap();
+}

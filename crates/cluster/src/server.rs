@@ -270,8 +270,18 @@ impl Cluster {
     pub async fn shutdown(self) -> Result<()> {
         self.ticker.abort();
         self.worker.abort();
+        // Aborted tasks drop their state handles when they next yield;
+        // wait for that so the database is closed when this returns.
+        let _ = self.ticker.await;
+        let _ = self.worker.await;
         self.router.shutdown().await.context("router shutdown")?;
         self.inner.files.store.shutdown().await.ok();
+        // Tasks of ended sessions let go of the state as their connections
+        // close; the database stays locked until the last one has.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&self.inner) > 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         Ok(())
     }
 }
@@ -490,6 +500,9 @@ async fn agent_session(inner: Arc<Inner>, conn: Connection) -> Result<()> {
     writer.abort();
     fetcher.abort();
     conn.close(0u32.into(), b"session ended");
+    // Wait until the fetcher has let go of the state, so a shutdown that
+    // waits for sessions really releases the database.
+    let _ = fetcher.await;
     result
 }
 

@@ -182,7 +182,7 @@ async fn check(only: Option<String>, docker: &str) -> Result<i32> {
                 solutions: pumasi_proto::gpu::GPU_CHALLENGE_SOLUTIONS,
             };
             let pci = g.pci.clone();
-            let c = challenge.clone();
+            let c = challenge;
             let start = Instant::now();
             let xs = tokio::task::spawn_blocking(move || gpu::solve(&pci, &c)).await?;
             let took = start.elapsed();

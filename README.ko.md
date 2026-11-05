@@ -58,7 +58,7 @@ python3 examples/python-wordcount/merge.py pumasi-out/<작업 ID>
 
 ### microVM 작업: 내 것이 아닌 기기에서 컨테이너 돌리기
 
-컨테이너는 호스트 커널을 공유하므로 Docker 작업은 내 기기용입니다. microVM 실행기는 같은 OCI 이미지를 태스크마다 가벼운 VM(KVM이 있는 Linux는 [Firecracker](https://firecracker-microvm.github.io/), macOS 11 이상은 Apple Virtualization.framework, Windows는 WHPX 가속 QEMU, 그 밖에는 QEMU) 안에서 자기 Linux 커널로, 네트워크 없이 돌립니다. 작업 명세에는 `executor = "microvm"` 한 줄만 더합니다.
+컨테이너는 호스트 커널을 공유하므로 Docker 작업은 내 기기용입니다. microVM 실행기는 같은 OCI 이미지를 태스크마다 가벼운 VM(KVM이 있는 Linux는 [Firecracker](https://firecracker-microvm.github.io/), macOS 11 이상은 Apple Virtualization.framework, Windows는 WHPX 가속 QEMU, 그 밖에는 QEMU) 안에서 자기 Linux 커널로 돌리고, 작업이 요청하지 않으면 네트워크도 없습니다. 작업 명세에는 `executor = "microvm"` 한 줄만 더합니다.
 
 ```sh
 # 기기마다 한 번 (KVM이 있는 Linux, macOS 11 이상, Windows 10/11 x86_64. Windows는 QEMU를 설치하므로 관리자 터미널에서)
@@ -71,6 +71,34 @@ pumasi run examples/python-wordcount/job-microvm.toml --output
 ```
 
 `pumasi vm setup`은 버전이 고정된 게스트 커널(Linux는 Firecracker, Windows는 QEMU도)을 받아 SHA-256을 확인하고, `pumasi vm status`는 설치 상태와 쓸 VM 모니터를 보여 줍니다. 릴리스 바이너리에는 게스트 init(VM의 PID 1)이 들어 있고, 소스 빌드는 `--guest`로 정적 Linux 빌드(`cargo build --release -p pumasi-guest --target x86_64-unknown-linux-musl`)를 넘깁니다. 에이전트가 이미지를 직접 받고(Docker 불필요) VM 디스크도 직접 포맷하며(e2fsprogs 불필요) 이미지는 VM 안에서 풀기 때문에, 믿을 수 없는 이미지 레이어가 호스트 파일시스템에 닿지 않습니다.
+
+`network = true`면 microVM은 **공인 주소에만** 닿는 네트워크 카드를 받습니다. 카드의 반대편은 호스트 네트워크 장치가 아니라 에이전트 안의 게이트웨이라서, 에이전트가 목적지를 확인한 뒤 연결을 직접 엽니다. 사설 대역(10/8, 172.16/12, 192.168/16, 100.64/10), 루프백, 링크 로컬(클라우드 메타데이터), 멀티캐스트, 예약 대역, 호스트 자신의 주소, 25번 포트로는 절대 연결하지 않습니다. DNS는 호스트의 리졸버로 답하고, 그 밖의 UDP·ICMP·IPv6는 넘기지 않습니다. 네트워크 작업에는 노드에 QEMU가 있어야 하고(Firecracker 노드도 QEMU가 깔려 있으면 그것을 씀, `pumasi vm status`로 확인), 할 수 있는 노드에만 배정됩니다.
+
+### GPU 작업
+
+작업 명세에 GPU를 요청하면 스케줄러가 그만큼 빈 GPU가 있는 노드에 태스크를 놓고, 정확히 그 장치만 넘기며, 쓴 시간을 영수증에 과금합니다.
+
+```toml
+image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+command = ["python", "/input/train.py", "{shard}", "{shards}"]
+files = ["train.py"]
+shards = 4
+gpus = 1                              # 태스크당. "all"이면 노드의 GPU 전부
+gpu = { vendor = "nvidia", min_vram_gb = 8 }   # 선택. 쓰면 gpus = 1이 기본
+```
+
+```sh
+pumasi gpu list                       # 이 기기의 GPU와 벤치마크
+pumasi gpu check                      # 작업이 GPU를 쓸 수 있는지, 모자란 것은 어떻게 고치는지
+pumasi run examples/pytorch-cuda/job.toml --output
+```
+
+- **NVIDIA**: NVML(드라이버에 들어 있는 라이브러리, 있으면 실행 중에 불러옴)로 찾고 CUDA 드라이버로 벤치마크합니다(FP32 처리량, 메모리 대역폭, 클러스터 GPU 검증용 해시 속도). Docker 작업에는 `--gpus device=...`로 넘기므로 Linux는 NVIDIA Container Toolkit이 필요하고, Windows Docker Desktop(WSL 2)은 기본으로 지원합니다.
+- **AMD**(Linux): sysfs로 찾고, FP32는 연산 유닛 수와 클럭으로 추정합니다. Docker 작업에는 `/dev/kfd`와 그 GPU의 render 노드를 넘깁니다(ROCm 이미지).
+- **Intel·Apple GPU**는 정보로만 표시하고 아직 어떤 실행기도 쓰지 않습니다.
+- **microVM(실험)**: Linux에서 `vfio-pci`에 묶여 있고 IOMMU 그룹이 깨끗하며 화면에 연결되지 않은 GPU는 microVM에 패스스루할 수 있습니다. VM은 GPU용 게스트 커널로 부팅해 자기 NVIDIA 드라이버를 올립니다(`scripts/kernel/build-gpu.sh`로 번들을 만들고 `pumasi vm setup --gpu-bundle DIR`로 설치, 바인딩 명령은 `pumasi gpu check`가 알려 줌). 제공자가 커널을 공유하지 않고 GPU를 빌려줄 수 있습니다.
+
+GPU 시간은 CPU·메모리에 더해 `gpu-tflops-hour`(기본 FP32 1 TFLOPS·1시간당 0.1 CU)와 `gpu-vram-gib-hour`(GPU 메모리 1 GiB·1시간당 0.3 CU)로 과금하므로, 12 GiB·12.7 TFLOPS 카드는 시간당 약 4.9 CU입니다. 내 기기는 잰 값 그대로 과금합니다. 제공자의 GPU는 컨트롤 플레인이 먼저 그 GPU만 빨리 풀 수 있는 챌린지로 시간을 잽니다. 틀린 답은 스트라이크이고 과금도 0, 주장보다 느린 GPU는 잰 만큼만, 챌린지를 못 받는 GPU(CUDA 없음)는 최대 10 TFLOPS로 과금합니다. 검증은 결과 검증 비율로 반복합니다. GPU 결과 자체는 결정적이지 않아 재실행 검증은 하지 않습니다. `pumasi node <id>`로 GPU별 과금 기준을 볼 수 있고, `--no-gpus`로 에이전트의 GPU를 클러스터에서 뺄 수 있습니다.
 
 ### Windows
 
@@ -253,23 +281,24 @@ pumasi secret ls                                    # 이름만, 값은 안 보�
 | `pumasi cluster start` | 컨트롤 플레인 실행. 처음 실행하면 클러스터를 만들고, 상태는 `~/.pumasi/cluster`에 저장합니다. |
 | `pumasi token [--ttl 24h] [--uses N]` | 내 다른 기기용 참가 티켓 발급 |
 | `pumasi invite <계정> [--ttl 7d] [--uses 1] [--allow-docker]` | 다른 사람의 기기를 `계정` 몫으로 버는 제공자로 초대 |
-| `pumasi agent join <티켓> [--allow-docker] [--allow-microvm]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`) |
+| `pumasi agent join <티켓> [--allow-docker] [--allow-microvm] [--no-gpus]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`). `--no-gpus`가 아니면 GPU도 제공 |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | 이전에 참가한 클러스터에 티켓 없이 재접속 |
 | `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- 에이전트 옵션]` | 부팅 시 시작하는 서비스로 에이전트 설치 (systemd, launchd, Windows 서비스). `status`, `uninstall`도 있음 |
 | `pumasi upgrade rollout 파일... [--wait] [--force]` | 클러스터 키로 서명한 새 에이전트 바이너리를 노드에 배포. `upgrade status`로 노드별 상태, `upgrade cancel`로 중단 |
-| `pumasi vm setup [--guest FILE] [--force]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치 |
+| `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치. `--gpu-bundle`은 패스스루용 GPU 게스트 커널과 드라이버 추가 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
-| `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
+| `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
+| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄 |
 | `pumasi store put 이름 경로... [--account A]` / `get 이름[@버전] \| --job ID [-o DIR]` / `ls [이름]` / `rm 이름[@버전]` / `usage` / `quota 계정 크기\|none` | 클러스터 파일 저장소: 버전 있는 데이터셋, 작업 출력, 이어받기, 쿼터 |
 | `pumasi secret set 이름 [값]` / `ls` / `rm 이름` | 클러스터 비밀. `registry/<호스트>`는 비공개 레지스트리 로그인 |
 | `pumasi run job.toml [--account A] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
-| `pumasi status` | 노드(역할, 온라인 여부, 실행기, 슬롯, 실행 중, 검증 기록, 과금 CPU 점수, 디스크 종류, 지연)와 최근 작업 및 CU 비용 |
-| `pumasi node <ID> [--rebenchmark]` | 노드 하나의 벤치마크 프로필, 과금 점수, 지연, 검증 기록. `--rebenchmark`면 다시 재게 함 |
+| `pumasi status` | 노드(역할, 온라인 여부, 실행기, 슬롯, 실행 중, 검증 기록, 과금 CPU 점수, 디스크 종류, 지연, GPU)와 최근 작업 및 CU 비용 |
+| `pumasi node <ID> [--rebenchmark]` | 노드 하나의 벤치마크 프로필, 과금 점수, GPU, 지연, 검증 기록. `--rebenchmark`면 다시 재게 함 |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | 에이전트와 같은 방식으로 이 기기를 벤치마크해 프로필 출력 |
 | `pumasi job <ID> [--output] [--out DIR]` | 태스크별 상태, 노드, 시도 횟수, 시간, 비용, 검증 결과, 출력. `--out`이면 결과 파일 다운로드 |
 | `pumasi cu list \| add <계정> <CU> \| payout <계정> <CU> \| ledger` | CU 잔액(사용 가능, 보류, 지출, 수익), 지급, 지급 기록, 원장 (`pumasi credit`도 그대로 동작) |
-| `pumasi prices [set ...]` | CU 단가(`--memory-gib-hour`, `--storage-gib-month`, `--storage-hdd-gib-month`, `--storage-nvme-gib-month`, `--egress-gib`), 기본 저장 쿼터(`--default-quota`), 원장 모드(`--ledger prepaid\|mutual`, `--credit-limit`), 정산 정책(보류 시간, 검증 비율, 최대 스트라이크) 조회·변경 |
-| `pumasi receipts <ID> [--export FILE]` | 작업의 서명된 사용 영수증 |
+| `pumasi prices [set ...]` | CU 단가(`--memory-gib-hour`, `--storage-gib-month`, `--storage-hdd-gib-month`, `--storage-nvme-gib-month`, `--egress-gib`, `--gpu-tflops-hour`, `--gpu-vram-gib-hour`), 기본 저장 쿼터(`--default-quota`), 원장 모드(`--ledger prepaid\|mutual`, `--credit-limit`), 정산 정책(보류 시간, 검증 비율, 최대 스트라이크) 조회·변경 |
+| `pumasi receipts <ID> [--export FILE]` | 작업의 서명된 사용 영수증(가격 중 GPU 몫 포함) |
 | `pumasi verify-receipts FILE [--cluster ID]` | 내보낸 영수증을 오프라인으로 검증 |
 | `pumasi cancel <ID>` | 작업 취소 |
 | `pumasi remove-node <ID>` | 노드 퇴출(다시 오려면 새 티켓 필요) |
@@ -287,8 +316,8 @@ pumasi secret ls                                    # 이름만, 값은 안 보�
 | 실행 대상 | `wasm32-wasip1` 모듈 | Linux OCI 이미지 | Linux OCI 이미지 |
 | 실행 위치 | 모든 노드 | `--allow-docker`로 시작한 노드만 (제공자는 초대에도 `--allow-docker` 필요) | `--allow-microvm`으로 시작한 노드 (제공자 포함) |
 | 격리 | Wasmtime 샌드박스, 모르는 코드도 안전 | 컨테이너, 내 기기나 믿는 사람끼리만 | 태스크마다 자기 커널을 가진 VM |
-| 네트워크 | 불가 | 기본 차단, `network = true`로 허용 | 불가 |
-| GPU | 불가 | `gpus = "all"` | 아직 불가 |
+| 네트워크 | 불가 | 기본 차단, `network = true`로 허용 | 기본 차단, `network = true`면 공인 주소에만 |
+| GPU | 불가 | `gpus = N` 또는 `gpu = {...}` (NVIDIA, Linux의 AMD) | `gpus = N`, VFIO 패스스루 (Linux, 실험) |
 | 파일 | `/input`, `/output` | `/input`, `/output` | `/input`, `/output` |
 
 WASM 작업:
@@ -316,7 +345,8 @@ command = ["python", "/input/count.py", "{shard}", "{shards}"]
 files = ["count.py", "texts/"]        # 모든 태스크의 /input에 복사
 shards = 4
 network = false                       # 기본값. true면 외부 네트워크 허용
-# gpus = "all"                        # docker run --gpus 에 전달
+# gpus = 1                            # 태스크당 GPU 수 ("all"이면 노드의 GPU 전부)
+# gpu = { vendor = "nvidia", min_vram_gb = 16 }  # 어떤 GPU인지 (vendor: nvidia, amd, any)
 
 [resources]
 memory_mb = 512
@@ -356,7 +386,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 - `~/.pumasi/cluster/admin.ticket`은 전체 권한이므로 비밀번호처럼 다뤄야 합니다.
 - WASM 태스크는 실행 기기로부터 격리(자기 `/input`·`/output`만 보임, 네트워크 차단, 메모리·CPU 상한)됩니다.
 - Docker 태스크는 컨테이너 수준의 격리라 호스트 커널을 공유합니다. 그래서 기기 주인이 `--allow-docker`를 줘야만 실행합니다. 내 기기나 믿을 수 있는 사람끼리의 클러스터에서 씁니다.
-- microVM 태스크는 작업으로부터 제공자의 기기를 보호합니다. 태스크마다 KVM 위에서 자기 커널을 쓰고(Firecracker는 seccomp로 자신도 가둠), 네트워크 장치가 없고, 자기 디스크만 보이며, 메모리와 vCPU 상한이 걸립니다. 이미지 레이어도 호스트가 아니라 VM 안에서 풉니다. 다만 제공자는 태스크가 하는 일을 볼 수 있습니다(오픈 등급).
+- microVM 태스크는 작업으로부터 제공자의 기기를 보호합니다. 태스크마다 KVM 위에서 자기 커널을 쓰고(Firecracker는 seccomp로 자신도 가둠), 자기 디스크만 보이며, 메모리와 vCPU 상한이 걸립니다. 작업이 `network = true`를 쓰지 않으면 네트워크 장치가 없고, 쓰더라도 에이전트가 공인 주소로만 넘겨 주는 카드뿐이라 제공자의 기기나 내부망에는 닿지 않습니다. 패스스루한 GPU는 IOMMU 뒤에 있고, IOMMU 그룹 전체를 함께 넘길 수 있는 GPU만 패스스루합니다. 이미지 레이어도 호스트가 아니라 VM 안에서 풉니다. 다만 제공자는 태스크가 하는 일을 볼 수 있습니다(오픈 등급).
 - 제공자 기기(`pumasi invite`로 받은 남의 기기)는 WASM과 microVM 작업을 받고, Docker는 초대가 허용할 때만 받으며, 검증의 판정은 내 기기만 맡습니다. microVM 결과는 결정적이지 않아 표본 검증 대상이 아닙니다.
 - 제공자는 가짜 결과를 낼 수 있습니다. 서명은 누가 무엇을 주장했는지를 증명할 뿐 참임을 증명하지는 않습니다. 표본 검증이 확률적으로 잡습니다. 기본 10%면 가짜 결과 20개를 낸 제공자는 88% 확률로 걸리고, 걸린 수익은 몰수되며, 3번이면 정지됩니다. 수익을 1시간 보류하는 이유가 이것입니다.
 - 어느 쪽이든 기기 주인에게 내용이 숨겨지지는 않습니다. 지금은 "오픈" 등급만 있습니다.
@@ -375,8 +405,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 5 | Windows 정식 지원: Docker Desktop(WSL 2), QEMU + WHPX microVM(없으면 TCG), 고정 버전 QEMU 설치, Job Object, 내장 ext4 포맷터와 게스트 init | 완료 |
 | 6 | 구형 Intel Mac(macOS 10.15+), Virtualization.framework microVM, 가용 정책(전원 연결 시, 유휴 시, 시간대, CPU 상한, 메모리에 맞춘 슬롯) | 완료 |
 | 7 | 성능 벤치마크와 컴퓨팅 유닛(CU): 노드가 서명한 성능 프로필(CPU, 메모리 대역폭, fio로 디스크 종류·속도, SMART 마모도, 지연), 1 CU = 기준 vCPU 1개를 1시간 쓰는 값과 자원별 CU 단가, 정수 milli-CU 원장, 돈 없이 서로 빌려 쓰는 그룹 로컬 원장 | 완료 |
-| 8 | 클러스터 파일 저장소(iroh-blobs): 버전 있는 데이터셋, `store:` 마운트와 출력 데이터셋, 크기 제한 없는 입출력, 해시 검증 이어받기, 노드끼리 나누는 캐시, 참조 GC, 쿼터, 저장·이그레스 CU 과금, 비공개 레지스트리 이미지 | 이번 릴리스 |
-| 9 | GPU·microVM 장치: 탐지, GPU 벤치마크와 CU 환산, 스케줄링, Docker GPU 작업, VFIO 패스스루, microVM 네트워크 | 예정 |
+| 8 | 클러스터 파일 저장소(iroh-blobs): 버전 있는 데이터셋, `store:` 마운트와 출력 데이터셋, 크기 제한 없는 입출력, 해시 검증 이어받기, 노드끼리 나누는 캐시, 참조 GC, 쿼터, 저장·이그레스 CU 과금, 비공개 레지스트리 이미지 | 완료 |
+| 9 | GPU·microVM 장치: NVIDIA(NVML, CUDA 벤치마크)·AMD 탐지, 서명된 장치 프로필, GPU 시간 CU 과금, GPU 단위 스케줄링, Docker GPU 작업, 제공자 GPU 검증, VFIO 패스스루(실험), 필터링되는 microVM 네트워크 | 이번 릴리스 |
 | 10 | 클러스터 관리: 라벨·selector, drain, 우선순위, 쿼터, 역할 티켓, `apply` | 예정 |
 | 11 | 모니터링·경보: 노드 지표, Prometheus, 실시간 로그, 웹훅 | 예정 |
 | 12 | 웹 대시보드(바이너리 내장) | 예정 |
@@ -387,7 +417,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 17 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
 | 18 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: CU는 실제 결제와 연결되어 있지 않고, GPU 단가는 9단계부터입니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM은 네트워크와 GPU가 아직 없으며, 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
+알려진 한계: CU는 실제 결제와 연결되어 있지 않습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 표시만 합니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다.
 
 ## 라이선스
 

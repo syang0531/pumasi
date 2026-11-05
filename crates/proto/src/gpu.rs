@@ -159,7 +159,7 @@ pub fn format_tflops(gflops: u32) -> String {
 fn format_mib(mib: u64) -> String {
     if mib >= 1024 {
         let tenths = (mib * 10 + 512) / 1024;
-        if tenths % 10 == 0 {
+        if tenths.is_multiple_of(10) {
             format!("{} GiB", tenths / 10)
         } else {
             format!("{}.{} GiB", tenths / 10, tenths % 10)

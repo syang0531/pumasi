@@ -1,0 +1,28 @@
+# Train a small classifier on one GPU per task with PyTorch and CUDA.
+#
+# Each task trains the same model with its own seed ({shard}) and writes
+# its loss curve and accuracy to /output, so 4 shards are 4 independent
+# runs (a tiny hyperparameter sweep). The data is generated in the task,
+# so nothing is downloaded but the image.
+#
+#   pumasi run examples/pytorch-cuda/job.toml
+#
+# Needs an agent with an NVIDIA GPU that Docker can use (the NVIDIA
+# Container Toolkit on Linux, Docker Desktop with WSL 2 on Windows) started
+# with `--allow-docker`; `pumasi gpu check` on that machine says whether it
+# is ready. Tasks only go to nodes with a free GPU of at least 4 GiB, and
+# their receipts bill the GPU time on top of CPU and memory.
+name = "pytorch-cuda"
+image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+command = ["python", "/input/train.py", "{shard}", "{shards}"]
+files = ["train.py"]
+shards = 4
+
+[gpu]
+vendor = "nvidia"
+min_vram_gb = 4
+
+[resources]
+memory_mb = 4096
+cpus = 2
+timeout = "15m"

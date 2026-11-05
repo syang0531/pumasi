@@ -123,8 +123,8 @@ machines. The microVM executor runs the same OCI images, but boots every
 task in its own lightweight VM ([Firecracker](https://firecracker-microvm.github.io/)
 on Linux with KVM, Apple's Virtualization.framework on macOS 11+, QEMU with
 WHPX on Windows, or QEMU elsewhere) with its
-own Linux kernel and no network. The job file only adds
-`executor = "microvm"`:
+own Linux kernel and no network unless the job asks for one. The job file
+only adds `executor = "microvm"`:
 
 ```sh
 # Once per machine (Linux with KVM, macOS 11+, Windows 10/11 x86_64; on
@@ -146,6 +146,66 @@ Linux build of `pumasi-guest`
 The agent pulls images itself (no Docker needed), formats the VM disks
 itself (no e2fsprogs), and unpacks images inside a VM, so untrusted image
 layers never touch the host's filesystem.
+
+With `network = true` a microVM gets a network card that reaches **public
+addresses only**. Its other end is a gateway inside the agent, not a host
+network device: the agent opens each connection itself after checking the
+destination, and never connects to private ranges (10/8, 172.16/12,
+192.168/16, 100.64/10), loopback, link-local (cloud metadata), multicast,
+reserved ranges, any address of the host itself, or port 25. DNS goes to the
+host's resolver; other UDP, ICMP and IPv6 are not forwarded. Network jobs
+need QEMU on the node (Firecracker nodes use it when it is installed;
+`pumasi vm status` says whether they can), and only go to nodes that can.
+
+### GPU jobs
+
+Ask for GPUs in the job file and the scheduler places each task on a node
+with that many free GPUs, hands the task exactly those devices, and bills
+their time on the receipt:
+
+```toml
+image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+command = ["python", "/input/train.py", "{shard}", "{shards}"]
+files = ["train.py"]
+shards = 4
+gpus = 1                              # per task; "all" for every GPU of the node
+gpu = { vendor = "nvidia", min_vram_gb = 8 }   # optional; implies gpus = 1
+```
+
+```sh
+pumasi gpu list                       # this machine's GPUs, benchmarked
+pumasi gpu check                      # what jobs could do with them, and how to fix what is missing
+pumasi run examples/pytorch-cuda/job.toml --output
+```
+
+- **NVIDIA**: found through NVML (the driver's own library, loaded when
+  present) and benchmarked with the CUDA driver (FP32 throughput, memory
+  bandwidth, and a hash rate for the cluster's GPU check). Docker jobs get
+  them with `--gpus device=...`, which needs the NVIDIA Container Toolkit on
+  Linux; Docker Desktop on Windows has it built in (WSL 2).
+- **AMD** (Linux): found in sysfs; FP32 is estimated from the compute
+  units and clock. Docker jobs get `/dev/kfd` and the GPU's render node
+  (ROCm images).
+- **Intel and Apple GPUs** are listed for information only; no executor
+  can use them yet.
+- **MicroVMs (experimental)**: a GPU bound to `vfio-pci` on Linux, with a
+  clean IOMMU group and no display attached, can be passed through to a
+  microVM, which boots a GPU guest kernel and loads its own NVIDIA driver
+  (`scripts/kernel/build-gpu.sh` builds the bundle, `pumasi vm setup
+  --gpu-bundle DIR` installs it, `pumasi gpu check` prints the binding
+  commands). This lets providers lend GPUs without sharing their kernel.
+
+GPU time costs `gpu-tflops-hour` (default 0.1 CU per FP32 TFLOPS per hour)
+plus `gpu-vram-gib-hour` (0.3 CU per GiB of GPU memory per hour) on top of
+CPU and memory, so a 12 GiB, 12.7 TFLOPS card costs about 4.9 CU an hour.
+Your own machines are billed at what they measured. A provider's GPU is
+timed by the control plane first, with a challenge only that GPU can answer
+quickly; a wrong answer is a strike and bills nothing, a GPU slower than it
+claims is billed at what was timed, and one that cannot take the challenge
+(no CUDA) is billed at 10 TFLOPS at most. Checks are repeated at the result
+check rate. GPU results themselves are not deterministic, so they are not
+re-run. `pumasi node <id>` shows each GPU and what it is billed at;
+`--no-gpus` keeps an agent's GPUs out of the cluster.
 
 ### Windows
 
@@ -463,23 +523,24 @@ image layers with each other instead of each pulling them.
 | `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. |
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
-| `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`). |
+| `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`). GPUs are offered unless `--no-gpus`. |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
 | `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- AGENT OPTIONS]` | Run the agent as a service that starts at boot (systemd, launchd, Windows service). `status` and `uninstall` too. |
 | `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
-| `pumasi vm setup [--guest FILE] [--force]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`. |
+| `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
-| `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
+| `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
+| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally. |
 | `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
 | `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
 | `pumasi run job.toml [--account A] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
-| `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency) and recent jobs with their cost in CU. |
-| `pumasi node <ID> [--rebenchmark]` | One node's benchmark profile, billed score, latency and checks; `--rebenchmark` asks it to measure again. |
+| `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency, GPUs) and recent jobs with their cost in CU. |
+| `pumasi node <ID> [--rebenchmark]` | One node's benchmark profile, billed score, GPUs, latency and checks; `--rebenchmark` asks it to measure again. |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | Benchmark this machine the way the agent does and print the profile. |
 | `pumasi job <ID> [--output] [--out DIR]` | Per-task state, node, attempts, time, cost and check result; stdout/stderr with `--output`; downloads output files with `--out`. |
 | `pumasi cu list \| add <ACCOUNT> <CU> \| payout <ACCOUNT> <CU> \| ledger [--account A]` | Balances in CU (available, held, spent, earned), grants, payouts, and the ledger (`pumasi credit` still works). |
-| `pumasi prices [set --memory-gib-hour X --storage-gib-month X --storage-hdd-gib-month X --storage-nvme-gib-month X --default-quota SIZE --egress-gib X --ledger prepaid\|mutual --credit-limit CU --hold 1h --verify-rate 10% --max-strikes 3]` | Show or change the CU rates, the ledger mode and the settlement policy. |
-| `pumasi receipts <ID> [--export FILE]` | A job's signed usage receipts. |
+| `pumasi prices [set --memory-gib-hour X --storage-gib-month X --storage-hdd-gib-month X --storage-nvme-gib-month X --default-quota SIZE --egress-gib X --gpu-tflops-hour X --gpu-vram-gib-hour X --ledger prepaid\|mutual --credit-limit CU --hold 1h --verify-rate 10% --max-strikes 3]` | Show or change the CU rates, the ledger mode and the settlement policy. |
+| `pumasi receipts <ID> [--export FILE]` | A job's signed usage receipts, with the GPU part of each price. |
 | `pumasi verify-receipts FILE [--cluster ID]` | Check exported receipts offline. |
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
 | `pumasi remove-node <ID>` | Revoke a node. It needs a new ticket to come back. |
@@ -499,8 +560,8 @@ A job runs on one of three executors with the same file format and commands:
 | Runs | a `wasm32-wasip1` module | any Linux OCI image | any Linux OCI image |
 | Where | every node | only nodes started with `--allow-docker` (providers also need an invite with `--allow-docker`) | nodes started with `--allow-microvm`, providers included |
 | Isolation | Wasmtime sandbox, safe for untrusted code | container, only for machines and people you trust | a VM with its own kernel per task |
-| Network | never | off by default, `network = true` to allow | never |
-| GPUs | no | `gpus = "all"` | not yet |
+| Network | never | off by default, `network = true` to allow | off by default, `network = true` reaches public addresses only |
+| GPUs | no | `gpus = N` or `gpu = {...}` (NVIDIA, AMD on Linux) | `gpus = N`, passed through with VFIO (Linux, experimental) |
 | Files | `/input`, `/output` | `/input`, `/output` | `/input`, `/output` |
 
 WASM job:
@@ -531,7 +592,8 @@ command = ["python", "/input/count.py", "{shard}", "{shards}"]
 files = ["count.py", "texts/"]        # copied into /input of every task
 shards = 4
 network = false                       # default; true allows outbound network
-# gpus = "all"                        # passed to `docker run --gpus`
+# gpus = 1                            # GPUs per task ("all": every GPU of the node)
+# gpu = { vendor = "nvidia", min_vram_gb = 16 }  # which GPUs (vendor: nvidia, amd, any)
 
 [resources]
 memory_mb = 512
@@ -633,6 +695,11 @@ checked.
 - **Benchmarks**: agents send a performance profile signed with their node
   key; the control plane times providers' CPU benchmark itself with a
   seeded challenge before trusting a score above the reference.
+- **Devices**: agents also send a signed device profile (GPUs with their
+  benchmark and what can use them, and whether microVMs can have a
+  network). The scheduler hands out GPUs one by one, like slots, and
+  providers' GPUs are timed with a challenge before they are billed above
+  the reference.
 
 ## Security model
 
@@ -649,7 +716,11 @@ checked.
   you trust.
 - MicroVM tasks protect the provider's machine from the job: each task gets
   its own kernel behind KVM (Firecracker, which also confines itself with
-  seccomp), no network device, only its own disks, and memory and vCPU caps.
+  seccomp), only its own disks, and memory and vCPU caps. It has no network
+  device unless the job sets `network = true`, and then only a card whose
+  traffic the agent forwards to public addresses (never the provider's own
+  machine or network). A passed-through GPU is behind the IOMMU, and only
+  GPUs whose whole IOMMU group can go with them are passed through.
   Image layers are unpacked inside a VM, never on the host. The provider
   still sees everything the task does (open tier).
 - Provider machines (other people's, admitted with `pumasi invite`) get WASM
@@ -688,8 +759,8 @@ with other clusters.
 | 5 | Windows: Docker Desktop (WSL 2), microVMs with QEMU + WHPX (TCG fallback), pinned QEMU install, Job Objects, built-in ext4 formatter and guest init | done |
 | 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours, CPU cap, memory-aware slots) | done |
 | 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | done |
-| 8 | Cluster file store (iroh-blobs): versioned datasets, `store:` mounts and output datasets, inputs and outputs of any size, resumable hash-checked transfers, node caches shared between nodes, reference GC, quotas, storage and egress billed in CU, private registry images | this release |
-| 9 | GPUs and microVM devices: detection, GPU benchmarks in CU, scheduling, Docker GPU jobs, VFIO passthrough, microVM networking | planned |
+| 8 | Cluster file store (iroh-blobs): versioned datasets, `store:` mounts and output datasets, inputs and outputs of any size, resumable hash-checked transfers, node caches shared between nodes, reference GC, quotas, storage and egress billed in CU, private registry images | done |
+| 9 | GPUs and microVM devices: NVIDIA (NVML, CUDA benchmark) and AMD detection, signed device profiles, GPU time billed in CU, per-GPU scheduling, Docker GPU jobs, GPU checks for providers, VFIO passthrough (experimental), filtered microVM networking | this release |
 | 10 | Cluster management: labels and selectors, drain, priorities, quotas, role tickets, `apply` | planned |
 | 11 | Monitoring and alerts: node metrics, Prometheus endpoint, live logs, webhooks | planned |
 | 12 | Web dashboard (built into the binary) | planned |
@@ -702,11 +773,14 @@ with other clusters.
 
 Known gaps: single control plane (no Raft yet), no web console, accounts
 exist only inside one cluster and only the admin can submit (with
-`--account`), CU are not connected to real payments, GPUs have no CU rate
-until phase 9, node-to-node latency and bandwidth are not measured yet
+`--account`), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
 (only each node's round trip to the control plane), the file store lives
 only on the control plane (no replicas on owner nodes yet, no S3-compatible
-gateway). MicroVMs have no network and no GPUs yet, and need KVM (Linux), Virtualization.framework
+gateway). GPUs are checked on real hardware by hand, not in CI (hosted
+runners have none); VFIO passthrough is experimental and NVIDIA-only
+(Turing and newer, with the open kernel modules); Intel and Apple GPUs are
+listed but not used. MicroVM networks need QEMU (not Firecracker alone or
+Virtualization.framework) and forward TCP and DNS only. MicroVMs need KVM (Linux), Virtualization.framework
 (macOS 11+) or WHPX (Windows x86_64) for speed (QEMU without them works but
 is slow, and Windows on ARM has no microVMs yet). WHPX and
 Virtualization.framework guests are checked on real machines only: CI

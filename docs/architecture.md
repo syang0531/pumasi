@@ -622,10 +622,11 @@ remotely; install a current binary on them once.
 
 ## Not yet
 
-- Remaining roadmap phases (7 to 17): benchmarks and compute units (CU),
+- Remaining roadmap phases (7 to 18): benchmarks and compute units (CU),
   a cluster file store, GPUs, cluster management, monitoring, a web
-  dashboard, Raft, WebGPU, the confidential tier, the hub, buying CU. See
-  the roadmap in the README.
+  dashboard, Raft, WebGPU, the confidential tier, self-hosting 1.0 (SSO,
+  audit log, external security review), the hub, buying CU. See the
+  roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node

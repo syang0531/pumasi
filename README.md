@@ -537,6 +537,11 @@ checked.
 
 ## Roadmap
 
+Phases 1 to 15 are enough to run Pumasi on your own machines, alone or as
+an organization (phase 13 covers the essentials). Phase 16 finishes what an
+organization needs to adopt it, and phases 17 and 18 are only for trading
+with other clusters.
+
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 1 | Private cluster: agent, control plane, iroh networking, WASM and Docker executors, file input/output, CLI | done |
@@ -554,8 +559,9 @@ checked.
 | 13 | Control plane high availability (Raft) | planned |
 | 14 | WebGPU executor (experimental) | planned |
 | 15 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
-| 16 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
-| 17 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
+| 16 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model, cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag | planned |
+| 17 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
+| 18 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
 Known gaps: single control plane (no Raft yet), no web console, accounts
 exist only inside one cluster and only the admin can submit (with

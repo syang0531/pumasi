@@ -5,6 +5,7 @@ mod gpu_cmd;
 mod manage;
 mod monitor;
 mod service;
+mod ui;
 mod upgrade;
 
 use std::{
@@ -38,11 +39,8 @@ use pumasi_proto::{
     },
     net::NetMode,
     perf::{DiskClass, PerfProfile},
-    receipt::Receipt,
-    store::{
-        DatasetView, MountRequest, MountSource, StoragePolicy, StoreRef, StoreTarget, format_size,
-        parse_size,
-    },
+    receipt::{Receipt, ReceiptRow},
+    store::{DatasetView, StoragePolicy, StoreRef, StoreTarget, format_size, parse_size},
     ticket::{AdminTicket, JoinTicket},
 };
 
@@ -389,6 +387,11 @@ enum Cmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Open the web dashboard: a web server on this machine that talks to
+    /// the cluster with your ticket, so the control plane opens no port.
+    /// Nodes, jobs (submit, live output, downloads), storage, CU, invites,
+    /// prices and events, plus a JSON API under /api/v1.
+    Ui(ui::UiArgs),
     /// Alert rules: node offline, failure rate, disk, temperature,
     /// benchmark drops, SMART, check mismatches.
     #[command(subcommand)]
@@ -965,6 +968,7 @@ async fn run(cli: Cli) -> Result<i32> {
             output,
             admin,
         } => monitor::events(&home, &admin, since.as_deref(), limit, follow, output).await,
+        Cmd::Ui(args) => ui::run(&home, args).await,
         Cmd::Alert(cmd) => monitor::alert(&home, cmd).await,
         Cmd::Webhook(cmd) => monitor::webhook(&home, cmd).await,
         Cmd::Store(cmd) => store(&home, cmd).await,
@@ -1101,7 +1105,7 @@ async fn run(cli: Cli) -> Result<i32> {
             if let Some(a) = &account {
                 validate_account(a)?;
             }
-            sub.account = account.clone();
+            sub.account = account;
             if let Some(p) = priority {
                 sub.priority = p;
             }
@@ -1111,25 +1115,8 @@ async fn run(cli: Cli) -> Result<i32> {
             sub.validate()?;
             let tasks = sub.tasks.len();
             let client = connect_admin(&home, &admin).await?;
-            if !upload.is_empty() {
-                // Too large to send with the job: through the file store.
-                let (stored, _) = client
-                    .store_put(&upload, None, account, |m| eprintln!("input files: {m}"))
-                    .await?;
-                sub.mounts.insert(
-                    0,
-                    MountRequest {
-                        source: MountSource::Upload { root: stored.root },
-                        select: None,
-                        at: String::new(),
-                    },
-                );
-            }
-            let AdminResponse::Submitted { id } =
-                client.call(AdminOp::Submit(Box::new(sub))).await?
-            else {
-                bail!("unexpected response");
-            };
+            // Inputs too large to send with the job go through the file store.
+            let id = client.submit(sub, &upload, |m| eprintln!("{m}")).await?;
             eprintln!("submitted job {id} ({tasks} tasks)");
             if detach {
                 println!("{id}");
@@ -1588,6 +1575,14 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
 }
 
 async fn connect_admin(home: &Path, args: &AdminArgs) -> Result<AdminClient> {
+    let ticket = load_ticket(home, args)?;
+    let net = net_for(&ticket.cluster, None);
+    AdminClient::connect(&ticket, net).await
+}
+
+/// The admin or access ticket: `--admin`, else the one `pumasi login` or a
+/// local cluster saved.
+fn load_ticket(home: &Path, args: &AdminArgs) -> Result<AdminTicket> {
     let text = match &args.admin {
         Some(t) => t.clone(),
         None => {
@@ -1601,9 +1596,7 @@ async fn connect_admin(home: &Path, args: &AdminArgs) -> Result<AdminClient> {
             std::fs::read_to_string(found)?
         }
     };
-    let ticket: AdminTicket = text.parse()?;
-    let net = net_for(&ticket.cluster, None);
-    AdminClient::connect(&ticket, net).await
+    text.parse()
 }
 
 async fn wait_for_job(client: &AdminClient, id: JobId) -> Result<JobView> {
@@ -3080,85 +3073,6 @@ fn human_secs(s: u64) -> String {
     } else {
         format!("{s}s")
     }
-}
-
-/// One exported receipt: readable fields plus the exact signed encoding.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ReceiptRow {
-    id: String,
-    job: String,
-    task: u32,
-    attempt: u32,
-    check: bool,
-    node: String,
-    cluster: String,
-    executor: String,
-    outcome: String,
-    fuel_used: u64,
-    wall_ms: u64,
-    billed_wall_ms: u64,
-    memory_limit_bytes: u64,
-    peak_memory_bytes: Option<u64>,
-    consumer: String,
-    provider: String,
-    cpu_score: u32,
-    /// The exact price in CU, and the CU moved (see `Billing::amount`).
-    exact_cu: String,
-    cu: String,
-    recorded_unix: u64,
-    /// GPUs the run held (receipts from before GPUs have none).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    gpu: Option<GpuRow>,
-    receipt: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct GpuRow {
-    names: Vec<String>,
-    gflops: u64,
-    vram_mib: u64,
-    /// The GPU part of `exact_cu`.
-    exact_cu: String,
-}
-
-impl From<&Receipt> for ReceiptRow {
-    fn from(r: &Receipt) -> Self {
-        let u = &r.usage;
-        let b = &r.billing;
-        Self {
-            id: data_hex(&r.id()),
-            job: u.task.job.to_string(),
-            task: u.task.index,
-            attempt: u.task.attempt,
-            check: u.task.check,
-            node: r.node_id(),
-            cluster: r.cluster_id(),
-            executor: u.executor.to_string(),
-            outcome: u.outcome.to_string(),
-            fuel_used: u.fuel_used,
-            wall_ms: u.wall_ms,
-            billed_wall_ms: b.billed_wall_ms,
-            memory_limit_bytes: u.memory_limit_bytes,
-            peak_memory_bytes: u.peak_memory_bytes,
-            consumer: b.consumer.clone(),
-            provider: b.provider.clone(),
-            cpu_score: b.cpu_score,
-            exact_cu: format_rate(b.exact_ucu),
-            cu: format_cu(b.amount),
-            recorded_unix: b.recorded_unix,
-            gpu: r.gpu.as_ref().map(|g| GpuRow {
-                names: g.names.clone(),
-                gflops: g.gflops,
-                vram_mib: g.vram_mib,
-                exact_cu: format_rate(g.exact_ucu),
-            }),
-            receipt: r.to_blob(),
-        }
-    }
-}
-
-fn data_hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn print_receipts(receipts: &[Receipt]) {

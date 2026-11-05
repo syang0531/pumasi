@@ -1,0 +1,380 @@
+//! The dashboard against an in-process cluster, on every CI platform (the
+//! browser tests in `e2e/` run on Linux only): sign-in link, pages, the
+//! JSON API submitting a job and downloading its outputs as a zip, and
+//! the request guards.
+
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
+
+use pumasi_agent::{Agent, AgentConfig};
+use pumasi_cluster::{Cluster, ClusterConfig};
+use pumasi_dashboard::UiConfig;
+use pumasi_proto::net::NetMode;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+
+const TICKER: &[u8] = include_bytes!("../e2e/fixtures/ticker.wasm");
+
+fn tempdir(tag: &str) -> PathBuf {
+    use std::hash::{BuildHasher, RandomState};
+    let n = RandomState::new().hash_one(SystemTime::now());
+    let p = std::env::temp_dir().join(format!("pumasi-ui-test-{tag}-{n:x}"));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+struct Resp {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Resp {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| panic!("{e}: {}", self.text()))
+    }
+}
+
+/// One HTTP/1.1 request on its own connection.
+async fn request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+) -> Resp {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        addr.port(),
+        body.len()
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(body).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+    let mut lines = head.lines();
+    let status = lines.next().unwrap()[9..12].parse().unwrap();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    let mut body = buf[split + 4..].to_vec();
+    let chunked = headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"));
+    if chunked {
+        let mut out = Vec::new();
+        let mut rest = &body[..];
+        loop {
+            let nl = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&rest[..nl]).unwrap().trim(), 16)
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&rest[nl + 2..nl + 2 + n]);
+            rest = &rest[nl + 2 + n + 2..];
+        }
+        body = out;
+    }
+    Resp {
+        status,
+        headers,
+        body,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_pages_api_and_guards() {
+    let mut config = ClusterConfig::new(tempdir("cp"));
+    config.name = "ui-cluster".into();
+    config.net = NetMode::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.heartbeat = Duration::from_millis(200);
+    config.node_timeout = Duration::from_secs(2);
+    let cluster = Cluster::start(config).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let agent = Agent::new(AgentConfig {
+        data_dir: tempdir("agent"),
+        name: "ui-node".into(),
+        slots: Some(2),
+        net: NetMode::Local,
+        bind: Some("127.0.0.1:0".parse().unwrap()),
+        docker: None,
+        microvm: None,
+        upgrade: None,
+        corrupt_results: false,
+        store_cache_bytes: None,
+        gpus: false,
+        fake_gpus: None,
+        max_cpu_percent: None,
+        availability: None,
+        bench: None,
+    })
+    .await
+    .unwrap();
+    let agent_task = tokio::spawn(agent.join(ticket));
+    for _ in 0..200 {
+        if cluster.status().nodes.iter().any(|n| n.online) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let admin = cluster.admin_ticket();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ui = pumasi_dashboard::start_on(
+        listener,
+        UiConfig {
+            ticket: admin.clone(),
+            net: NetMode::Local,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            login_only: false,
+            upload_limit: 64 << 20,
+        },
+    )
+    .await
+    .unwrap();
+    let addr = ui.addr();
+    let url = ui.url();
+    let token_path = &url[url.find("/login").unwrap()..];
+
+    // Pages need a session; the printed link gives one.
+    let r = request(addr, "GET", "/", &[], b"").await;
+    assert_eq!(r.status, 303);
+    assert_eq!(r.header("location"), Some("/login"));
+    assert_eq!(
+        request(addr, "GET", "/login?token=wrong", &[], b"")
+            .await
+            .status,
+        401
+    );
+    let r = request(addr, "GET", token_path, &[], b"").await;
+    assert_eq!(r.status, 303, "{}", r.text());
+    let cookie = r
+        .header("set-cookie")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(r.header("set-cookie").unwrap().contains("HttpOnly"));
+    let page = request(addr, "GET", "/", &[("Cookie", cookie.clone())], b"").await;
+    assert_eq!(page.status, 200);
+    let html = page.text();
+    assert!(html.contains("ui-cluster"), "{html}");
+    assert!(
+        page.header("content-security-policy")
+            .unwrap()
+            .contains("script-src 'self'")
+    );
+    for path in [
+        "/nodes",
+        "/jobs",
+        "/storage",
+        "/cu",
+        "/access",
+        "/prices",
+        "/events",
+        "/jobs/new",
+    ] {
+        let r = request(addr, "GET", path, &[("Cookie", cookie.clone())], b"").await;
+        assert_eq!(r.status, 200, "{path}: {}", r.text());
+    }
+    assert!(
+        request(addr, "GET", "/nodes", &[("Cookie", cookie.clone())], b"")
+            .await
+            .text()
+            .contains("ui-node")
+    );
+
+    // A session's POST without its CSRF token is refused.
+    let r = request(
+        addr,
+        "POST",
+        "/jobs/0000000000000001/cancel",
+        &[("Cookie", cookie.clone())],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    // So is a foreign Host header.
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /healthz HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 421"));
+
+    // The API: no ticket, a ticket of the wrong form, then the admin's.
+    assert_eq!(
+        request(addr, "GET", "/api/v1/status", &[], b"")
+            .await
+            .status,
+        401
+    );
+    let bad = request(
+        addr,
+        "GET",
+        "/api/v1/status",
+        &[("Authorization", "Bearer nope".into())],
+        b"",
+    )
+    .await;
+    assert_eq!(bad.status, 401);
+    let auth = ("Authorization", format!("Bearer {admin}"));
+    let status = request(
+        addr,
+        "GET",
+        "/api/v1/status",
+        std::slice::from_ref(&auth),
+        b"",
+    )
+    .await;
+    assert_eq!(status.status, 200);
+    assert_eq!(status.json()["cluster_name"], "ui-cluster");
+
+    // Submit through the API with the module as a file.
+    let boundary = "pumasi-test-boundary";
+    let mut body = Vec::new();
+    let job = "name = \"api\"\nmodule = \"ticker.wasm\"\nargs = [\"1\"]\nshards = 2\ndeterministic = false\n";
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"job\"\r\n\r\n{job}\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"ticker.wasm\"\r\nContent-Type: application/wasm\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(TICKER);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let r = request(
+        addr,
+        "POST",
+        "/api/v1/jobs",
+        &[
+            auth.clone(),
+            (
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            ),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(id.len(), 16);
+    let mut state = String::new();
+    for _ in 0..300 {
+        let j = request(
+            addr,
+            "GET",
+            &format!("/api/v1/jobs/{id}"),
+            std::slice::from_ref(&auth),
+            b"",
+        )
+        .await;
+        state = j.json()["summary"]["state"].as_str().unwrap().to_string();
+        if state == "Succeeded" || state == "Failed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(state, "Succeeded");
+
+    // The job page and a task's output.
+    let r = request(
+        addr,
+        "GET",
+        &format!("/jobs/{id}"),
+        &[("Cookie", cookie.clone())],
+        b"",
+    )
+    .await;
+    assert!(r.text().contains("result.txt"), "{}", r.text());
+    let logs = request(
+        addr,
+        "GET",
+        &format!("/api/v1/jobs/{id}/tasks/0/logs"),
+        std::slice::from_ref(&auth),
+        b"",
+    )
+    .await
+    .json();
+    assert_eq!(logs["stdout"], "tick\ndone\n");
+    assert_eq!(logs["done"], true);
+
+    // Outputs as a zip, one file directly.
+    let zip = request(
+        addr,
+        "GET",
+        &format!("/api/v1/jobs/{id}/outputs.zip"),
+        std::slice::from_ref(&auth),
+        b"",
+    )
+    .await;
+    assert_eq!(zip.status, 200);
+    assert_eq!(zip.header("content-type"), Some("application/zip"));
+    assert_eq!(&zip.body[..4], b"PK\x03\x04");
+    let text = String::from_utf8_lossy(&zip.body);
+    assert!(text.contains("task-0/result.txt") && text.contains("task-1/result.txt"));
+    assert_eq!(text.matches("pumasi dashboard ok\n").count(), 2);
+    let one = request(
+        addr,
+        "GET",
+        &format!("/jobs/{id}/tasks/1/files/result.txt"),
+        &[("Cookie", cookie.clone())],
+        b"",
+    )
+    .await;
+    assert_eq!(one.body, b"pumasi dashboard ok\n");
+    assert!(
+        one.header("content-disposition")
+            .unwrap()
+            .starts_with("attachment")
+    );
+
+    // Receipts in the export format.
+    let receipts = request(
+        addr,
+        "GET",
+        &format!("/api/v1/jobs/{id}/receipts"),
+        std::slice::from_ref(&auth),
+        b"",
+    )
+    .await
+    .json();
+    assert!(receipts.as_array().unwrap().len() >= 2);
+
+    ui.stop();
+    agent_task.abort();
+}

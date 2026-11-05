@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ModuleHash, Secret,
-    economy::{Micros, Policy},
+    economy::{MilliCu, Policy},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput},
+    perf::{BenchChallenge, PerfProfile, SignedPerf},
     receipt::{Receipt, SignedUsage},
     release::{ReleaseFile, SignedRelease, Target},
 };
@@ -25,9 +26,9 @@ pub enum Role {
     /// executor it offers, and its results settle checks.
     #[default]
     Owner,
-    /// Someone else's machine, admitted with an invite. Runs WASM only
-    /// (unless the invite allowed Docker), gets paid in credits, and has a
-    /// sample of its results re-run elsewhere.
+    /// Someone else's machine, admitted with an invite. Runs WASM and
+    /// microVM tasks (Docker only if the invite allowed it), earns CU, and
+    /// has a sample of its results re-run elsewhere.
     Provider,
 }
 
@@ -239,6 +240,11 @@ pub enum ToAgent {
     /// Replace the agent binary with this release, then restart. Sent only
     /// to idle nodes that accept upgrades.
     Upgrade(Box<SignedRelease>),
+    /// Run the CPU benchmark kernel with this seed now and answer with
+    /// [`FromAgent::BenchResult`]; the control plane times it (protocol 7).
+    Benchmark(BenchChallenge),
+    /// Measure this machine again and send a new profile (protocol 7).
+    Rebenchmark,
 }
 
 /// How a task ended.
@@ -308,6 +314,14 @@ pub enum FromAgent {
     },
     /// The node's availability changed (protocol 6).
     Availability(Availability),
+    /// The node's signed performance profile, sent after the welcome and
+    /// whenever it measured again (protocol 7).
+    Perf(Box<SignedPerf>),
+    /// The answer to a [`ToAgent::Benchmark`] challenge (protocol 7).
+    BenchResult {
+        nonce: u64,
+        result: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -357,17 +371,23 @@ pub enum AdminOp {
         account: Option<String>,
         limit: u32,
     },
-    /// Adds prepaid credit to an account (accounting only).
+    /// Grants CU to an account (prepaid mode only; bookkeeping, no money
+    /// moves).
     Deposit {
         account: String,
-        amount: Micros,
+        amount: MilliCu,
         memo: String,
     },
-    /// Records a payout from an account's available balance.
+    /// Records CU leaving an account's available balance (prepaid mode
+    /// only).
     Payout {
         account: String,
-        amount: Micros,
+        amount: MilliCu,
         memo: String,
+    },
+    /// Asks a node (id or unique prefix) to measure itself again.
+    Benchmark {
+        id: String,
     },
     GetPolicy,
     SetPolicy(Policy),
@@ -486,20 +506,21 @@ impl std::fmt::Display for UpgradeState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountView {
     pub name: String,
-    /// Spendable credit. Negative when charges overran the prepaid amount.
-    pub balance: Micros,
+    /// Spendable milli-CU. Negative when charges overran the prepaid
+    /// amount, or in mutual mode when the account used more than it lent.
+    pub balance: MilliCu,
     /// Earnings waiting out the hold period.
-    pub held: Micros,
+    pub held: MilliCu,
     /// Totals since the account was created.
-    pub spent: Micros,
-    pub earned: Micros,
+    pub spent: MilliCu,
+    pub earned: MilliCu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LedgerKind {
-    /// Prepaid credit added by the owner.
+    /// CU granted by the owner (prepaid mode).
     Deposit,
-    /// Credit paid out.
+    /// CU taken out of the cluster's books (prepaid mode).
     Payout,
     /// A consumer paying for a run.
     Charge,
@@ -511,6 +532,9 @@ pub enum LedgerKind {
     Forfeit,
     /// A consumer getting a forfeited charge back.
     Refund,
+    /// The opening balance after converting the phase 2 credit ledger to
+    /// milli-CU.
+    Convert,
 }
 
 impl std::fmt::Display for LedgerKind {
@@ -523,6 +547,7 @@ impl std::fmt::Display for LedgerKind {
             LedgerKind::Release => "release",
             LedgerKind::Forfeit => "forfeit",
             LedgerKind::Refund => "refund",
+            LedgerKind::Convert => "convert",
         })
     }
 }
@@ -533,9 +558,9 @@ pub struct LedgerEntry {
     pub unix: u64,
     pub account: String,
     pub kind: LedgerKind,
-    /// Change to the account's spendable balance (`Hold` and `Forfeit`
-    /// change the held amount instead).
-    pub amount: Micros,
+    /// Change to the account's spendable balance in milli-CU (`Hold` and
+    /// `Forfeit` change the held amount instead).
+    pub amount: MilliCu,
     /// The run this entry is about, if any.
     pub task: Option<TaskRef>,
     pub memo: String,
@@ -622,6 +647,17 @@ pub struct NodeView {
     pub last_seen_unix: u64,
     /// Online but taking no new tasks, and why (its availability policy).
     pub paused: Option<String>,
+    /// The node's latest signed performance profile.
+    pub perf: Option<PerfProfile>,
+    /// CPU score its runs are billed at (1000 = the reference vCPU).
+    pub cpu_score: u32,
+    /// Why the billed score differs from the profile's, or what the
+    /// cluster's own timing found.
+    pub perf_note: Option<String>,
+    /// Round-trip time to the control plane, as the control plane measures
+    /// it on the connection, and whether it goes through a relay.
+    pub rtt_us: Option<u32>,
+    pub relayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -635,8 +671,8 @@ pub struct JobSummary {
     pub running: u32,
     pub submitted_unix: u64,
     pub account: String,
-    /// Credits charged so far.
-    pub cost: Micros,
+    /// Milli-CU charged so far.
+    pub cost: MilliCu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -661,8 +697,8 @@ pub struct TaskView {
     /// Names and sizes of the files the task wrote to `/output`.
     pub output_files: Vec<(String, u64)>,
     pub verification: Verification,
-    /// Credits charged for this task's runs (including check runs).
-    pub cost: Micros,
+    /// Milli-CU charged for this task's runs (including check runs).
+    pub cost: MilliCu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

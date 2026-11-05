@@ -8,6 +8,7 @@ pub mod economy;
 pub mod job;
 pub mod msg;
 pub mod net;
+pub mod perf;
 pub mod receipt;
 pub mod release;
 pub mod ticket;
@@ -21,7 +22,7 @@ pub const ADMIN_ALPN: &[u8] = b"pumasi/admin/0";
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        6
+        7
     };
 }
 
@@ -29,8 +30,9 @@ macro_rules! protocol_version {
 pub const PROTOCOL_VERSION: u32 = protocol_version!();
 
 /// The oldest agent protocol the control plane still accepts, so agents of
-/// the previous release can connect and take a rollout. Protocol 5 agents
-/// lack only the availability report (6).
+/// older releases can connect and take a rollout. Protocol 5 agents lack
+/// the availability report (6), protocol 6 agents the performance profile
+/// and benchmark challenges (7): they are billed at the reference score.
 pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi

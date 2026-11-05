@@ -15,13 +15,14 @@ use anyhow::{Context, Result, bail};
 use iroh::{PublicKey, SecretKey};
 use pumasi_proto::{
     ModuleHash, Secret,
-    economy::{Metered, Micros, Policy, validate_account, vcpus},
+    economy::{Metered, MilliCu, Policy, validate_account, vcpus},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
     msg::{
         AccountView, Availability, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo,
         NodeView, OWNER_ACCOUNT, Outcome, Role, TaskAssignment, TaskRef, TaskReport, TaskState,
         TaskView, ToAgent, UpgradeHello, Verification,
     },
+    perf::SignedPerf,
     receipt::{Billing, Receipt, check_usage, result_digest},
     secrets_eq,
 };
@@ -29,7 +30,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::{rollout::RolloutRecord, store::Store};
+use crate::{
+    perf::{PerfCheck, PerfRuntime, cpu_score},
+    rollout::RolloutRecord,
+    store::Store,
+};
 
 /// Extra time past a task's own timeout before the control plane assumes
 /// the node hung and reschedules the task elsewhere.
@@ -60,6 +65,10 @@ pub struct Member {
     /// Checks this node's runs passed / failed.
     pub checks_passed: u32,
     pub strikes: u32,
+    /// The node's latest signed performance profile.
+    pub perf: Option<SignedPerf>,
+    /// The cluster's own timing of its CPU benchmark.
+    pub perf_check: Option<PerfCheck>,
 }
 
 impl Member {
@@ -162,8 +171,8 @@ pub struct TaskRecord {
     pub stderr: Vec<u8>,
     pub output_files: Vec<FileEntry>,
     pub check: Option<CheckRecord>,
-    /// Credits charged for this task's runs.
-    pub cost: Micros,
+    /// Milli-CU charged for this task's runs.
+    pub cost: MilliCu,
 }
 
 /// A provider earning waiting out the hold period.
@@ -172,7 +181,7 @@ pub struct Hold {
     pub task: TaskRef,
     pub consumer: String,
     pub provider: String,
-    pub amount: Micros,
+    pub amount: MilliCu,
     pub release_after_unix: u64,
 }
 
@@ -213,6 +222,8 @@ pub(crate) struct NodeRuntime {
     /// Its availability policy says no new tasks now (on battery, in use,
     /// outside its hours), and why.
     pub paused: Option<String>,
+    /// Protocol, round-trip time and benchmark checks.
+    pub perf: PerfRuntime,
 }
 
 impl NodeRuntime {
@@ -245,6 +256,9 @@ pub struct State {
     pub(crate) queue: VecDeque<QueueItem>,
     pub(crate) accounts: HashMap<String, AccountView>,
     pub(crate) holds: HashMap<TaskRef, Hold>,
+    /// Micro-CU owed between two accounts (consumer, provider) that did not
+    /// make a whole milli-CU yet.
+    pub(crate) carry: HashMap<(String, String), i64>,
     pub(crate) next_ledger_seq: u64,
     pub(crate) next_seq: u64,
     pub(crate) next_generation: u64,
@@ -319,6 +333,7 @@ impl State {
                 .map(|a| (a.name.clone(), a))
                 .collect(),
             holds: snap.holds.into_iter().map(|h| (h.task, h)).collect(),
+            carry: snap.carry.into_iter().collect(),
             next_ledger_seq: snap.next_ledger_seq,
             next_seq: 0,
             next_generation: 1,
@@ -327,6 +342,7 @@ impl State {
             upgrading: HashMap::new(),
         };
         state.rollout = state.load_rollout()?;
+        state.convert_credit_receipts()?;
         state.ensure_account(OWNER_ACCOUNT)?;
         let mut jobs = snap.jobs;
         jobs.sort_by_key(|(m, _)| m.seq);
@@ -475,6 +491,8 @@ impl State {
                 allow_docker: i.allow_docker,
                 checks_passed: 0,
                 strikes: 0,
+                perf: None,
+                perf_check: None,
             },
             None => Member {
                 id: id.to_string(),
@@ -485,6 +503,8 @@ impl State {
                 allow_docker: true,
                 checks_passed: 0,
                 strikes: 0,
+                perf: None,
+                perf_check: None,
             },
         };
         self.ensure_account(&member.account)?;
@@ -513,7 +533,7 @@ impl State {
         Ok(())
     }
 
-    fn resolve_member(&self, id: &str) -> Result<String> {
+    pub(crate) fn resolve_member(&self, id: &str) -> Result<String> {
         let id = id.trim();
         let matches: Vec<&String> = self
             .members
@@ -528,9 +548,11 @@ impl State {
     }
 
     /// Registers a live connection and returns its generation.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_connect(
         &mut self,
         id: &str,
+        protocol: u32,
         info: NodeInfo,
         upgrade: Option<UpgradeHello>,
         availability: Availability,
@@ -585,6 +607,10 @@ impl State {
                 upgrade,
                 draining: false,
                 paused: availability.paused_reason().map(String::from),
+                perf: PerfRuntime {
+                    protocol,
+                    ..Default::default()
+                },
             },
         );
         self.schedule();
@@ -622,6 +648,7 @@ impl State {
         }
         node.online = false;
         node.tx = None;
+        node.perf.challenge = None;
         if let Some(kill) = node.kill.take() {
             let _ = kill.send(());
         }
@@ -685,6 +712,7 @@ impl State {
         }
         self.release_holds(now_unix());
         self.expire_upgrades();
+        self.expire_challenges();
         if !self.queue.is_empty() || self.rollout.is_some() {
             self.schedule();
         }
@@ -942,21 +970,29 @@ impl State {
             .unwrap_or_else(|| OWNER_ACCOUNT.into());
         let consumer = job.meta.account.clone();
         let billed_wall_ms = signed.usage.wall_ms.min(observed_ms);
-        let amount = if provider == consumer {
+        let cpu_score = self.billing_score_of(node_id);
+        let exact_ucu = if provider == consumer {
             0
         } else {
-            self.policy.prices.charge(&Metered {
+            self.policy.rates.charge(&Metered {
                 executor: signed.usage.executor,
                 fuel_used: signed.usage.fuel_used,
                 wall_ms: billed_wall_ms,
                 memory_bytes: signed.usage.memory_limit_bytes,
                 cpu_millis: signed.usage.cpu_millis,
+                cpu_score,
             })
         };
+        let amount = self.carry_forward(&consumer, &provider, exact_ucu);
+        if signed.usage.executor == Executor::Wasm {
+            self.note_run_speed(node_id, signed.usage.fuel_used, billed_wall_ms);
+        }
         let billing = Billing {
             consumer,
             provider,
             billed_wall_ms,
+            cpu_score,
+            exact_ucu,
             amount,
             check: r.check,
             recorded_unix: now_unix(),
@@ -1129,8 +1165,10 @@ impl State {
 
     /// Places as many queued runs as free slots allow.
     pub fn schedule(&mut self) {
-        // Idle nodes due for an upgrade get it before any new task.
+        // Idle nodes due for an upgrade get it before any new task, and
+        // idle nodes due for a benchmark check get that.
         self.drive_rollout();
+        self.drive_challenges();
         let mut skipped = VecDeque::new();
         let mut dirty: Vec<(JobId, u32)> = Vec::new();
         while let Some(item) = self.queue.pop_front() {
@@ -1170,7 +1208,11 @@ impl State {
                 _ => vcpus(job.meta.limits.cpu_millis),
             };
             let consumer = job.meta.account.as_str();
-            let can_pay = self.accounts.get(consumer).is_some_and(|a| a.balance > 0);
+            let floor = self.policy.ledger.floor();
+            let can_pay = self
+                .accounts
+                .get(consumer)
+                .is_some_and(|a| a.balance > floor);
             // Free (same account) and trusted nodes first, then most free
             // slots to spread work.
             let best = self
@@ -1181,6 +1223,8 @@ impl State {
                         && !n.suspended
                         && !n.draining
                         && n.paused.is_none()
+                        && !n.perf.wanted
+                        && n.perf.challenge.is_none()
                         && !self.upgrading.contains_key(id.as_str())
                         && n.free_slots() > 0
                         && n.info.memory_bytes >= need
@@ -1336,6 +1380,8 @@ impl State {
             .map(|m| {
                 let rt = self.nodes.get(&m.id);
                 let info = rt.map(|n| n.info.clone()).unwrap_or_else(|| m.info.clone());
+                let (cpu_score, perf_note) = cpu_score(m);
+                let online = rt.filter(|n| n.online);
                 NodeView {
                     id: m.id.clone(),
                     executors: m.executors(&info.executors),
@@ -1349,7 +1395,12 @@ impl State {
                     running: rt.map(|n| n.running.len() as u32).unwrap_or(0),
                     completed: rt.map(|n| n.completed).unwrap_or(0),
                     last_seen_unix: rt.map(|n| n.last_seen_unix).unwrap_or(0),
-                    paused: rt.filter(|n| n.online).and_then(|n| n.paused.clone()),
+                    paused: online.and_then(|n| n.paused.clone()),
+                    perf: m.perf.as_ref().map(|p| p.profile.clone()),
+                    cpu_score,
+                    perf_note,
+                    rtt_us: online.and_then(|n| n.perf.rtt_us),
+                    relayed: online.is_some_and(|n| n.perf.relayed),
                 }
             })
             .collect();
@@ -1464,7 +1515,15 @@ mod tests {
         st.authorize(&id, &info, Some(&token.secret)).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let (kill, _) = oneshot::channel();
-        st.on_connect(&id, info, None, Availability::Available, tx, kill);
+        st.on_connect(
+            &id,
+            pumasi_proto::PROTOCOL_VERSION,
+            info,
+            None,
+            Availability::Available,
+            tx,
+            kill,
+        );
         (id, rx)
     }
 

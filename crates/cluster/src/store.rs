@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use pumasi_proto::{
     ModuleHash, Secret,
     economy::Policy,
-    msg::{AccountView, LedgerEntry, TaskRef},
+    msg::{AccountView, LedgerEntry, LedgerKind, TaskRef},
     receipt::Receipt,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -34,11 +34,21 @@ const LEDGER: TableDefinition<u64, &[u8]> = TableDefinition::new("ledger");
 type RunKey = (u128, u32, u32, bool);
 const HOLDS: TableDefinition<RunKey, &[u8]> = TableDefinition::new("holds");
 const RECEIPTS: TableDefinition<RunKey, &[u8]> = TableDefinition::new("receipts");
+/// Micro-CU owed below one milli-CU, key: (consumer, provider).
+const CARRY: TableDefinition<(&str, &str), i64> = TableDefinition::new("carry");
+/// The phase 2 credit ledger and receipts, kept as they were when the
+/// database moved to compute units (layout 4).
+const CREDIT_LEDGER: TableDefinition<u64, &[u8]> = TableDefinition::new("credit_ledger");
+const CREDIT_RECEIPTS: TableDefinition<RunKey, &[u8]> = TableDefinition::new("credit_receipts");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
+/// The old price of a core-hour in micro-credits, which became one CU.
+const CREDIT_RATE_META: &str = "credit_cpu_hour";
+/// Set once the credit receipts were countersigned again in CU.
+const CREDIT_RECEIPTS_DONE_META: &str = "credit_receipts_converted";
 /// Layout version written by this build.
-const SCHEMA: u32 = 3;
+const SCHEMA: u32 = 4;
 
 fn run_key(t: &TaskRef) -> RunKey {
     (t.job.0, t.index, t.attempt, t.check)
@@ -57,6 +67,7 @@ pub struct Snapshot {
     pub modules: Vec<(ModuleHash, Vec<u8>)>,
     pub accounts: Vec<AccountView>,
     pub holds: Vec<Hold>,
+    pub carry: Vec<((String, String), i64)>,
     pub next_ledger_seq: u64,
     pub policy: Option<Policy>,
 }
@@ -68,6 +79,7 @@ pub struct LedgerWrite<'a> {
     pub entries: &'a [LedgerEntry],
     pub put_holds: &'a [Hold],
     pub del_holds: &'a [TaskRef],
+    pub carries: &'a [(String, String, i64)],
     pub receipt: Option<&'a Receipt>,
 }
 
@@ -99,6 +111,7 @@ impl Store {
         tx.open_table(LEDGER)?;
         tx.open_table(HOLDS)?;
         tx.open_table(RECEIPTS)?;
+        tx.open_table(CARRY)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -128,6 +141,9 @@ impl Store {
         if schema < 3 {
             store.migrate_v2()?;
         }
+        if schema < 4 {
+            store.migrate_v3()?;
+        }
         Ok(store)
     }
 
@@ -144,7 +160,7 @@ impl Store {
                 .map(|r| r.map(|(k, v)| (k.value().to_string(), v.value().to_vec())))
                 .collect::<std::result::Result<_, _>>()?;
             for (k, v) in rows {
-                let m: Member = dec::<legacy::Member>(&v)?.into();
+                let m: legacy::MemberV3 = dec::<legacy::Member>(&v)?.into();
                 t.insert(k.as_str(), enc(&m).as_slice())?;
                 counts.0 += 1;
             }
@@ -206,13 +222,183 @@ impl Store {
             let mut meta = tx.open_table(META)?;
             let old = meta.get(POLICY_META)?.map(|v| v.value().to_vec());
             if let Some(old) = old {
-                let p: Policy = dec::<legacy::PolicyV2>(&old)?.into();
+                let p: legacy::PolicyV3 = dec::<legacy::PolicyV2>(&old)?.into();
                 meta.insert(POLICY_META, enc(&p).as_slice())?;
             }
-            meta.insert(SCHEMA_META, SCHEMA.to_le_bytes().as_slice())?;
+            meta.insert(SCHEMA_META, 3u32.to_le_bytes().as_slice())?;
         }
         tx.commit()?;
-        info!("migrated state database to layout {SCHEMA}");
+        info!("migrated state database to layout 3");
+        Ok(())
+    }
+
+    /// Layout 4 moves from credits to compute units. The old price of one
+    /// core-hour becomes one CU: balances, holds, earnings and task costs
+    /// are converted at that rate (balances so that their total converts
+    /// exactly, rounded down), each account's ledger starts again with a
+    /// `convert` entry for its opening balance, and the credit ledger and
+    /// receipts are kept in tables of their own (the receipts are
+    /// countersigned again in CU when the control plane starts, see
+    /// [`Store::credit_receipts`]). Members get room for a performance
+    /// profile.
+    fn migrate_v3(&self) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        let cpu_hour;
+        {
+            let mut meta = tx.open_table(META)?;
+            let old = meta.get(POLICY_META)?.map(|v| v.value().to_vec());
+            cpu_hour = match old {
+                Some(old) => {
+                    let (p, rate) = dec::<legacy::PolicyV3>(&old)?.convert();
+                    meta.insert(POLICY_META, enc(&p).as_slice())?;
+                    rate
+                }
+                None => legacy::OLD_CPU_HOUR,
+            };
+            meta.insert(CREDIT_RATE_META, cpu_hour.to_le_bytes().as_slice())?;
+        }
+        {
+            let mut t = tx.open_table(MEMBERS)?;
+            let rows: Vec<(String, Vec<u8>)> = t
+                .iter()?
+                .map(|r| r.map(|(k, v)| (k.value().to_string(), v.value().to_vec())))
+                .collect::<std::result::Result<_, _>>()?;
+            for (k, v) in rows {
+                let m: Member = dec::<legacy::MemberV3>(&v)?.into();
+                t.insert(k.as_str(), enc(&m).as_slice())?;
+            }
+        }
+        let mut holds: Vec<Hold> = Vec::new();
+        for row in tx.open_table(HOLDS)?.iter()? {
+            holds.push(dec(row?.1.value())?);
+        }
+        let mut accounts: Vec<AccountView> = Vec::new();
+        for row in tx.open_table(ACCOUNTS)?.iter()? {
+            accounts.push(dec(row?.1.value())?);
+        }
+        let before: Vec<AccountView> = accounts.clone();
+        legacy::convert_balances(&mut accounts, &mut holds, cpu_hour);
+        {
+            let mut t = tx.open_table(HOLDS)?;
+            for h in &holds {
+                t.insert(run_key(&h.task), enc(h).as_slice())?;
+            }
+            let mut t = tx.open_table(ACCOUNTS)?;
+            for a in &accounts {
+                t.insert(a.name.as_str(), enc(a).as_slice())?;
+            }
+        }
+        {
+            let mut t = tx.open_table(TASKS)?;
+            let rows: Vec<((u128, u32), Vec<u8>)> = t
+                .iter()?
+                .map(|r| r.map(|(k, v)| (k.value(), v.value().to_vec())))
+                .collect::<std::result::Result<_, _>>()?;
+            for (k, v) in rows {
+                let mut task: TaskRecord = dec(&v)?;
+                if task.cost != 0 {
+                    task.cost = legacy::to_milli_cu(task.cost, cpu_hour);
+                    t.insert(k, enc(&task).as_slice())?;
+                }
+            }
+        }
+        // The credit ledger moves aside; each account starts over with its
+        // converted balance.
+        let mut next_seq = 1;
+        {
+            let mut old = tx.open_table(LEDGER)?;
+            let rows: Vec<(u64, Vec<u8>)> = old
+                .iter()?
+                .map(|r| r.map(|(k, v)| (k.value(), v.value().to_vec())))
+                .collect::<std::result::Result<_, _>>()?;
+            let mut archive = tx.open_table(CREDIT_LEDGER)?;
+            for (k, v) in &rows {
+                archive.insert(*k, v.as_slice())?;
+                old.remove(*k)?;
+                next_seq = next_seq.max(k + 1);
+            }
+            let now = crate::state::now_unix();
+            for (a, b) in accounts.iter().zip(&before) {
+                if a.balance == 0 && a.held == 0 {
+                    continue;
+                }
+                let e = LedgerEntry {
+                    seq: next_seq,
+                    unix: now,
+                    account: a.name.clone(),
+                    kind: LedgerKind::Convert,
+                    amount: a.balance,
+                    task: None,
+                    memo: format!(
+                        "converted {} credits ({} held) to CU at {} CU per credit",
+                        legacy::format_credits(b.balance),
+                        legacy::format_credits(b.held),
+                        pumasi_proto::economy::format_rate(1_000_000_000_000 / cpu_hour)
+                    ),
+                };
+                next_seq += 1;
+                old.insert(e.seq, enc(&e).as_slice())?;
+            }
+        }
+        {
+            let mut old = tx.open_table(RECEIPTS)?;
+            let rows: Vec<(RunKey, Vec<u8>)> = old
+                .iter()?
+                .map(|r| r.map(|(k, v)| (k.value(), v.value().to_vec())))
+                .collect::<std::result::Result<_, _>>()?;
+            let mut archive = tx.open_table(CREDIT_RECEIPTS)?;
+            for (k, v) in &rows {
+                archive.insert(*k, v.as_slice())?;
+                old.remove(*k)?;
+            }
+        }
+        tx.open_table(META)?
+            .insert(SCHEMA_META, 4u32.to_le_bytes().as_slice())?;
+        tx.commit()?;
+        info!(
+            accounts = accounts.len(),
+            holds = holds.len(),
+            cpu_hour,
+            "migrated state database to layout 4 (compute units)"
+        );
+        Ok(())
+    }
+
+    /// Receipts from the credit ledger still to be countersigned in CU,
+    /// with the old price of a core-hour. `None` when there is nothing to
+    /// convert.
+    pub(crate) fn credit_receipts(&self) -> Result<Option<(i64, Vec<legacy::ReceiptV1>)>> {
+        let tx = self.db.begin_read()?;
+        let meta = tx.open_table(META)?;
+        if meta.get(CREDIT_RECEIPTS_DONE_META)?.is_some() {
+            return Ok(None);
+        }
+        let Some(rate) = meta.get(CREDIT_RATE_META)? else {
+            return Ok(None);
+        };
+        let rate = i64::from_le_bytes(rate.value().try_into().context("corrupt credit rate")?);
+        let Ok(t) = tx.open_table(CREDIT_RECEIPTS) else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        for row in t.iter()? {
+            out.push(dec(row?.1.value())?);
+        }
+        Ok(Some((rate, out)))
+    }
+
+    /// Stores the receipts countersigned again in CU.
+    pub(crate) fn finish_credit_receipts(&self, receipts: &[Receipt]) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(RECEIPTS)?;
+            for r in receipts {
+                t.insert(run_key(&r.usage.task), enc(r).as_slice())?;
+            }
+            tx.open_table(META)?
+                .insert(CREDIT_RECEIPTS_DONE_META, [1u8].as_slice())?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -275,6 +461,11 @@ impl Store {
         for row in tx.open_table(HOLDS)?.iter()? {
             let (_, v) = row?;
             snap.holds.push(dec(v.value())?);
+        }
+        for row in tx.open_table(CARRY)?.iter()? {
+            let (k, v) = row?;
+            let (c, p) = k.value();
+            snap.carry.push(((c.to_string(), p.to_string()), v.value()));
         }
         snap.next_ledger_seq = tx
             .open_table(LEDGER)?
@@ -387,6 +578,10 @@ impl Store {
             for k in w.del_holds {
                 t.remove(run_key(k))?;
             }
+            let mut t = tx.open_table(CARRY)?;
+            for (c, p, v) in w.carries {
+                t.insert((c.as_str(), p.as_str()), *v)?;
+            }
             if let Some(r) = w.receipt {
                 tx.open_table(RECEIPTS)?
                     .insert(run_key(&r.usage.task), enc(r).as_slice())?;
@@ -427,7 +622,18 @@ impl Store {
 }
 
 /// Older record layouts, kept only to migrate old databases.
-mod legacy {
+pub(crate) mod legacy {
+    use std::collections::HashMap;
+
+    use pumasi_proto::{
+        economy::{CuRates, LedgerMode, MICRO_PER_CU, Policy},
+        msg::AccountView,
+        receipt::Usage,
+    };
+    use serde::Serialize;
+
+    use crate::state::Hold;
+
     /// Layout 2 policy: no microVM price.
     #[derive(serde::Deserialize)]
     pub struct PolicyV2 {
@@ -444,10 +650,10 @@ mod legacy {
         memory_gib_hour: i64,
     }
 
-    impl From<PolicyV2> for pumasi_proto::economy::Policy {
+    impl From<PolicyV2> for PolicyV3 {
         fn from(p: PolicyV2) -> Self {
             Self {
-                prices: pumasi_proto::economy::PriceList {
+                prices: PricesV3 {
                     wasm_per_gfuel: p.prices.wasm_per_gfuel,
                     docker_cpu_hour: p.prices.docker_cpu_hour,
                     microvm_cpu_hour: p.prices.docker_cpu_hour,
@@ -456,6 +662,173 @@ mod legacy {
                 hold_secs: p.hold_secs,
                 verify_permille: p.verify_permille,
                 max_strikes: p.max_strikes,
+            }
+        }
+    }
+
+    /// Layout 3 policy: a price list in micro-credits.
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    pub struct PolicyV3 {
+        pub prices: PricesV3,
+        pub hold_secs: u64,
+        pub verify_permille: u32,
+        pub max_strikes: u32,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    pub struct PricesV3 {
+        pub wasm_per_gfuel: i64,
+        pub docker_cpu_hour: i64,
+        pub microvm_cpu_hour: i64,
+        pub memory_gib_hour: i64,
+    }
+
+    /// The old default price of a core-hour (0.05 credits).
+    pub const OLD_CPU_HOUR: i64 = 50_000;
+    const OLD_DEFAULT: PricesV3 = PricesV3 {
+        wasm_per_gfuel: 10_000,
+        docker_cpu_hour: 50_000,
+        microvm_cpu_hour: 50_000,
+        memory_gib_hour: 5_000,
+    };
+
+    impl PolicyV3 {
+        /// The CU policy, and the price of a core-hour that becomes one CU.
+        /// The old default prices give the new default rates; custom ones
+        /// keep their memory-to-CPU ratio.
+        pub fn convert(self) -> (Policy, i64) {
+            let p = &self.prices;
+            let cpu_hour = [p.docker_cpu_hour, p.microvm_cpu_hour]
+                .into_iter()
+                .find(|&v| v > 0)
+                .unwrap_or(OLD_CPU_HOUR);
+            let rates = if self.prices == OLD_DEFAULT {
+                CuRates::default()
+            } else {
+                CuRates {
+                    memory_gib_hour: (p.memory_gib_hour.max(0) as i128 * MICRO_PER_CU as i128
+                        / cpu_hour as i128) as i64,
+                    ..CuRates::default()
+                }
+            };
+            (
+                Policy {
+                    rates,
+                    hold_secs: self.hold_secs,
+                    verify_permille: self.verify_permille,
+                    max_strikes: self.max_strikes,
+                    ledger: LedgerMode::Prepaid,
+                },
+                cpu_hour,
+            )
+        }
+    }
+
+    /// Micro-credits to milli-CU, rounded down.
+    pub fn to_milli_cu(micro_credits: i64, cpu_hour: i64) -> i64 {
+        let (n, d) = pumasi_proto::economy::credits_to_milli_cu_num(micro_credits, cpu_hour);
+        n.div_euclid(d) as i64
+    }
+
+    pub fn format_credits(m: i64) -> String {
+        let sign = if m < 0 { "-" } else { "" };
+        let abs = m.unsigned_abs();
+        let (whole, frac) = (abs / 1_000_000, abs % 1_000_000);
+        if frac == 0 {
+            return format!("{sign}{whole}");
+        }
+        let frac = format!("{frac:06}");
+        format!("{sign}{whole}.{}", frac.trim_end_matches('0'))
+    }
+
+    /// Converts balances and holds from micro-credits to milli-CU. Holds
+    /// and the spent and earned totals round down one by one; the
+    /// available balances are set so that every account's available plus
+    /// held is its old total converted, and the cluster-wide total of
+    /// those converts exactly (rounded down once): the remainders go to
+    /// the accounts that lost most to rounding.
+    pub fn convert_balances(accounts: &mut [AccountView], holds: &mut [Hold], cpu_hour: i64) {
+        let d = cpu_hour.max(1) as i128;
+        let mut held: HashMap<String, i64> = HashMap::new();
+        for h in holds.iter_mut() {
+            h.amount = to_milli_cu(h.amount, cpu_hour);
+            *held.entry(h.provider.clone()).or_default() += h.amount;
+        }
+        let nums: Vec<i128> = accounts
+            .iter()
+            .map(|a| (a.balance as i128 + a.held as i128) * 1000)
+            .collect();
+        let target = nums.iter().sum::<i128>().div_euclid(d);
+        let mut totals: Vec<i128> = nums.iter().map(|n| n.div_euclid(d)).collect();
+        let mut extra = target - totals.iter().sum::<i128>();
+        let mut order: Vec<usize> = (0..accounts.len()).collect();
+        order.sort_by(|&a, &b| {
+            nums[b]
+                .rem_euclid(d)
+                .cmp(&nums[a].rem_euclid(d))
+                .then(accounts[a].name.cmp(&accounts[b].name))
+        });
+        for i in order {
+            if extra <= 0 {
+                break;
+            }
+            totals[i] += 1;
+            extra -= 1;
+        }
+        for (a, total) in accounts.iter_mut().zip(totals) {
+            let h = held.get(&a.name).copied().unwrap_or(0);
+            a.held = h;
+            a.balance = total as i64 - h;
+            a.spent = to_milli_cu(a.spent, cpu_hour);
+            a.earned = to_milli_cu(a.earned, cpu_hour);
+        }
+    }
+
+    /// Layout 3 receipt billing, in micro-credits.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct BillingV1 {
+        pub consumer: String,
+        pub provider: String,
+        pub billed_wall_ms: u64,
+        pub amount: i64,
+        pub check: bool,
+        pub recorded_unix: u64,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct ReceiptV1 {
+        pub usage: Usage,
+        pub node_sig: iroh::Signature,
+        pub billing: BillingV1,
+        pub cluster_sig: iroh::Signature,
+    }
+
+    /// Layout 2 and 3 member: no performance profile.
+    #[derive(Serialize, Deserialize)]
+    pub struct MemberV3 {
+        pub id: String,
+        pub info: NodeInfo,
+        pub joined_unix: u64,
+        pub role: Role,
+        pub account: String,
+        pub allow_docker: bool,
+        pub checks_passed: u32,
+        pub strikes: u32,
+    }
+
+    impl From<MemberV3> for crate::state::Member {
+        fn from(m: MemberV3) -> Self {
+            Self {
+                id: m.id,
+                info: m.info,
+                joined_unix: m.joined_unix,
+                role: m.role,
+                account: m.account,
+                allow_docker: m.allow_docker,
+                checks_passed: m.checks_passed,
+                strikes: m.strikes,
+                perf: None,
+                perf_check: None,
             }
         }
     }
@@ -474,7 +847,7 @@ mod legacy {
         joined_unix: u64,
     }
 
-    impl From<Member> for crate::state::Member {
+    impl From<Member> for MemberV3 {
         fn from(m: Member) -> Self {
             Self {
                 id: m.id,
@@ -581,6 +954,7 @@ mod legacy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Hold;
     use pumasi_proto::{
         job::{Executor, JobId, Limits, TaskInput, Tier},
         msg::{NodeInfo, TaskState},
@@ -667,9 +1041,10 @@ mod tests {
             tx.commit().unwrap();
         }
         let p = Store::open(&path).unwrap().load().unwrap().policy.unwrap();
-        assert_eq!(p.prices.docker_cpu_hour, 7);
-        assert_eq!(p.prices.microvm_cpu_hour, 7, "starts at the docker price");
-        assert_eq!(p.prices.memory_gib_hour, 3);
+        // Through layout 3 (microVM price = docker price) to CU: memory
+        // keeps its ratio to a core-hour.
+        assert_eq!(p.rates.memory_gib_hour, 3 * 1_000_000 / 7);
+        assert_eq!(p.ledger, pumasi_proto::economy::LedgerMode::Prepaid);
         assert_eq!(
             (p.hold_secs, p.verify_permille, p.max_strikes),
             (60, 250, 2)
@@ -677,6 +1052,227 @@ mod tests {
         // Reopening does not migrate again.
         let again = Store::open(&path).unwrap().load().unwrap().policy.unwrap();
         assert_eq!(again, p);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn account(name: &str, balance: i64, held: i64, spent: i64, earned: i64) -> AccountView {
+        AccountView {
+            name: name.into(),
+            balance,
+            held,
+            spent,
+            earned,
+        }
+    }
+
+    #[test]
+    fn converts_balances_so_the_total_matches() {
+        let task = TaskRef {
+            job: JobId(1),
+            index: 0,
+            attempt: 1,
+            check: false,
+        };
+        let mut accounts = vec![
+            account("owner", 962_500, 0, 37_500, 0),
+            account("bob", 25_000, 12_500, 0, 25_000),
+            account("alice", 30, 0, 0, 0),
+            account("dave", 30, 0, 0, 0),
+            account("carol", -333, 0, 333, 0),
+        ];
+        let mut holds = vec![Hold {
+            task,
+            consumer: "owner".into(),
+            provider: "bob".into(),
+            amount: 12_500,
+            release_after_unix: 9,
+        }];
+        let total_before: i64 = accounts.iter().map(|a| a.balance + a.held).sum();
+        legacy::convert_balances(&mut accounts, &mut holds, legacy::OLD_CPU_HOUR);
+        let total_after: i64 = accounts.iter().map(|a| a.balance + a.held).sum();
+        // 1 credit = 20 CU at the old default price: micro-credits / 50.
+        assert_eq!(total_after, (total_before * 1000).div_euclid(50_000));
+        let get = |n: &str| accounts.iter().find(|a| a.name == n).unwrap().clone();
+        assert_eq!(get("owner"), account("owner", 19_250, 0, 750, 0));
+        assert_eq!(get("bob"), account("bob", 500, 250, 0, 500));
+        assert_eq!(holds[0].amount, 250);
+        assert_eq!(get("carol").balance, -7);
+        // 0.6 + 0.6 + 0.34 milli-CU lost to rounding make one: it goes to
+        // the largest remainder (alice and dave tie; by name).
+        assert_eq!((get("alice").balance, get("dave").balance), (1, 0));
+    }
+
+    #[test]
+    fn migrates_a_layout3_database_to_compute_units() {
+        use crate::state::State;
+        use iroh::SecretKey;
+        use pumasi_proto::{
+            msg::{Outcome, Role},
+            receipt::{SignedUsage, Usage, result_digest},
+        };
+        let path =
+            std::env::temp_dir().join(format!("pumasi-store-{}.redb", rand::random::<u64>()));
+        let cluster = SecretKey::generate();
+        let node = SecretKey::generate();
+        let task = TaskRef {
+            job: JobId(3),
+            index: 0,
+            attempt: 1,
+            check: false,
+        };
+        {
+            let db = Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert(SCHEMA_META, 3u32.to_le_bytes().as_slice())
+                    .unwrap();
+                let old = legacy::PolicyV3 {
+                    prices: legacy::PricesV3 {
+                        wasm_per_gfuel: 10_000,
+                        docker_cpu_hour: 50_000,
+                        microvm_cpu_hour: 50_000,
+                        memory_gib_hour: 5_000,
+                    },
+                    hold_secs: 60,
+                    verify_permille: 100,
+                    max_strikes: 3,
+                };
+                meta.insert(POLICY_META, enc(&old).as_slice()).unwrap();
+                let m = legacy::MemberV3 {
+                    id: node.public().to_string(),
+                    info: NodeInfo {
+                        name: "bob".into(),
+                        os: "linux".into(),
+                        arch: "x86_64".into(),
+                        cpus: 2,
+                        memory_bytes: 1 << 30,
+                        slots: 1,
+                        agent_version: "0.6".into(),
+                        executors: vec![Executor::Wasm],
+                    },
+                    joined_unix: 1,
+                    role: Role::Provider,
+                    account: "bob".into(),
+                    allow_docker: false,
+                    checks_passed: 4,
+                    strikes: 1,
+                };
+                tx.open_table(MEMBERS)
+                    .unwrap()
+                    .insert(m.id.as_str(), enc(&m).as_slice())
+                    .unwrap();
+                let mut accounts = tx.open_table(ACCOUNTS).unwrap();
+                for a in [
+                    account("owner", 962_500, 0, 37_500, 0),
+                    account("bob", 25_000, 12_500, 0, 25_000),
+                ] {
+                    accounts
+                        .insert(a.name.as_str(), enc(&a).as_slice())
+                        .unwrap();
+                }
+                let hold = Hold {
+                    task,
+                    consumer: "owner".into(),
+                    provider: "bob".into(),
+                    amount: 12_500,
+                    release_after_unix: 9,
+                };
+                tx.open_table(HOLDS)
+                    .unwrap()
+                    .insert(run_key(&task), enc(&hold).as_slice())
+                    .unwrap();
+                let entry = LedgerEntry {
+                    seq: 7,
+                    unix: 1,
+                    account: "owner".into(),
+                    kind: LedgerKind::Deposit,
+                    amount: 1_000_000,
+                    task: None,
+                    memo: String::new(),
+                };
+                tx.open_table(LEDGER)
+                    .unwrap()
+                    .insert(7, enc(&entry).as_slice())
+                    .unwrap();
+                let usage = Usage {
+                    cluster: *cluster.public().as_bytes(),
+                    node: *node.public().as_bytes(),
+                    task,
+                    executor: Executor::Wasm,
+                    outcome: Outcome::Exited(0),
+                    fuel_used: 12_500,
+                    wall_ms: 5,
+                    memory_limit_bytes: 1 << 20,
+                    peak_memory_bytes: None,
+                    cpu_millis: None,
+                    result_digest: result_digest(&Outcome::Exited(0), b"", &[]),
+                    finished_unix: 1,
+                };
+                let signed = SignedUsage::sign(usage, &node);
+                let old = legacy::ReceiptV1 {
+                    usage: signed.usage,
+                    node_sig: signed.node_sig,
+                    billing: legacy::BillingV1 {
+                        consumer: "owner".into(),
+                        provider: "bob".into(),
+                        billed_wall_ms: 5,
+                        amount: 12_500,
+                        check: false,
+                        recorded_unix: 2,
+                    },
+                    cluster_sig: cluster.sign(b"old"),
+                };
+                tx.open_table(RECEIPTS)
+                    .unwrap()
+                    .insert(run_key(&task), enc(&old).as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let snap = store.load().unwrap();
+        assert_eq!(snap.members[0].strikes, 1);
+        assert!(snap.members[0].perf.is_none());
+        let p = snap.policy.unwrap();
+        assert_eq!(p.rates, pumasi_proto::economy::CuRates::default());
+        assert_eq!(p.hold_secs, 60);
+        let bob = snap.accounts.iter().find(|a| a.name == "bob").unwrap();
+        assert_eq!((bob.balance, bob.held, bob.earned), (500, 250, 500));
+        assert_eq!(snap.holds[0].amount, 250);
+        let ledger = store.ledger(None, 10).unwrap();
+        assert_eq!(ledger.len(), 2);
+        assert!(
+            ledger
+                .iter()
+                .all(|e| e.kind == LedgerKind::Convert && e.seq >= 8)
+        );
+        assert_eq!(
+            ledger.iter().find(|e| e.account == "owner").unwrap().amount,
+            19_250
+        );
+        // The receipt is countersigned again, in CU, when the control
+        // plane starts; the node's signature still holds.
+        assert!(store.receipts(3).unwrap().is_empty());
+        let st = State::load(
+            "t".into(),
+            cluster.public().to_string(),
+            store,
+            cluster.clone(),
+        )
+        .unwrap();
+        let rs = st.store.receipts(3).unwrap();
+        assert_eq!(rs.len(), 1);
+        rs[0].verify().unwrap();
+        assert_eq!(
+            (rs[0].billing.amount, rs[0].billing.exact_ucu),
+            (250, 250_000)
+        );
+        drop(st);
+        // Once only.
+        let store = Store::open(&path).unwrap();
+        assert!(store.credit_receipts().unwrap().is_none());
+        assert_eq!(store.ledger(None, 10).unwrap().len(), 2);
         let _ = std::fs::remove_file(&path);
     }
 

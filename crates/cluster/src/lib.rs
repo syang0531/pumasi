@@ -2,6 +2,7 @@
 
 mod check;
 mod ledger;
+pub mod perf;
 pub mod rollout;
 pub mod server;
 pub mod state;

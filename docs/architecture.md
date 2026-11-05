@@ -1,11 +1,11 @@
 # Architecture
 
 This document records how the cluster is built and why: the private
-cluster of phase 1, the invited providers, receipts, credit ledger and
+cluster of phase 1, the invited providers, receipts, ledger and
 result checks of phase 2, the microVM executor of phase 3, the
 releases, OS services and signed agent upgrades of phase 4, the
-Windows support of phase 5, and the Mac support and availability policy of
-phase 6. The
+Windows support of phase 5, the Mac support and availability policy of
+phase 6, and the benchmarks and compute units of phase 7. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -261,36 +261,120 @@ are this node's and its own, the task ref is the run it placed, the digest
 matches the stdout and files it received, and the numbers match the report
 and the job's limits. A rejected report counts as a strike and the run is
 requeued. Otherwise it adds `Billing { consumer, provider, billed wall ms,
-amount, check, recorded }` and countersigns
-`"pumasi/receipt/cluster/v1\0" || postcard(usage, node sig, billing)`.
+cpu score, exact µCU, amount (mCU), check, recorded }` and countersigns
+`"pumasi/receipt/cluster/v2\0" || postcard(usage, node sig, billing)`.
 `billed wall ms` is the node's figure capped by how long the control plane
-saw the run, so a node cannot inflate time. Receipts are stored in the
-`receipts` table keyed by run and exported by `pumasi receipts --export` as
-JSON rows with readable fields plus a `pumasireceipt...` blob; `pumasi
-verify-receipts` checks both signatures and that the readable fields match
-the blob.
+saw the run, so a node cannot inflate time; `cpu score` is the score the
+run was billed at (see "Benchmarks and the CPU score"). Receipts are stored
+in the `receipts` table keyed by run and exported by `pumasi receipts
+--export` as JSON rows with readable fields plus a `pumasicureceipt...`
+blob; `pumasi verify-receipts` checks both signatures and that the readable
+fields match the blob. Phase 2 credit receipts (`pumasireceipt...`, domain
+v1) are converted when the database is migrated, see "Persistence".
 
-### Prices and the ledger
+### Compute units and the ledger
 
-Amounts are integer micro-credits. The fixed price list:
+Everything inside a cluster is priced in compute units (CU). One CU is one
+reference vCPU (score 1000, see below) busy for an hour. The engine knows
+nothing about money; a hub may later sell CU, but nothing here converts
+them back.
 
-- WASM: `fuel × wasm_per_gfuel / 10^9`. Fuel is hardware independent and a
+Rates are integer micro-CU (`CuRates`, set with `pumasi prices set`):
+
+- CPU: always 1 CU per reference vCPU-hour, so it is not a setting.
+- `memory_gib_hour`: 250 000 µCU (0.25 CU) per GiB of the memory limit per
+  reference hour, so 1 vCPU with 2 GiB costs 1.5 CU an hour and with 4 GiB
+  2 CU.
+- `storage_gib_month` (0.5 CU) and `egress_gib` (0.1 CU): stored in the
+  policy now and charged once the file store (phase 8) meters them.
+
+A run's reference time, in nanoseconds, is what it would have taken on the
+reference vCPU:
+
+- WASM: `fuel / REFERENCE_FUEL_PER_SEC`. Fuel is hardware independent and a
   check run reproduces it, so slow machines are paid the same for the same
   work and a provider cannot pad it unnoticed.
-- Docker: `cpus × wall hours × docker_cpu_hour` (one core when unset).
-- MicroVM: `vCPUs × wall hours × microvm_cpu_hour`, vCPUs being `cpus`
-  rounded up (one when unset). Wall time starts at boot; the first pull of an
-  image is not billed.
-- All: `memory limit GiB × wall hours × memory_gib_hour`.
+- Docker and microVM: `billed wall × cpu score / 1000`. A node twice as fast
+  as the reference finishes in half the time and earns the same. Wall time
+  starts at boot; the first pull of an image is not billed.
+
+The charge is `vCPUs × reference hours` CU plus `memory limit GiB ×
+reference hours × memory_gib_hour`, where vCPUs are the Docker CPU limit in
+thousandths (one when unset), the microVM's whole vCPUs (`cpus` rounded up),
+or one for WASM. `CuRates::charge` returns the exact amount in µCU, which
+goes on the receipt. The ledger keeps integer milli-CU: each
+(consumer, provider) pair has a `carry` of the sub-milli remainder, so many
+tiny runs add up to what one long run would cost instead of rounding to
+zero each time.
 
 Every receipt with a non-zero amount writes, in one redb transaction with
-the receipt: the consumer's `Charge` (balance down), the provider's `Hold`
-(held up) and a hold record that releases at `recorded + hold_secs`. The
-ticker releases due holds (`Release`: held down, balance up) unless the
-task is still being checked. A rejected run's hold is `Forfeit`ed and the
-consumer gets a `Refund`. `Deposit` and `Payout` are admin bookkeeping.
-Balances can go slightly negative: the credit check happens at placement,
-and runs already placed are charged when they finish.
+the receipt and the carry: the consumer's `Charge` (balance down), the
+provider's `Hold` (held up) and a hold record that releases at `recorded +
+hold_secs`. The ticker releases due holds (`Release`: held down, balance up)
+unless the task is still being checked. A rejected run's hold is
+`Forfeit`ed and the consumer gets a `Refund`. Balances can go slightly past
+the floor: the balance check happens at placement, and runs already placed
+are charged when they finish.
+
+`Policy::ledger` picks how accounts get CU:
+
+- `Prepaid` (default): the owner grants CU with `pumasi cu add` (`Deposit`)
+  and takes them out with `Payout`; an account needs a positive balance to
+  use other accounts' machines.
+- `Mutual { credit_limit }`: money-free pooling (품앗이). Nobody grants CU;
+  lending a machine earns them and using others' machines spends them, and
+  a balance may go down to `-credit_limit`. Deposits and payouts are
+  refused, so balances add up to zero (plus whatever was granted before the
+  switch).
+
+### Benchmarks and the CPU score
+
+Each agent measures itself when it starts (unless `perf.json` in its data
+directory is younger than a day and of the current `BENCH_VERSION`) and
+again every day while idle (`--bench-interval`, `--no-benchmark` turns it
+off), and on `pumasi node <id> --rebenchmark`. `pumasi bench` runs the same
+measurements locally.
+
+- CPU: a seeded integer kernel (`perf::KERNEL_WAT`: 64-bit multiply, rotate,
+  xor and a 4 KiB table) runs in Wasmtime with fuel on, as tasks do, first
+  on one thread and then on every offered CPU. The score is iterations per
+  second relative to `REFERENCE_ITERS_PER_SEC` (150 M, one hardware thread
+  of a 2.5 GHz Skylake-class server core), bounded to 100..5000 for
+  billing. A vCPU's score is `min(multi / threads, single)`, so SMT and
+  thermal limits count.
+- Memory: copy bandwidth over 256 MiB.
+- Disk, under the agent's work directory, fio-style with the page cache
+  bypassed (O_DIRECT, F_NOCACHE, `FILE_FLAG_NO_BUFFERING`): sequential write
+  and read in 1 MiB blocks, 4 KiB random reads at queue depth 1 (p50 and
+  p99 latency) and 8 (IOPS). Without direct I/O the class is `unknown`;
+  otherwise a p50 of 1.5 ms or more is `hdd`, 700 MB/s sequential or more
+  is `nvme`, and the rest `ssd`. The OS's rotational flag is recorded
+  beside it.
+- SMART: health, wear (percentage used or remaining life), power-on hours
+  and media errors from `smartctl -j -a` when installed and permitted.
+
+The profile is signed with the node key (`"pumasi/perf/node/v1\0" ||
+postcard(profile)`) and sent as `FromAgent::Perf`; the control plane keeps
+it on the member. The round-trip time of each node's selected iroh path,
+and whether it is relayed, is read on every heartbeat. `pumasi status`
+shows score, disk class and RTT; `pumasi node <id>` the whole profile.
+
+A profile is only a claim, so the control plane times it: when an untrusted
+node's profile arrives (or its WASM runs go much slower than its score
+says) and the node is idle, it sends `ToAgent::Benchmark { nonce, seed,
+iters }` with iterations sized for half a second at the claimed
+single-thread score, and no tasks are placed there meanwhile. The agent
+runs the kernel and answers with the result; the control plane takes the
+elapsed time minus the RTT, recomputes the answer natively
+(`perf::kernel_native`) and records `PerfCheck { claimed, measured,
+correct, attempts }`. Billing then uses the profile's score capped at
+1.25 × the best timing of that claim; a wrong answer bills at the minimum
+and counts as a strike. A claim more than twice the timed score is timed
+again (at least 5 s later, in case the machine was just busy with its
+owner's work) and struck if it still is. Until a node has
+been timed, a profile above the reference is billed at 1000. A node with
+no profile (older agent or benchmarks off) is billed at 1000. Owner nodes
+are trusted and billed at their own score.
 
 ### Result checks
 
@@ -599,8 +683,8 @@ name, policy, layout version), `members`, `tokens`, `jobs` (metadata),
 `tasks` keyed by `(job, index)` so a completion rewrites only that task
 (including its output files and check record), `modules` keyed by hash,
 which holds both WASM modules and input file bundles, `accounts`, `ledger`
-keyed by sequence number, and `holds` and `receipts` keyed by run
-`(job, index, attempt, check)`.
+keyed by sequence number, `holds` and `receipts` keyed by run
+`(job, index, attempt, check)`, and `carry` keyed by (consumer, provider).
 
 Postcard is not self-describing, so `meta.schema` versions the record
 layout, and older layouts are migrated in place on first open. A phase 1
@@ -610,10 +694,25 @@ belong to `owner` and are not deterministic. Layout 3 (phase 3) adds
 `Executor::Microvm` was appended to the enum, so older records decode
 unchanged. Phase 4 adds no new record layout: the rollout lives under the
 new `meta.rollout` key and uploaded binaries are files in
-`<cluster dir>/releases/`. Phase 6 adds none either. `PROTOCOL_VERSION`
-is 6: protocol 5 (phase 4) added `UpgradeHello` and the upgrade messages,
-protocol 6 appends `AgentHello::availability` and
-`FromAgent::Availability`. The control plane accepts hellos from
+`<cluster dir>/releases/`. Phase 6 adds none either.
+
+Layout 4 (phase 7) moves the ledger from credits to milli-CU at the price
+the cluster charged for a Docker core-hour (`docker_cpu_hour`, 0.05 credits
+by default, so one credit becomes 20 CU). Balances and held amounts are
+converted with largest-remainder rounding so the total stays exact, open
+holds keep their release time, the credit ledger and receipts are kept in
+`credit_ledger` and `credit_receipts`, and the old rate is in
+`meta.credit_cpu_hour`. The converted ledger starts with one `Convert`
+entry per account with a balance, and task costs are converted too. Members gain the profile and the last benchmark check. On the
+next start the control plane re-countersigns each credit receipt as a CU
+receipt at score 1000 (the node signature still holds because `Usage` is
+unchanged) and marks it done in `meta.credit_receipts_converted`.
+
+`PROTOCOL_VERSION` is 7: protocol 5 (phase 4) added `UpgradeHello` and the
+upgrade messages, protocol 6 appends `AgentHello::availability` and
+`FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
+`BenchResult` and `ToAgent::Benchmark` and `Rebenchmark`, which the control
+plane sends only to agents of protocol 7 or later. The hello is unchanged. The control plane accepts hellos from
 `MIN_AGENT_PROTOCOL` (5) up: `AgentHello::decode` tries the current layout
 and falls back to the protocol 5 one (available), so phase 4 and 5 agents
 keep working and can take a rollout. Upgrade the control plane first; it
@@ -622,10 +721,10 @@ remotely; install a current binary on them once.
 
 ## Not yet
 
-- Remaining roadmap phases (7 to 17): benchmarks and compute units (CU),
-  a cluster file store, GPUs, cluster management, monitoring, a web
-  dashboard, Raft, WebGPU, the confidential tier, the hub, buying CU. See
-  the roadmap in the README.
+- Remaining roadmap phases (8 to 18): a cluster file store, GPUs, cluster
+  management, monitoring, a web dashboard, Raft, WebGPU, the confidential
+  tier, self-hosting 1.0 (SSO, audit log, external security review), the
+  hub, buying CU. See the roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node
@@ -633,10 +732,12 @@ remotely; install a current binary on them once.
 - High availability: one control plane; Raft (openraft) planned.
 - Accounts other than `owner` exist only as ledger entries; consumer
   tickets that let other people submit (and see only their jobs) are next.
-- Credits are not connected to a payment provider, and there is no
-  platform fee.
-- Benchmarks at join and "honeypot" tasks with known answers (needed for
-  non-deterministic Docker and microVM work, which checks cannot cover).
+- CU cannot be bought or exchanged, and there is no platform fee; both
+  belong to the hub.
+- "Honeypot" tasks with known answers (needed for non-deterministic Docker
+  and microVM work, which checks cannot cover). The CPU benchmark
+  challenge keeps the billed speed honest, not the results. Disk and
+  memory figures are not challenged yet, and no scheduling uses them.
 - MicroVM: private registries, network (a tap device with egress rules),
   GPU passthrough (VFIO), a snapshot pool for faster boots.
 - Availability: running tasks are not stopped when a node pauses, and

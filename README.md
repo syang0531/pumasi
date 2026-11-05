@@ -11,13 +11,14 @@ binary, the same on Linux, macOS and Windows, x86_64 and ARM64.
 
 Pumasi grows in phases: a private cluster tool that is useful on its own
 (phase 1), then other people's machines joining by invite, with signed
-usage receipts, a prepaid credit ledger and spot checks of their results
+usage receipts, a prepaid ledger and spot checks of their results
 (phase 2), then a microVM executor that runs container images on those
 machines with VM isolation (phase 3), then release binaries, OS services
 and signed cluster-wide upgrades (phase 4), then Windows as a first-class
-host for all three executors (phase 5, this release), and later old Macs,
-storage, GPUs, cluster management, monitoring, a dashboard and a
-marketplace. See [docs/architecture.md](docs/architecture.md)
+host for all three executors (phase 5), old Intel Macs and availability
+policies (phase 6), then benchmarks and compute units (phase 7, this
+release), and later storage, GPUs, cluster management, monitoring, a
+dashboard and a marketplace. See [docs/architecture.md](docs/architecture.md)
 and the roadmap below.
 
 ## Install
@@ -224,28 +225,29 @@ LaunchDaemon sees it) and from terminals and desktop sessions on Linux; on
 Windows the agent must run in the user's session to see input (as a
 service it reports that it cannot tell, and stays paused).
 
-### Other people's machines: invites, credit and checks
+### Other people's machines: invites, compute units and checks
 
 A friend can lend their PC to your cluster. Invite it for their account:
 
 ```sh
 pumasi invite bob                  # prints `pumasi agent join pumasijoin...` for bob to run
-pumasi credit add owner 100        # prepaid credit for runs on other people's machines
+pumasi cu add owner 100            # 100 CU for runs on other people's machines
 pumasi run examples/montecarlo/job.toml
 ```
 
 - Bob's machine joins as a **provider**: it runs WASM tasks, and microVM
   tasks if bob started his agent with `--allow-microvm` (Docker only if you
   invited it with `--allow-docker` *and* bob started his agent with
-  `--allow-docker`), and only for jobs whose account has credit.
+  `--allow-docker`), and only for jobs whose account has CU.
 - Your own machines are used first and cost nothing; work overflows to
-  providers. Each provider run is priced from the fixed price list
-  (`pumasi prices`) and charged to the job's account. The provider's
-  earning is **held** (default 1 hour), then becomes available.
+  providers. Each provider run is priced in **compute units** (below) and
+  charged to the job's account. The provider's earning is **held**
+  (default 1 hour), then becomes available.
 - Every run produces a **usage receipt** (fuel, wall time, memory,
-  executor, a hash of the result) signed by the node and countersigned by
-  the control plane. `pumasi receipts <JOB> --export r.json` exports them;
-  `pumasi verify-receipts r.json` checks the signatures offline.
+  executor, a hash of the result, the CPU score and CU it was billed at)
+  signed by the node and countersigned by the control plane. `pumasi
+  receipts <JOB> --export r.json` exports them; `pumasi verify-receipts
+  r.json` checks the signatures offline.
 - WASM jobs run in **deterministic mode** by default (virtual clock, seeded
   random numbers), so every honest node computes the same result. A sample
   of provider-run tasks (10%; 50% for new providers; all of them after a
@@ -255,23 +257,88 @@ pumasi run examples/montecarlo/job.toml
   wins, it replaces the provider's.
 
 ```
-$ pumasi job a21f288f39011a2d
-job a21f288f39011a2d "estimate-pi": succeeded
-  executor wasm
-  account owner  cost 0.0375 credits  deterministic
-  tasks 16  succeeded 16  failed 0  fuel 6000109645
-  [0] ok node=a8020286f9 attempts=1 46ms
-  [1] ok node=46e7353324 attempts=1 66ms cost=0.00375
-  [2] ok node=46e7353324 attempts=1 42ms cost=0.00375 check=passed
+$ pumasi job 7c1e04b2d9a8f310
+job 7c1e04b2d9a8f310 "render-frames": succeeded
+  executor microvm (python:3.12-slim)
+  account owner  cost 0.81 CU
+  tasks 8  succeeded 8  failed 0
+  [0] ok node=a8020286f9 attempts=1 270114ms
+  [1] ok node=46e7353324 attempts=1 268420ms cost=0.135
 ...
-$ pumasi credit list
-ACCOUNT               AVAILABLE           HELD          SPENT         EARNED
-bob                      0.0375              0              0         0.0375
-owner                   99.9625              0         0.0375              0
+$ pumasi cu list
+ACCOUNT            AVAILABLE CU           HELD          SPENT         EARNED
+bob                        0.81              0              0           0.81
+owner                     99.19              0           0.81              0
 ```
 
-Credits are bookkeeping only: no money moves. `pumasi credit payout bob 10`
-records that you settled with bob outside Pumasi.
+CU are bookkeeping only: the engine knows no money. `pumasi cu payout bob
+10` records that 10 CU left the cluster's books (you settled with bob
+outside Pumasi).
+
+### Compute units and benchmarks
+
+**1 CU is one reference vCPU for one hour.** The reference vCPU has CPU
+score 1000 (one hardware thread of a 2.5 GHz Skylake-class server core).
+Other resources have their own rates, which `pumasi prices set` changes:
+
+| Resource | Default rate |
+| --- | --- |
+| CPU (Docker, microVM) | 1 CU per vCPU-hour at score 1000 |
+| WASM | 1 CU per hour of reference time its fuel stands for |
+| Memory | 0.25 CU per GiB-hour reserved |
+| Storage (cluster file store) | 0.5 CU per GiB-month |
+| Egress | 0.1 CU per GiB |
+
+So 1 vCPU with 2 GiB for an hour is 1.5 CU, with 4 GiB 2 CU. Ledger
+amounts are whole milli-CU; what a run costs below a milli-CU carries over
+to the next run between the same two accounts, so many short runs add up
+exactly.
+
+Every agent **benchmarks** its machine when it starts (if its saved
+profile is stale) and again every day while idle (`--bench-interval`,
+`--no-benchmark`), and sends the result signed with its node key:
+
+- **CPU**: a fixed integer kernel in the same WASM sandbox tasks run in,
+  on one thread and on every offered CPU at once, as a score.
+- **Memory**: copy bandwidth.
+- **Disk** (under the agent's directory), fio-style with the page cache
+  bypassed: sequential read and write, 4 KiB random reads one at a time
+  (latency) and eight at a time (IOPS). Seek latency and speed tell a
+  spinning disk (`hdd`), a SATA SSD (`ssd`) and `nvme` apart.
+- **SMART** health, wear (share of rated endurance used), power-on hours
+  and media errors, when `smartctl` is installed.
+- **Latency**: the control plane measures the round trip on each node's
+  connection itself (direct or through a relay).
+
+CPU time is billed for **wall time x score / 1000**, so a job costs about
+the same on a slow machine that takes longer as on a fast one, and WASM by
+fuel, which is the same everywhere. A provider cannot simply claim a
+faster CPU: until the control plane has timed it, it is billed at no more
+than 1000; then the control plane sends it a fresh seed for the benchmark
+kernel when it is idle, times the answer and recomputes it. The provider
+is billed at no more than 1.25 times what the cluster timed, and a claim
+over twice that (or a wrong answer) is a strike. Claiming shorter runs to
+look fast does not pay either: the bill is time x score.
+
+```
+$ pumasi bench
+cpu      Intel(R) Core(TM) i5-4250U CPU @ 1.30GHz (4 threads)
+         score 811 single-thread, 2035 all threads, 508 per vCPU (reference vCPU = 1000)
+memory   4.0 GiB, copy 9120 MB/s
+disk     ssd (the OS says ssd)
+         sequential 512 MB/s read, 431 MB/s write; 4 KiB random read 96 us median, 180 us p99, 31150 IOPS (8 in flight)
+smart    APPLE SSD SM0128F, health ok, 7% of endurance used, 21530 h powered on, 0 media errors
+```
+
+`pumasi status` shows each node's billed score, disk class and latency;
+`pumasi node <ID>` the whole profile and what the cluster's timing found,
+and `pumasi node <ID> --rebenchmark` asks it to measure again.
+
+**Mutual mode (품앗이).** For a group pooling machines without money:
+`pumasi prices set --ledger mutual --credit-limit 20`. Nobody grants CU;
+lending your machine earns them, using others' machines spends them, and
+an account may go down to minus the credit limit. The balances always add
+up to zero.
 
 ### Run the agent as a service
 
@@ -343,10 +410,12 @@ back.
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
 | `pumasi run job.toml [--account A] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
-| `pumasi status` | Nodes (role, online, executors, slots, running, checks) and recent jobs with their cost. |
+| `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency) and recent jobs with their cost in CU. |
+| `pumasi node <ID> [--rebenchmark]` | One node's benchmark profile, billed score, latency and checks; `--rebenchmark` asks it to measure again. |
+| `pumasi bench [--quick] [--json] [--dir DIR]` | Benchmark this machine the way the agent does and print the profile. |
 | `pumasi job <ID> [--output] [--out DIR]` | Per-task state, node, attempts, time, cost and check result; stdout/stderr with `--output`; downloads output files with `--out`. |
-| `pumasi credit list \| add <ACCOUNT> <AMOUNT> \| payout <ACCOUNT> <AMOUNT> \| ledger [--account A]` | Balances (available, held, spent, earned), prepaid deposits, payouts, and the ledger. |
-| `pumasi prices [set --wasm-per-gfuel X --docker-cpu-hour X --microvm-cpu-hour X --memory-gib-hour X --hold 1h --verify-rate 10% --max-strikes 3]` | Show or change the price list and settlement policy. |
+| `pumasi cu list \| add <ACCOUNT> <CU> \| payout <ACCOUNT> <CU> \| ledger [--account A]` | Balances in CU (available, held, spent, earned), grants, payouts, and the ledger (`pumasi credit` still works). |
+| `pumasi prices [set --memory-gib-hour X --storage-gib-month X --egress-gib X --ledger prepaid\|mutual --credit-limit CU --hold 1h --verify-rate 10% --max-strikes 3]` | Show or change the CU rates, the ledger mode and the settlement policy. |
 | `pumasi receipts <ID> [--export FILE]` | A job's signed usage receipts. |
 | `pumasi verify-receipts FILE [--cluster ID]` | Check exported receipts offline. |
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
@@ -494,8 +563,12 @@ checked.
   timeout) are reported, not retried.
 - **Receipts and settlement**: the agent signs each run's usage with its
   node key; the control plane checks it against the result it received,
-  caps the wall time at what it observed itself, prices it, countersigns it
-  and stores it next to the ledger entries it caused, in one transaction.
+  caps the wall time at what it observed itself, prices it in CU at the
+  node's billed CPU score, countersigns it and stores it next to the ledger
+  entries it caused, in one transaction.
+- **Benchmarks**: agents send a performance profile signed with their node
+  key; the control plane times providers' CPU benchmark itself with a
+  seeded challenge before trusting a score above the reference.
 
 ## Security model
 
@@ -537,6 +610,11 @@ checked.
 
 ## Roadmap
 
+Phases 1 to 15 are enough to run Pumasi on your own machines, alone or as
+an organization (phase 13 covers the essentials). Phase 16 finishes what an
+organization needs to adopt it, and phases 17 and 18 are only for trading
+with other clusters.
+
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 1 | Private cluster: agent, control plane, iroh networking, WASM and Docker executors, file input/output, CLI | done |
@@ -544,8 +622,8 @@ checked.
 | 3 | microVM executor: same OCI images as docker jobs in Firecracker or QEMU VMs, behind the same job format, open to providers | done |
 | 4 | Distribution and install: release binaries for six platforms with SHA256SUMS, install scripts, OS services, signed cluster-driven upgrades with rollback | done |
 | 5 | Windows: Docker Desktop (WSL 2), microVMs with QEMU + WHPX (TCG fallback), pinned QEMU install, Job Objects, built-in ext4 formatter and guest init | done |
-| 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours, CPU cap, memory-aware slots) | this release |
-| 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | planned |
+| 6 | Old Intel Macs (macOS 10.15+), Virtualization.framework microVMs, availability policy (on AC power, idle, hours, CPU cap, memory-aware slots) | done |
+| 7 | Benchmarks and compute units (CU): signed node performance profiles (CPU, memory bandwidth, disk class and speed with fio, SMART wear, latency), 1 CU = one reference vCPU for one hour with per-resource CU rates, ledger in integer milli-CU, group-local ledger for money-free pooling | this release |
 | 8 | Cluster file store (iroh-blobs): datasets, large inputs and outputs, resumable transfers, storage billed in CU, private registry images | planned |
 | 9 | GPUs and microVM devices: detection, GPU benchmarks in CU, scheduling, Docker GPU jobs, VFIO passthrough, microVM networking | planned |
 | 10 | Cluster management: labels and selectors, drain, priorities, quotas, role tickets, `apply` | planned |
@@ -554,12 +632,16 @@ checked.
 | 13 | Control plane high availability (Raft) | planned |
 | 14 | WebGPU executor (experimental) | planned |
 | 15 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
-| 16 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
-| 17 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
+| 16 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model, cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag | planned |
+| 17 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
+| 18 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
 Known gaps: single control plane (no Raft yet), no web console, accounts
 exist only inside one cluster and only the admin can submit (with
-`--account`), credits are not connected to real payments, input and output
+`--account`), CU are not connected to real payments, GPUs have no CU rate
+until phase 9 and storage and egress are not metered until phase 8,
+node-to-node latency and bandwidth are not measured yet (only each node's
+round trip to the control plane), input and output
 files are size-capped (48 MiB in, 32 MiB out per task) because they travel
 through the control plane. MicroVMs pull only public images, have no
 network and no GPUs yet, and need KVM (Linux), Virtualization.framework
@@ -589,8 +671,10 @@ and agents on localhost and cover sharded jobs, node failure and rescheduling,
 ticket rejection and reuse, reconnect without a ticket, cancellation, fuel
 limits, bad admin credentials, restarting the control plane, docker jobs
 with input/output files (skipped when no Linux Docker daemon is available),
-an invited provider paid from prepaid credit with verifiable receipts, a
-dishonest provider caught by check runs, refunded and suspended, microVM
+an invited provider paid in CU with verifiable receipts, a dishonest
+provider caught by check runs, refunded and suspended, signed benchmark
+profiles and a provider with an inflated CPU score caught by the
+cluster's timing, mutual-mode lending and borrowing that adds up to zero, microVM
 jobs on an invited provider, and an agent upgrade rollout (opt-in, forged
 signature and tampered binary refused). The microVM test runs when `PUMASI_TEST_VM_DIR`
 points at a directory prepared with `pumasi vm setup` (CI does this on Linux

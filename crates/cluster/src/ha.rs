@@ -49,7 +49,10 @@ use openraft::{
     AnyError, ChangeMembers, Config, Entry, EntryPayload, LogId, LogState, Raft, RaftLogReader,
     RaftMetrics, RaftNetwork, RaftNetworkFactory, RaftSnapshotBuilder, ServerState, Snapshot,
     SnapshotMeta, SnapshotPolicy, StorageError, StorageIOError, StoredMembership, Vote,
-    error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable},
+    error::{
+        ChangeMembershipError, ClientWriteError, InstallSnapshotError, NetworkError, RPCError,
+        RaftError, RemoteError, Unreachable,
+    },
     network::RPCOption,
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
@@ -1045,19 +1048,39 @@ impl Ha {
         let mut ids = BTreeSet::new();
         ids.insert(id);
         if voters.contains(&id) {
-            self.raft
-                .change_membership(ChangeMembers::RemoveVoters(ids.clone()), false)
+            self.change_membership(ChangeMembers::RemoveVoters(ids.clone()))
                 .await
                 .map_err(|e| anyhow::anyhow!("remove {name}: {e}"))?;
         }
         if self.members().iter().any(|(m, _)| *m == id) {
-            self.raft
-                .change_membership(ChangeMembers::RemoveNodes(ids), false)
+            self.change_membership(ChangeMembers::RemoveNodes(ids))
                 .await
                 .map_err(|e| anyhow::anyhow!("remove {name}: {e}"))?;
         }
         info!(replica = %name, "removed a control plane replica");
         Ok(())
+    }
+
+    /// One membership change. Raft takes one at a time, and another (a
+    /// replica that just joined becoming a voter) may still be committing:
+    /// wait for it rather than fail.
+    async fn change_membership(
+        &self,
+        change: ChangeMembers<NodeId, Replica>,
+    ) -> std::result::Result<(), RaftError<NodeId, ClientWriteError<NodeId, Replica>>> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.raft.change_membership(change.clone(), false).await {
+                Ok(_) => return Ok(()),
+                Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                    ChangeMembershipError::InProgress(e),
+                ))) if Instant::now() < deadline => {
+                    debug!("waiting for a membership change to finish: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Serves another replica's connection on [`RAFT_ALPN`]. `tags` lists

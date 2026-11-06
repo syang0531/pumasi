@@ -644,6 +644,16 @@ fn smart(device: Option<&str>) -> std::result::Result<SmartInfo, String> {
 // The whole profile
 // ---------------------------------------------------------------------------
 
+/// The CPU scores `inflate` times too high (for testing the checks that
+/// catch it).
+fn inflated(mut cpu: CpuPerf, inflate: u32) -> CpuPerf {
+    if inflate > 1 {
+        cpu.single = cpu.single.saturating_mul(inflate);
+        cpu.multi = cpu.multi.saturating_mul(inflate);
+    }
+    cpu
+}
+
 /// Measures this machine. Blocking; takes about `cpu * 2.4 + disk * 4` plus
 /// the memory test.
 pub fn measure(
@@ -653,11 +663,7 @@ pub fn measure(
     threads: u32,
 ) -> Result<PerfProfile> {
     let mut notes = Vec::new();
-    let mut cpu = cpu(kernel, threads, config.cpu)?;
-    if config.inflate > 1 {
-        cpu.single = cpu.single.saturating_mul(config.inflate);
-        cpu.multi = cpu.multi.saturating_mul(config.inflate);
-    }
+    let cpu = inflated(cpu(kernel, threads, config.cpu)?, config.inflate);
     let memory = memory(
         config.memory_bytes,
         config.cpu.min(Duration::from_millis(400)),
@@ -866,18 +872,15 @@ mod tests {
             ),
             None
         );
-        // An inflated benchmark reports the multiple.
-        let inflated = BenchConfig {
-            inflate: 10,
-            ..config
-        };
-        let q = measure(&inflated, &k, &key, 1).unwrap();
-        assert!(
-            q.cpu.single > p.cpu.single * 3,
-            "{} vs {}",
-            q.cpu.single,
-            p.cpu.single
+        // An inflated benchmark reports the multiple. Exactly, not against
+        // a second timing: a throttled CI machine can run that one several
+        // times slower.
+        let x10 = inflated(p.cpu.clone(), 10);
+        assert_eq!(
+            (x10.single, x10.multi),
+            (p.cpu.single * 10, p.cpu.multi * 10)
         );
+        assert_eq!(inflated(p.cpu.clone(), 1), p.cpu);
     }
 
     #[test]

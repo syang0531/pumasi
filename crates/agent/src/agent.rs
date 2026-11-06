@@ -173,6 +173,13 @@ pub struct Agent {
     config: AgentConfig,
     info: NodeInfo,
     upgrader: Option<Arc<Upgrader>>,
+    /// Upgrades run one at a time, also across sessions: a download that
+    /// outlives its connection finishes installing before another starts.
+    upgrade_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The version of a binary installed but not yet running. Set by the
+    /// upgrade task, so the process restarts into it even when the session
+    /// that asked for it has ended meanwhile.
+    installed: watch::Sender<Option<String>>,
     /// What the availability policy says now, kept current by a
     /// background check.
     available: watch::Receiver<Availability>,
@@ -211,6 +218,14 @@ enum SessionEnd {
     NotLeader(Option<EndpointAddr>),
     /// Installed a new binary; the process must restart.
     Upgraded(String),
+}
+
+/// How an upgrade that did not install ended.
+enum UpgradeEnd {
+    /// Refused or broken: recorded, and reported to the cluster.
+    Failed(String),
+    /// The connection it downloaded over dropped.
+    Interrupted,
 }
 
 /// Adds control plane replicas a replica told us about to the addresses
@@ -456,6 +471,8 @@ impl Agent {
             config,
             info,
             upgrader,
+            upgrade_lock: Default::default(),
+            installed: watch::channel(None).0,
             available,
             kernel,
             perf: Arc::new(Mutex::new(perf)),
@@ -596,7 +613,11 @@ impl Agent {
             Ok(AgentExit::RolledBack { reason })
         };
         let mut backoff = Duration::from_millis(500);
+        let mut installed = self.installed.subscribe();
         loop {
+            if let Some(version) = installed.borrow_and_update().clone() {
+                return Ok(AgentExit::Upgraded { version });
+            }
             let (target, count) = {
                 let c = candidates.lock().unwrap();
                 let t = hint.take().unwrap_or_else(|| c[next % c.len()].clone());
@@ -658,7 +679,11 @@ impl Agent {
                     }
                 }
             }
-            tokio::time::sleep(backoff).await;
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                // A binary installed while we were disconnected.
+                _ = installed.changed() => {}
+            }
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
@@ -921,38 +946,39 @@ impl Agent {
             })
         };
 
-        // An upgrade in progress reports here when it is done.
-        let (up_tx, mut up_rx) = mpsc::unbounded_channel::<([u8; 32], Result<String>)>();
+        // An upgrade in progress reports a failure here; a success shows
+        // in `installed`.
+        let (up_tx, mut up_rx) = mpsc::unbounded_channel::<([u8; 32], UpgradeEnd)>();
         let mut upgrading = false;
+        let mut installed = self.installed.subscribe();
+        // Look once at what is there already: an upgrade may have finished
+        // since the reconnect loop checked.
+        installed.mark_changed();
 
         // Reader: handle assignments and cancellations.
         let end = loop {
             let msg = tokio::select! {
                 m = read_msg::<_, ToAgent>(&mut recv) => m,
-                Some((sha, res)) = up_rx.recv() => {
-                    upgrading = false;
-                    match res {
-                        Ok(version) => {
-                            heartbeat.abort();
-                            metrics.abort();
-                            availability.abort();
-                            if let Some(b) = &benchmarks {
-                                b.abort();
-                            }
-                            writer.abort();
-                            conn.close(0u32.into(), b"upgrading");
-                            return SessionEnd::Upgraded(version);
-                        }
-                        Err(e) => {
-                            let reason = format!("{e:#}");
-                            warn!("upgrade failed: {reason}");
-                            if let Some(up) = &self.upgrader {
-                                up.record_failure(&sha, &reason);
-                            }
-                            let _ = out_tx.send(FromAgent::UpgradeFailed { sha256: sha, reason });
-                            continue;
-                        }
+                Ok(()) = installed.changed() => {
+                    let Some(version) = installed.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    heartbeat.abort();
+                    metrics.abort();
+                    availability.abort();
+                    if let Some(b) = &benchmarks {
+                        b.abort();
                     }
+                    writer.abort();
+                    conn.close(0u32.into(), b"upgrading");
+                    return SessionEnd::Upgraded(version);
+                }
+                Some((sha, end)) = up_rx.recv() => {
+                    upgrading = false;
+                    if let UpgradeEnd::Failed(reason) = end {
+                        let _ = out_tx.send(FromAgent::UpgradeFailed { sha256: sha, reason });
+                    }
+                    continue;
                 }
             };
             match msg {
@@ -983,19 +1009,48 @@ impl Agent {
                     let conn = conn.clone();
                     let running = running.clone();
                     let up_tx = up_tx.clone();
+                    let lock = self.upgrade_lock.clone();
+                    let installed = self.installed.clone();
                     let cluster_key = *cluster.id.as_bytes();
                     info!(version = %release.file().version, "cluster offered an agent upgrade");
                     tokio::spawn(async move {
-                        let res = async {
-                            let staged = up.fetch(&conn, *release, &cluster_key, role).await?;
-                            // Tasks placed before the offer finish first.
-                            while !running.lock().unwrap().is_empty() {
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                            }
-                            up.install(staged).await
+                        // An upgrade from an earlier session may still be
+                        // installing; if it succeeds the process restarts
+                        // before this one starts.
+                        let _one_at_a_time = lock.lock().await;
+                        if installed.borrow().is_some() {
+                            return;
                         }
-                        .await;
-                        let _ = up_tx.send((sha, res));
+                        let end = match up.fetch(&conn, *release, &cluster_key, role).await {
+                            // The connection went away mid-download: the
+                            // cluster offers the release again on the
+                            // next session, so this is no failure of it.
+                            Err(e) if conn.close_reason().is_some() => {
+                                debug!("upgrade download interrupted: {e:#}");
+                                UpgradeEnd::Interrupted
+                            }
+                            Err(e) => UpgradeEnd::Failed(format!("{e:#}")),
+                            Ok(staged) => {
+                                // Tasks placed before the offer finish first.
+                                while !running.lock().unwrap().is_empty() {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                                match up.install(staged).await {
+                                    Ok(version) => {
+                                        // Seen by the session, or by the
+                                        // reconnect loop if it has ended.
+                                        installed.send_replace(Some(version));
+                                        return;
+                                    }
+                                    Err(e) => UpgradeEnd::Failed(format!("{e:#}")),
+                                }
+                            }
+                        };
+                        if let UpgradeEnd::Failed(reason) = &end {
+                            warn!("upgrade failed: {reason}");
+                            up.record_failure(&sha, reason);
+                        }
+                        let _ = up_tx.send((sha, end));
                     });
                 }
                 Ok(Some(ToAgent::Assign(mut a))) => {

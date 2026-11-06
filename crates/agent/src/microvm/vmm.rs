@@ -229,14 +229,19 @@ impl Vmm {
             tee_machine(&mut cmd, t, spec.mem_mib);
         } else if pci {
             cmd.args(["-M", if x86 { "q35" } else { "virt" }]);
-        } else if x86 && self.accelerated && cfg!(target_os = "linux") {
-            // KVM's in-kernel 8259 is never programmed by this kernel (no
-            // legacy PIC in its ACPI tables), so the PIT's first tick
-            // arrives as vector 0 and panics the boot as a divide error.
-            // The local APIC timer and kvm-clock are all it needs.
-            cmd.args(["-M", "microvm,pic=off,pit=off"]);
-        } else if x86 {
+        } else if x86 && cfg!(target_os = "macos") && self.accelerated {
+            // HVF: no kvm-clock and no fixed TSC rate on the command line,
+            // so the guest calibrates its TSC against the PIT.
             cmd.args(["-M", "microvm"]);
+        } else if x86 {
+            // The 8259 is never programmed by this kernel (no legacy PIC in
+            // its ACPI tables), so a PIT tick that gets through arrives as
+            // vector 0: a divide error that panics the boot, or kills
+            // whatever runs then. Whether it gets through depends on timing,
+            // which made TCG and WHPX boots fail on some machines only, as
+            // with KVM's in-kernel one. The local APIC timer, with kvm-clock
+            // or the fixed TSC rate below, is all the guest needs.
+            cmd.args(["-M", "microvm,pic=off,pit=off"]);
         } else {
             cmd.args(["-M", "virt"]);
         }
@@ -527,6 +532,10 @@ mod tests {
         assert!(joined.contains("-smp 2"));
         assert!(!joined.contains("-accel kvm"));
         assert!(!joined.contains("-netdev"), "no network by default");
+        if cfg!(target_arch = "x86_64") {
+            // No legacy timer whose ticks would arrive as vector 0.
+            assert!(joined.contains("-M microvm,pic=off,pit=off"), "{joined}");
+        }
 
         let net = VmSpec {
             net: Some("127.0.0.1:4567".parse().unwrap()),

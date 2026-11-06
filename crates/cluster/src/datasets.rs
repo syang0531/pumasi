@@ -152,7 +152,13 @@ pub enum StoreCmd {
         job: JobId,
         arch: String,
         reference: String,
+        /// A confidential job's key: the image is sealed with it (phase
+        /// 16) and kept only sealed.
+        seal: Option<[u8; 32]>,
     },
+    /// Build and seal a confidential task's input, then call
+    /// [`State::on_input_sealed`].
+    SealInput(Box<crate::confidential::SealInputJob>),
     /// Combine the tasks' stored outputs into one collection, then call
     /// [`State::on_job_output`].
     FinishJob {
@@ -433,7 +439,10 @@ impl State {
             && let Some(d) = &sub.docker
             && let Ok(image) = ImageRef::parse(&d.image)
         {
-            ext.private_image = self.registry_credentials().contains_key(&image.registry);
+            // A confidential job's image is always pulled here: the nodes
+            // get it only sealed.
+            ext.private_image = sub.tier == pumasi_proto::job::Tier::Confidential
+                || self.registry_credentials().contains_key(&image.registry);
         }
         if let Some(name) = &ext.output_dataset {
             validate_dataset_name(name)?;
@@ -485,6 +494,11 @@ impl State {
     /// Asks for a job's private image on every architecture among the
     /// nodes that could run it. Returns the architectures it is ready on.
     pub(crate) fn want_images(&mut self, id: JobId) -> Vec<(String, ImageBlob)> {
+        let seal = self
+            .jobs
+            .get(&id)
+            .is_some_and(|j| j.meta.tier == pumasi_proto::job::Tier::Confidential)
+            .then(|| self.job_key(id));
         let Some(job) = self.jobs.get_mut(&id) else {
             return vec![];
         };
@@ -492,14 +506,20 @@ impl State {
         let Some(reference) = job.meta.docker.as_ref().map(|d| d.image.clone()) else {
             return vec![];
         };
-        let archs: HashSet<String> = self
-            .nodes
-            .values()
-            .filter(|n| {
-                n.online && n.perf.protocol >= STORE_PROTOCOL && n.executors.contains(&executor)
-            })
-            .map(|n| oci_arch_of(&n.info.arch))
-            .collect();
+        // Confidential VMs run on amd64 hosts only (SEV-SNP, TDX).
+        let archs: HashSet<String> = if seal.is_some() {
+            HashSet::from(["amd64".to_string()])
+        } else {
+            self.nodes
+                .values()
+                .filter(|n| {
+                    n.online
+                        && n.perf.protocol >= STORE_PROTOCOL
+                        && n.executors.contains(&executor)
+                })
+                .map(|n| oci_arch_of(&n.info.arch))
+                .collect()
+        };
         for arch in archs {
             if !job.meta.ext.images.contains_key(&arch) {
                 job.meta
@@ -512,6 +532,7 @@ impl State {
                         job: id,
                         arch,
                         reference: reference.clone(),
+                        seal,
                     });
                 }
             }
@@ -685,6 +706,7 @@ impl State {
         self.files.finishing.remove(&id);
         self.store_cmd(StoreCmd::UntagPrefix(files::in_prefix(id.0)));
         self.store_cmd(StoreCmd::UntagPrefix(format!("img/{id}/")));
+        self.conf_job_ended(id);
         if let Some(job) = self.jobs.get_mut(&id) {
             job.meta.ext.finished = Some(finished);
             job.meta.ext.images.clear();

@@ -357,6 +357,8 @@ impl State {
             tolerations: policy.tolerations.clone().unwrap_or_default(),
             gpu_caps: graphics,
             gpu_graphics: graphics,
+            trusted_only: false,
+            confidential: None,
         };
         let usage = self.account_usage();
         let at_quota = !self.within_quota(&need_for(Executor::Wasm, None, false), &usage);

@@ -27,14 +27,14 @@ use pumasi_proto::{
     RAFT_ALPN, Secret, blobs,
     msg::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
-        FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, ToAgent,
+        FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, TaskReport, ToAgent,
     },
     net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key, write_private},
     perf::DiskClass,
     perf::kernel_native,
     release::SignedRelease,
     secrets_eq,
-    store::{BlobHash, MAX_STORE_OUTPUT_BYTES, StoreTarget, format_size},
+    store::{BlobHash, MAX_STORE_OUTPUT_BYTES, StoreTarget, StoredOutput, format_size},
     ticket::{AdminTicket, JoinTicket, ReplicaTicket},
     wire::{read_frame, read_msg, write_msg},
 };
@@ -89,6 +89,9 @@ pub struct ClusterConfig {
     pub metrics_retention: Duration,
     /// How often a follower copies the leader's file store.
     pub mirror_every: Duration,
+    /// Accept the test stand-in for a TEE, so confidential jobs run on
+    /// machines without SEV-SNP or TDX (tests only: nothing is protected).
+    pub insecure_test_tee: bool,
 }
 
 impl ClusterConfig {
@@ -107,6 +110,7 @@ impl ClusterConfig {
             metrics_token: None,
             metrics_retention: Duration::from_secs(7 * 86_400),
             mirror_every: Duration::from_secs(30),
+            insecure_test_tee: false,
         }
     }
 }
@@ -270,6 +274,12 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
         shared.key.clone(),
     )?;
     state.set_metrics_retention(config.metrics_retention);
+    if config.insecure_test_tee {
+        warn!(
+            "--insecure-test-tee: confidential tasks may run without a TEE; nothing they hold is protected"
+        );
+    }
+    state.attach_verifier(Arc::new(crate::attest::Verifier::new(config.insecure_test_tee)?));
     let (stopped, _) = watch::channel(false);
     let prometheus = match config.metrics_addr {
         Some(addr) => {
@@ -1011,9 +1021,21 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     }
                 }
                 Ok(Some(FromAgent::Done(report))) => {
-                    let mut st = inner.state();
-                    st.on_heartbeat(&node_id, generation);
-                    st.on_report(&node_id, generation, *report);
+                    match inner.state().open_info(&report.task) {
+                        Some(info) => {
+                            let inner = inner.clone();
+                            let node_id = node_id.clone();
+                            tokio::spawn(async move {
+                                open_confidential(&inner, &node_id, generation, *report, None, info)
+                                    .await;
+                            });
+                        }
+                        None => {
+                            let mut st = inner.state();
+                            st.on_heartbeat(&node_id, generation);
+                            st.on_report(&node_id, generation, *report);
+                        }
+                    }
                 }
                 Ok(Some(FromAgent::Report { report, stored })) => {
                     // A stored output must be complete in the store and be
@@ -1034,11 +1056,28 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                             Err(e) => Err(format!("stored output: {e:#}")),
                         },
                     };
-                    let mut st = inner.state();
-                    st.on_heartbeat(&node_id, generation);
-                    match verdict {
-                        Ok(()) => st.on_report_stored(&node_id, generation, *report, stored),
-                        Err(why) => st.on_report_rejected(&node_id, generation, report.task, &why),
+                    // A confidential run's result is opened (off the lock)
+                    // before it counts.
+                    let open = inner.state().open_info(&report.task);
+                    match (verdict, open) {
+                        (Ok(()), Some(info)) => {
+                            let inner = inner.clone();
+                            let node_id = node_id.clone();
+                            tokio::spawn(async move {
+                                open_confidential(&inner, &node_id, generation, *report, stored, info)
+                                    .await;
+                            });
+                        }
+                        (verdict, _) => {
+                            let mut st = inner.state();
+                            st.on_heartbeat(&node_id, generation);
+                            match verdict {
+                                Ok(()) => st.on_report_stored(&node_id, generation, *report, stored),
+                                Err(why) => {
+                                    st.on_report_rejected(&node_id, generation, report.task, &why)
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(Some(FromAgent::StoreState { addr, full, added, removed })) => {
@@ -1094,6 +1133,37 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
                     st.on_image(&node_id, generation, task, image, digest);
+                }
+                Ok(Some(FromAgent::Tee(r))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_tee(&node_id, generation, *r);
+                }
+                Ok(Some(FromAgent::Attest { task, evidence })) => {
+                    let begun = {
+                        let mut st = inner.state();
+                        st.on_heartbeat(&node_id, generation);
+                        st.begin_attest(&node_id, generation, task, &evidence)
+                    };
+                    // The checks may fetch from AMD or Intel: off the lock.
+                    let inner = inner.clone();
+                    let node_id = node_id.clone();
+                    tokio::spawn(async move {
+                        let reply = match begun {
+                            Err(why) => {
+                                warn!(node = %node_id, task = %task, "keys refused: {why}");
+                                Err(why)
+                            }
+                            Ok((expected, verifier)) => {
+                                let checked = verifier.check(&evidence, &expected).await;
+                                inner.state().finish_attest(&node_id, task, &evidence, checked)
+                            }
+                        };
+                        let tx = inner.state().nodes.get(&node_id).and_then(|n| n.tx.clone());
+                        if let Some(tx) = tx {
+                            let _ = tx.send(ToAgent::Keys { task, reply });
+                        }
+                    });
                 }
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),
@@ -1241,6 +1311,47 @@ impl ProtocolHandler for AdminHandler {
     }
 }
 
+/// Opens a confidential run's sealed result and hands both the report as
+/// sent (for its receipt) and the opened one to the state. A sealed output
+/// that does not open is the node's doing: a strike, and the run again.
+async fn open_confidential(
+    inner: &Arc<Inner>,
+    node_id: &str,
+    generation: u64,
+    report: TaskReport,
+    stored: Option<StoredOutput>,
+    info: Option<crate::confidential::OpenInfo>,
+) {
+    let task = report.task;
+    let Some(info) = info else {
+        inner.state().on_report_rejected(
+            node_id,
+            generation,
+            task,
+            "the run's key lease is gone (the control plane restarted)",
+        );
+        return;
+    };
+    let tag = if task.check {
+        crate::files::chk_tag(task.job.0, task.index, task.attempt)
+    } else {
+        crate::files::out_tag(task.job.0, task.index)
+    };
+    let opened =
+        crate::confidential::open_output(&inner.files, &info, &report, stored.as_ref(), &tag).await;
+    let mut st = inner.state();
+    st.on_heartbeat(node_id, generation);
+    match opened {
+        Ok(o) => st.on_report_opened(node_id, generation, report, stored, Some(o)),
+        Err(e) => {
+            let why = format!("{e:#}");
+            warn!(node = %node_id, task = %task, "confidential result rejected: {why}");
+            st.strike(node_id, &format!("confidential result: {why}"));
+            st.on_report_rejected(node_id, generation, task, &why);
+        }
+    }
+}
+
 /// Runs the file store worker: tags, image pulls and output datasets, in
 /// the order the state machine asked for them.
 async fn store_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<StoreCmd>) {
@@ -1255,16 +1366,36 @@ async fn store_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<StoreCm
                 job,
                 arch,
                 reference,
+                seal,
             } => {
                 let inner = inner.clone();
                 tokio::spawn(async move {
                     let creds = inner.state().registry_credentials();
                     let owner = format!("{job}/{arch}");
-                    let r = inner
+                    let mut r = inner
                         .files
                         .pull_image(&reference, &arch, &owner, creds)
                         .await;
+                    // A confidential job's image replaces the plain one
+                    // under the same tag, sealed.
+                    if let (Some(key), Ok(plain)) = (seal, &r) {
+                        let tag = crate::files::img_tag(&owner, &plain.digest);
+                        r = crate::confidential::seal_image(&inner.files, plain, &key, &tag)
+                            .await
+                            .context("seal the image");
+                    }
                     inner.state().on_image_ready(job, &arch, r);
+                });
+                Ok(())
+            }
+            StoreCmd::SealInput(req) => {
+                let inner = inner.clone();
+                tokio::spawn(async move {
+                    let (job, index) = (req.job, req.index);
+                    // Under the job's input tags: dropped when it ends.
+                    let tag = format!("{}sealed-{index}", crate::files::in_prefix(job.0));
+                    let r = crate::confidential::seal_input(&inner.files, *req, &tag).await;
+                    inner.state().on_input_sealed(job, index, r);
                 });
                 Ok(())
             }
@@ -1588,6 +1719,21 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
         AdminOp::SetAccountPolicy { account, policy } => {
             inner.state().set_account_policy(&account, *policy)?;
             Ok(AdminResponse::Ok)
+        }
+        AdminOp::Confidential => Ok(AdminResponse::Confidential(Box::new(
+            inner.state().confidential_view(),
+        ))),
+        AdminOp::TrustMeasurement { id, trusted, note } => {
+            inner.state().trust_measurement(&id, trusted, &note)?;
+            Ok(AdminResponse::Confidential(Box::new(
+                inner.state().confidential_view(),
+            )))
+        }
+        AdminOp::TrustNode { node, trusted } => {
+            inner.state().trust_node(&node, trusted)?;
+            Ok(AdminResponse::Confidential(Box::new(
+                inner.state().confidential_view(),
+            )))
         }
         AdminOp::CreateAccess {
             name,

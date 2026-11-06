@@ -5,6 +5,7 @@
 //! exchange, the admin API, and the tickets used to join a cluster.
 
 pub mod blobs;
+pub mod confidential;
 pub mod economy;
 pub mod gpu;
 pub mod ha;
@@ -19,6 +20,7 @@ pub mod registry;
 pub mod release;
 pub mod store;
 pub mod ticket;
+pub mod vmdisk;
 pub mod webgpu;
 pub mod wire;
 
@@ -53,11 +55,17 @@ pub const WEBGPU_PROTOCOL: u32 = 12;
 /// ([`msg::FromAgent::Image`]), and runs GPU tasks with driver
 /// capabilities.
 pub const REMOTE_PROTOCOL: u32 = 13;
+/// The first agent protocol with confidential VMs (phase 16): it reports
+/// the TEEs it can start ([`msg::FromAgent::Tee`]), runs confidential
+/// tasks ([`msg::TaskAssignment::confidential`]) and passes their
+/// attestation to the control plane ([`msg::FromAgent::Attest`],
+/// [`msg::ToAgent::Keys`]).
+pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        13
+        14
     };
 }
 
@@ -77,6 +85,8 @@ pub const PROTOCOL_VERSION: u32 = protocol_version!();
 /// it. Protocol 11 agents have no WebGPU: they get no wasm jobs with GPUs.
 /// Protocol 12 agents report their executors only when they connect and
 /// no image digests: they get no GPU jobs with driver capabilities.
+/// Protocol 13 agents start no confidential VMs: they get no confidential
+/// jobs.
 pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi

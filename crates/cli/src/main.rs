@@ -613,6 +613,7 @@ impl VmArgs {
         MicrovmConfig {
             dir: self.vm_dir.clone().unwrap_or_else(|| home.join("vm")),
             backend: self.vm_backend,
+            confidential: Default::default(),
         }
     }
 }
@@ -833,6 +834,17 @@ struct AgentOpts {
     /// Needs `pumasi vm setup` first.
     #[arg(long)]
     allow_microvm: bool,
+    /// With --allow-microvm, also run `tier = "confidential"` jobs in
+    /// SEV-SNP or TDX microVMs, whose memory this machine cannot read.
+    /// Needs a host with SEV-SNP or TDX on, and the confidential guest's
+    /// firmware and kernel in the VM directory's `tee/` (see the docs).
+    #[arg(long, requires = "allow_microvm")]
+    allow_confidential: bool,
+    /// With --allow-microvm, run confidential jobs in ordinary microVMs
+    /// that pretend to attest: for tests only, nothing is protected. The
+    /// control plane must be started with --insecure-test-tee too.
+    #[arg(long, requires = "allow_microvm", hide = true)]
+    insecure_test_tee: bool,
     /// Also offer this machine's GPUs to wasm jobs that ask for one, through
     /// WebGPU (Vulkan, Metal, DX12 or OpenGL): experimental. The only way
     /// to use GPUs without CUDA, such as integrated GPUs and old Macs'.
@@ -1538,7 +1550,14 @@ async fn agent(
         net,
         bind: opts.net.bind,
         docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
-        microvm: opts.allow_microvm.then(|| opts.vm.config(home)),
+        microvm: opts.allow_microvm.then(|| {
+            let mut c = opts.vm.config(home);
+            c.confidential = pumasi_agent::microvm::tee::TeeOptions {
+                enabled: opts.allow_confidential,
+                test: opts.insecure_test_tee,
+            };
+            c
+        }),
         bench,
         upgrade: own_exe().map(|exe| UpgradeConfig {
             exe,

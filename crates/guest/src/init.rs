@@ -11,6 +11,7 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     os::unix::{
         ffi::OsStrExt,
+        fs::{FileExt, OpenOptionsExt},
         fs::{PermissionsExt, chroot},
         io::{AsRawFd, FromRawFd},
     },
@@ -22,6 +23,10 @@ use pumasi_guest::{
     MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES, MAX_STREAM_BYTES, MODE_PARAM, OUTPUT_MARK,
     OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL, SPEC_ENTRY,
     STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY,
+    seal::{
+        self, AttestReply, AttestRequest, EVIDENCE_AT, Evidence, Kind, REPLY_AT, SealReader,
+        SealWriter, TaskKeys, TeeKind,
+    },
 };
 
 type R<T> = Result<T, String>;
@@ -122,13 +127,19 @@ fn boot() {
         log("no output disk");
         return;
     };
+    let mut seal_out = None;
     let payload = match mode.as_str() {
         "build" => build(&disks),
         "run" => run(&disks),
         "probe" => probe(&disks),
+        "sealed" => {
+            let (p, s) = sealed(&disks);
+            seal_out = s;
+            p
+        }
         other => Payload::failed(format!("unknown mode {other:?}")),
     };
-    if let Err(e) = write_output(&output, payload) {
+    if let Err(e) = write_output(&output, payload, seal_out.as_ref()) {
         log(&format!("cannot write the result: {e}"));
     }
 }
@@ -151,6 +162,10 @@ struct Disks {
     input: Option<String>,
     output: Option<String>,
     gpu: Option<String>,
+    /// Confidential tasks: the attest disk and the sealed layers and input.
+    attest: Option<String>,
+    sealed_layers: Option<String>,
+    sealed_input: Option<String>,
 }
 
 fn find_disks() -> io::Result<Disks> {
@@ -174,6 +189,14 @@ fn find_disks() -> io::Result<Disks> {
         let head = &head[..n];
         if head.starts_with(OUTPUT_MARK) {
             d.output = Some(dev);
+        } else if let Some(kind) = seal::sealed_kind(head) {
+            match kind {
+                Kind::Layers => d.sealed_layers = Some(dev),
+                Kind::Input => d.sealed_input = Some(dev),
+                Kind::Output => log(&format!("{dev}: a sealed output where none belongs")),
+            }
+        } else if AttestRequest::decode(head).is_some() {
+            d.attest = Some(dev);
         } else if let Some(label) = ext4_label(head) {
             match label.as_str() {
                 BASE_LABEL => d.base = Some(dev),
@@ -312,6 +335,7 @@ fn probe(d: &Disks) -> Payload {
         .ok_or_else(|| "no input disk".to_string())
         .and_then(|input| {
             fs::create_dir_all(TASK_DIR).ctx(TASK_DIR)?;
+            let input = File::open(input).ctx("open input disk")?;
             read_input(input, dir).map(|_| ())
         });
     match copied {
@@ -359,6 +383,15 @@ fn build_inner(d: &Disks) -> R<()> {
     fs::create_dir_all("/newroot").ctx("mkdir /newroot")?;
     mount(base, "/newroot", "ext4", 0, "")?;
     let layers = File::open(layers).ctx("open layers disk")?;
+    let res = unpack_in_chroot(layers);
+    unsafe { libc::sync() };
+    umount("/newroot");
+    res
+}
+
+/// Unpacks the layers tar read from `layers` into `/newroot`, in a child
+/// chrooted there.
+fn unpack_in_chroot(layers: impl Read) -> R<()> {
     let mut fds = [0; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(format!("pipe: {}", io::Error::last_os_error()));
@@ -387,8 +420,6 @@ fn build_inner(d: &Disks) -> R<()> {
     let mut msg = String::new();
     let _ = unsafe { File::from_raw_fd(fds[0]) }.read_to_string(&mut msg);
     let (_, status) = waitpid(pid).ctx("wait for unpacker")?;
-    unsafe { libc::sync() };
-    umount("/newroot");
     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
         Ok(())
     } else if msg.is_empty() {
@@ -398,7 +429,7 @@ fn build_inner(d: &Disks) -> R<()> {
     }
 }
 
-fn unpack_layers(disk: File) -> R<()> {
+fn unpack_layers(disk: impl Read) -> R<()> {
     let mut outer = tar::Archive::new(BufReader::with_capacity(1 << 20, disk));
     let mut index = 0;
     for entry in outer.entries().ctx("read layers disk")? {
@@ -553,7 +584,13 @@ fn run_inner(d: &Disks) -> R<Payload> {
         0,
         "lowerdir=/lower,upperdir=/scratch/upper,workdir=/scratch/work",
     )?;
+    let input = File::open(input).ctx("open input disk")?;
+    run_in_root(d, input)
+}
 
+/// Reads the input into the root at [`ROOT`], runs the command and
+/// collects the result.
+fn run_in_root(d: &Disks, input: impl Read) -> R<Payload> {
     let root = Path::new(ROOT);
     let input_dir = root.join("input");
     ensure_dir(&input_dir, 0o755)?;
@@ -649,6 +686,178 @@ fn run_inner(d: &Disks) -> R<Payload> {
         output_dir: Some(root.join("output")),
         limits: (spec.files_limit(), spec.count_limit()),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Sealed mode (confidential tasks, phase 16)
+// ---------------------------------------------------------------------------
+
+/// How long the guest waits for the cluster to release its keys.
+const KEY_WAIT_SECS: u64 = 600;
+
+/// Attests, unpacks the sealed layers into memory, reads the sealed input
+/// and runs the command. The result is sealed whenever the keys came: from
+/// then on nothing leaves the VM in the clear. Without them, only why goes
+/// out.
+fn sealed(d: &Disks) -> (Payload, Option<OutputSeal>) {
+    let (nonce, keys) = match attest(d) {
+        Ok(k) => k,
+        Err(e) => return (Payload::failed(e), None),
+    };
+    let seal = OutputSeal {
+        key: keys.task,
+        nonce,
+    };
+    let p = match sealed_inner(d, &keys) {
+        Ok(p) => p,
+        Err(e) => Payload::failed(e),
+    };
+    (p, Some(seal))
+}
+
+fn sealed_inner(d: &Disks, keys: &TaskKeys) -> R<Payload> {
+    let layers = d.sealed_layers.as_deref().ok_or("no sealed layers disk")?;
+    let input = d.sealed_input.as_deref().ok_or("no sealed input disk")?;
+    // The image and what the task writes live in memory, which the TEE
+    // encrypts: the host's disks see only sealed bytes.
+    for dir in [ROOT, "/scratch"] {
+        fs::create_dir_all(dir).ctx(dir)?;
+        mount("tmpfs", dir, "tmpfs", 0, "mode=0755,size=90%")?;
+    }
+    fs::create_dir_all(TASK_DIR).ctx(TASK_DIR)?;
+    let layers = File::open(layers).ctx("open sealed layers disk")?;
+    let layers = SealReader::new(layers, &keys.image, Kind::Layers, b"").ctx("sealed layers")?;
+    unpack_in_chroot(layers)?;
+    let input = File::open(input).ctx("open sealed input disk")?;
+    let input = SealReader::new(input, &keys.task, Kind::Input, b"").ctx("sealed input")?;
+    run_in_root(d, input)
+}
+
+/// Asks the TEE for a report binding a new key pair to the run's nonce,
+/// hands it to the host, and waits for the keys sealed to that key pair.
+fn attest(d: &Disks) -> R<([u8; 32], TaskKeys)> {
+    let dev = d.attest.as_deref().ok_or("no attest disk")?;
+    let head = read_direct(dev, 0, 4096).ctx("read attest disk")?;
+    let req = AttestRequest::decode(&head).ok_or("bad attest request")?;
+    let (secret, public) = seal::key_pair();
+    let rd = seal::report_data(&req.nonce, &public);
+    let evidence = match req.tee {
+        // No hardware: the "measurement" is the init's own hash, so the
+        // trust flow (an admin approves what was seen) works the same.
+        TeeKind::Test => Evidence {
+            tee: TeeKind::Test,
+            report: {
+                use sha2::Digest;
+                let init = fs::read("/init").ctx("read /init")?;
+                sha2::Sha384::digest(&init).to_vec()
+            },
+            aux: Vec::new(),
+            key: public,
+            report_data: rd.to_vec(),
+        },
+        TeeKind::SevSnp | TeeKind::Tdx => {
+            let (tee, report, aux) = tsm_report(&rd)?;
+            Evidence {
+                tee,
+                report,
+                aux,
+                key: public,
+                report_data: Vec::new(),
+            }
+        }
+    };
+    log(&format!("attesting ({:?})", evidence.tee));
+    write_direct(dev, EVIDENCE_AT, &evidence.frame()).ctx("write evidence")?;
+    let start = std::time::Instant::now();
+    loop {
+        let b = read_direct(dev, REPLY_AT, 4096).ctx("read attest disk")?;
+        match AttestReply::unframe(&b) {
+            Some(AttestReply::Keys(w)) => {
+                let keys = seal::unwrap_keys(&secret, &req.nonce, &w).ctx("open the keys")?;
+                log("keys released");
+                return Ok((req.nonce, keys));
+            }
+            Some(AttestReply::Refused(why)) => {
+                return Err(format!("the cluster did not release the keys: {why}"));
+            }
+            None if start.elapsed().as_secs() > KEY_WAIT_SECS => {
+                return Err("no answer from the cluster about the keys".into());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(200)),
+        }
+    }
+}
+
+/// A report from the kernel's TSM interface (configfs, Linux 6.7+): the
+/// SEV-SNP attestation report or the TDX quote, with `report_data` in it.
+fn tsm_report(report_data: &[u8; 64]) -> R<(TeeKind, Vec<u8>, Vec<u8>)> {
+    let cfg = "/sys/kernel/config";
+    if !Path::new(cfg).join("tsm").exists() {
+        let _ = mount("configfs", cfg, "configfs", 0, "");
+    }
+    let dir = Path::new(cfg).join("tsm/report/pumasi");
+    if !dir.exists() {
+        fs::create_dir(&dir).ctx(
+            "create a TSM report (needs a kernel with CONFIG_TSM_REPORTS and a SEV-SNP or TDX guest)",
+        )?;
+    }
+    fs::write(dir.join("inblob"), report_data).ctx("write the report data")?;
+    let provider = fs::read_to_string(dir.join("provider")).ctx("read the TSM provider")?;
+    let tee = match provider.trim() {
+        "sev_guest" => TeeKind::SevSnp,
+        "tdx_guest" => TeeKind::Tdx,
+        other => return Err(format!("unknown TSM provider {other:?}")),
+    };
+    let report = fs::read(dir.join("outblob")).ctx("get the report")?;
+    let aux = fs::read(dir.join("auxblob")).unwrap_or_default();
+    Ok((tee, report, aux))
+}
+
+/// A 4 KiB-aligned buffer of `len` bytes (`O_DIRECT` needs one).
+struct Aligned {
+    buf: Vec<u8>,
+    at: usize,
+    len: usize,
+}
+
+impl Aligned {
+    fn new(len: usize) -> Self {
+        let buf = vec![0u8; len + 4096];
+        let at = buf.as_ptr().align_offset(4096);
+        Self { buf, at, len }
+    }
+
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[self.at..self.at + self.len]
+    }
+}
+
+/// Reads from the attest disk past the page cache, so what the host wrote
+/// since is seen.
+fn read_direct(dev: &str, at: u64, len: usize) -> io::Result<Vec<u8>> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(dev)?;
+    let mut b = Aligned::new(len);
+    let mut n = 0;
+    while n < len {
+        match f.read_at(&mut b.as_mut()[n..], at + n as u64)? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(b.as_mut()[..n].to_vec())
+}
+
+fn write_direct(dev: &str, at: u64, data: &[u8]) -> io::Result<()> {
+    let f = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT | libc::O_SYNC)
+        .open(dev)?;
+    let mut b = Aligned::new(data.len().div_ceil(4096) * 4096);
+    b.as_mut()[..data.len()].copy_from_slice(data);
+    f.write_all_at(b.as_mut(), at)
 }
 
 /// Where the GPU driver's libraries and tools appear in the task's root
@@ -835,9 +1044,8 @@ fn ensure_dir(p: &Path, mode: u32) -> R<()> {
 }
 
 /// Reads the input disk: the run spec, stdin, and the `/input` files.
-fn read_input(dev: &str, input_dir: &Path) -> R<RunSpec> {
-    let f = File::open(dev).ctx("open input disk")?;
-    let mut ar = tar::Archive::new(BufReader::with_capacity(1 << 20, f));
+fn read_input(input: impl Read, input_dir: &Path) -> R<RunSpec> {
+    let mut ar = tar::Archive::new(BufReader::with_capacity(1 << 20, input));
     let mut spec: Option<RunSpec> = None;
     for entry in ar.entries().ctx("read input disk")? {
         let mut entry = entry.ctx("read input disk")?;
@@ -1085,9 +1293,26 @@ fn resolve_user(root: &Path, user: &str) -> R<(u32, u32, String)> {
 // Result
 // ---------------------------------------------------------------------------
 
-fn write_output(dev: &str, mut p: Payload) -> io::Result<()> {
+/// Seals a confidential task's result.
+struct OutputSeal {
+    key: [u8; 32],
+    nonce: [u8; 32],
+}
+
+fn write_output(dev: &str, p: Payload, seal: Option<&OutputSeal>) -> io::Result<()> {
     let f = OpenOptions::new().write(true).open(dev)?;
-    let mut b = tar::Builder::new(BufWriter::with_capacity(1 << 20, f));
+    let f = match seal {
+        None => write_tar(f, p)?,
+        Some(s) => {
+            let w = SealWriter::new(f, &s.key, Kind::Output, &s.nonce)?;
+            write_tar(w, p)?.finish()?.0
+        }
+    };
+    f.sync_all()
+}
+
+fn write_tar<W: Write>(out: W, mut p: Payload) -> io::Result<W> {
+    let mut b = tar::Builder::new(BufWriter::with_capacity(1 << 20, out));
     b.mode(tar::HeaderMode::Deterministic);
     if let Some(path) = &p.stdout {
         p.result.stdout_dropped = append_capped(&mut b, STDOUT_ENTRY, path)?;
@@ -1124,8 +1349,7 @@ fn write_output(dev: &str, mut p: Payload) -> io::Result<()> {
     h.set_mode(0o644);
     b.append_data(&mut h, RESULT_ENTRY, json.as_slice())?;
     let w = b.into_inner()?;
-    let f = w.into_inner().map_err(|e| e.into_error())?;
-    f.sync_all()
+    w.into_inner().map_err(|e| e.into_error())
 }
 
 /// Appends at most [`MAX_STREAM_BYTES`] of a file; returns the bytes left out.

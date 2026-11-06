@@ -90,14 +90,52 @@ impl FromStr for JobId {
     }
 }
 
-/// Confidentiality tier. Only `Open` exists in phase 1: the provider can in
-/// principle read the code and data. See the research doc for why stronger
-/// tiers need TEE hardware.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Confidentiality tier: who could read the job's code and data.
+///
+/// - `Open`: any node. Sandboxes protect the node from the job, not the
+///   job from the node's owner, who can read everything.
+/// - `Trusted`: only the cluster owner's machines and providers the admin
+///   trusts (`pumasi node trust`). Their owners could still read the job;
+///   the protection is that you know and trust them.
+/// - `Confidential`: microVM jobs only, each task in a VM whose memory the
+///   node's owner cannot read (AMD SEV-SNP or Intel TDX), with the image,
+///   input and output sealed to keys the control plane releases only after
+///   checking the VM's attestation. The node sees the job's name, run time
+///   and resource use. Physical attacks on the machine (memory bus
+///   interposers) are out of scope.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     #[default]
     Open,
+    // Phase 16 from here (appended: postcard numbers variants in order).
+    Trusted,
+    Confidential,
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Tier::Open => "open",
+            Tier::Trusted => "trusted",
+            Tier::Confidential => "confidential",
+        })
+    }
+}
+
+impl std::str::FromStr for Tier {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "open" => Ok(Tier::Open),
+            "trusted" => Ok(Tier::Trusted),
+            "confidential" => Ok(Tier::Confidential),
+            other => bail!("unknown tier {other:?} (open, trusted or confidential)"),
+        }
+    }
 }
 
 /// Which executor runs the task.
@@ -428,6 +466,20 @@ impl JobSubmission {
                     "ask for GPUs with a GPU request, not docker's --gpus"
                 );
             }
+        }
+        if self.tier == Tier::Confidential {
+            ensure!(
+                self.executor == Executor::Microvm,
+                "confidential jobs run in microVMs: set executor = \"microvm\""
+            );
+            ensure!(
+                self.gpu.is_none(),
+                "confidential jobs cannot have GPUs yet (that needs NVIDIA confidential computing on H100 or later)"
+            );
+            ensure!(
+                !self.docker.as_ref().is_some_and(|d| d.network),
+                "confidential jobs have no network: the node would carry the traffic"
+            );
         }
         if let Some(g) = &self.gpu {
             g.validate()?;

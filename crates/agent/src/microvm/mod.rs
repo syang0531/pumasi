@@ -29,6 +29,7 @@
 pub mod ext4;
 pub mod net;
 pub mod setup;
+pub mod tee;
 pub mod vmm;
 pub mod vz;
 
@@ -44,27 +45,26 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use pumasi_guest::{
-    BASE_LABEL, DISK_ROLE_ENTRY, GuestOutcome, GuestResult, INPUT_PREFIX, OUTPUT_DISK_BYTES,
-    OUTPUT_MARK, OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL,
-    SPEC_ENTRY, STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY,
+    BASE_LABEL, GuestOutcome, OUTPUT_DISK_BYTES, OUTPUT_MARK, RunSpec, SCRATCH_LABEL,
 };
 use pumasi_proto::{
     economy::vcpus,
-    job::{
-        DockerSpec, FileEntry, Limits, MAX_OUTPUT_BYTES, MAX_OUTPUT_FILES_BYTES, TaskInput,
-        validate_rel_path,
-    },
+    job::{DockerSpec, FileEntry, Limits, TaskInput},
     msg::{Outcome, TaskRef},
     store::{IMAGE_MANIFEST, ImageManifest, MAX_STORE_OUTPUT_BYTES, image_layer_name},
+    vmdisk::{
+        GuestOutput, note_dropped, outcome_of, parse_output, run_spec, write_input_tar,
+        write_layers_tar,
+    },
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 pub use pumasi_proto::registry::{ContainerConfig, Registry};
-pub use vmm::{Backend, Disk, VmSpec, Vmm};
+pub use vmm::{Backend, Disk, TeeVm, VmSpec, Vmm};
 
 use crate::{
-    executor::{LocalImage, RunResult, TaskIo},
+    executor::{ConfidentialIo, LocalImage, RunResult, TaskIo},
     tempdir::TempDir,
 };
 
@@ -112,6 +112,8 @@ pub struct MicrovmConfig {
     /// `None` picks Firecracker when it is installed and KVM is usable,
     /// otherwise QEMU.
     pub backend: Option<Backend>,
+    /// Confidential VMs (phase 16).
+    pub confidential: tee::TeeOptions,
 }
 
 // `EMBEDDED_GUEST`: the guest init built into this binary, if any.
@@ -344,6 +346,9 @@ pub struct MicrovmExecutor {
     registry: Registry,
     /// One image pull and build at a time.
     pull_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The TEEs confidential tasks can run in here, and QEMU for them.
+    tee: tee::TeeAssets,
+    tee_vmm: Option<Vmm>,
 }
 
 /// How a VM run ended, as seen from the host.
@@ -450,6 +455,21 @@ impl MicrovmExecutor {
             _ => None,
         };
         let gpu = GpuAssets::find(&config.dir, &assets);
+        let tee = tee::TeeAssets::detect(
+            &config.confidential,
+            &config.dir,
+            assets.qemu.is_some(),
+            assets.kvm,
+        );
+        if let Some(why) = &tee.unavailable {
+            warn!("confidential VMs unavailable: {why}");
+        }
+        let tee_vmm = assets.qemu.clone().filter(|_| assets.kvm).map(|bin| Vmm {
+            backend: Backend::Qemu,
+            bin,
+            accelerated: true,
+            tsc_khz: None,
+        });
         let mut exec = Self {
             vmm,
             net_vmm,
@@ -460,6 +480,8 @@ impl MicrovmExecutor {
             run_dir,
             registry: Registry::new()?,
             pull_lock: Default::default(),
+            tee,
+            tee_vmm,
         };
         // WHPX is not equally good everywhere: nested under Hyper-V (cloud
         // Windows machines, CI runners) QEMU's virtio disks can break under
@@ -555,6 +577,7 @@ impl MicrovmExecutor {
             mem_mib: MIN_VM_MIB,
             net: None,
             pci: vec![],
+            tee: None,
         };
         let deadline = Instant::now() + PROBE_TIMEOUT;
         let status = match self
@@ -599,6 +622,11 @@ impl MicrovmExecutor {
     /// Whether GPUs can be passed through to microVMs here.
     pub fn gpu_passthrough(&self) -> bool {
         self.gpu.is_some()
+    }
+
+    /// The TEEs confidential tasks can run in here (protocol 14).
+    pub fn tee_report(&self) -> pumasi_proto::confidential::TeeReport {
+        self.tee.report()
     }
 
     /// Runs one task to completion.
@@ -675,6 +703,9 @@ impl MicrovmExecutor {
         cancel: &AtomicBool,
         io: &TaskIo,
     ) -> Result<RunResult> {
+        if let Some(c) = &io.confidential {
+            return self.run_confidential(task, c, limits, cancel, io).await;
+        }
         ensure!(spec.gpus.is_none(), "ask for GPUs with a GPU request");
         let gpu = if io.gpus.is_empty() {
             None
@@ -791,6 +822,7 @@ impl MicrovmExecutor {
             mem_mib: (limits.memory_bytes.div_ceil(1 << 20) + VM_OVERHEAD_MIB).max(MIN_VM_MIB),
             net: gateway.as_ref().map(|g| g.addr),
             pci: vec![],
+            tee: None,
         };
         let mut vm = vm;
         if let Some((assets, pci)) = &gpu {
@@ -852,16 +884,7 @@ impl MicrovmExecutor {
         };
         let mut stderr = out.stderr;
         note_dropped(&mut stderr, &out.result);
-        let outcome = match out.result.outcome {
-            GuestOutcome::Exited(code) => Outcome::Exited(code),
-            // Same exit status a shell or `docker run` reports.
-            GuestOutcome::Signaled(sig) => Outcome::Exited(128 + sig),
-            GuestOutcome::OutOfMemory => Outcome::Trap(format!(
-                "out of memory (limit {} MiB)",
-                limits.memory_bytes >> 20
-            )),
-            GuestOutcome::Failed(msg) => Outcome::Error(format!("microVM: {msg}")),
-        };
+        let outcome = outcome_of(&out.result.outcome, limits.memory_bytes);
         Ok(RunResult {
             outcome,
             stdout: out.stdout,
@@ -871,6 +894,182 @@ impl MicrovmExecutor {
             wall_ms,
             peak_memory_bytes: None,
             out_dir: kept,
+        })
+    }
+
+    /// Runs a confidential task (phase 16): a VM in the TEE the cluster
+    /// placed it for, booting the sealed image and input. Its guest attests
+    /// over the attest disk; the evidence goes to the cluster and the keys,
+    /// sealed to the guest, come back the same way. What comes out is
+    /// sealed too, and goes to the cluster as `output.sealed`.
+    async fn run_confidential(
+        &self,
+        task: TaskRef,
+        c: &ConfidentialIo,
+        limits: &Limits,
+        cancel: &AtomicBool,
+        io: &TaskIo,
+    ) -> Result<RunResult> {
+        use pumasi_guest::seal::{
+            ATTEST_DISK_BYTES, AttestReply, AttestRequest, EVIDENCE_AT, Evidence, REPLY_AT,
+        };
+        use pumasi_proto::confidential::{SEALED_OUTPUT_FILE, TeeKind};
+        let t = &c.task;
+        let (vmm, kernel, tee_vm) = match t.tee {
+            TeeKind::Test => {
+                ensure!(self.tee.test, "this node does not offer the test TEE");
+                (&self.vmm, self.kernel.clone(), None)
+            }
+            TeeKind::SevSnp | TeeKind::Tdx => {
+                let boot = match t.tee {
+                    TeeKind::SevSnp => &self.tee.snp,
+                    _ => &self.tee.tdx,
+                };
+                let boot = boot
+                    .as_ref()
+                    .with_context(|| format!("{} VMs are not available here", t.tee))?;
+                let vmm = self
+                    .tee_vmm
+                    .as_ref()
+                    .context("confidential VMs need QEMU with KVM")?;
+                let vm = TeeVm {
+                    kind: t.tee,
+                    firmware: boot.firmware.clone(),
+                    cbitpos: tee::cbitpos(),
+                };
+                (vmm, boot.kernel.clone(), Some(vm))
+            }
+        };
+        let run_start = Instant::now();
+        let scratch = TempDir::new_in(&self.run_dir, &format!("{}-{}-c", task.job, task.index))?;
+        let dir = scratch.path().to_path_buf();
+        let attest = dir.join("attest.img");
+        let output = dir.join("output.img");
+        {
+            let (attest, output) = (attest.clone(), output.clone());
+            let (image, input) = (c.image.clone(), c.input.clone());
+            let req = AttestRequest {
+                tee: t.tee,
+                nonce: t.nonce,
+            }
+            .encode();
+            let out_bytes = t.output_bytes;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut f = create_sparse(&attest, ATTEST_DISK_BYTES)?;
+                f.write_all(&req)?;
+                make_output_disk(&output, out_bytes)?;
+                pad_to_sector(&image)?;
+                pad_to_sector(&input)?;
+                Ok(())
+            })
+            .await??;
+        }
+        let disk = |path: &Path, read_only: bool| Disk {
+            path: path.to_path_buf(),
+            read_only,
+        };
+        let vm = VmSpec {
+            kernel,
+            initrd: self.initrd.clone(),
+            mode: "sealed",
+            disks: vec![
+                disk(&c.image, true),
+                disk(&c.input, true),
+                disk(&attest, false),
+                disk(&output, false),
+            ],
+            vcpus: vcpus(limits.cpu_millis).min(MAX_VCPUS),
+            mem_mib: (limits.memory_bytes.div_ceil(1 << 20) + VM_OVERHEAD_MIB + t.extra_mib)
+                .max(MIN_VM_MIB),
+            net: None,
+            pci: vec![],
+            tee: tee_vm,
+        };
+        // Passes the guest's evidence on, and the answer back.
+        let watcher = {
+            let (attest, keys) = (attest.clone(), c.keys.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let a = attest.clone();
+                    let Ok(Ok(b)) = tokio::task::spawn_blocking(move || {
+                        read_at(&a, EVIDENCE_AT, (REPLY_AT - EVIDENCE_AT) as usize)
+                    })
+                    .await
+                    else {
+                        continue;
+                    };
+                    let reply = match Evidence::unframe(&b) {
+                        None => continue,
+                        Some(Err(e)) => AttestReply::Refused(format!("bad evidence: {e}")),
+                        Some(Ok(ev)) => match keys.ask(ev).await {
+                            Ok(w) => AttestReply::Keys(w),
+                            Err(why) => AttestReply::Refused(why),
+                        },
+                    };
+                    let a = attest.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        write_at(&a, REPLY_AT, &reply.frame())
+                    })
+                    .await;
+                    return;
+                }
+            })
+        };
+        let deadline = run_start + Duration::from_millis(limits.timeout_ms);
+        debug!(task = %task, tee = %t.tee, "booting confidential microvm");
+        let end = self
+            .boot_on(vmm, &vm, &dir, Some(deadline), cancel)
+            .await;
+        watcher.abort();
+        let end = end?;
+        let wall_ms = run_start.elapsed().as_millis() as u64;
+        let result = |outcome: Outcome| RunResult {
+            outcome,
+            stdout: vec![],
+            stderr: vec![],
+            files: vec![],
+            fuel_used: 0,
+            wall_ms,
+            peak_memory_bytes: None,
+            out_dir: None,
+        };
+        let status = match end {
+            VmEnd::Timeout => return Ok(result(Outcome::Timeout)),
+            VmEnd::Cancelled => return Ok(result(Outcome::Cancelled)),
+            VmEnd::Exited(status) => status,
+        };
+        // Sealed: kept as it is for the cluster. Not sealed: the guest
+        // failed before it had keys, and says why in the clear.
+        let kept = io.out_dir("sealed")?;
+        let sealed = {
+            let (output, target) = (output.clone(), kept.path().join(SEALED_OUTPUT_FILE));
+            tokio::task::spawn_blocking(move || copy_sealed_output(&output, &target)).await??
+        };
+        if sealed {
+            return Ok(RunResult {
+                out_dir: Some(Arc::new(kept)),
+                ..result(Outcome::Exited(0))
+            });
+        }
+        let out = {
+            let output = output.clone();
+            tokio::task::spawn_blocking(move || read_output_disk(&output, None)).await??
+        };
+        let Some(out) = out else {
+            bail!(
+                "the confidential microVM stopped without a result ({} {status}); console:\n{}",
+                vmm.backend,
+                console_tail(&dir)
+            );
+        };
+        let outcome = match outcome_of(&out.result.outcome, limits.memory_bytes) {
+            o @ Outcome::Error(_) => o,
+            other => Outcome::Error(format!("the guest returned {other} without sealing it")),
+        };
+        Ok(RunResult {
+            stderr: out.stderr,
+            ..result(outcome)
         })
     }
 
@@ -1088,6 +1287,7 @@ impl MicrovmExecutor {
             mem_mib: BUILD_VM_MIB,
             net: None,
             pci: vec![],
+            tee: None,
         };
         let deadline = Instant::now() + BUILD_TIMEOUT;
         let status = match self.boot(&vm, work.path(), Some(deadline), cancel).await? {
@@ -1159,42 +1359,7 @@ impl MicrovmExecutor {
     }
 }
 
-/// What the guest runs: the image's entrypoint, then the job's command and
-/// task args (or the image's `Cmd` when both are empty), like `docker run`.
-fn run_spec(config: &ContainerConfig, spec: &DockerSpec, input: &TaskInput) -> RunSpec {
-    let override_cmd: Vec<String> = spec
-        .command
-        .iter()
-        .chain(input.args.iter())
-        .cloned()
-        .collect();
-    let cmd = if override_cmd.is_empty() {
-        config.cmd.clone().unwrap_or_default()
-    } else {
-        override_cmd
-    };
-    let mut argv = config.entrypoint.clone().unwrap_or_default();
-    argv.extend(cmd);
-    let mut env: Vec<String> = config.env.clone().unwrap_or_default();
-    let mut set = |k: &str, v: &str| {
-        let prefix = format!("{k}=");
-        env.retain(|e| !e.starts_with(&prefix));
-        env.push(format!("{k}={v}"));
-    };
-    set("HOSTNAME", "pumasi");
-    for (k, v) in &input.env {
-        set(k, v);
-    }
-    RunSpec {
-        argv,
-        env,
-        workdir: pumasi_proto::job::INPUT_DIR.into(),
-        user: config.user.clone().unwrap_or_default(),
-        hostname: "pumasi".into(),
-        ..Default::default()
-    }
-}
-
+#[cfg(test)]
 fn tar_entry<W: Write>(b: &mut tar::Builder<W>, name: &str, data: &[u8]) -> Result<()> {
     let mut h = tar::Header::new_gnu();
     h.set_size(data.len() as u64);
@@ -1204,8 +1369,8 @@ fn tar_entry<W: Write>(b: &mut tar::Builder<W>, name: &str, data: &[u8]) -> Resu
     Ok(())
 }
 
-/// Pads a disk image to whole 512-byte sectors.
-fn pad_to_sector(path: &Path) -> Result<()> {
+/// Pads a disk image to whole 4 KiB blocks.
+pub(crate) fn pad_to_sector(path: &Path) -> Result<()> {
     let f = std::fs::OpenOptions::new().write(true).open(path)?;
     let len = f.metadata()?.len();
     let padded = len.div_ceil(4096).max(1) * 4096;
@@ -1217,14 +1382,7 @@ fn pad_to_sector(path: &Path) -> Result<()> {
 
 fn write_layers_disk(path: &Path, blobs: &[PathBuf]) -> Result<()> {
     let f = std::fs::File::create(path)?;
-    let mut b = tar::Builder::new(std::io::BufWriter::with_capacity(1 << 20, f));
-    b.mode(tar::HeaderMode::Deterministic);
-    tar_entry(&mut b, DISK_ROLE_ENTRY, ROLE_LAYERS.as_bytes())?;
-    for (i, blob) in blobs.iter().enumerate() {
-        let mut f = std::fs::File::open(blob)?;
-        b.append_file(format!("layer-{i:03}"), &mut f)?;
-    }
-    b.into_inner()?.flush()?;
+    write_layers_tar(std::io::BufWriter::with_capacity(1 << 20, f), blobs)?.flush()?;
     pad_to_sector(path)
 }
 
@@ -1237,47 +1395,25 @@ fn write_input_disk(
     staged: &[(String, PathBuf, u64)],
 ) -> Result<()> {
     let f = std::fs::File::create(path)?;
-    let mut b = tar::Builder::new(std::io::BufWriter::with_capacity(1 << 20, f));
-    b.mode(tar::HeaderMode::Deterministic);
-    tar_entry(&mut b, DISK_ROLE_ENTRY, ROLE_INPUT.as_bytes())?;
-    tar_entry(&mut b, SPEC_ENTRY, &serde_json::to_vec(spec)?)?;
-    tar_entry(&mut b, STDIN_ENTRY, stdin)?;
-    // Files from the file store first; the job's inline files after them
-    // win, and the task's own files win over shared ones.
-    for (rel, file, size) in staged {
-        validate_rel_path(rel)?;
-        let mut h = tar::Header::new_gnu();
-        h.set_size(*size);
-        h.set_mode(0o644);
-        h.set_entry_type(tar::EntryType::Regular);
-        let f = std::fs::File::open(file).with_context(|| format!("read {}", file.display()))?;
-        b.append_data(&mut h, format!("{INPUT_PREFIX}{rel}"), f.take(*size))?;
-    }
-    for f in shared.iter().chain(own) {
-        validate_rel_path(&f.path)?;
-        tar_entry(&mut b, &format!("{INPUT_PREFIX}{}", f.path), &f.data)?;
-    }
-    b.into_inner()?.flush()?;
+    write_input_tar(
+        std::io::BufWriter::with_capacity(1 << 20, f),
+        spec,
+        stdin,
+        shared,
+        own,
+        staged,
+    )?
+    .flush()?;
     pad_to_sector(path)
 }
 
-fn make_output_disk(path: &Path, size: u64) -> Result<()> {
+pub(crate) fn make_output_disk(path: &Path, size: u64) -> Result<()> {
     let mut f = create_sparse(path, size.max(OUTPUT_DISK_BYTES).div_ceil(4096) * 4096)?;
     f.write_all(OUTPUT_MARK)?;
     Ok(())
 }
 
-struct GuestOutput {
-    result: GuestResult,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    files: Vec<FileEntry>,
-}
-
-/// Parses the output disk. `None` if the guest never wrote it. The guest
-/// is untrusted: entries are only read into memory, within the caps, or
-/// with `kept` written as plain files under that directory (within the
-/// file store's caps).
+/// Parses the output disk. `None` if the guest never wrote it.
 fn read_output_disk(path: &Path, kept: Option<&Path>) -> Result<Option<GuestOutput>> {
     let mut f = std::fs::File::open(path)?;
     let mut head = vec![0u8; OUTPUT_MARK.len()];
@@ -1286,91 +1422,45 @@ fn read_output_disk(path: &Path, kept: Option<&Path>) -> Result<Option<GuestOutp
         return Ok(None);
     }
     let f = std::fs::File::open(path)?;
-    let mut ar = tar::Archive::new(BufReader::new(f));
-    let mut result = None;
-    let (mut stdout, mut stderr, mut files) = (Vec::new(), Vec::new(), Vec::new());
-    let mut total = 0usize;
-    let read = |e: &mut tar::Entry<_>, cap: usize| -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        e.take(cap as u64).read_to_end(&mut buf)?;
-        Ok(buf)
-    };
-    for entry in ar.entries().context("read output disk")? {
-        let mut entry = entry.context("read output disk")?;
-        if entry.header().entry_type() != tar::EntryType::Regular {
-            continue;
-        }
-        let name = entry.path()?.to_string_lossy().into_owned();
-        if name == RESULT_ENTRY {
-            result = Some(
-                serde_json::from_slice::<GuestResult>(&read(&mut entry, 64 * 1024)?)
-                    .context("bad result from the guest")?,
-            );
-        } else if name == STDOUT_ENTRY {
-            stdout = read(&mut entry, MAX_OUTPUT_BYTES)?;
-        } else if name == STDERR_ENTRY {
-            stderr = read(&mut entry, MAX_OUTPUT_BYTES)?;
-        } else if let Some(rel) = name.strip_prefix(OUTPUT_PREFIX) {
-            if validate_rel_path(rel).is_err() {
-                continue;
-            }
-            if let Some(dir) = kept {
-                let size = entry.header().size()?;
-                if total as u64 + size > MAX_STORE_OUTPUT_BYTES {
-                    continue;
-                }
-                let target = dir.join(rel);
-                if let Some(p) = target.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                let mut f = std::fs::File::create(&target)?;
-                total += std::io::copy(&mut Read::take(&mut entry, size), &mut f)? as usize;
-                continue;
-            }
-            let size = entry.header().size()? as usize;
-            if total + size > MAX_OUTPUT_FILES_BYTES {
-                continue;
-            }
-            let data = read(&mut entry, size)?;
-            total += data.len();
-            files.push(FileEntry {
-                path: rel.to_string(),
-                data,
-            });
-        }
-    }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    let result = result.context("the guest's result is incomplete")?;
-    Ok(Some(GuestOutput {
-        result,
-        stdout,
-        stderr,
-        files,
-    }))
+    parse_output(BufReader::new(f), kept)
+        .context("read output disk")
+        .map(Some)
 }
 
-fn note_dropped(stderr: &mut Vec<u8>, r: &GuestResult) {
-    if r.stdout_dropped > 0 || r.stderr_dropped > 0 {
-        stderr.extend_from_slice(
-            format!(
-                "\n[pumasi] output over {} MiB was dropped ({} bytes of stdout, {} of stderr)\n",
-                MAX_OUTPUT_BYTES >> 20,
-                r.stdout_dropped,
-                r.stderr_dropped
-            )
-            .as_bytes(),
-        );
+/// Copies a sealed output from the output disk to `target`. `false` when
+/// the disk holds no sealed output.
+fn copy_sealed_output(disk: &Path, target: &Path) -> Result<bool> {
+    use pumasi_guest::seal::{HEADER, Kind, sealed_kind, sealed_len};
+    let mut f = std::fs::File::open(disk)?;
+    let mut head = vec![0u8; HEADER];
+    f.read_exact(&mut head)?;
+    if sealed_kind(&head) != Some(Kind::Output) {
+        return Ok(false);
     }
-    if r.files_dropped > 0 {
-        stderr.extend_from_slice(
-            format!(
-                "\n[pumasi] output files exceeded {} MiB; {} were dropped\n",
-                MAX_OUTPUT_FILES_BYTES >> 20,
-                r.files_dropped
-            )
-            .as_bytes(),
-        );
-    }
+    let plain = u64::from_le_bytes(head[16..24].try_into().expect("8 bytes"));
+    let disk_len = f.metadata()?.len();
+    let len = sealed_len(plain).min(disk_len);
+    let f = std::fs::File::open(disk)?;
+    let mut out = std::fs::File::create(target)?;
+    std::io::copy(&mut f.take(len), &mut out)?;
+    Ok(true)
+}
+
+fn read_at(path: &Path, at: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(at))?;
+    let mut b = Vec::with_capacity(len);
+    f.take(len as u64).read_to_end(&mut b)?;
+    Ok(b)
+}
+
+fn write_at(path: &Path, at: u64, data: &[u8]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(at))?;
+    f.write_all(data)?;
+    f.sync_all()
 }
 
 /// Creates `path` as a sparse file of `len` bytes (zeros that take no
@@ -1407,6 +1497,9 @@ fn console_tail(dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumasi_guest::{
+        DISK_ROLE_ENTRY, GuestResult, RESULT_ENTRY, SPEC_ENTRY, STDIN_ENTRY, STDOUT_ENTRY,
+    };
 
     /// Needs a VM directory set up with `pumasi vm setup`.
     #[tokio::test]
@@ -1418,6 +1511,7 @@ mod tests {
         let config = MicrovmConfig {
             dir: dir.into(),
             backend: None,
+            confidential: Default::default(),
         };
         let exec = MicrovmExecutor::detect(&config, "probe-test")
             .await
@@ -1427,6 +1521,7 @@ mod tests {
 
     #[test]
     fn limits_match_the_guest() {
+        use pumasi_proto::job::{MAX_OUTPUT_BYTES, MAX_OUTPUT_FILES_BYTES};
         assert_eq!(pumasi_guest::MAX_STREAM_BYTES as usize, MAX_OUTPUT_BYTES);
         assert_eq!(
             pumasi_guest::MAX_OUTPUT_FILES_BYTES as usize,

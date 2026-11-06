@@ -1290,6 +1290,7 @@ fn microvm_config() -> Option<pumasi_agent::MicrovmConfig> {
     Some(pumasi_agent::MicrovmConfig {
         dir: dir.into(),
         backend,
+        confidential: Default::default(),
     })
 }
 

@@ -68,6 +68,9 @@ fn op_name(op: &AdminOp) -> &'static str {
         HaInvite { .. } | HaRemove { .. } => "change the control plane replicas",
         Backup { .. } => "back up the control plane",
         SetAccountPolicy { .. } => "set job policies",
+        Confidential => "read the confidential tier",
+        TrustMeasurement { .. } => "trust launch measurements",
+        TrustNode { .. } => "trust nodes",
     }
 }
 
@@ -108,6 +111,7 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | Events { .. }
             | Logs { .. }
             | Alerts
+            | Confidential
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -191,6 +195,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | Quotas
         | Schedules
         | WhoAmI
+        | Confidential
         | StoreList { .. }
         | StoreUpload { .. }) => op,
         Ledger {

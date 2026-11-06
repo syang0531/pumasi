@@ -192,6 +192,9 @@ pub struct Agent {
     webgpu_profile: pumasi_proto::webgpu::SignedWebGpu,
     /// Samples the machine for the cluster's monitoring.
     sampler: Arc<Mutex<Sampler>>,
+    /// Confidential runs waiting for the cluster's answer about their
+    /// keys (phase 16).
+    key_waiters: crate::executor::KeyWaiters,
     _router: Router,
 }
 
@@ -462,6 +465,7 @@ impl Agent {
             webgpu,
             webgpu_profile,
             sampler: Arc::new(Mutex::new(sampler)),
+            key_waiters: Default::default(),
             _router: router,
         })
     }
@@ -817,6 +821,14 @@ impl Agent {
             &docker.borrow_and_update(),
             microvm_on,
         ))));
+        // The TEEs confidential tasks can run in here (none without
+        // microVMs).
+        let tee = self
+            .microvm
+            .as_ref()
+            .map(|vm| vm.tee_report())
+            .unwrap_or_default();
+        let _ = out_tx.send(FromAgent::Tee(Box::new(tee)));
         // Docker coming and going, and the GPUs it reaches.
         let docker_changes = {
             let out_tx = out_tx.clone();
@@ -1077,6 +1089,11 @@ impl Agent {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                Ok(Some(ToAgent::Keys { task, reply })) => {
+                    if let Some(w) = self.key_waiters.lock().unwrap().remove(&task) {
+                        let _ = w.send(reply);
+                    }
+                }
                 Ok(None) => break anyhow::anyhow!("cluster closed the stream"),
                 Err(e) => break e,
             }
@@ -1175,13 +1192,26 @@ impl Agent {
         let node_store = self.node_store.clone();
         let cluster_addr = cluster_addr.clone();
         let cluster = *cluster_key.id.as_bytes();
+        let key_link = crate::executor::KeyLink {
+            task: a.task,
+            tx: out_tx.clone(),
+            waiters: self.key_waiters.clone(),
+        };
         debug!(task = %a.task, executor = %a.executor, "starting task");
         tokio::spawn(async move {
             let task = a.task;
             // Mounted datasets and a private image come from the file store
             // first; the run's timeout starts after.
-            let prepared =
-                prepare_io(&node_store, &a, &cluster_addr, &docker, &microvm, &cancel).await;
+            let prepared = prepare_io(
+                &node_store,
+                &a,
+                &cluster_addr,
+                &docker,
+                &microvm,
+                &cancel,
+                key_link,
+            )
+            .await;
             let (mut io, _held, _dirs) = match prepared {
                 Ok(p) => p,
                 Err(e) => {
@@ -1201,8 +1231,9 @@ impl Agent {
                 tx: out_tx.clone(),
             });
             // What the task prints goes to the cluster as it comes (not for
-            // check runs: only the task's own run is shown).
-            let streamer = (!task.check).then(|| {
+            // check runs: only the task's own run is shown; and a
+            // confidential task's output never leaves its VM in the clear).
+            let streamer = (!task.check && a.confidential.is_none()).then(|| {
                 let live = LiveOutput::default();
                 // Stops with the run, however it ends.
                 io.live = Some(live.clone());
@@ -1334,6 +1365,7 @@ async fn prepare_io(
     docker: &Option<DockerExecutor>,
     microvm: &Option<MicrovmExecutor>,
     cancel: &AtomicBool,
+    keys: crate::executor::KeyLink,
 ) -> Result<(TaskIo, Vec<InUse>, Vec<TempDir>)> {
     let mut held = Vec::new();
     let mut dirs = Vec::new();
@@ -1380,6 +1412,26 @@ async fn prepare_io(
         io.image = Some(LocalImage {
             digest: img.digest.clone(),
             dir: dir.path().to_path_buf(),
+        });
+        dirs.push(dir);
+    }
+    if let Some(c) = &a.confidential {
+        // The sealed image and input, as files for the VM's disks.
+        use pumasi_proto::confidential::{SEALED_IMAGE_FILE, SEALED_INPUT_FILE};
+        let dir = store.scratch("sealed")?;
+        for (root, name, label) in [
+            (c.image.root, SEALED_IMAGE_FILE, "sealed image"),
+            (c.input.root, SEALED_INPUT_FILE, "sealed input"),
+        ] {
+            let used = store.ensure(root, label, &a.peers, cluster, cancel).await?;
+            store.export_one(&used, name, dir.path()).await?;
+            held.push(used);
+        }
+        io.confidential = Some(crate::executor::ConfidentialIo {
+            task: c.clone(),
+            image: dir.path().join(SEALED_IMAGE_FILE),
+            input: dir.path().join(SEALED_INPUT_FILE),
+            keys,
         });
         dirs.push(dir);
     }

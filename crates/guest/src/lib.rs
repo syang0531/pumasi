@@ -27,6 +27,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod seal;
+
 /// Label of the ext4 filesystem holding an image's root filesystem.
 pub const BASE_LABEL: &str = "pumasi-base";
 /// Label of a task's empty writable disk.

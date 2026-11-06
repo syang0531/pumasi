@@ -538,9 +538,9 @@ impl AccountPolicy {
             return true;
         }
         let full = full_image_name(image);
-        self.images
-            .iter()
-            .any(|p| glob_match(p, image) || glob_match(p, &full))
+        self.images.iter().any(|p| {
+            glob_match(p, image) || glob_match(p, &full) || glob_match(&full_image_name(p), &full)
+        })
     }
 
     /// Checks a job against the policy and adds its selector. The error
@@ -1477,6 +1477,93 @@ impl ClusterFile {
 mod tests {
     use super::*;
     use chrono::{FixedOffset, Utc};
+
+    #[test]
+    fn image_names_and_patterns() {
+        assert_eq!(
+            full_image_name("python:3.12"),
+            "docker.io/library/python:3.12"
+        );
+        assert_eq!(full_image_name("me/app"), "docker.io/me/app:latest");
+        assert_eq!(
+            full_image_name("localhost:5000/x@sha256:ab"),
+            "localhost:5000/x@sha256:ab"
+        );
+        assert_eq!(full_image_name("ghcr.io/a/b:1"), "ghcr.io/a/b:1");
+        assert!(glob_match("ghcr.io/lab/*", "ghcr.io/lab/blender:4.2"));
+        assert!(glob_match("a?c", "abc") && !glob_match("a?c", "ac"));
+        assert!(glob_match("*", "") && !glob_match("x*", "y"));
+        let p = AccountPolicy {
+            images: vec!["ghcr.io/lab/*".into(), "python:3.12-slim".into()],
+            ..Default::default()
+        };
+        assert!(p.allows_image("ghcr.io/lab/render:1"));
+        assert!(p.allows_image("python:3.12-slim"));
+        assert!(p.allows_image("docker.io/library/python:3.12-slim"));
+        assert!(!p.allows_image("python:3.13"));
+        assert!(!p.allows_image("ghcr.io/other/render:1"));
+        let pinned = AccountPolicy {
+            require_digest: true,
+            ..Default::default()
+        };
+        assert!(!pinned.allows_image("python:3.12"));
+        assert!(pinned.allows_image("python@sha256:0123"));
+    }
+
+    #[test]
+    fn policies_refuse_and_add_selectors() {
+        let dir = std::env::temp_dir();
+        let job = |text: &str| {
+            crate::job::JobFile::parse(text)
+                .unwrap()
+                .resolve(&dir)
+                .unwrap()
+        };
+        let p = AccountPolicy {
+            images: vec!["ghcr.io/lab/*".into()],
+            executors: vec![Executor::Docker],
+            deny_network: true,
+            selector: "gpu=nvidia".parse().unwrap(),
+            tolerations: Some(vec![]),
+            max_timeout_ms: Some(600_000),
+            max_gpus_per_task: Some(1),
+            ..Default::default()
+        };
+        p.validate().unwrap();
+        let mut ok = job("image = \"ghcr.io/lab/a:1\"\ncommand = [\"true\"]");
+        p.admit(&mut ok).unwrap();
+        assert_eq!(ok.selector.to_string(), "gpu=nvidia");
+        for (text, why) in [
+            ("image = \"ghcr.io/x/a\"", "does not allow the image"),
+            ("image = \"ghcr.io/lab/a\"\nnetwork = true", "network"),
+            ("image = \"ghcr.io/lab/a\"\ngpus = 2", "above the 1"),
+            (
+                "image = \"ghcr.io/lab/a\"\ngpus = \"all\"",
+                "gpus = \"all\"",
+            ),
+            (
+                "image = \"ghcr.io/lab/a\"\n[resources]\ntimeout = \"1h\"",
+                "above the 10m",
+            ),
+            (
+                "image = \"ghcr.io/lab/a\"\ntolerations = [\"spot\"]",
+                "toleration",
+            ),
+        ] {
+            let mut sub = job(text);
+            let e = p.admit(&mut sub).unwrap_err();
+            assert!(format!("{e:#}").contains(why), "{text}: {e:#}");
+        }
+        assert!(AccountPolicy::default().is_empty());
+        assert!(
+            AccountPolicy {
+                images: vec!["bad name".into()],
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
 
     fn labels(pairs: &[(&str, &[&str])]) -> LabelSet {
         pairs

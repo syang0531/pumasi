@@ -1317,6 +1317,72 @@ mod tests {
     }
 
     #[test]
+    fn blender_examples_resolve() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/blender-render");
+        for (file, graphics) in [("job-cycles.toml", false), ("job-eevee.toml", true)] {
+            let text = std::fs::read_to_string(dir.join(file)).unwrap();
+            let sub = JobFile::parse(&text).unwrap().resolve(&dir).unwrap();
+            sub.validate().unwrap();
+            assert_eq!(sub.needs_gpu_graphics(), graphics, "{file}");
+            assert_eq!(sub.queue_timeout_ms, Some(30 * 60_000), "{file}");
+            assert_eq!(sub.tasks.len(), 4);
+        }
+    }
+
+    #[test]
+    fn gpu_capabilities_and_queue_timeout() {
+        let dir = tempdir();
+        let sub = JobFile::parse(
+            "image = \"x\"\nqueue_timeout = \"90s\"\n[gpu]\nvendor = \"nvidia\"\ncapabilities = [\"video\", \"compute\", \"graphics\", \"video\"]",
+        )
+        .unwrap()
+        .resolve(&dir)
+        .unwrap();
+        sub.validate().unwrap();
+        assert_eq!(
+            sub.gpu_capabilities,
+            vec![GpuCapability::Graphics, GpuCapability::Video]
+        );
+        assert_eq!(sub.queue_timeout_ms, Some(90_000));
+        assert_eq!(
+            GpuCapability::driver_env(&sub.gpu_capabilities),
+            "compute,utility,graphics,video"
+        );
+        assert_eq!(GpuCapability::driver_env(&[]), "compute,utility");
+        for (text, why) in [
+            (
+                "image = \"x\"\n[gpu]\ncapabilities = [\"opengl\"]",
+                "unknown GPU capability",
+            ),
+            (
+                "image = \"x\"\ngpus = 1\n[gpu]\nvendor = \"amd\"\ncapabilities = [\"graphics\"]",
+                "NVIDIA",
+            ),
+            ("image = \"x\"\nqueue_timeout = \"500ms\"", "at least 1s"),
+        ] {
+            let e = JobFile::parse(text)
+                .and_then(|f| f.resolve(&dir))
+                .and_then(|s| s.validate());
+            let e = e.unwrap_err();
+            assert!(format!("{e:#}").contains(why), "{text}: {e:#}");
+        }
+    }
+
+    #[test]
+    fn durations_format_back() {
+        for (ms, s) in [
+            (0, "0s"),
+            (1500, "1500ms"),
+            (90_000, "1m30s"),
+            (5_400_000, "1h30m"),
+            (172_800_000, "2d"),
+        ] {
+            assert_eq!(format_duration_ms(ms), s);
+            assert_eq!(parse_duration_ms(s).unwrap_or(ms), ms, "{s}");
+        }
+    }
+
+    #[test]
     fn gpu_requests() {
         let dir = tempdir();
         let two = JobFile::parse("image = \"pytorch/pytorch\"\ngpus = 2").unwrap();

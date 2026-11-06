@@ -421,6 +421,10 @@ impl State {
         if !gpus.is_empty() {
             put("gpus", gpus.len().to_string());
         }
+        // Its Docker GPU tasks can draw (phase 15).
+        if self.nodes.get(id).is_some_and(|n| n.gpu_graphics) {
+            put("gpu.graphics", "true".into());
+        }
         if let Some(w) = self
             .webgpu
             .get(id)

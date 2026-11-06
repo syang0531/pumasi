@@ -758,10 +758,6 @@ fn create_args(
     a
 }
 
-/// Options that give a container its GPUs: `--gpus` with the NVIDIA
-/// GPUs' UUIDs (NVIDIA Container Toolkit, or Docker Desktop), AMD GPUs as
-/// `/dev/kfd` plus their render nodes, and `PUMASI_GPUS` with the node's
-/// numbers for them either way.
 /// A short reason for `docker version` failing, for the cluster's status.
 fn not_running(stderr: &str) -> String {
     let s = stderr.to_ascii_lowercase();
@@ -799,6 +795,12 @@ fn pick_digest(image: &str, answer: &str) -> Option<String> {
         .or_else(|| (!id.trim().is_empty()).then(|| id.trim().to_string()))
 }
 
+/// Options that give a container its GPUs: `--gpus` with the NVIDIA
+/// GPUs' UUIDs (NVIDIA Container Toolkit, or Docker Desktop), AMD GPUs as
+/// `/dev/kfd` plus their render nodes, and `PUMASI_GPUS` with the node's
+/// numbers for them either way.
+/// NVIDIA tasks also get `NVIDIA_DRIVER_CAPABILITIES` for the
+/// capabilities the job asked for (phase 15).
 fn gpu_args(
     gpus: &[pumasi_proto::gpu::GpuInfo],
     caps: &[pumasi_proto::job::GpuCapability],

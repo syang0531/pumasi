@@ -2519,6 +2519,95 @@ mod tests {
     }
 
     #[test]
+    fn graphics_jobs_need_nodes_that_draw() {
+        let mut st = state();
+        let (draws, _, mut draws_rx) = join_gpus(&mut st, "draws", vec![gpu(0, 12_700, 0)], None);
+        let (_, _, mut plain_rx) = join_gpus(&mut st, "plain", vec![gpu(0, 12_700, 0)], None);
+        let cap = st.capacity("owner");
+        assert_eq!((cap.ready_gpu, cap.ready_gpu_graphics), (2, 0));
+        let mut eevee = gpu_job(1, 1);
+        eevee.gpu_capabilities = vec![pumasi_proto::job::GpuCapability::Graphics];
+        let id = st.submit(eevee).unwrap();
+        assert!(assigned(&mut draws_rx).is_empty());
+        assert!(assigned(&mut plain_rx).is_empty());
+        assert!(st.why_unplaced(id, 0).contains("cannot draw"));
+
+        // `pumasi gpu check --docker-run` found that it draws.
+        let generation = st.nodes[&draws].generation;
+        st.on_executors(
+            &draws,
+            generation,
+            pumasi_proto::msg::ExecutorReport {
+                executors: vec![Executor::Wasm, Executor::Docker],
+                unavailable: vec![],
+                gpu_graphics: true,
+            },
+        );
+        let got = assigned(&mut draws_rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].task.job, id);
+        assert_eq!(
+            got[0].gpu_capabilities,
+            vec![pumasi_proto::job::GpuCapability::Graphics]
+        );
+        assert!(assigned(&mut plain_rx).is_empty());
+        assert_eq!(
+            st.node_labels(&draws).get("gpu.graphics"),
+            Some(&vec!["true".to_string()])
+        );
+        // A CUDA job takes the other node.
+        st.submit(gpu_job(1, 1)).unwrap();
+        assert_eq!(assigned(&mut plain_rx).len(), 1);
+    }
+
+    #[test]
+    fn nodes_report_docker_going_away_and_coming_back() {
+        let mut st = state();
+        let (id, mut rx) = join(&mut st, "win", vec![Executor::Wasm, Executor::Docker], None);
+        let generation = st.nodes[&id].generation;
+        let report = |up: bool| pumasi_proto::msg::ExecutorReport {
+            executors: if up {
+                vec![Executor::Wasm, Executor::Docker]
+            } else {
+                vec![Executor::Wasm]
+            },
+            unavailable: if up {
+                vec![]
+            } else {
+                vec![(Executor::Docker, "Docker Desktop is not running".into())]
+            },
+            gpu_graphics: false,
+        };
+        st.on_executors(&id, generation, report(false));
+        let view = st.status();
+        let node = view.nodes.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(node.unavailable.len(), 1);
+        let jid = st.submit(job(Executor::Docker, 1)).unwrap();
+        assert_eq!(st.jobs[&jid].tasks[0].state, TaskState::Pending);
+        let cap = st.capacity("owner");
+        assert_eq!(cap.ready_for(Executor::Docker), 0);
+        assert_eq!(cap.ready_for(Executor::Wasm), 1);
+        assert!(
+            st.why_unplaced(jid, 0).contains("docker"),
+            "{}",
+            st.why_unplaced(jid, 0)
+        );
+        assert!(
+            st.events(0, 0, 100)
+                .iter()
+                .any(|e| e.kind == "node.executor_unavailable")
+        );
+        // Docker Desktop started: the waiting task goes there.
+        st.on_executors(&id, generation, report(true));
+        let got = assigned(&mut rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].task.job, jid);
+        // A report from an older connection is ignored.
+        st.on_executors(&id, generation + 1, report(false));
+        assert!(st.status().nodes[0].unavailable.is_empty());
+    }
+
+    #[test]
     fn gpu_runs_are_billed_and_receipts_record_them() {
         let mut st = state();
         st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();

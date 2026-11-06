@@ -268,7 +268,7 @@ impl State {
     }
 
     /// Why no node takes a task: every node with its reason.
-    fn why_unplaced(&mut self, job: JobId, index: u32) -> String {
+    pub(crate) fn why_unplaced(&mut self, job: JobId, index: u32) -> String {
         let priority = self.priority_of(job);
         let item = QueueItem {
             job,

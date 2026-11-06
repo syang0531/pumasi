@@ -1962,6 +1962,86 @@ mod tests {
     }
 
     #[test]
+    fn migrates_layout6_schedules() {
+        use pumasi_proto::job::{Executor, JobSubmission, Limits, TaskInput, Tier};
+        let path =
+            std::env::temp_dir().join(format!("pumasi-store-{}.redb", rand::random::<u64>()));
+        let r = crate::manage::ScheduleRecord {
+            spec: pumasi_proto::manage::ScheduleSpec {
+                name: "nightly".into(),
+                cron: "@daily".into(),
+                job: JobSubmission {
+                    name: "report".into(),
+                    executor: Executor::Wasm,
+                    module: b"\0asm\x01\0\0\0".to_vec(),
+                    docker: None,
+                    files: vec![],
+                    tasks: vec![TaskInput::default(); 2],
+                    limits: Limits::default(),
+                    tier: Tier::Open,
+                    max_attempts: 2,
+                    max_price_per_hour: None,
+                    account: Some("lab".into()),
+                    deterministic: true,
+                    mounts: vec![],
+                    task_mounts: vec![],
+                    output_dataset: None,
+                    gpu: None,
+                    priority: 3,
+                    selector: Default::default(),
+                    tolerations: vec![],
+                    after: vec![],
+                    queue_timeout_ms: None,
+                    gpu_capabilities: vec![],
+                },
+                overlap: true,
+            },
+            next_unix: Some(1_800_000_000),
+            last_unix: None,
+            last_job: None,
+            last_error: Some("x".into()),
+            runs: 4,
+        };
+        // A layout 6 record is the same without the job's last two fields
+        // (an empty option and an empty list, a byte each).
+        let job = enc(&r.spec.job);
+        let record = |job: &[u8]| {
+            let mut b = enc(&r.spec.name);
+            b.extend(enc(&r.spec.cron));
+            b.extend_from_slice(job);
+            b.extend(enc(&r.spec.overlap));
+            b.extend(enc(&r.next_unix));
+            b.extend(enc(&r.last_unix));
+            b.extend(enc(&r.last_job));
+            b.extend(enc(&r.last_error));
+            b.extend(enc(&r.runs));
+            b
+        };
+        assert_eq!(record(&job), enc(&r));
+        let old = record(&job[..job.len() - 2]);
+        {
+            let store = Store::open(&path).unwrap();
+            let tx = store.db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(SCHEDULES).unwrap();
+                t.insert("nightly", old.as_slice()).unwrap();
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert(SCHEMA_META, 6u32.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let snap = Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(snap.schedules.len(), 1);
+        assert_eq!(enc(&snap.schedules[0]), enc(&r));
+        assert_eq!(snap.schedules[0].spec.job.priority, 3);
+        // Reopening does not migrate again.
+        let again = Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(enc(&again.schedules[0]), enc(&r));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn migrates_a_layout2_policy() {
         let path =
             std::env::temp_dir().join(format!("pumasi-store-{}.redb", rand::random::<u64>()));

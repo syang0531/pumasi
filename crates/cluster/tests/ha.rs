@@ -62,7 +62,9 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pumasi=info,openraft=error,warn".into()),
+                // The agent's task starts and ends too: a failover test
+                // that hangs then shows where the tasks stopped.
+                .unwrap_or_else(|_| "pumasi=info,pumasi_agent=debug,openraft=error,warn".into()),
         )
         .with_test_writer()
         .try_init();

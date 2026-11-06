@@ -16,6 +16,12 @@ end-to-end test against real Keycloak and OpenLDAP
 (`scripts/sso-e2e.sh`). Every Sunday the Long checks workflow fuzzes each
 target for 20 minutes.
 
+The internal review for 1.0 was done on 2026-11-06. It found one
+high-severity problem (a job file uploaded through the dashboard could
+name any file on the dashboard's machine), fixed it and nine smaller
+ones, and left one residual risk (device sign-in, now off by default); all of it is in the threat model's
+[Internal review for 1.0](threat-model.md#internal-review-for-10).
+
 An external review is planned once the project has users or funding to
 justify one. Free programs for open source audits (OSTIF, the OpenSSF's
 Alpha-Omega, the Sovereign Tech Agency, and OSS-Fuzz for continuous

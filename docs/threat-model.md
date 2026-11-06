@@ -95,7 +95,7 @@ reachable by anyone, with scripts elsewhere holding submitter tickets
 | The admin ticket leaks | `pumasi admin rotate` replaces the admin secret: every copy of the old admin ticket stops working, access tickets and SSO sessions keep working, and the rotation itself is audited (`admin.rotate`). | The holder could already have rolled out a binary to the nodes (`upgrade.rollout` is audited) or read confidential jobs. Treat it as a compromise of every node that auto-upgrades: see [operations.md](operations.md#a-leaked-admin-ticket). |
 | A browser session is stolen | Dashboard sessions are `HttpOnly`, `SameSite=Strict` cookies holding a random session id kept in the `pumasi ui` process, `Secure` when the dashboard is served over HTTPS or its `--public-url` is HTTPS (added in phase 17); SSO sessions are access tickets with a length (12 h by default, at most 30 days; `pumasi sso session`) and revocable like any other (`pumasi access revoke <name>` revokes every session of that person). | Restarting `pumasi ui` signs everyone out of the browser, but the underlying session ticket stays valid until it expires or is revoked. |
 | A ticket is guessed | Secrets are 32 random bytes (`new_secret`); comparisons are constant-time (`secrets_eq`). | None. |
-| An SSO sign-in is replayed or forged | OIDC: authorization code flow with PKCE (S256), `state` bound to a short-lived cookie on the browser that started it (`SameSite=Lax`, `Path=/sso`), `nonce` checked in the ID token, ID tokens verified against the issuer's JWKS with asymmetric algorithms only (no `none`, no HMAC), `iss`, `aud`, `azp` and `exp` checked, and email rules only for `email_verified` emails. Pending logins expire after 10 minutes and are used once. The redirect URI must be HTTPS (or loopback) and end in `/sso/callback`. Device flow (RFC 8628) for the CLI, with the device code held by the control plane, never the client. LDAP: user names are escaped in filters (RFC 4515), empty passwords are refused (no unauthenticated bind), and the bind is LDAPS or StartTLS (plain LDAP only to loopback). | Whoever controls the IdP or directory controls who signs in. Rules mapping `anyone` or a whole `domain:` give access to everyone the IdP vouches for. |
+| An SSO sign-in is replayed or forged | OIDC: authorization code flow with PKCE (S256), `state` bound to a short-lived cookie on the browser that started it (`SameSite=Lax`, `Path=/sso`), `nonce` checked in the ID token, ID tokens verified against the issuer's JWKS with asymmetric algorithms only (no `none`, no HMAC), `iss`, `aud`, `azp` and `exp` checked, and email rules only for `email_verified` emails. Pending logins expire after 10 minutes and are used once. The redirect URI must be HTTPS (or loopback) and end in `/sso/callback`. Device flow (RFC 8628) for the CLI, off unless an admin turns it on, with the device code held by the control plane, never the client. LDAP: user names are escaped in filters (RFC 4515), empty passwords are refused (no unauthenticated bind), and the bind is LDAPS or StartTLS (plain LDAP only to loopback). | Whoever controls the IdP or directory controls who signs in. Rules mapping `anyone` or a whole `domain:` give access to everyone the IdP vouches for. |
 
 ### Policy bypasses
 
@@ -104,14 +104,14 @@ reachable by anyone, with scripts elsewhere holding submitter tickets
 | A submitter calls an operation its role does not allow | Every admin operation goes through `access::admit` on the control plane, which lists per role what is allowed (an allow list: new operations are refused for submitters and viewers until they are added). Responses go through `access::scope`, which removes other accounts' jobs, nodes' details and the like. The HTTP API has no checks of its own to get wrong: `/api/v1/op` and every route forward the caller's secret. Refusals are audited (`call.<Op>`, `audit.read`, `sso.read`). | A mistake in `admit`'s table (`crates/cluster/src/access.rs`), which `crates/cluster/tests/manage.rs` and `tests/security.rs` exercise per role for the main operations but not exhaustively; the review should read it line by line. |
 | A submitter's job escapes the account's policy | Job policies (`pumasi quota ACCOUNT --images ... --executors ... --network deny ...`) are checked on the control plane at submission, whoever submits (including admins), and refusals answer `403` with the reasons. Images are resolved to digests and recorded with the job. | A policy that allows Docker lets jobs run containers sharing the host kernel. |
 | A submitter reads or cancels another account's job | `admit` checks the job's account; `scope` filters lists. | None known. |
-| Path traversal in job files, outputs or the file store | `validate_rel_path` (no absolute paths, `..`, `\` or `:`) on every file name from a job or a guest; guest output tars are parsed in memory with caps (`vmdisk::parse_output`). Both are fuzzed. | None known. |
+| Path traversal in job files, outputs or the file store | `validate_rel_path` (no absolute paths, `..`, `\` or `:`) on every file name from a job or a guest; guest output tars are parsed in memory with caps (`vmdisk::parse_output`). Both are fuzzed. A job file uploaded through the dashboard may only name files it was uploaded with (`JobFile::load_split_confined`): `module`, `stdin`, `files` and the tasks' own. | None known. Until the 1.0 review, an uploaded job file could name any file on the dashboard's machine (see "Internal review for 1.0"). |
 | Cross-site request forgery on the dashboard | Session cookie `SameSite=Strict`; requests that change something must repeat the session's CSRF token in `X-Pumasi-CSRF`; the sign-in forms check the `Origin` header against the dashboard's host (`same_origin`); the API takes bearer tickets only (no cookies). | None known. |
 
 ### Request floods
 
 | Threat | What answers it | Left over |
 | --- | --- | --- |
-| Password and ticket guessing | Wrong tickets and failed sign-ins are limited per client address in `pumasi ui` (10 attempts, then 10 a minute; `--real-ip-header` behind a proxy). LDAP: 5 wrong passwords per user in 5 minutes, then that user is refused without asking the directory; at most 4 directory binds at once. | Limits live in each `pumasi ui` process; an attacker with many addresses gets more attempts (each still has to guess 32 random bytes). LDAP per-user lockout lets a stranger lock a known user out for 5 minutes. |
+| Password and ticket guessing | Wrong tickets and failed sign-ins are limited per client address in `pumasi ui` (10 attempts, then 10 a minute; `--real-ip-header` behind a proxy, of which only the last address of a list counts, the one the proxy added). LDAP: 5 wrong passwords per user name (whatever its capitalization) in 5 minutes, then that user is refused without asking the directory; at most 4 directory binds at once. | Limits live in each `pumasi ui` process; an attacker with many addresses gets more attempts (each still has to guess 32 random bytes). LDAP per-user lockout lets a stranger lock a known user out for 5 minutes. |
 | Floods of valid requests from one ticket | A token bucket per ticket in `pumasi ui` (120 requests at once, then 20 per second), answered with `429` and `Retry-After`; at most 8 `?wait=` long polls per ticket at a time. | A leaked ticket can still use its share. |
 | Huge request bodies | Body limits per route: 1 MiB by default (including the unauthenticated sign-in forms), 32 MiB for `/api/v1/op`, and `--max-upload` (4 GiB by default) only on job submission and file store uploads, which require a valid ticket. | Before phase 17 the upload limit applied to every route, including `/login`: fixed. |
 | Floods of sign-in calls straight at the control plane | Sign-in calls take no secret, so anyone who knows the endpoint id can send them. Pending OIDC logins are capped (1000, 10 minutes each), device flows too, LDAP binds are limited as above, and unknown secrets are refused before anything is stored or audited. | No per-peer rate limit on the control plane itself (iroh endpoint ids are free to make); a stranger can keep the pending-login table full, which blocks new SSO sign-ins until entries expire. Keep the control plane's endpoint id to yourself (it is in tickets) and put `pumasi ui` in front of it. |
@@ -205,6 +205,50 @@ mismatch; three strikes suspend it. Providers never settle a check.
 9. **RSA and P-256/P-384 verification use crates with timing advisories**
    (RUSTSEC-2023-0071, RUSTSEC-2026-0387) that concern private keys and
    secret integers; Pumasi only verifies signatures with public keys.
+10. **Device sign-in can be phished once turned on.** It is off by
+    default; with `pumasi sso device on`, as with any RFC 8628 flow,
+    someone can start `pumasi login --sso` and talk a member into
+    entering the code at the IdP, and the session is then theirs with the
+    member's role. Every sign-in is audited with the IdP's name for the
+    person.
+
+## Internal review for 1.0
+
+Done on 2026-11-06 over the scope of [security-review.md](security-review.md),
+in its priority order: the dashboard and API, authorization on the
+control plane (`access.rs` read against every `AdminOp`), SSO, the audit
+log, the parsers of untrusted input, the confidential tier and job
+isolation on agents. By the maintainers with AI assistance, so not
+independent. Every finding below is fixed, with a test, in the pull
+request that added this section (residual risk 10 is what is left of
+the device-flow finding).
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| High | **Files on the dashboard's machine could be read through a job upload.** The dashboard loaded an uploaded `job.toml` the way `pumasi run` loads one the user wrote, so `stdin`, `module` or a task's `stdin` could be an absolute path or climb out with `..`. A submitter (any ticket that may submit, over the internet-facing API too) could set `stdin = "/home/admin/.pumasi/…/admin.ticket"` and get the dashboard's own admin ticket back in the job's output. (`files` already had to stay inside.) | `JobFile::load_split_confined` refuses every local path that is absolute, has `..` or a drive or UNC prefix; the dashboard uses it for both the pages and `/api/v1/jobs`. `pumasi run` is unchanged. |
+| Medium | **Every admin call formatted its whole request with `Debug`**, to name it in case it was refused. For a release chunk (`UploadRelease`, up to the 64 MiB frame) that is a string several times its size, built on every call, including by a viewer whose call is then refused: a cheap way to exhaust the control plane's memory, and wasted work on every legitimate rollout. | The call's name is taken from the start of the `Debug` output and formatting stops there. |
+| Low | **`--real-ip-header X-Forwarded-For` counted clients under the first address in the list**, which the client writes itself. Anyone could pick the address their failed sign-ins counted against: unlimited guesses, or getting someone else's address blocked. | The last address counts, the one the proxy in front added. `CF-Connecting-IP` was not affected. |
+| Low | **Open redirect in the language switch** (`/lang/en?next=`): browsers drop tabs and newlines from URLs, so `next=/%09/evil.example` sent the browser to another site. | `next` must be a path of visible ASCII. |
+| Low | **The LDAP lockout counted user names as typed**, so `bob`, `Bob` and `BOB` each got five tries, while directories match names without case. | The count is per lowercased name. |
+| Low | **Dashboard sessions were not bounded**: anyone with a valid ticket could keep signing in and grow the session table until sessions went idle (12 hours). | At most 10,000 sessions; the least recently used goes first. |
+| Low | **Uploads and output zips went to world-readable temporary directories** (`/tmp/pumasi-ui-*`, mode 0755), so other users of the dashboard's machine could read jobs' inputs and outputs while they were there. | Created with mode 0700, and never reusing a directory that already exists. |
+| Low | **Answers from the IdP were read whole before their size was checked.** Only a malicious or broken IdP could send one, but it could exhaust the control plane's memory. | Reading stops at 1 MiB. |
+| Medium | **A bare `group:NAME` rule matched any LDAP group with that `cn`**, wherever it was in the directory: `group:admins` also matched `cn=admins,ou=contractors,...`. Where people other than the directory's admins can create groups (delegated OUs in Active Directory), they could make an `admins` group, join it and sign in as admin. | Groups match by their whole DN; a bare name matches only groups under `--group-base`. Rules that named groups outside it by `cn` must now give the DN. |
+| Medium | **Device sign-in could be phished.** Anyone with the sign-in ticket (it holds no secret) could start `pumasi login --sso` and send its code to a member; a member who entered it at the IdP signed that person in with their own role. | The device flow is off unless an admin runs `pumasi sso device on` (stored with the SSO settings; phase 17's stored settings read as off). |
+
+Read and found sound: the role table in `access.rs` (an allow list; every
+submitter call on a job, dataset or schedule is checked against its
+account, and replies go through `scope`); the sign-in calls are the only
+ones that skip the secret check (`AdminOp::is_sign_in`), and unknown
+secrets are refused before anything is audited; OIDC state, nonce, PKCE,
+issuer, audience, `azp`, algorithm and key handling; LDAP filter
+escaping and the refusal of empty passwords; the audit chain and its
+signed head; the syslog export (each entry is JSON, so newlines in names
+cannot forge entries); frame limits on the wire; SEV-SNP and TDX checks
+(report data bound to the run's nonce and the guest's key, debug policies
+refused, VCEK firmware versions matched to the report); key release once
+per lease, to the node the run was placed on; the microVM network filter
+(public unicast IPv4 only, not the host's own addresses).
 
 ## Changes made while writing this
 

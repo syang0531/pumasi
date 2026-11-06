@@ -39,6 +39,8 @@ pub const SESSION_COOKIE: &str = "pumasi_session";
 pub const CSRF_HEADER: &str = "x-pumasi-csrf";
 /// A session unused for this long is dropped.
 const IDLE: Duration = Duration::from_secs(12 * 3600);
+/// Sessions kept at most.
+const MAX_SESSIONS: usize = 10_000;
 
 /// The ticket behind a request.
 #[derive(Debug, Clone)]
@@ -83,6 +85,16 @@ impl Sessions {
         let mut map = self.map.lock().unwrap();
         let now = Instant::now();
         map.retain(|_, (_, used)| now.duration_since(*used) < IDLE);
+        // Anyone with a valid ticket can sign in again and again: keep
+        // memory bounded by dropping the least recently used session.
+        if map.len() >= MAX_SESSIONS
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
         map.insert(id.clone(), (ident, now));
         id
     }
@@ -359,5 +371,20 @@ mod tests {
         assert!(s.get("nope").is_none());
         s.remove(&id);
         assert!(s.get(&id).is_none());
+    }
+
+    #[test]
+    fn sessions_are_bounded() {
+        let s = Sessions::default();
+        let ident = Identity {
+            secret: [1; 32],
+            name: "admin".into(),
+            role: AccessRole::Admin,
+            csrf: String::new(),
+        };
+        for _ in 0..=MAX_SESSIONS {
+            s.create(ident.clone());
+        }
+        assert_eq!(s.map.lock().unwrap().len(), MAX_SESSIONS);
     }
 }

@@ -1394,9 +1394,16 @@ async fn handle_sign_in(inner: &Arc<Inner>, op: AdminOp, peer: &str) -> AdminRes
                 let who = inner.sso.finish(&o, &state, &code).await?;
                 session_ticket(inner, &who, "sso", peer)
             }
-            AdminOp::SsoDeviceStart => Ok(AdminResponse::SsoDevice(Box::new(
-                inner.sso.device_start(&oidc()?).await?,
-            ))),
+            AdminOp::SsoDeviceStart => {
+                let o = oidc()?;
+                anyhow::ensure!(
+                    config.device,
+                    "sign-in from a terminal (the device flow) is off on this cluster; sign in through the dashboard, or ask an admin to turn it on (pumasi sso device on)"
+                );
+                Ok(AdminResponse::SsoDevice(Box::new(
+                    inner.sso.device_start(&o).await?,
+                )))
+            }
             AdminOp::SsoDevicePoll { handle } => {
                 match inner.sso.device_poll(&oidc()?, &handle).await? {
                     Ok(who) => session_ticket(inner, &who, "sso", peer),

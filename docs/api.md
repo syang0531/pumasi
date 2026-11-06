@@ -78,7 +78,9 @@ no pages, no sign-in link, no cookies, and only
 from one address, that address gets `429 Too Many Requests` for 5
 minutes. Behind a tunnel every connection comes from 127.0.0.1, so
 `--real-ip-header` names the header that carries the client's address
-(trusted only on connections from this machine). Keep it running as a
+(trusted only on connections from this machine). For a list such as
+`X-Forwarded-For` the last address counts, the one the proxy in front
+added; earlier ones are whatever the client sent. Keep it running as a
 service the same way as the agent (systemd, launchd or Task Scheduler).
 
 ### 3. Put it on the internet

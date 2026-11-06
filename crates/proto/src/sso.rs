@@ -85,8 +85,9 @@ pub struct LdapSettings {
 /// Who a sign-in rule matches.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Subject {
-    /// A group from the ID token's groups claim, or an LDAP group (its
-    /// whole DN or its `cn`). Compared without case.
+    /// A group from the ID token's groups claim, or an LDAP group: its
+    /// whole DN, or its `cn` for groups under the directory's group base.
+    /// Compared without case.
     Group(String),
     /// One verified email address.
     Email(String),
@@ -169,17 +170,45 @@ impl Subject {
     }
 }
 
-/// `want` is a group name or DN; `have` is what the provider listed. An
-/// LDAP DN also matches by its first `cn`.
+/// `want` is a group name or DN; `have` is what the provider listed (an
+/// LDAP sign-in also lists the `cn` of groups under the directory's group
+/// base). Compared without case, and DNs without the spaces around `,`
+/// and `=`. A bare name never matches a DN by its `cn` here: a group of
+/// that name could have been made anywhere in the directory.
 fn group_matches(want: &str, have: &str) -> bool {
-    if want.eq_ignore_ascii_case(have) {
-        return true;
+    normalize_dn(want) == normalize_dn(have)
+}
+
+/// A DN (or a plain name) for comparing: lowercase, no spaces around `,`
+/// and `=`.
+pub fn normalize_dn(s: &str) -> String {
+    s.split(',')
+        .map(|rdn| match rdn.split_once('=') {
+            Some((k, v)) => format!("{}={}", k.trim(), v.trim()),
+            None => rdn.trim().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+        .to_lowercase()
+}
+
+/// The `cn` of a group DN that lies under `base` (`cn=ops,ou=groups,dc=x`
+/// under `ou=groups,dc=x` is `ops`), for rules that name LDAP groups
+/// briefly. `None` for a DN elsewhere, or with an empty base.
+pub fn short_group_name(dn: &str, base: &str) -> Option<String> {
+    if base.trim().is_empty() {
+        return None;
     }
-    let first = have.split(',').next().unwrap_or("");
-    match first.split_once('=') {
-        Some((k, v)) if k.trim().eq_ignore_ascii_case("cn") => v.trim().eq_ignore_ascii_case(want),
-        _ => false,
-    }
+    let dn = normalize_dn(dn);
+    let base = normalize_dn(base);
+    let (first, rest) = dn.split_once(',')?;
+    let (k, v) = first.split_once('=')?;
+    // `\` at the end: the comma after it was escaped, part of the value.
+    (k == "cn"
+        && !v.is_empty()
+        && !v.ends_with('\\')
+        && (rest == base || rest.ends_with(&format!(",{base}"))))
+    .then(|| v.to_string())
 }
 
 /// One rule: whoever `subject` matches gets `role`.
@@ -217,6 +246,9 @@ pub enum SsoUpdate {
     Unmap(Subject),
     /// How long a sign-in lasts.
     SessionHours(u32),
+    /// Allow the device flow (`pumasi login --sso`), off by default: anyone
+    /// can start one and talk a member into entering its code (1.0 review).
+    Device(bool),
 }
 
 /// The settings as an admin sees them: without the client secret or the
@@ -393,10 +425,14 @@ mod tests {
     fn subjects_parse_and_match() {
         let g: Subject = "group:Engineering".parse().unwrap();
         assert!(g.matches(&who(None, &["engineering"])));
-        assert!(g.matches(&who(None, &["cn=engineering,ou=groups,dc=x"])));
+        // A bare name does not match a DN by its cn: anyone allowed to
+        // make groups somewhere could make one of that name.
+        assert!(!g.matches(&who(None, &["cn=engineering,ou=contractors,dc=x"])));
         assert!(!g.matches(&who(None, &["ou=engineering,dc=x"])));
         let dn: Subject = "group:cn=ops,ou=groups,dc=x".parse().unwrap();
         assert!(dn.matches(&who(None, &["CN=ops,OU=groups,DC=x"])));
+        assert!(dn.matches(&who(None, &["cn=ops, ou=groups, dc=x"])));
+        assert!(!dn.matches(&who(None, &["cn=ops,ou=other,dc=x"])));
         let e: Subject = "email:Alice@Example.com".parse().unwrap();
         assert_eq!(e.to_string(), "email:alice@example.com");
         assert!(e.matches(&who(Some("alice@example.com"), &[])));
@@ -421,6 +457,24 @@ mod tests {
         ] {
             assert!(bad.parse::<Subject>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn short_group_names_only_under_the_group_base() {
+        let base = "ou=groups,dc=x";
+        assert_eq!(
+            short_group_name("cn=Ops,ou=groups,dc=x", base).as_deref(),
+            Some("ops")
+        );
+        assert_eq!(
+            short_group_name("cn=ops,ou=team,ou=groups,dc=x", base).as_deref(),
+            Some("ops")
+        );
+        assert_eq!(short_group_name("cn=ops,ou=contractors,dc=x", base), None);
+        assert_eq!(short_group_name("cn=ops,xou=groups,dc=x", base), None);
+        assert_eq!(short_group_name("ou=ops,ou=groups,dc=x", base), None);
+        assert_eq!(short_group_name("cn=ops,ou=groups,dc=x", ""), None);
+        assert_eq!(short_group_name("cn=ops\\,ou=groups,dc=x", "dc=x"), None);
     }
 
     #[test]

@@ -383,6 +383,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
                 Map(m) => ("sso.map", m.subject.to_string(), m.role.to_string()),
                 Unmap(s) => ("sso.unmap", s.to_string(), none()),
                 SessionHours(h) => ("sso.session", none(), format!("{h} hours")),
+                Device(on) => ("sso.device", none(), if *on { "on" } else { "off" }.into()),
             }
         }
         // Reads.
@@ -427,15 +428,30 @@ pub fn refused_action(op: &AdminOp) -> String {
         Some((a, _, _)) => a.to_string(),
         None if matches!(op, AdminOp::Audit { .. } | AdminOp::AuditVerify) => "audit.read".into(),
         None if matches!(op, AdminOp::SsoGet) => "sso.read".into(),
-        None => {
-            let dbg = format!("{op:?}");
-            let name: String = dbg
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric())
-                .collect();
-            format!("call.{name}")
+        None => format!("call.{}", variant_name(op)),
+    }
+}
+
+/// The name of `op`'s variant (`StoreUpload`), from the start of its
+/// `Debug` output. Formatting stops there: the whole output of a store or
+/// release chunk would be several times its 32 MiB of data, on every call.
+fn variant_name(op: &AdminOp) -> String {
+    use std::fmt::Write;
+    struct Name(String);
+    impl Write for Name {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for c in s.chars() {
+                if !c.is_ascii_alphanumeric() || self.0.len() >= 64 {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push(c);
+            }
+            Ok(())
         }
     }
+    let mut n = Name(String::new());
+    let _ = write!(n, "{op:?}");
+    n.0
 }
 
 #[cfg(test)]
@@ -454,6 +470,21 @@ mod tests {
             (a, t.as_str(), d.as_str()),
             ("webhook.set", "ops", "hooks.slack.com")
         );
+    }
+
+    #[test]
+    fn refusals_are_named_without_formatting_the_payload() {
+        let op = AdminOp::UploadRelease {
+            sha256: [0; 32],
+            size: 64 << 20,
+            offset: 0,
+            bytes: vec![255; 64 << 20],
+        };
+        let t = std::time::Instant::now();
+        assert_eq!(refused_action(&op), "call.UploadRelease");
+        // The whole `Debug` output would be about 320 MB.
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(variant_name(&AdminOp::Status), "Status");
     }
 
     #[test]

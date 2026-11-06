@@ -1979,9 +1979,9 @@ remotely; install a current binary on them once.
   at the control plane, the audit log is never pruned (pruning behind a
   signed checkpoint), no SCIM provisioning (people appear when they first
   sign in and their sessions simply expire), no SAML, the control plane
-  has no service installer of its own, and the 1.0 tag waits for the
-  internal security review and a green long-checks run. No third-party
-  audit yet.
+  has no service installer of its own, and the 1.0 tag waits for a
+  green long-checks run. The internal security review is done (threat
+  model, "Internal review for 1.0"); no third-party audit yet.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node

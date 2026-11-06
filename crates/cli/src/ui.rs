@@ -51,7 +51,8 @@ pub struct UiArgs {
     /// A header with the client's address, trusted only on connections
     /// from this machine (a tunnel or reverse proxy here), for limiting
     /// failed sign-ins per client: `CF-Connecting-IP` behind Cloudflare
-    /// Tunnel, `X-Forwarded-For` behind most proxies.
+    /// Tunnel, `X-Forwarded-For` behind most proxies (its last address
+    /// is used: the one the proxy here added).
     #[arg(long)]
     real_ip_header: Option<String>,
     /// Allow `--api-only` on an address other than loopback without

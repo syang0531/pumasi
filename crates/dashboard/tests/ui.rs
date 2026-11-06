@@ -585,6 +585,40 @@ async fn api_only_over_tls_with_rate_limit_and_long_poll() {
     .await;
     assert_eq!(r.status, 201, "{}", r.text());
     let id = r.json()["id"].as_str().unwrap().to_string();
+
+    // A job file names only files it was sent with, never one on this
+    // machine (internal review, 1.0).
+    let secret = std::env::temp_dir().join(format!("pumasi-ui-secret-{}", std::process::id()));
+    std::fs::write(&secret, "not for jobs").unwrap();
+    let job = format!(
+        "module = \"ticker.wasm\"\nstdin = \"{}\"\n",
+        secret.display().to_string().replace('\\', "/")
+    );
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"job\"\r\n\r\n{job}\r\n--{boundary}--\r\n"
+    );
+    let r = request_tls(
+        addr,
+        "POST",
+        "/api/v1/jobs",
+        &[
+            auth.clone(),
+            (
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            ),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    let _ = std::fs::remove_file(&secret);
+    assert!(
+        r.status == 400 && r.text().contains("inside its folder"),
+        "{} {}",
+        r.status,
+        r.text()
+    );
+
     let r = request_tls(
         addr,
         "GET",

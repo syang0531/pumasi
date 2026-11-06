@@ -473,6 +473,7 @@ pumasi sso map group:<관리자-그룹-id> admin
 pumasi sso map group:<연구-그룹-id> submitter:research
 pumasi sso map domain:acme.com viewer
 pumasi ui --public-url https://pumasi.acme.com     # "Acme SSO로 로그인" 버튼
+pumasi sso device on                               # pumasi login --sso 허용(기본 꺼짐)
 pumasi sso ticket                                  # CLI용: pumasi login --sso <티켓>
 ```
 
@@ -491,7 +492,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | 명령 | 설명 |
 | --- | --- |
 | `pumasi cluster start [--metrics-addr ADDR] [--keep-jobs 30d]` | 컨트롤 플레인 실행. 처음 실행하면 클러스터를 만들고, 상태는 `~/.pumasi/cluster`에 저장합니다. `--metrics-addr`는 Prometheus 지표 제공, `--keep-jobs`는 끝난 작업 보관 기간(`0`이면 영구) |
-| `pumasi sso status` / `sso oidc ...` / `sso ldap ...` / `sso map 규칙 역할` / `sso unmap 규칙` / `sso session 12h` / `sso ticket` | SSO: OIDC 제공자나 LDAP 디렉터리, 규칙(`group:`, `email:`, `domain:`, `anyone`)과 역할(`admin`, `viewer`, `submitter:계정`), 로그인 유지 시간, 로그인용 티켓 |
+| `pumasi sso status` / `sso oidc ...` / `sso ldap ...` / `sso map 규칙 역할` / `sso unmap 규칙` / `sso session 12h` / `sso device on\|off` / `sso ticket` | SSO: OIDC 제공자나 LDAP 디렉터리, 규칙(`group:`, `email:`, `domain:`, `anyone`)과 역할(`admin`, `viewer`, `submitter:계정`), 로그인 유지 시간, 터미널 로그인(`pumasi login --sso`, 디바이스 흐름, 기본 꺼짐) 허용 여부, 로그인용 티켓 |
 | `pumasi login <티켓> [--sso \| --ldap 사용자]` | 원격 클러스터에 로그인. `--sso`(디바이스 흐름)와 `--ldap`은 `pumasi sso ticket`의 로그인 티켓으로 |
 | `pumasi audit ls` / `audit verify [--against HEAD]` / `audit export [--syslog udp://\|tcp://호스트:포트]` | 감사 로그 조회, 해시 체인 전체 검증과 서명된 끝, syslog(RFC 5424) 내보내기 |
 | `pumasi admin rotate` | 관리자 시크릿 교체: 기존 관리자 티켓은 모두 무효 |
@@ -639,7 +640,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. 1.0 태그는 [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검을 마치고, 태그할 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 붙입니다. 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0 태그는 태그할 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 붙입니다. 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -659,7 +660,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 14 | WebGPU 실행기(실험): `gpus = 1`인 wasm 작업이 wgpu(Vulkan, Metal, DX12, GL)와 `pumasi_webgpu` 임포트로 어떤 GPU에서든 WGSL 컴퓨트 셰이더 실행, WGSL 벤치마크가 담긴 서명된 어댑터 프로필, GPU 목록과 슬롯 공유, GPU 시간 CU 과금, CI에서 Linux·Windows·macOS 결과를 CPU와 비교하는 행렬곱·블러 예제, GPU 드라이버를 불러올 수 있는 glibc Linux 바이너리 | 완료 |
 | 15 | 원격 API 클라이언트: 계정별 작업 정책(이미지·다이제스트, 실행기, 네트워크 차단, 강제 selector, toleration, 최대 제한 시간, 태스크당 GPU), 작업마다 제출자와 실제 이미지 다이제스트 기록, `queue_timeout`, 지금 그 계정 작업을 받을 노드 수와 못 받는 이유, 실행 중인 에이전트의 Docker 재확인, HTTPS(`--tls-cert`)와 인증 실패 제한이 있는 `pumasi ui --api-only`, Cloudflare Tunnel 안내, `?wait=` 롱폴링, CI에서 실행하는 curl 예제, 그리기용 GPU 드라이버 능력(`gpu.graphics`, `gpu check --docker-run`)과 Blender 예제 | 완료 |
 | 16 | 기밀 등급: `trusted`(내 기기와 신뢰하는 제공자)와 `confidential`(SEV-SNP·TDX microVM). 이미지와 입력을 컨트롤 플레인에서 봉인, AMD·Intel 인증서로 원격 증명 검증, 관리자가 신뢰한 실행 측정값의 새 게스트에만 키 전달, 봉인된 결과, `pumasi confidential` | 완료 |
-| 17 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델(인터넷에 노출된 API와 터널 시나리오 포함: 티켓 유출, 정책 우회, 요청 폭주), CI에 cargo-audit·cargo-deny·CodeQL·퍼징, Keycloak·OpenLDAP로 SSO 종단 테스트, 내부 보안 점검, 운영 문서, Linux·macOS 장시간 소크 테스트 뒤 1.0 태그. 함께: 작업 보관 기간(`--keep-jobs`), 관리자 시크릿 교체, 티켓별 요청 제한 | 이번 릴리스(점검·태그 남음) |
+| 17 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델(인터넷에 노출된 API와 터널 시나리오 포함: 티켓 유출, 정책 우회, 요청 폭주), CI에 cargo-audit·cargo-deny·CodeQL·퍼징, Keycloak·OpenLDAP로 SSO 종단 테스트, 내부 보안 점검, 운영 문서, Linux·macOS 장시간 소크 테스트 뒤 1.0 태그. 함께: 작업 보관 기간(`--keep-jobs`), 관리자 시크릿 교체, 티켓별 요청 제한 | 이번 릴리스(태그 남음) |
 | 18 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
 | 19 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 

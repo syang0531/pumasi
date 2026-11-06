@@ -362,10 +362,9 @@ pub async fn set_lang(Path(lang): Path<String>, Query(q): Query<LangQuery>) -> R
     let Some(l) = Lang::parse(&lang) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // Only paths on this server.
     let next = q
         .next
-        .filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.contains('\\'))
+        .filter(|n| local_path(n))
         .unwrap_or_else(|| "/".into());
     (
         [(
@@ -379,6 +378,16 @@ pub async fn set_lang(Path(lang): Path<String>, Query(q): Query<LangQuery>) -> R
         Redirect::to(&next),
     )
         .into_response()
+}
+
+/// A path on this server, safe to redirect to. Browsers drop tabs and
+/// newlines from URLs and read `\` as `/`, so `/\t/evil.example` would
+/// become `//evil.example`, another site: only visible ASCII is allowed.
+fn local_path(n: &str) -> bool {
+    n.starts_with('/')
+        && !n.starts_with("//")
+        && !n.contains('\\')
+        && n.bytes().all(|b| b.is_ascii_graphic())
 }
 
 fn form(l: Lang, sso: &SsoInfo, error: Option<&str>, status: StatusCode) -> Response {
@@ -428,4 +437,25 @@ fn form(l: Lang, sso: &SsoInfo, error: Option<&str>, status: StatusCode) -> Resp
         }
     };
     (status, Html(body.into_string())).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn language_switch_redirects_only_here() {
+        for ok in ["/", "/jobs?x=1", "/login"] {
+            assert!(super::local_path(ok), "{ok}");
+        }
+        for bad in [
+            "//evil.example",
+            "/\\evil.example",
+            "/\t/evil.example",
+            "/\n/evil.example",
+            "/ /evil.example",
+            "https://evil.example",
+            "evil",
+        ] {
+            assert!(!super::local_path(bad), "{bad:?}");
+        }
+    }
 }

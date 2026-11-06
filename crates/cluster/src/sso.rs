@@ -70,6 +70,31 @@ pub struct SsoConfig {
     pub maps: Vec<RoleMap>,
     /// 0 means [`DEFAULT_SESSION_HOURS`].
     pub session_hours: u32,
+    /// The device flow (`pumasi login --sso`) is allowed. Off unless an
+    /// admin turns it on (1.0 review): anyone can start a device sign-in
+    /// and talk a member into entering its code.
+    pub device: bool,
+}
+
+/// [`SsoConfig`] as phase 17 stored it, before `device`.
+#[derive(Deserialize)]
+pub struct SsoConfigV1 {
+    pub oidc: Option<OidcSettings>,
+    pub ldap: Option<LdapSettings>,
+    pub maps: Vec<RoleMap>,
+    pub session_hours: u32,
+}
+
+impl From<SsoConfigV1> for SsoConfig {
+    fn from(c: SsoConfigV1) -> Self {
+        SsoConfig {
+            oidc: c.oidc,
+            ldap: c.ldap,
+            maps: c.maps,
+            session_hours: c.session_hours,
+            device: false,
+        }
+    }
 }
 
 impl SsoConfig {
@@ -152,6 +177,7 @@ impl State {
                 c.maps.retain(|m| m.subject != s);
                 ensure!(c.maps.len() < before, "no rule for {s}");
             }
+            SsoUpdate::Device(on) => c.device = on,
             SsoUpdate::SessionHours(h) => {
                 ensure!(
                     (1..=MAX_SESSION_HOURS).contains(&h),
@@ -171,7 +197,7 @@ impl State {
         let c = &self.sso.config;
         SsoInfo {
             oidc: c.oidc.as_ref().map(|o| o.name.clone()),
-            device: c.oidc.is_some(),
+            device: c.oidc.is_some() && c.device,
             ldap: c.ldap.is_some(),
         }
     }
@@ -358,6 +384,23 @@ fn pct(s: &str) -> String {
     out
 }
 
+/// Largest answer read from a provider.
+const MAX_ANSWER: usize = 1 << 20;
+
+/// Reads an answer of at most [`MAX_ANSWER`] bytes, stopping as soon as it
+/// is larger (rather than buffering all of it first).
+async fn read_limited(mut resp: reqwest::Response) -> Result<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > MAX_ANSWER as u64) {
+        bail!("answer too large");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        ensure!(body.len() + chunk.len() <= MAX_ANSWER, "answer too large");
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// A redirect URI must come back to a dashboard's callback over HTTPS (or
 /// to this machine).
 fn check_redirect(uri: &str) -> Result<()> {
@@ -394,9 +437,10 @@ impl Runtime {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
-        let body = resp.bytes().await?;
         ensure!(status.is_success(), "GET {url}: HTTP {status}");
-        ensure!(body.len() <= 1 << 20, "GET {url}: answer too large");
+        let body = read_limited(resp)
+            .await
+            .with_context(|| format!("GET {url}"))?;
         serde_json::from_slice(&body).with_context(|| format!("GET {url}: not the JSON expected"))
     }
 
@@ -413,8 +457,9 @@ impl Runtime {
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status().as_u16();
-        let body = resp.bytes().await?;
-        ensure!(body.len() <= 1 << 20, "POST {url}: answer too large");
+        let body = read_limited(resp)
+            .await
+            .with_context(|| format!("POST {url}"))?;
         let v: Value = serde_json::from_slice(&body)
             .with_context(|| format!("POST {url}: HTTP {status}, not JSON"))?;
         Ok((status, v))
@@ -781,7 +826,11 @@ impl Runtime {
         if password.is_empty() || password.len() > 1024 {
             return Err(plain(anyhow!("wrong user name or password")));
         }
-        self.ldap_allowed(user).map_err(plain)?;
+        // Directories match user names without regard to case, so the
+        // failure count must too: otherwise `Alice`, `ALICE`, `aLice`...
+        // each get their own five tries.
+        let key = user.to_lowercase();
+        self.ldap_allowed(&key).map_err(plain)?;
         let _slot = self
             .ldap_slots
             .acquire()
@@ -789,13 +838,13 @@ impl Runtime {
             .map_err(|_| plain(anyhow!("shutting down")))?;
         let found = ldap_lookup(l, user).await.map_err(plain)?;
         let Some((dn, mut groups, mail)) = found else {
-            self.ldap_failed(user);
+            self.ldap_failed(&key);
             return Err(plain(anyhow!("wrong user name or password")));
         };
         match ldap_bind(l, &dn, password).await {
             Ok(true) => {}
             Ok(false) => {
-                self.ldap_failed(user);
+                self.ldap_failed(&key);
                 return Err((
                     anyhow!("wrong user name or password"),
                     Some(format!("ldap:{user}")),
@@ -806,6 +855,15 @@ impl Runtime {
         if !l.group_base.is_empty() {
             groups.extend(ldap_groups(l, &dn, user).await.map_err(plain)?);
         }
+        // Rules may name groups under the group base by their cn alone;
+        // elsewhere only the whole DN matches (1.0 review).
+        let short: Vec<String> = groups
+            .iter()
+            .filter_map(|g| pumasi_proto::sso::short_group_name(g, &l.group_base))
+            .collect();
+        groups.extend(short);
+        groups.sort();
+        groups.dedup();
         Ok(Identity {
             name: clip_name(&format!("ldap:{user}")),
             // Directory addresses are what the organization wrote down.

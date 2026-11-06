@@ -81,7 +81,15 @@ async fn err(c: &AdminClient, op: AdminOp) -> String {
 }
 
 async fn audit(c: &AdminClient) -> Vec<AuditEntry> {
-    match ok(c, AdminOp::Audit { after: 0, limit: 10_000 }).await {
+    match ok(
+        c,
+        AdminOp::Audit {
+            after: 0,
+            limit: 10_000,
+        },
+    )
+    .await
+    {
         AdminResponse::Audit(v) => v,
         r => panic!("{r:?}"),
     }
@@ -136,7 +144,11 @@ async fn the_audit_log_chains_calls_refusals_and_restarts() -> Result<()> {
     ok(&viewer, AdminOp::Status).await;
     // A wrong ticket is refused before anything is logged.
     let wrong = AdminClient::connect(&anonymous(&cluster.admin_ticket()), NetMode::Local).await?;
-    assert!(err(&wrong, AdminOp::Status).await.contains("invalid admin credentials"));
+    assert!(
+        err(&wrong, AdminOp::Status)
+            .await
+            .contains("invalid admin credentials")
+    );
 
     let log = audit(&admin).await;
     let actions: Vec<(&str, &str, bool)> = log
@@ -157,7 +169,17 @@ async fn the_audit_log_chains_calls_refusals_and_restarts() -> Result<()> {
     assert!(!log[3].peer.is_empty());
     verify_chain(GENESIS, 1, &log)?;
     // Viewers cannot read it.
-    assert!(err(&viewer, AdminOp::Audit { after: 0, limit: 10 }).await.contains("audit"));
+    assert!(
+        err(
+            &viewer,
+            AdminOp::Audit {
+                after: 0,
+                limit: 10
+            }
+        )
+        .await
+        .contains("audit")
+    );
 
     let head = match ok(&admin, AdminOp::AuditVerify).await {
         AdminResponse::AuditHead(h) => h,
@@ -178,7 +200,13 @@ async fn the_audit_log_chains_calls_refusals_and_restarts() -> Result<()> {
     cluster.shutdown().await?;
     let cluster = start_cluster(dir.clone()).await?;
     let admin = AdminClient::connect(&cluster.admin_ticket(), NetMode::Local).await?;
-    err(&admin, AdminOp::Cancel { id: pumasi_proto::job::JobId(7) }).await;
+    err(
+        &admin,
+        AdminOp::Cancel {
+            id: pumasi_proto::job::JobId(7),
+        },
+    )
+    .await;
     let log = audit(&admin).await;
     assert_eq!(log.len(), 7);
     assert_eq!(log[5].action, "control-plane.start");
@@ -210,12 +238,16 @@ async fn rotating_the_admin_secret_retires_the_old_ticket() -> Result<()> {
         r => panic!("{r:?}"),
     };
     assert_ne!(new.secret, old.secret);
-    assert!(err(&admin, AdminOp::Status).await.contains("invalid admin credentials"));
+    assert!(
+        err(&admin, AdminOp::Status)
+            .await
+            .contains("invalid admin credentials")
+    );
     let fresh = AdminClient::connect(&new, NetMode::Local).await?;
     ok(&fresh, AdminOp::Status).await;
     // The file next to the cluster has the new one.
-    let saved: AdminTicket = std::fs::read_to_string(dir.join(pumasi_cluster::ADMIN_TICKET_FILE))?
-        .parse()?;
+    let saved: AdminTicket =
+        std::fs::read_to_string(dir.join(pumasi_cluster::ADMIN_TICKET_FILE))?.parse()?;
     assert_eq!(saved.secret, new.secret);
     let log = audit(&fresh).await;
     assert_eq!(log.last().unwrap().action, "admin.rotate");
@@ -276,7 +308,12 @@ fn sign_token(idp: &Idp, nonce: Option<&str>) -> String {
     };
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
     header.kid = Some("k1".into());
-    jsonwebtoken::encode(&header, &claims, &jsonwebtoken::EncodingKey::from_ec_der(key)).unwrap()
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &jsonwebtoken::EncodingKey::from_ec_der(key),
+    )
+    .unwrap()
 }
 
 async fn discovery(State(idp): State<SharedIdp>) -> Json<Value> {
@@ -293,8 +330,10 @@ async fn discovery(State(idp): State<SharedIdp>) -> Json<Value> {
 async fn jwks(State(idp): State<SharedIdp>) -> Json<Value> {
     let i = idp.lock().unwrap();
     let (x, y) = i.point[1..].split_at(32);
-    Json(json!({"keys": [{"kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig",
-                          "kid": "k1", "x": b64(x), "y": b64(y)}]}))
+    Json(
+        json!({"keys": [{"kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig",
+                          "kid": "k1", "x": b64(x), "y": b64(y)}]}),
+    )
 }
 
 /// The user agrees at once: back to the redirect URI with a code.
@@ -309,7 +348,11 @@ async fn authorize(
     let code = format!("code-{}", rand::random::<u32>());
     idp.lock().unwrap().codes.insert(
         code.clone(),
-        (q["nonce"].clone(), q["code_challenge"].clone(), q["redirect_uri"].clone()),
+        (
+            q["nonce"].clone(),
+            q["code_challenge"].clone(),
+            q["redirect_uri"].clone(),
+        ),
     );
     let to = format!("{}?code={code}&state={}", q["redirect_uri"], q["state"]);
     (StatusCode::FOUND, [(header::LOCATION, to)]).into_response()
@@ -318,18 +361,28 @@ async fn authorize(
 async fn token(State(idp): State<SharedIdp>, Form(f): Form<HashMap<String, String>>) -> Response {
     let mut i = idp.lock().unwrap();
     if f.get("client_secret").map(String::as_str) != Some("s3cret") {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid_client"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid_client"})),
+        )
+            .into_response();
     }
     match f["grant_type"].as_str() {
         "authorization_code" => {
             let Some((nonce, challenge, redirect)) = i.codes.remove(&f["code"]) else {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_grant"})))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid_grant"})),
+                )
                     .into_response();
             };
             use sha2::Digest;
             let want = b64(&sha2::Sha256::digest(f["code_verifier"].as_bytes()));
             if want != challenge || f["redirect_uri"] != redirect {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_grant"})))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid_grant"})),
+                )
                     .into_response();
             }
             Json(json!({"id_token": sign_token(&i, Some(&nonce)), "token_type": "Bearer"}))
@@ -338,13 +391,19 @@ async fn token(State(idp): State<SharedIdp>, Form(f): Form<HashMap<String, Strin
         "urn:ietf:params:oauth:grant-type:device_code" => {
             assert_eq!(f["device_code"], "dev-1");
             if !i.device_approved {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": "authorization_pending"})))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "authorization_pending"})),
+                )
                     .into_response();
             }
             i.device_approved = false;
             Json(json!({"id_token": sign_token(&i, None)})).into_response()
         }
-        _ => (StatusCode::BAD_REQUEST, Json(json!({"error": "unsupported_grant_type"})))
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unsupported_grant_type"})),
+        )
             .into_response(),
     }
 }
@@ -359,8 +418,8 @@ async fn start_idp() -> (SharedIdp, SocketAddr) {
     use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-    let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
-        .unwrap();
+    let pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
     let evil = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -369,7 +428,12 @@ async fn start_idp() -> (SharedIdp, SocketAddr) {
         pkcs8: pkcs8.as_ref().to_vec(),
         point: pair.public_key().as_ref().to_vec(),
         evil_pkcs8: evil.as_ref().to_vec(),
-        user: ("u-1".into(), "Alice@Corp.example".into(), true, vec!["ml-team".into()]),
+        user: (
+            "u-1".into(),
+            "Alice@Corp.example".into(),
+            true,
+            vec!["ml-team".into()],
+        ),
         ..Default::default()
     }));
     let app = Router::new()
@@ -444,7 +508,11 @@ async fn oidc_sign_in_maps_groups_to_roles() -> Result<()> {
             .contains("no OpenID Connect")
     );
     // Sign-in calls are the only ones without a ticket.
-    assert!(err(&anon, AdminOp::SsoGet).await.contains("invalid admin credentials"));
+    assert!(
+        err(&anon, AdminOp::SsoGet)
+            .await
+            .contains("invalid admin credentials")
+    );
 
     let settings = OidcSettings {
         name: "Corp".into(),
@@ -454,7 +522,11 @@ async fn oidc_sign_in_maps_groups_to_roles() -> Result<()> {
         scopes: vec!["email".into(), "profile".into()],
         groups_claim: "groups".into(),
     };
-    ok(&admin, AdminOp::SsoSet(Box::new(SsoUpdate::Oidc(Some(Box::new(settings)))))).await;
+    ok(
+        &admin,
+        AdminOp::SsoSet(Box::new(SsoUpdate::Oidc(Some(Box::new(settings))))),
+    )
+    .await;
     let view = match ok(&admin, AdminOp::SsoGet).await {
         AdminResponse::Sso(v) => v,
         r => panic!("{r:?}"),
@@ -508,14 +580,24 @@ async fn oidc_sign_in_maps_groups_to_roles() -> Result<()> {
         r => panic!("{r:?}"),
     };
     assert_eq!(view.name, "sso:alice@corp.example");
-    assert_eq!(view.role, AccessRole::Submitter { account: "ml".into() });
+    assert_eq!(
+        view.role,
+        AccessRole::Submitter {
+            account: "ml".into()
+        }
+    );
     let expires = view.expires_unix.unwrap() - view.created_unix;
     assert_eq!(expires, 12 * 3600);
     let alice = AdminClient::connect(&ticket, NetMode::Local).await?;
     match ok(&alice, AdminOp::WhoAmI).await {
         AdminResponse::WhoAmI { name, role } => {
             assert_eq!(name, "sso:alice@corp.example");
-            assert_eq!(role, AccessRole::Submitter { account: "ml".into() });
+            assert_eq!(
+                role,
+                AccessRole::Submitter {
+                    account: "ml".into()
+                }
+            );
         }
         r => panic!("{r:?}"),
     }
@@ -559,14 +641,28 @@ async fn oidc_sign_in_maps_groups_to_roles() -> Result<()> {
         r => panic!("{r:?}"),
     };
     assert_eq!(start.user_code, "ABCD-EFGH");
-    match ok(&anon, AdminOp::SsoDevicePoll { handle: start.handle.clone() }).await {
+    match ok(
+        &anon,
+        AdminOp::SsoDevicePoll {
+            handle: start.handle.clone(),
+        },
+    )
+    .await
+    {
         AdminResponse::SsoPending { interval_secs } => assert!(interval_secs >= 1),
         r => panic!("{r:?}"),
     }
     idp.lock().unwrap().device_approved = true;
     let got = loop {
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        match ok(&anon, AdminOp::SsoDevicePoll { handle: start.handle.clone() }).await {
+        match ok(
+            &anon,
+            AdminOp::SsoDevicePoll {
+                handle: start.handle.clone(),
+            },
+        )
+        .await
+        {
             AdminResponse::SsoPending { .. } => continue,
             AdminResponse::AccessTicket { view, .. } => break view,
             r => panic!("{r:?}"),
@@ -574,14 +670,34 @@ async fn oidc_sign_in_maps_groups_to_roles() -> Result<()> {
     };
     assert_eq!(got.name, "sso:eve@corp.example");
     assert_eq!(got.role, AccessRole::Viewer);
-    assert!(err(&anon, AdminOp::SsoDevicePoll { handle: start.handle }).await.contains("unknown"));
+    assert!(
+        err(
+            &anon,
+            AdminOp::SsoDevicePoll {
+                handle: start.handle
+            }
+        )
+        .await
+        .contains("unknown")
+    );
 
     // Revoking by name ends every session of that person.
-    match ok(&admin, AdminOp::RevokeAccess { id: "sso:alice@corp.example".into() }).await {
+    match ok(
+        &admin,
+        AdminOp::RevokeAccess {
+            id: "sso:alice@corp.example".into(),
+        },
+    )
+    .await
+    {
         AdminResponse::AccessList(v) => assert_eq!(v.len(), 1),
         r => panic!("{r:?}"),
     }
-    assert!(err(&alice, AdminOp::WhoAmI).await.contains("invalid admin credentials"));
+    assert!(
+        err(&alice, AdminOp::WhoAmI)
+            .await
+            .contains("invalid admin credentials")
+    );
 
     let log = audit(&admin).await;
     let logins: Vec<(&str, &str, bool)> = log
@@ -621,7 +737,10 @@ async fn start_ldap() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let users: HashMap<&str, (&str, Vec<&str>)> = HashMap::from([
-        ("alice", ("wonderland", vec!["cn=ops,ou=groups,dc=example,dc=com"])),
+        (
+            "alice",
+            ("wonderland", vec!["cn=ops,ou=groups,dc=example,dc=com"]),
+        ),
         ("bob", ("builder", vec![])),
     ]);
     let users = Arc::new(users);
@@ -644,10 +763,9 @@ async fn start_ldap() -> SocketAddr {
                         ServerOps::SimpleBind(b) => {
                             let ok = if b.dn == "cn=svc,dc=example,dc=com" {
                                 b.pw == "svcpw"
-                            } else if let Some(uid) = b
-                                .dn
-                                .strip_prefix("uid=")
-                                .and_then(|r| r.strip_suffix(",ou=people,dc=example,dc=com"))
+                            } else if let Some(uid) =
+                                b.dn.strip_prefix("uid=")
+                                    .and_then(|r| r.strip_suffix(",ou=people,dc=example,dc=com"))
                             {
                                 users.get(uid).is_some_and(|(pw, _)| *pw == b.pw)
                             } else {
@@ -656,11 +774,18 @@ async fn start_ldap() -> SocketAddr {
                                 b.pw.is_empty()
                             };
                             bound = ok;
-                            vec![if ok { b.gen_success() } else { b.gen_invalid_cred() }]
+                            vec![if ok {
+                                b.gen_success()
+                            } else {
+                                b.gen_invalid_cred()
+                            }]
                         }
                         ServerOps::Search(s) => {
                             if !bound {
-                                vec![s.gen_error(LdapResultCode::InsufficentAccessRights, "bind first".into())]
+                                vec![s.gen_error(
+                                    LdapResultCode::InsufficentAccessRights,
+                                    "bind first".into(),
+                                )]
                             } else {
                                 // The filter is (uid=<escaped>): pick the value.
                                 let f = format!("{:?}", s.filter);
@@ -673,11 +798,16 @@ async fn start_ldap() -> SocketAddr {
                                             attributes: vec![
                                                 LdapPartialAttribute {
                                                     atype: "memberOf".into(),
-                                                    vals: groups.iter().map(|g| g.as_bytes().to_vec()).collect(),
+                                                    vals: groups
+                                                        .iter()
+                                                        .map(|g| g.as_bytes().to_vec())
+                                                        .collect(),
                                                 },
                                                 LdapPartialAttribute {
                                                     atype: "mail".into(),
-                                                    vals: vec![format!("{uid}@example.com").into_bytes()],
+                                                    vals: vec![
+                                                        format!("{uid}@example.com").into_bytes(),
+                                                    ],
                                                 },
                                             ],
                                         })
@@ -714,7 +844,11 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
         user: user.into(),
         password: Hidden(pw.into()),
     };
-    assert!(err(&anon, login("alice", "wonderland")).await.contains("no LDAP"));
+    assert!(
+        err(&anon, login("alice", "wonderland"))
+            .await
+            .contains("no LDAP")
+    );
 
     let mut settings = LdapSettings {
         url: "ldap://directory.example.com".into(),
@@ -729,12 +863,19 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
     };
     // Plain LDAP to another machine would send passwords in the clear.
     assert!(
-        err(&admin, AdminOp::SsoSet(Box::new(SsoUpdate::Ldap(Some(Box::new(settings.clone()))))))
-            .await
-            .contains("ldaps")
+        err(
+            &admin,
+            AdminOp::SsoSet(Box::new(SsoUpdate::Ldap(Some(Box::new(settings.clone())))))
+        )
+        .await
+        .contains("ldaps")
     );
     settings.url = format!("ldap://{dir_addr}");
-    ok(&admin, AdminOp::SsoSet(Box::new(SsoUpdate::Ldap(Some(Box::new(settings)))))).await;
+    ok(
+        &admin,
+        AdminOp::SsoSet(Box::new(SsoUpdate::Ldap(Some(Box::new(settings))))),
+    )
+    .await;
     ok(
         &admin,
         AdminOp::SsoSet(Box::new(SsoUpdate::Map(RoleMap {
@@ -752,12 +893,32 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
         r => panic!("{r:?}"),
     }
     // Wrong password, empty password, filter injection, unknown user.
-    assert!(err(&anon, login("alice", "nope")).await.contains("wrong user name or password"));
-    assert!(err(&anon, login("alice", "")).await.contains("wrong user name or password"));
-    assert!(err(&anon, login("*", "x")).await.contains("wrong user name or password"));
-    assert!(err(&anon, login("mallory", "x")).await.contains("wrong user name or password"));
+    assert!(
+        err(&anon, login("alice", "nope"))
+            .await
+            .contains("wrong user name or password")
+    );
+    assert!(
+        err(&anon, login("alice", ""))
+            .await
+            .contains("wrong user name or password")
+    );
+    assert!(
+        err(&anon, login("*", "x"))
+            .await
+            .contains("wrong user name or password")
+    );
+    assert!(
+        err(&anon, login("mallory", "x"))
+            .await
+            .contains("wrong user name or password")
+    );
     // Bob is in no group that has a rule.
-    assert!(err(&anon, login("bob", "builder")).await.contains("no rule"));
+    assert!(
+        err(&anon, login("bob", "builder"))
+            .await
+            .contains("no rule")
+    );
     // Too many wrong passwords pause the user name.
     for _ in 0..5 {
         err(&anon, login("bob", "guess")).await;
@@ -774,7 +935,10 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
     // Unknown users and injected names are not logged; known ones are.
     assert_eq!(ldap[0], ("ldap:alice", true));
     assert_eq!(ldap[1], ("ldap:alice", false));
-    assert!(ldap.iter().all(|(t, _)| *t == "ldap:alice" || *t == "ldap:bob"));
+    assert!(
+        ldap.iter()
+            .all(|(t, _)| *t == "ldap:alice" || *t == "ldap:bob")
+    );
     assert_eq!(ldap.iter().filter(|(t, _)| *t == "ldap:bob").count(), 6);
     admin.close().await;
     anon.close().await;

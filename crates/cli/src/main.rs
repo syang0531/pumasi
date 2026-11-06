@@ -5,6 +5,7 @@ mod gpu_cmd;
 mod ha_cmd;
 mod manage;
 mod monitor;
+mod security;
 mod service;
 mod ui;
 mod upgrade;
@@ -221,8 +222,20 @@ enum Cmd {
         admin: AdminArgs,
     },
     /// Save an admin ticket (or an access ticket from `pumasi access
-    /// create`) so this machine can manage a remote cluster.
-    Login { ticket: String },
+    /// create`) for the other commands. With --sso or --ldap, sign in with
+    /// the organization's account instead (TICKET is then the sign-in
+    /// ticket from `pumasi sso ticket`) and save the session's ticket.
+    Login {
+        ticket: String,
+        /// Sign in with the cluster's OpenID Connect provider (opens a
+        /// code to enter in a browser, on any device).
+        #[arg(long, conflicts_with = "ldap")]
+        sso: bool,
+        /// Sign in with this LDAP user (the password is asked for, or
+        /// read from PUMASI_PASSWORD).
+        #[arg(long, value_name = "USER")]
+        ldap: Option<String>,
+    },
     /// Stop giving a node new tasks (NODE: name or id prefix). Running
     /// tasks finish.
     Cordon {
@@ -294,6 +307,17 @@ enum Cmd {
     /// viewer.
     #[command(subcommand)]
     Access(manage::AccessCmd),
+    /// The audit log: who changed what, as a hash chain the cluster key
+    /// signs. Admins only.
+    #[command(subcommand)]
+    Audit(security::AuditCmd),
+    /// Single sign-on: an OpenID Connect provider or LDAP directory, and
+    /// rules that map its groups to roles.
+    #[command(subcommand)]
+    Sso(security::SsoCmd),
+    /// The cluster's own admin ticket.
+    #[command(subcommand)]
+    Admin(security::AdminCmd),
     /// Show which ticket this machine uses and what it may do.
     Whoami {
         #[command(flatten)]
@@ -1305,7 +1329,10 @@ async fn run(cli: Cli) -> Result<i32> {
             eprintln!("removed node {id}");
             Ok(0)
         }
-        Cmd::Login { ticket } => {
+        Cmd::Login { ticket, sso, ldap } if sso || ldap.is_some() => {
+            security::login(&home, &ticket, ldap).await
+        }
+        Cmd::Login { ticket, .. } => {
             let t: AdminTicket = ticket.parse()?;
             let path = home.join(ADMIN_TICKET_FILE);
             pumasi_proto::net::write_private(&path, t.to_string().as_bytes())?;
@@ -1376,6 +1403,9 @@ async fn run(cli: Cli) -> Result<i32> {
             .await
         }
         Cmd::Access(cmd) => manage::access(&home, cmd).await,
+        Cmd::Audit(cmd) => security::audit(&home, cmd).await,
+        Cmd::Sso(cmd) => security::sso(&home, cmd).await,
+        Cmd::Admin(cmd) => security::admin(&home, cmd).await,
         Cmd::Whoami { admin } => manage::whoami(&home, &admin).await,
         Cmd::Schedule(cmd) => manage::schedule(&home, cmd).await,
         Cmd::Confidential(cmd) => manage::confidential(&home, cmd).await,

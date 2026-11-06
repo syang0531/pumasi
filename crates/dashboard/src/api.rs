@@ -9,7 +9,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Multipart, Path, Query},
+    extract::{DefaultBodyLimit, Multipart, Path, Query},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -29,14 +29,16 @@ use crate::{St, auth::Api, pages};
 
 pub const OPENAPI: &str = include_str!("../assets/openapi.json");
 
-pub fn routes() -> Router<St> {
+/// The API's routes; `uploads` is the body limit of job submissions.
+pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
+    let op_limit = DefaultBodyLimit::max(crate::OP_BODY_LIMIT);
     Router::new()
         .route("/whoami", get(whoami))
         .route("/status", get(status))
         .route("/metrics", get(metrics))
         .route("/events", get(events))
         .route("/alerts", get(alerts))
-        .route("/jobs", post(submit))
+        .route("/jobs", post(submit).layer(uploads))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/jobs/{id}/receipts", get(receipts))
@@ -50,7 +52,9 @@ pub fn routes() -> Router<St> {
         .route("/prices", get(prices))
         .route("/confidential", get(confidential))
         .route("/invites", post(invite))
-        .route("/op", post(op))
+        .route("/op", post(op).layer(op_limit))
+        .route("/audit", get(audit))
+        .route("/audit/verify", get(audit_verify))
 }
 
 pub async fn openapi() -> Response {
@@ -180,6 +184,21 @@ async fn job(
         None => Duration::ZERO,
         Some(Ok(ms)) => Duration::from_millis(ms).min(MAX_WAIT),
         Some(Err(e)) => return error(StatusCode::BAD_REQUEST, &format!("wait: {e:#}")),
+    };
+    // Each open long poll holds a task here and calls the control plane:
+    // a few per ticket at once.
+    let _slot = if wait.is_zero() {
+        None
+    } else {
+        match st.waits.enter(a.0.secret) {
+            Some(s) => Some(s),
+            None => {
+                return crate::limit::slow_down(
+                    Duration::from_secs(1),
+                    "too many ?wait= requests open with this ticket",
+                );
+            }
+        }
     };
     let deadline = tokio::time::Instant::now() + wait;
     let mut pause = Duration::from_millis(250);
@@ -405,6 +424,31 @@ async fn invite(axum::extract::State(st): S, a: Api, Json(b): Json<InviteBody>) 
         },
     )
     .await
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    after: u64,
+    limit: Option<u32>,
+}
+
+/// Audit log entries (admins only), oldest first.
+async fn audit(axum::extract::State(st): S, a: Api, Query(q): Query<AuditQuery>) -> Response {
+    simple(
+        st,
+        a,
+        AdminOp::Audit {
+            after: q.after,
+            limit: q.limit.unwrap_or(100).min(10_000),
+        },
+    )
+    .await
+}
+
+/// The audit chain checked, with its signed head.
+async fn audit_verify(axum::extract::State(st): S, a: Api) -> Response {
+    simple(st, a, AdminOp::AuditVerify).await
 }
 
 /// Any admin call, as the JSON form of `AdminOp` (e.g.

@@ -31,13 +31,13 @@ use crate::{
     i18n::Lang,
 };
 
-pub fn routes() -> Router<St> {
+pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
     Router::new()
         .route("/", get(overview::page))
         .route("/nodes", get(nodes::list))
         .route("/nodes/{node}", get(nodes::detail))
         .route("/nodes/{node}/{action}", post(nodes::action))
-        .route("/jobs", get(jobs::list).post(jobs::submit))
+        .route("/jobs", get(jobs::list).post(jobs::submit).layer(uploads))
         .route("/jobs/new", get(jobs::new))
         .route("/jobs/{id}", get(jobs::detail))
         .route("/jobs/{id}/cancel", post(jobs::cancel))
@@ -46,7 +46,10 @@ pub fn routes() -> Router<St> {
         .route("/jobs/{id}/tasks/{index}", get(jobs::task))
         .route("/jobs/{id}/tasks/{index}/stream", get(jobs::stream))
         .route("/jobs/{id}/tasks/{index}/files/{*path}", get(jobs::file))
-        .route("/storage", get(storage::list).post(storage::upload))
+        .route(
+            "/storage",
+            get(storage::list).post(storage::upload).layer(uploads),
+        )
         .route("/storage/{name}", get(storage::versions))
         .route("/storage/{name}/remove", post(storage::remove))
         .route("/storage/{name}/download.zip", get(storage::download))

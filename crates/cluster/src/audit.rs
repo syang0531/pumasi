@@ -132,8 +132,7 @@ impl State {
     }
 
     pub fn audit_entries(&self, after: u64, limit: u32) -> Result<Vec<AuditEntry>> {
-        self.store
-            .audit(after, limit.clamp(1, 10_000) as usize)
+        self.store.audit(after, limit.clamp(1, 10_000) as usize)
     }
 
     /// Checks the whole chain from the first entry and signs its head.
@@ -357,7 +356,11 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
             note.clone(),
         ),
         TrustNode { node, trusted } => (
-            if *trusted { "node.trust" } else { "node.untrust" },
+            if *trusted {
+                "node.trust"
+            } else {
+                "node.untrust"
+            },
             node.clone(),
             none(),
         ),
@@ -447,7 +450,10 @@ mod tests {
             format: pumasi_proto::monitor::WebhookFormat::Slack,
         }));
         let (a, t, d) = describe(&op).unwrap();
-        assert_eq!((a, t.as_str(), d.as_str()), ("webhook.set", "ops", "hooks.slack.com"));
+        assert_eq!(
+            (a, t.as_str(), d.as_str()),
+            ("webhook.set", "ops", "hooks.slack.com")
+        );
     }
 
     #[test]

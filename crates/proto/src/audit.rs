@@ -117,8 +117,7 @@ impl AuditEntry {
 /// hash.
 pub fn verify_chain(prev: [u8; 32], first_seq: u64, entries: &[AuditEntry]) -> Result<[u8; 32]> {
     let mut prev = prev;
-    let mut seq = first_seq;
-    for e in entries {
+    for (seq, e) in (first_seq..).zip(entries) {
         ensure!(
             e.seq == seq,
             "audit entry #{} where #{seq} should be (an entry is missing or out of order)",
@@ -135,7 +134,6 @@ pub fn verify_chain(prev: [u8; 32], first_seq: u64, entries: &[AuditEntry]) -> R
             e.seq
         );
         prev = e.hash;
-        seq += 1;
     }
     Ok(prev)
 }
@@ -379,7 +377,10 @@ mod tests {
         };
         head.verify().unwrap();
         let j = serde_json::to_string(&head).unwrap();
-        serde_json::from_str::<AuditHead>(&j).unwrap().verify().unwrap();
+        serde_json::from_str::<AuditHead>(&j)
+            .unwrap()
+            .verify()
+            .unwrap();
         head.seq = 2;
         assert!(head.verify().is_err());
     }
@@ -393,7 +394,9 @@ mod tests {
         e.action = "a\"b]".into();
         let l = syslog_line(&e, "my host");
         assert!(l.starts_with("<85>1 "), "{l}");
-        assert!(l.contains(" myhost pumasi - audit [pumasi@32473 seq=\"1\" action=\"a\\\"b\\]\"] {"));
+        assert!(
+            l.contains(" myhost pumasi - audit [pumasi@32473 seq=\"1\" action=\"a\\\"b\\]\"] {")
+        );
         e.ok = false;
         assert!(syslog_line(&e, "").starts_with("<84>1 "));
         assert!(syslog_line(&e, "").contains(" - pumasi - audit "));

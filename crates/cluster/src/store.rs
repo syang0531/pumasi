@@ -35,8 +35,8 @@ use crate::{
     remote::JobOrigin,
     state::{DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord},
 };
-use pumasi_proto::manage::{AccountPolicy, AccountQuota, NodeConfig};
 use pumasi_proto::audit::AuditEntry;
+use pumasi_proto::manage::{AccountPolicy, AccountQuota, NodeConfig};
 use pumasi_proto::monitor::{AlertPolicy, EventView, MetricPoint, WebhookSpec};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");

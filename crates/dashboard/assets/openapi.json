@@ -3,7 +3,7 @@
   "info": {
     "title": "Pumasi dashboard API",
     "version": "1",
-    "description": "Served by `pumasi ui`. Every call is made with the caller's Pumasi ticket (admin, submitter or viewer), whose role the control plane enforces. Authenticate with `Authorization: Bearer <ticket>` (a `pumasiadmin...` admin or access ticket), or with a signed-in browser session plus the `X-Pumasi-CSRF` header on POST. Job ids are hex strings; CU amounts are integers in milli-CU, rates in micro-CU. With `pumasi ui --api-only` only bearer tickets are taken. After 10 failed sign-ins or wrong tickets within a minute, a client address gets 429 for 5 minutes."
+    "description": "Served by `pumasi ui`. Every call is made with the caller's Pumasi ticket (admin, submitter or viewer), whose role the control plane enforces. Authenticate with `Authorization: Bearer <ticket>` (a `pumasiadmin...` admin or access ticket), or with a signed-in browser session plus the `X-Pumasi-CSRF` header on POST. Job ids are hex strings; CU amounts are integers in milli-CU, rates in micro-CU. With `pumasi ui --api-only` only bearer tickets are taken. After 10 failed sign-ins or wrong tickets within a minute, a client address gets 429 for 5 minutes. Each ticket may make 120 requests in a burst and 20 a second after that (429 with Retry-After beyond), and hold at most 8 `?wait=` requests open at once. Request bodies are limited to 1 MiB, except job submissions (the upload limit) and `/api/v1/op` (32 MiB)."
   },
   "servers": [
     {
@@ -1019,6 +1019,97 @@
                 "type": "object"
               }
             }
+          }
+        }
+      }
+    },
+    "/api/v1/audit": {
+      "get": {
+        "summary": "Audit log entries (admin tickets only), oldest first",
+        "tags": [
+          "cluster"
+        ],
+        "description": "Who changed what: every call that changes the cluster, refused calls, sign-ins and nodes joining. Each entry carries `prev` and `hash` (hex BLAKE3) forming a chain. Cursor-based: pass the last `seq` you saw as `after`; with `after` 0, the newest `limit`.",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Default 100, at most 10000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/audit/verify": {
+      "get": {
+        "summary": "Checks the whole audit chain and returns its head, signed by the cluster key (admin tickets only)",
+        "tags": [
+          "cluster"
+        ],
+        "description": "`signature` is Ed25519 by the cluster key (`cluster`, an iroh endpoint id) over `pumasi/audit-head/v1\\0 || seq (u64 LE) || hash || unix (u64 LE)`. Keep a head elsewhere and compare later: `pumasi audit verify --against`.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }

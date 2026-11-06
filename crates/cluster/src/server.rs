@@ -1410,7 +1410,10 @@ async fn handle_sign_in(inner: &Arc<Inner>, op: AdminOp, peer: &str) -> AdminRes
                     }
                 }
             }
-            other => anyhow::bail!("not a sign-in call: {}", crate::audit::refused_action(&other)),
+            other => anyhow::bail!(
+                "not a sign-in call: {}",
+                crate::audit::refused_action(&other)
+            ),
         }
     }
     .await;
@@ -1941,9 +1944,9 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             inner.state().remove_webhook(&name)?;
             Ok(AdminResponse::Ok)
         }
-        AdminOp::Audit { after, limit } => {
-            Ok(AdminResponse::Audit(inner.state().audit_entries(after, limit)?))
-        }
+        AdminOp::Audit { after, limit } => Ok(AdminResponse::Audit(
+            inner.state().audit_entries(after, limit)?,
+        )),
         AdminOp::AuditVerify => Ok(AdminResponse::AuditHead(Box::new(
             inner.state().audit_verify()?,
         ))),
@@ -1965,7 +1968,10 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
         }
         AdminOp::SsoGet => Ok(AdminResponse::Sso(Box::new(inner.state().sso_view()))),
         AdminOp::SsoSet(u) => Ok(AdminResponse::Sso(Box::new(inner.state().sso_update(*u)?))),
-        other => anyhow::bail!("unexpected admin call {}", crate::audit::refused_action(&other)),
+        other => anyhow::bail!(
+            "unexpected admin call {}",
+            crate::audit::refused_action(&other)
+        ),
     })();
     result.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))
 }

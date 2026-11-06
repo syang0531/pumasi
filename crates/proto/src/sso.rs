@@ -321,7 +321,9 @@ impl LdapSettings {
             "the user filter must contain {{user}}"
         );
         ensure!(
-            self.group_base.is_empty() || self.group_filter.contains("{dn}") || self.group_filter.contains("{user}"),
+            self.group_base.is_empty()
+                || self.group_filter.contains("{dn}")
+                || self.group_filter.contains("{user}"),
             "the group filter must contain {{dn}} or {{user}}"
         );
         Ok(())
@@ -403,8 +405,20 @@ mod tests {
         assert!(d.matches(&who(Some("bob@example.com"), &[])));
         assert!(!d.matches(&who(Some("bob@example.com.evil.io"), &[])));
         assert!(!d.matches(&who(Some("bob@sub.example.com"), &[])));
-        assert!("anyone".parse::<Subject>().unwrap().matches(&who(None, &[])));
-        for bad in ["", "group:", "foo:bar", "email:nope", "domain:x", "group:a\nb"] {
+        assert!(
+            "anyone"
+                .parse::<Subject>()
+                .unwrap()
+                .matches(&who(None, &[]))
+        );
+        for bad in [
+            "",
+            "group:",
+            "foo:bar",
+            "email:nope",
+            "domain:x",
+            "group:a\nb",
+        ] {
             assert!(bad.parse::<Subject>().is_err(), "{bad:?}");
         }
     }

@@ -137,6 +137,22 @@ pub fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
+/// Holds a browser sign-in's state between the provider and the
+/// callback. `Lax`, because the provider sends the browser back with a
+/// cross-site navigation, which carries no `Strict` cookie.
+pub const SSO_COOKIE: &str = "pumasi_sso";
+
+pub fn sso_cookie(state: &str, secure: bool) -> String {
+    format!(
+        "{SSO_COOKIE}={state}; Path=/sso; HttpOnly; SameSite=Lax; Max-Age=600{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+pub fn clear_sso_cookie() -> String {
+    format!("{SSO_COOKIE}=; Path=/sso; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
 pub fn session_cookie(id: &str) -> String {
     format!("{SESSION_COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict")
 }
@@ -231,6 +247,14 @@ fn csrf_ok(parts: &Parts, ident: &Identity) -> bool {
         .is_some_and(|v| same(v, &ident.csrf))
 }
 
+/// Slows down a ticket that makes requests faster than
+/// [`crate::limit::TICKET_RATE`] a second (phase 17).
+fn throttle(st: &St, ident: &Identity) -> Result<(), Response> {
+    st.tickets.take(&ident.secret).map_err(|wait| {
+        crate::limit::slow_down(wait, "too many requests with this ticket; slow down")
+    })
+}
+
 /// A signed-in browser, for pages. Others are sent to the sign-in page.
 pub struct Page(pub Identity);
 
@@ -247,6 +271,7 @@ impl FromRequestParts<St> for Page {
         if !csrf_ok(parts, &ident) {
             return Err((StatusCode::FORBIDDEN, "missing or wrong CSRF token").into_response());
         }
+        throttle(st, &ident)?;
         Ok(Page(ident))
     }
 }
@@ -266,7 +291,9 @@ impl FromRequestParts<St> for Api {
         if let Some(text) = bearer {
             // The control plane still checks the secret and its role on
             // every call.
-            return self::bearer(st, parts, text).await.map(Api);
+            let ident = self::bearer(st, parts, text).await?;
+            throttle(st, &ident)?;
+            return Ok(Api(ident));
         }
         if st.api_only {
             return Err(crate::api::error(
@@ -275,7 +302,10 @@ impl FromRequestParts<St> for Api {
             ));
         }
         match session_of(st, parts) {
-            Some(ident) if csrf_ok(parts, &ident) => Ok(Api(ident)),
+            Some(ident) if csrf_ok(parts, &ident) => {
+                throttle(st, &ident)?;
+                Ok(Api(ident))
+            }
             Some(_) => Err(crate::api::error(
                 StatusCode::FORBIDDEN,
                 "missing or wrong CSRF token (X-Pumasi-CSRF)",

@@ -28,5 +28,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 
 [dev-dependencies]
 pumasi-agent.workspace = true
+jsonwebtoken.workspace = true
+ring.workspace = true
 wat.workspace = true
 tracing-subscriber.workspace = true

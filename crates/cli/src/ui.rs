@@ -59,6 +59,12 @@ pub struct UiArgs {
     /// a TLS proxy on another machine of a private network).
     #[arg(long)]
     insecure_http: bool,
+    /// The URL browsers use to reach this dashboard (behind a tunnel or
+    /// proxy, its public address, e.g. https://pumasi.example.com). SSO
+    /// sends browsers back to <URL>/sso/callback; register that at the
+    /// identity provider.
+    #[arg(long)]
+    public_url: Option<String>,
     #[command(flatten)]
     admin: AdminArgs,
 }
@@ -105,6 +111,7 @@ pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
             api_only: args.api_only,
             tls,
             real_ip_header: args.real_ip_header.clone(),
+            public_url: args.public_url.clone(),
         },
     )
     .await?;

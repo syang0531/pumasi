@@ -449,7 +449,11 @@ impl Runtime {
         Ok(d)
     }
 
-    async fn key_for(&self, jwks_uri: &str, kid: Option<&str>) -> Result<jsonwebtoken::DecodingKey> {
+    async fn key_for(
+        &self,
+        jwks_uri: &str,
+        kid: Option<&str>,
+    ) -> Result<jsonwebtoken::DecodingKey> {
         let mut cache = self.jwks.lock().await;
         let find = |set: &jsonwebtoken::jwk::JwkSet| -> Option<jsonwebtoken::jwk::Jwk> {
             match kid {
@@ -477,7 +481,9 @@ impl Runtime {
         let set: jsonwebtoken::jwk::JwkSet = self.get_json(jwks_uri).await?;
         let k = find(&set);
         *cache = Some((jwks_uri.to_string(), set, Instant::now()));
-        let k = k.with_context(|| format!("the ID token's key {kid:?} is not among the provider's keys"))?;
+        let k = k.with_context(|| {
+            format!("the ID token's key {kid:?} is not among the provider's keys")
+        })?;
         Ok(jsonwebtoken::DecodingKey::from_jwk(&k)?)
     }
 
@@ -571,7 +577,10 @@ impl Runtime {
             login.issuer == o.issuer,
             "the provider changed during the sign-in; start again"
         );
-        ensure!(!code.is_empty() && code.len() <= 4096, "bad authorization code");
+        ensure!(
+            !code.is_empty() && code.len() <= 4096,
+            "bad authorization code"
+        );
         let d = self.discover(o).await?;
         let (status, body) = self
             .post_form(
@@ -587,7 +596,8 @@ impl Runtime {
             )
             .await?;
         let token = id_token(status, &body)?;
-        self.verify_id_token(o, &d, &token, Some(&login.nonce)).await
+        self.verify_id_token(o, &d, &token, Some(&login.nonce))
+            .await
     }
 
     pub async fn device_start(&self, o: &OidcSettings) -> Result<DeviceStart> {
@@ -609,7 +619,10 @@ impl Runtime {
             )
             .await?;
         if status != 200 {
-            bail!("the provider refused the device sign-in: {}", oauth_error(&body));
+            bail!(
+                "the provider refused the device sign-in: {}",
+                oauth_error(&body)
+            );
         }
         let s = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
         let device_code = s("device_code").context("no device_code in the answer")?;
@@ -618,7 +631,11 @@ impl Runtime {
         let verification_uri = s("verification_uri")
             .or_else(|| s("verification_url"))
             .context("no verification_uri in the answer")?;
-        let interval = body.get("interval").and_then(Value::as_u64).unwrap_or(5).clamp(1, 60);
+        let interval = body
+            .get("interval")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .clamp(1, 60);
         let expires = body
             .get("expires_in")
             .and_then(Value::as_u64)
@@ -628,7 +645,10 @@ impl Runtime {
         let mut devs = self.devices.lock().unwrap();
         let now = Instant::now();
         devs.retain(|_, d| d.expires > now);
-        ensure!(devs.len() < MAX_PENDING, "too many device sign-ins under way");
+        ensure!(
+            devs.len() < MAX_PENDING,
+            "too many device sign-ins under way"
+        );
         devs.insert(
             handle.clone(),
             PendingDevice {
@@ -836,7 +856,10 @@ fn identity_from_claims(o: &OidcSettings, c: &Value, nonce: Option<&str>) -> Res
         );
     }
     if let Some(azp) = c.get("azp").and_then(Value::as_str) {
-        ensure!(azp == o.client_id, "the ID token was issued to another client");
+        ensure!(
+            azp == o.client_id,
+            "the ID token was issued to another client"
+        );
     }
     let sub = c
         .get("sub")
@@ -1033,7 +1056,10 @@ mod tests {
     #[test]
     fn forms_and_redirects() {
         assert_eq!(form(&[("a b", "c&d=é")]), "a%20b=c%26d%3D%C3%A9");
-        assert_eq!(pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
         check_redirect("https://pumasi.example.com/sso/callback").unwrap();
         check_redirect("http://127.0.0.1:7400/sso/callback").unwrap();
         assert!(check_redirect("http://pumasi.example.com/sso/callback").is_err());
@@ -1043,7 +1069,13 @@ mod tests {
 
     #[test]
     fn filters_are_escaped() {
-        assert_eq!(fill("(uid={user})", "a*)(uid=*", ""), "(uid=a\\2a\\29\\28uid=\\2a)");
-        assert_eq!(fill("(member={dn})", "x", "cn=a(b)"), "(member=cn=a\\28b\\29)");
+        assert_eq!(
+            fill("(uid={user})", "a*)(uid=*", ""),
+            "(uid=a\\2a\\29\\28uid=\\2a)"
+        );
+        assert_eq!(
+            fill("(member={dn})", "x", "cn=a(b)"),
+            "(member=cn=a\\28b\\29)"
+        );
     }
 }

@@ -383,6 +383,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
                 Map(m) => ("sso.map", m.subject.to_string(), m.role.to_string()),
                 Unmap(s) => ("sso.unmap", s.to_string(), none()),
                 SessionHours(h) => ("sso.session", none(), format!("{h} hours")),
+                Device(on) => ("sso.device", none(), if *on { "on" } else { "off" }.into()),
             }
         }
         // Reads.

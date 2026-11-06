@@ -110,6 +110,12 @@ umask 022
   --group-base ou=groups,dc=example,dc=com >/dev/null
 "$bin" sso map group:pumasi-admins admin >/dev/null
 "$bin" sso map group:research submitter:research >/dev/null
+# Sign-in from a terminal (the device flow) is off until turned on.
+"$bin" sso status 2>/dev/null | grep -q 'pumasi login --sso): off' ||
+  fail "pumasi sso status: the device flow should start off"
+"$bin" sso device on >/dev/null
+"$bin" sso status 2>/dev/null | grep -q 'pumasi login --sso): on' ||
+  fail "pumasi sso device on did not turn the device flow on"
 signin=$("$bin" sso ticket 2>/dev/null | grep -o 'pumasisignin[A-Za-z0-9]*' | head -n1)
 [ -n "$signin" ] || fail "pumasi sso ticket printed no sign-in ticket"
 ok "SSO configured (OIDC, LDAP, two group rules)"

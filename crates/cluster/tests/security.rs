@@ -536,7 +536,8 @@ async fn oidc_sign_in_maps_groups_to_roles() -> Result<()> {
     match ok(&anon, AdminOp::SsoInfo).await {
         AdminResponse::SsoInfo(i) => {
             assert_eq!(i.oidc.as_deref(), Some("Corp"));
-            assert!(i.device && !i.ldap);
+            // The device flow is off until an admin turns it on.
+            assert!(!i.device && !i.ldap);
         }
         r => panic!("{r:?}"),
     }
@@ -635,7 +636,18 @@ async fn oidc_sign_in_maps_groups_to_roles() -> Result<()> {
     }
     idp.lock().unwrap().wrong_nonce = false;
 
-    // Device flow (pumasi login --sso).
+    // Device flow (pumasi login --sso): off by default, since anyone can
+    // start one and talk a member into entering its code.
+    assert!(
+        err(&anon, AdminOp::SsoDeviceStart)
+            .await
+            .contains("device flow) is off")
+    );
+    ok(&admin, AdminOp::SsoSet(Box::new(SsoUpdate::Device(true)))).await;
+    match ok(&anon, AdminOp::SsoInfo).await {
+        AdminResponse::SsoInfo(i) => assert!(i.device),
+        r => panic!("{r:?}"),
+    }
     let start = match ok(&anon, AdminOp::SsoDeviceStart).await {
         AdminResponse::SsoDevice(d) => d,
         r => panic!("{r:?}"),
@@ -726,8 +738,8 @@ async fn oidc_sign_in_maps_groups_to_roles() -> Result<()> {
 // A stand-in LDAP directory
 // ---------------------------------------------------------------------------
 
-/// `uid=alice` (password `wonderland`, in `cn=ops`) and `uid=bob`
-/// (password `builder`, no groups) under `ou=people,dc=example,dc=com`;
+/// `uid=alice` (password `wonderland`, in `cn=ops,ou=groups`) and `uid=bob`
+/// (password `builder`, in a `cn=ops` among contractors) under `ou=people,dc=example,dc=com`;
 /// the service account is `cn=svc,dc=example,dc=com` / `svcpw`.
 async fn start_ldap() -> SocketAddr {
     use futures::{SinkExt, StreamExt};
@@ -741,7 +753,11 @@ async fn start_ldap() -> SocketAddr {
             "alice",
             ("wonderland", vec!["cn=ops,ou=groups,dc=example,dc=com"]),
         ),
-        ("bob", ("builder", vec![])),
+        // A group of the same name elsewhere in the directory.
+        (
+            "bob",
+            ("builder", vec!["cn=ops,ou=contractors,dc=example,dc=com"]),
+        ),
     ]);
     let users = Arc::new(users);
     tokio::spawn(async move {
@@ -876,14 +892,18 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
         AdminOp::SsoSet(Box::new(SsoUpdate::Ldap(Some(Box::new(settings))))),
     )
     .await;
-    ok(
-        &admin,
-        AdminOp::SsoSet(Box::new(SsoUpdate::Map(RoleMap {
-            subject: "group:ops".parse()?,
-            role: AccessRole::Admin,
-        }))),
-    )
-    .await;
+    // Without a group base, LDAP groups match by their whole DN only: a
+    // bare `group:ops` must not match bob's `cn=ops` among contractors.
+    for subject in ["group:cn=ops,ou=groups,dc=example,dc=com", "group:ops"] {
+        ok(
+            &admin,
+            AdminOp::SsoSet(Box::new(SsoUpdate::Map(RoleMap {
+                subject: subject.parse()?,
+                role: AccessRole::Admin,
+            }))),
+        )
+        .await;
+    }
 
     match ok(&anon, login("alice", "wonderland")).await {
         AdminResponse::AccessTicket { view, .. } => {
@@ -913,7 +933,7 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
             .await
             .contains("wrong user name or password")
     );
-    // Bob is in no group that has a rule.
+    // Bob is in no group that has a rule (his `cn=ops` is not the one).
     assert!(
         err(&anon, login("bob", "builder"))
             .await

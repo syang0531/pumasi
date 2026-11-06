@@ -70,6 +70,31 @@ pub struct SsoConfig {
     pub maps: Vec<RoleMap>,
     /// 0 means [`DEFAULT_SESSION_HOURS`].
     pub session_hours: u32,
+    /// The device flow (`pumasi login --sso`) is allowed. Off unless an
+    /// admin turns it on (1.0 review): anyone can start a device sign-in
+    /// and talk a member into entering its code.
+    pub device: bool,
+}
+
+/// [`SsoConfig`] as phase 17 stored it, before `device`.
+#[derive(Deserialize)]
+pub struct SsoConfigV1 {
+    pub oidc: Option<OidcSettings>,
+    pub ldap: Option<LdapSettings>,
+    pub maps: Vec<RoleMap>,
+    pub session_hours: u32,
+}
+
+impl From<SsoConfigV1> for SsoConfig {
+    fn from(c: SsoConfigV1) -> Self {
+        SsoConfig {
+            oidc: c.oidc,
+            ldap: c.ldap,
+            maps: c.maps,
+            session_hours: c.session_hours,
+            device: false,
+        }
+    }
 }
 
 impl SsoConfig {
@@ -152,6 +177,7 @@ impl State {
                 c.maps.retain(|m| m.subject != s);
                 ensure!(c.maps.len() < before, "no rule for {s}");
             }
+            SsoUpdate::Device(on) => c.device = on,
             SsoUpdate::SessionHours(h) => {
                 ensure!(
                     (1..=MAX_SESSION_HOURS).contains(&h),
@@ -171,7 +197,7 @@ impl State {
         let c = &self.sso.config;
         SsoInfo {
             oidc: c.oidc.as_ref().map(|o| o.name.clone()),
-            device: c.oidc.is_some(),
+            device: c.oidc.is_some() && c.device,
             ldap: c.ldap.is_some(),
         }
     }
@@ -829,6 +855,15 @@ impl Runtime {
         if !l.group_base.is_empty() {
             groups.extend(ldap_groups(l, &dn, user).await.map_err(plain)?);
         }
+        // Rules may name groups under the group base by their cn alone;
+        // elsewhere only the whole DN matches (1.0 review).
+        let short: Vec<String> = groups
+            .iter()
+            .filter_map(|g| pumasi_proto::sso::short_group_name(g, &l.group_base))
+            .collect();
+        groups.extend(short);
+        groups.sort();
+        groups.dedup();
         Ok(Identity {
             name: clip_name(&format!("ldap:{user}")),
             // Directory addresses are what the organization wrote down.

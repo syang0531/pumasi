@@ -1539,7 +1539,14 @@ impl Store {
     }
 
     pub fn sso(&self) -> Result<Option<crate::sso::SsoConfig>> {
-        self.get_meta(SSO_META)?.map(|b| dec(&b)).transpose()
+        // Phase 17 stored it without `device`; postcard has no field
+        // names, so the old layout is read as such.
+        self.get_meta(SSO_META)?
+            .map(|b| {
+                dec::<crate::sso::SsoConfig>(&b)
+                    .or_else(|_| dec::<crate::sso::SsoConfigV1>(&b).map(Into::into))
+            })
+            .transpose()
     }
 
     pub fn put_sso(&self, c: &crate::sso::SsoConfig) -> Result<()> {
@@ -2497,6 +2504,37 @@ mod tests {
         // Opening again does not migrate twice.
         let snap = Store::open(&path).unwrap().load().unwrap();
         assert_eq!(snap.jobs[0].1[0].fuel_used, 9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase_17_sso_settings_read_with_the_device_flow_off() {
+        #[derive(Serialize)]
+        struct V17 {
+            oidc: Option<pumasi_proto::sso::OidcSettings>,
+            ldap: Option<pumasi_proto::sso::LdapSettings>,
+            maps: Vec<pumasi_proto::sso::RoleMap>,
+            session_hours: u32,
+        }
+        let path = std::env::temp_dir().join(format!("pumasi-sso-{}.db", rand::random::<u64>()));
+        let store = Store::open(&path).unwrap();
+        store
+            .put_meta(
+                SSO_META,
+                &enc(&V17 {
+                    oidc: None,
+                    ldap: None,
+                    maps: vec![],
+                    session_hours: 7,
+                }),
+            )
+            .unwrap();
+        let c = store.sso().unwrap().unwrap();
+        assert_eq!((c.session_hours, c.device), (7, false));
+        let on = crate::sso::SsoConfig { device: true, ..c };
+        store.put_sso(&on).unwrap();
+        assert_eq!(store.sso().unwrap().unwrap(), on);
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 }

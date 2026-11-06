@@ -137,7 +137,11 @@ pumasi sso ldap --url ldaps://dc1.acme.local:636 \
 
 OpenLDAP: `--user-filter '(uid={user})'` (the default), and
 `--group-base ou=groups,dc=example,dc=com` if the directory has no
-`memberOf`. Use `ldaps://`, or `ldap://` with `--starttls`; plain LDAP is
+`memberOf`. A `group:` rule names an LDAP group by its whole DN
+(`group:CN=pumasi-admins,OU=Groups,DC=acme,DC=local`), or by its `cn`
+alone (`group:pumasi-admins`) only when the group lies under
+`--group-base`: a bare name never matches a group elsewhere in the
+directory, where someone else may have made one of the same name. Use `ldaps://`, or `ldap://` with `--starttls`; plain LDAP is
 accepted only to a loopback address.
 
 ### Rules and sessions
@@ -163,6 +167,13 @@ pumasi sso ticket          # print once, share it: it holds no secret
 pumasi login --sso pumasisignin...        # device flow: opens a code to confirm
 pumasi login --ldap alice pumasisignin... # asks for the password
 ```
+
+Sign-in from a terminal with `--sso` (the OpenID Connect device flow) is
+off until you run `pumasi sso device on`. Anyone with the sign-in ticket
+can start a device sign-in and send its code to a member; a member who
+enters it at the provider signs that person in with their own role. Turn
+it on only if people need it and know to enter only codes they asked for
+themselves; the browser sign-in and `--ldap` do not have this problem.
 
 ## 3. Upgrade
 

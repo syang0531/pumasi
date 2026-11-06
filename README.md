@@ -944,6 +944,7 @@ pumasi sso map group:<admins-group-id> admin
 pumasi sso map group:<research-group-id> submitter:research
 pumasi sso map domain:acme.com viewer
 pumasi ui --public-url https://pumasi.acme.com     # "Sign in with Acme SSO"
+pumasi sso device on                               # allow pumasi login --sso (off by default)
 pumasi sso ticket                                  # for the CLI: pumasi login --sso <ticket>
 ```
 
@@ -992,7 +993,7 @@ defends against, including the API exposed to the internet.
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
 | `pumasi remove-node <ID>` | Revoke a node. It needs a new ticket to come back. |
 | `pumasi login <TICKET> [--sso \| --ldap USER]` | Manage a remote cluster from this machine, with the admin ticket or an access ticket; `--sso` (device flow) and `--ldap` sign in with a sign-in ticket from `pumasi sso ticket`. |
-| `pumasi sso status` / `sso oidc --issuer URL --client-id ID --client-secret-file F` / `sso ldap --url ldaps://... --user-base DN` / `sso map RULE ROLE` / `sso unmap RULE` / `sso session 12h` / `sso ticket` | Single sign-on: an OpenID Connect provider or an LDAP directory, rules (`group:`, `email:`, `domain:`, `anyone`) giving `admin`, `viewer` or `submitter:ACCOUNT`, how long a sign-in lasts, and the ticket people sign in with. `--off` turns a method off. |
+| `pumasi sso status` / `sso oidc --issuer URL --client-id ID --client-secret-file F` / `sso ldap --url ldaps://... --user-base DN` / `sso map RULE ROLE` / `sso unmap RULE` / `sso session 12h` / `sso device on\|off` / `sso ticket` | Single sign-on: an OpenID Connect provider or an LDAP directory, rules (`group:`, `email:`, `domain:`, `anyone`) giving `admin`, `viewer` or `submitter:ACCOUNT`, how long a sign-in lasts, whether `pumasi login --sso` (device flow, off by default) is allowed, and the ticket people sign in with. `--off` turns a method off. |
 | `pumasi audit ls [--after N] [--limit N] [--json] [-f]` / `audit verify [--json] [--against HEAD]` / `audit export [--syslog udp://\|tcp://HOST:PORT] [--state F] [-f]` | The audit log: entries, a check of the whole hash chain with a head signed by the cluster key, and syslog (RFC 5424) export. |
 | `pumasi admin rotate` | Replace the admin secret: every copy of the old admin ticket stops working. |
 | `pumasi confidential ls [--json]` / `confidential trust ID [--note N]` / `confidential untrust ID` | TEE nodes and the launch measurements their guests attested with; keys go only to guests whose measurement is trusted. |

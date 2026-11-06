@@ -153,7 +153,7 @@ pub enum SsoCmd {
         admin: AdminArgs,
     },
     /// Give whoever matches RULE a role: `group:NAME` (an ID token group,
-    /// or an LDAP group's DN or cn), `email:ADDRESS`, `domain:DOMAIN`
+    /// or an LDAP group's DN, or its cn if it is under --group-base), `email:ADDRESS`, `domain:DOMAIN`
     /// (verified emails only) or `anyone`. Someone several rules match
     /// gets the most powerful role.
     Map {
@@ -166,6 +166,16 @@ pub enum SsoCmd {
     /// Remove the rule for RULE.
     Unmap {
         rule: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Allow or refuse sign-in from a terminal (`pumasi login --sso`, the
+    /// OpenID Connect device flow). Off by default: anyone can start a
+    /// device sign-in and talk a member into entering its code at the
+    /// provider, and the session is then theirs, with the member's role.
+    Device {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -588,6 +598,10 @@ pub async fn sso(home: &Path, cmd: SsoCmd) -> Result<i32> {
             admin,
             AdminOp::SsoSet(Box::new(SsoUpdate::Unmap(rule.parse::<Subject>()?))),
         ),
+        SsoCmd::Device { state, admin } => (
+            admin,
+            AdminOp::SsoSet(Box::new(SsoUpdate::Device(state == "on"))),
+        ),
         SsoCmd::Session { length, admin } => {
             let ms = pumasi_proto::job::parse_duration_ms(&length)?;
             let hours = (ms / 3_600_000).max(1);
@@ -614,6 +628,18 @@ pub async fn sso(home: &Path, cmd: SsoCmd) -> Result<i32> {
         bail!("unexpected response");
     };
     print_sso(&v);
+    if v.oidc.is_some()
+        && let Ok(AdminResponse::SsoInfo(i)) = call(home, &admin, AdminOp::SsoInfo).await
+    {
+        println!(
+            "sign-in from a terminal (pumasi login --sso): {}",
+            if i.device {
+                "on"
+            } else {
+                "off (pumasi sso device on)"
+            }
+        );
+    }
     Ok(0)
 }
 

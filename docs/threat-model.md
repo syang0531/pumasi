@@ -95,7 +95,7 @@ reachable by anyone, with scripts elsewhere holding submitter tickets
 | The admin ticket leaks | `pumasi admin rotate` replaces the admin secret: every copy of the old admin ticket stops working, access tickets and SSO sessions keep working, and the rotation itself is audited (`admin.rotate`). | The holder could already have rolled out a binary to the nodes (`upgrade.rollout` is audited) or read confidential jobs. Treat it as a compromise of every node that auto-upgrades: see [operations.md](operations.md#a-leaked-admin-ticket). |
 | A browser session is stolen | Dashboard sessions are `HttpOnly`, `SameSite=Strict` cookies holding a random session id kept in the `pumasi ui` process, `Secure` when the dashboard is served over HTTPS or its `--public-url` is HTTPS (added in phase 17); SSO sessions are access tickets with a length (12 h by default, at most 30 days; `pumasi sso session`) and revocable like any other (`pumasi access revoke <name>` revokes every session of that person). | Restarting `pumasi ui` signs everyone out of the browser, but the underlying session ticket stays valid until it expires or is revoked. |
 | A ticket is guessed | Secrets are 32 random bytes (`new_secret`); comparisons are constant-time (`secrets_eq`). | None. |
-| An SSO sign-in is replayed or forged | OIDC: authorization code flow with PKCE (S256), `state` bound to a short-lived cookie on the browser that started it (`SameSite=Lax`, `Path=/sso`), `nonce` checked in the ID token, ID tokens verified against the issuer's JWKS with asymmetric algorithms only (no `none`, no HMAC), `iss`, `aud`, `azp` and `exp` checked, and email rules only for `email_verified` emails. Pending logins expire after 10 minutes and are used once. The redirect URI must be HTTPS (or loopback) and end in `/sso/callback`. Device flow (RFC 8628) for the CLI, with the device code held by the control plane, never the client. LDAP: user names are escaped in filters (RFC 4515), empty passwords are refused (no unauthenticated bind), and the bind is LDAPS or StartTLS (plain LDAP only to loopback). | Whoever controls the IdP or directory controls who signs in. Rules mapping `anyone` or a whole `domain:` give access to everyone the IdP vouches for. |
+| An SSO sign-in is replayed or forged | OIDC: authorization code flow with PKCE (S256), `state` bound to a short-lived cookie on the browser that started it (`SameSite=Lax`, `Path=/sso`), `nonce` checked in the ID token, ID tokens verified against the issuer's JWKS with asymmetric algorithms only (no `none`, no HMAC), `iss`, `aud`, `azp` and `exp` checked, and email rules only for `email_verified` emails. Pending logins expire after 10 minutes and are used once. The redirect URI must be HTTPS (or loopback) and end in `/sso/callback`. Device flow (RFC 8628) for the CLI, off unless an admin turns it on, with the device code held by the control plane, never the client. LDAP: user names are escaped in filters (RFC 4515), empty passwords are refused (no unauthenticated bind), and the bind is LDAPS or StartTLS (plain LDAP only to loopback). | Whoever controls the IdP or directory controls who signs in. Rules mapping `anyone` or a whole `domain:` give access to everyone the IdP vouches for. |
 
 ### Policy bypasses
 
@@ -205,17 +205,12 @@ mismatch; three strikes suspend it. Providers never settle a check.
 9. **RSA and P-256/P-384 verification use crates with timing advisories**
    (RUSTSEC-2023-0071, RUSTSEC-2026-0387) that concern private keys and
    secret integers; Pumasi only verifies signatures with public keys.
-10. **A `group:NAME` rule also matches LDAP groups by their first `cn`**,
-    wherever they are in the directory: `group:admins` matches
-    `cn=admins,ou=contractors,...` as well. Where people other than the
-    directory's admins can create groups, map roles (admin above all) to
-    a group's full DN.
-11. **Device sign-in can be phished.** As with any RFC 8628 flow, someone
-    can start `pumasi login --sso` and talk a member into entering the
-    code at the IdP; the session is then theirs, with the member's role.
-    The IdP's consent screen names the application, every sign-in is
-    audited with the IdP's name for the person, and an IdP that does not
-    need the device flow can turn the device grant off for Pumasi's client.
+10. **Device sign-in can be phished once turned on.** It is off by
+    default; with `pumasi sso device on`, as with any RFC 8628 flow,
+    someone can start `pumasi login --sso` and talk a member into
+    entering the code at the IdP, and the session is then theirs with the
+    member's role. Every sign-in is audited with the IdP's name for the
+    person.
 
 ## Internal review for 1.0
 
@@ -225,8 +220,8 @@ control plane (`access.rs` read against every `AdminOp`), SSO, the audit
 log, the parsers of untrusted input, the confidential tier and job
 isolation on agents. By the maintainers with AI assistance, so not
 independent. Every finding below is fixed, with a test, in the pull
-request that added this section; what was not fixed is in the residual risks
-above (10 and 11 were added by this review).
+request that added this section (residual risk 10 is what is left of
+the device-flow finding).
 
 | Severity | Finding | Fix |
 | --- | --- | --- |
@@ -238,6 +233,8 @@ above (10 and 11 were added by this review).
 | Low | **Dashboard sessions were not bounded**: anyone with a valid ticket could keep signing in and grow the session table until sessions went idle (12 hours). | At most 10,000 sessions; the least recently used goes first. |
 | Low | **Uploads and output zips went to world-readable temporary directories** (`/tmp/pumasi-ui-*`, mode 0755), so other users of the dashboard's machine could read jobs' inputs and outputs while they were there. | Created with mode 0700, and never reusing a directory that already exists. |
 | Low | **Answers from the IdP were read whole before their size was checked.** Only a malicious or broken IdP could send one, but it could exhaust the control plane's memory. | Reading stops at 1 MiB. |
+| Medium | **A bare `group:NAME` rule matched any LDAP group with that `cn`**, wherever it was in the directory: `group:admins` also matched `cn=admins,ou=contractors,...`. Where people other than the directory's admins can create groups (delegated OUs in Active Directory), they could make an `admins` group, join it and sign in as admin. | Groups match by their whole DN; a bare name matches only groups under `--group-base`. Rules that named groups outside it by `cn` must now give the DN. |
+| Medium | **Device sign-in could be phished.** Anyone with the sign-in ticket (it holds no secret) could start `pumasi login --sso` and send its code to a member; a member who entered it at the IdP signed that person in with their own role. | The device flow is off unless an admin runs `pumasi sso device on` (stored with the SSO settings; phase 17's stored settings read as off). |
 
 Read and found sound: the role table in `access.rs` (an allow list; every
 submitter call on a job, dataset or schedule is checked against its

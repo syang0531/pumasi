@@ -473,6 +473,7 @@ pumasi sso map group:<관리자-그룹-id> admin
 pumasi sso map group:<연구-그룹-id> submitter:research
 pumasi sso map domain:acme.com viewer
 pumasi ui --public-url https://pumasi.acme.com     # "Acme SSO로 로그인" 버튼
+pumasi sso device on                               # pumasi login --sso 허용(기본 꺼짐)
 pumasi sso ticket                                  # CLI용: pumasi login --sso <티켓>
 ```
 
@@ -491,7 +492,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | 명령 | 설명 |
 | --- | --- |
 | `pumasi cluster start [--metrics-addr ADDR] [--keep-jobs 30d]` | 컨트롤 플레인 실행. 처음 실행하면 클러스터를 만들고, 상태는 `~/.pumasi/cluster`에 저장합니다. `--metrics-addr`는 Prometheus 지표 제공, `--keep-jobs`는 끝난 작업 보관 기간(`0`이면 영구) |
-| `pumasi sso status` / `sso oidc ...` / `sso ldap ...` / `sso map 규칙 역할` / `sso unmap 규칙` / `sso session 12h` / `sso ticket` | SSO: OIDC 제공자나 LDAP 디렉터리, 규칙(`group:`, `email:`, `domain:`, `anyone`)과 역할(`admin`, `viewer`, `submitter:계정`), 로그인 유지 시간, 로그인용 티켓 |
+| `pumasi sso status` / `sso oidc ...` / `sso ldap ...` / `sso map 규칙 역할` / `sso unmap 규칙` / `sso session 12h` / `sso device on\|off` / `sso ticket` | SSO: OIDC 제공자나 LDAP 디렉터리, 규칙(`group:`, `email:`, `domain:`, `anyone`)과 역할(`admin`, `viewer`, `submitter:계정`), 로그인 유지 시간, 터미널 로그인(`pumasi login --sso`, 디바이스 흐름, 기본 꺼짐) 허용 여부, 로그인용 티켓 |
 | `pumasi login <티켓> [--sso \| --ldap 사용자]` | 원격 클러스터에 로그인. `--sso`(디바이스 흐름)와 `--ldap`은 `pumasi sso ticket`의 로그인 티켓으로 |
 | `pumasi audit ls` / `audit verify [--against HEAD]` / `audit export [--syslog udp://\|tcp://호스트:포트]` | 감사 로그 조회, 해시 체인 전체 검증과 서명된 끝, syslog(RFC 5424) 내보내기 |
 | `pumasi admin rotate` | 관리자 시크릿 교체: 기존 관리자 티켓은 모두 무효 |

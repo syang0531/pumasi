@@ -1,0 +1,14 @@
+# Matrix multiplication on a GPU through WebGPU (experimental): each task
+# multiplies two 1024 x 1024 matrices with a WGSL shader, checks the result
+# against the CPU and prints both speeds. Runs on nodes started with
+# `pumasi agent --allow-webgpu` (any GPU with Vulkan, Metal, DX12 or GL).
+# Build the module first:
+#   cargo build --release --target wasm32-wasip1 --manifest-path examples/webgpu/Cargo.toml
+name = "webgpu-matmul"
+module = "target/wasm32-wasip1/release/matmul.wasm"
+args = ["1024"]
+gpus = 1
+
+[resources]
+memory_mb = 256
+timeout = "5m"

@@ -23,7 +23,9 @@ and the roadmap below.
 
 ## Install
 
-Every release has a `pumasi` binary for Linux (x86_64, aarch64; static),
+Every release has a `pumasi` binary for Linux (x86_64, aarch64; glibc 2.28
+or later, so any distribution from 2018 on; on Alpine build from source with
+`--target x86_64-unknown-linux-musl`, which has no GPUs),
 macOS (x86_64 from 10.15, Apple Silicon) and Windows (x86_64, ARM64), a
 `SHA256SUMS` file, and two install scripts that download the right binary
 and check its checksum:
@@ -186,8 +188,8 @@ pumasi run examples/pytorch-cuda/job.toml --output
 - **AMD** (Linux): found in sysfs; FP32 is estimated from the compute
   units and clock. Docker jobs get `/dev/kfd` and the GPU's render node
   (ROCm images).
-- **Intel and Apple GPUs** are listed for information only; no executor
-  can use them yet.
+- **Intel and Apple GPUs**, and any GPU without CUDA, are used by wasm jobs
+  through WebGPU (below).
 - **MicroVMs (experimental)**: a GPU bound to `vfio-pci` on Linux, with a
   clean IOMMU group and no display attached, can be passed through to a
   microVM, which boots a GPU guest kernel and loads its own NVIDIA driver
@@ -206,6 +208,64 @@ claims is billed at what was timed, and one that cannot take the challenge
 check rate. GPU results themselves are not deterministic, so they are not
 re-run. `pumasi node <id>` shows each GPU and what it is billed at;
 `--no-gpus` keeps an agent's GPUs out of the cluster.
+
+### WebGPU: any GPU from a wasm job (experimental)
+
+A wasm job that asks for `gpus = 1` gets one GPU through WebGPU: the agent
+opens it with [wgpu](https://wgpu.rs) on whatever the machine has (Vulkan
+on Linux, Metal on macOS, DX12 on Windows, OpenGL as a fallback), and the
+module runs WGSL compute shaders on it through a small host API, the
+`pumasi_webgpu` imports. It is the only way to use GPUs without CUDA:
+Intel and AMD integrated GPUs, the GPUs of old Intel Macs, Apple Silicon.
+The sandbox stays the same: no network, no files outside `/input` and
+`/output`, and the job's memory limit and timeout cover the GPU too.
+
+```sh
+pumasi gpu webgpu                     # the adapters this machine offers, benchmarked
+cargo build --release --target wasm32-wasip1 --manifest-path examples/webgpu/Cargo.toml
+pumasi exec --gpu --webgpu-software examples/webgpu/target/wasm32-wasip1/release/matmul.wasm 256
+# adapter: llvmpipe (LLVM 20.1.2, 256 bits) (vulkan)     <- a software rasterizer; real GPUs are far faster
+# matmul 256x256: gpu 26.2 ms (1.3 GFLOPS; 172.7 ms with uploads and compile), cpu 47.9 ms (0.70 GFLOPS), speedup 1.8x
+# checksum gpu 4.178840e6 cpu 4.178840e6; max relative error 0.00e0 (tolerance 1e-3): ok
+pumasi agent start --allow-webgpu     # offer this machine's adapters to the cluster
+pumasi run examples/webgpu/matmul.toml --output
+```
+
+```toml
+module = "matmul.wasm"
+gpus = 1                              # one WebGPU adapter per task
+gpu = { vendor = "intel" }            # optional: nvidia, amd, intel, apple, any
+```
+
+The two examples in `examples/webgpu` (a tiled matrix multiplication and
+a Gaussian blur of a PPM image) check the GPU's answer against the same
+computation on the CPU and print both speeds; `src/lib.rs` there is a
+small Rust wrapper of the host API to copy. The calls are:
+
+| Import (`pumasi_webgpu`) | Does |
+| --- | --- |
+| `adapter(ptr, cap) -> len` | the task's GPU as JSON (name, backend, limits); -1 without one |
+| `shader(src, len, entry, entry_len) -> handle` | compiles a WGSL compute entry point (automatic layout) |
+| `buffer(size: i64) -> handle` | a zero-filled storage buffer (size a multiple of 4) |
+| `write(buf, offset: i64, src, len)` / `read(buf, offset: i64, dst, len)` | copy memory to and from a buffer; `read` waits for earlier dispatches |
+| `dispatch(shader, bufs, n, x, y, z)` | runs x*y*z workgroups with `n` buffers bound at `@group(0) @binding(0..n)` |
+| `wait()` / `release(handle)` | wait for every dispatch; free a shader or buffer |
+| `error(ptr, cap) -> len` | why the last call failed (WGSL compile errors included) |
+
+Every call returns a negative number when it fails. They map one to one
+onto WebGPU, so modules can move to the component model's `wasi:webgpu`
+(wasi-gfx) once Wasmtime runs it. Agents offer WebGPU only with
+`--allow-webgpu` (providers too: WebGPU validates every shader and bounds
+checks every access, as browsers do, but it still reaches the GPU driver).
+An adapter that is one of the node's listed GPUs shares its slot, so a
+Docker job and a WebGPU job never use the same GPU at once. Its time is
+billed like any GPU's, at the FP32 rate the agent measured with a WGSL
+shader; there is no GPU challenge over WebGPU yet, so a provider's
+adapter is billed at 1 TFLOPS at most unless it is a CUDA GPU the cluster
+already timed. GPU results differ slightly from GPU to GPU, so these jobs
+are not deterministic and are never re-run to check them. CI runs both
+examples on Linux (lavapipe, a software Vulkan driver), Windows and macOS
+and compares the results across them; real GPUs are checked by hand.
 
 ### Windows
 
@@ -764,14 +824,14 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR] [--metrics-addr ADDR]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. `--metrics-addr` serves Prometheus metrics. |
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
-| `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`). GPUs are offered unless `--no-gpus`. |
+| `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
 | `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- AGENT OPTIONS]` | Run the agent as a service that starts at boot (systemd, launchd, Windows service). `status` and `uninstall` too. |
 | `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
-| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally. |
+| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` / `gpu webgpu [--software]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally; `webgpu` lists the WebGPU adapters wasm jobs can use. |
 | `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
 | `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
 | `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
@@ -803,7 +863,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi cluster replica <TICKET> [--net public\|local] [--bind ADDR]` | Run this machine as a control plane replica (restart it later with `pumasi cluster start`). |
 | `pumasi backup FILE` / `pumasi cluster restore FILE` | A consistent copy of the control plane's state and cluster key, and a control plane made from one. |
 | `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB]` | The web dashboard and its JSON API, served from this machine (default 127.0.0.1:7400). |
-| `pumasi exec module.wasm [--input DIR] [--seed S] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode). |
+| `pumasi exec module.wasm [--input DIR] [--seed S] [--gpu] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode, `--gpu` gives it this machine's best WebGPU adapter). |
 
 `--home DIR` or `PUMASI_HOME` changes the state directory, which lets you run
 a cluster and several agents on one machine for testing. `PUMASI_LOG=debug`
@@ -819,7 +879,7 @@ A job runs on one of three executors with the same file format and commands:
 | Where | every node | only nodes started with `--allow-docker` (providers also need an invite with `--allow-docker`) | nodes started with `--allow-microvm`, providers included |
 | Isolation | Wasmtime sandbox, safe for untrusted code | container, only for machines and people you trust | a VM with its own kernel per task |
 | Network | never | off by default, `network = true` to allow | off by default, `network = true` reaches public addresses only |
-| GPUs | no | `gpus = N` or `gpu = {...}` (NVIDIA, AMD on Linux) | `gpus = N`, passed through with VFIO (Linux, experimental) |
+| GPUs | `gpus = 1`: any GPU through WebGPU (nodes with `--allow-webgpu`, experimental) | `gpus = N` or `gpu = {...}` (NVIDIA, AMD on Linux) | `gpus = N`, passed through with VFIO (Linux, experimental) |
 | Files | `/input`, `/output` | `/input`, `/output` | `/input`, `/output` |
 
 WASM job:
@@ -833,7 +893,8 @@ env = { MODE = "fast" }               # optional
 stdin = "input.txt"                   # optional, fed to every task
 files = ["data/", "lookup.csv"]       # optional, appear under /input; "store:NAME" mounts a dataset
 max_attempts = 3                      # placements before giving up on lost nodes
-deterministic = true                  # default: virtual clock + seeded random, so results can be checked
+deterministic = true                  # default (off with gpus): virtual clock + seeded random, so results can be checked
+# gpus = 1                            # one GPU through WebGPU (the pumasi_webgpu imports)
 priority = 0                          # -1000..1000; higher runs first and may preempt lower
 after = []                            # job ids that must succeed before this job starts
 tolerations = []                      # taints of nodes it may run on, e.g. ["gpu-only"]
@@ -1035,8 +1096,8 @@ with other clusters.
 | 10 | Cluster management: node labels and taints, job selectors and tolerations, cordon and drain, priorities with preemption, per-account quotas (slots, GPUs, CU per day, priority, storage), role tickets (admin, submitter, viewer), declarative `apply` with `get` and `describe`, cron schedules, job dependencies | done |
 | 11 | Monitoring and alerts: node metrics (CPU, memory, disk, network, temperature, GPUs) kept 7 days with downsampling, `top`, live `logs -f`, `events`, opt-in Prometheus endpoint with a Grafana dashboard, alert rules (node offline, failure rate, disk, temperature, benchmark drop, SMART, check mismatch) sent to Slack, Discord or JSON webhooks | done |
 | 12 | Web dashboard built into the binary (`pumasi ui`): overview, nodes with charts, cordon and drain, jobs with submit, live output, cancel and output downloads, storage with uploads and downloads, CU and ledger, invites and access tickets, prices, events and alerts; sign-in with access tickets and their roles, Korean and English, JSON API with OpenAPI, Playwright tests in CI | done |
-| 13 | Control plane high availability: state replicated over Raft (openraft) to 3 or 5 control planes, automatic failover with nodes, CLI and dashboard following the leader, tickets listing every replica, replicas catching up from snapshots, `pumasi backup` and `cluster restore` | this release |
-| 14 | WebGPU executor (experimental) | planned |
+| 13 | Control plane high availability: state replicated over Raft (openraft) to 3 or 5 control planes, automatic failover with nodes, CLI and dashboard following the leader, tickets listing every replica, replicas catching up from snapshots, `pumasi backup` and `cluster restore` | done |
+| 14 | WebGPU executor (experimental): wasm jobs with `gpus = 1` run WGSL compute shaders on any GPU through wgpu (Vulkan, Metal, DX12, GL) and the `pumasi_webgpu` imports, signed adapter profiles with a WGSL benchmark, adapters sharing slots with listed GPUs, GPU time billed in CU, matrix multiplication and blur examples checked against the CPU on Linux, Windows and macOS in CI, glibc Linux binaries that can load GPU drivers | this release |
 | 15 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
 | 16 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model, cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag | planned |
 | 17 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
@@ -1047,7 +1108,11 @@ replicas every 30 seconds rather than as part of each write (a file
 uploaded just before the leader dies may be missing until it comes back),
 agent binaries uploaded with `pumasi upgrade rollout` stay on the replica
 that took them (roll out again after a failover), and agents older than
-this release follow only the replica they joined. Accounts
+this release follow only the replica they joined. WebGPU is experimental: it is
+checked on software rasterizers in CI and on real GPUs by hand, offers
+compute shaders only (no textures or samplers, one bind group, no f16), a
+runaway shader is stopped by the GPU driver's watchdog rather than the
+job's timeout, and there is no GPU challenge over WebGPU yet. Accounts
 exist only inside one cluster (no SSO yet: access tickets are handed out
 by the admin), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
 (only each node's round trip to the control plane), the file store lives
@@ -1055,7 +1120,7 @@ only on the control plane (no replicas on owner nodes yet, no S3-compatible
 gateway). GPUs are checked on real hardware by hand, not in CI (hosted
 runners have none); VFIO passthrough is experimental and NVIDIA-only
 (Turing and newer, with the open kernel modules); Intel and Apple GPUs are
-listed but not used. MicroVM networks need QEMU (not Firecracker alone or
+used only through WebGPU. MicroVM networks need QEMU (not Firecracker alone or
 Virtualization.framework) and forward TCP and DNS only. MicroVMs need KVM (Linux), Virtualization.framework
 (macOS 11+) or WHPX (Windows x86_64) for speed (QEMU without them works but
 is slow, and Windows on ARM has no microVMs yet). WHPX and

@@ -97,6 +97,8 @@ const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
 const METRICS: TableDefinition<(&str, u8, u64), &[u8]> = TableDefinition::new("metrics");
 /// Webhooks, by name.
 const WEBHOOKS: TableDefinition<&str, &[u8]> = TableDefinition::new("webhooks");
+/// A node's latest signed WebGPU adapters (phase 14), by node id.
+const MEMBER_WEBGPU: TableDefinition<&str, &[u8]> = TableDefinition::new("member_webgpu");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -147,7 +149,8 @@ macro_rules! tables {
             SCHEDULES,
             EVENTS,
             METRICS,
-            WEBHOOKS
+            WEBHOOKS,
+            MEMBER_WEBGPU
         )
     };
 }
@@ -395,6 +398,7 @@ pub struct Snapshot {
     pub secrets: Vec<(String, u64, String)>,
     pub uploads: Vec<([u8; 32], crate::state::UploadRecord)>,
     pub devices: Vec<(String, crate::gpu::DeviceRecord)>,
+    pub webgpu: Vec<(String, pumasi_proto::webgpu::SignedWebGpu)>,
     pub job_gpu: Vec<(u128, GpuRequest)>,
     pub job_sched: Vec<(u128, JobSched)>,
     pub node_config: Vec<(String, NodeConfig)>,
@@ -530,6 +534,7 @@ impl Store {
         tx.open_table(EVENTS)?;
         tx.open_table(METRICS)?;
         tx.open_table(WEBHOOKS)?;
+        tx.open_table(MEMBER_WEBGPU)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -941,6 +946,10 @@ impl Store {
             let (k, v) = row?;
             snap.devices.push((k.value().to_string(), dec(v.value())?));
         }
+        for row in tx.open_table(MEMBER_WEBGPU)?.iter()? {
+            let (k, v) = row?;
+            snap.webgpu.push((k.value().to_string(), dec(v.value())?));
+        }
         for row in tx.open_table(JOB_GPU)?.iter()? {
             let (k, v) = row?;
             snap.job_gpu.push((k.value(), dec(v.value())?));
@@ -993,6 +1002,7 @@ impl Store {
         let mut b = Batch::default();
         b.del(MEMBERS, id);
         b.del(MEMBER_DEVICES, id);
+        b.del(MEMBER_WEBGPU, id);
         b.del(NODE_CONFIG, id);
         self.commit(b)
     }
@@ -1000,6 +1010,12 @@ impl Store {
     pub fn put_devices(&self, id: &str, d: &crate::gpu::DeviceRecord) -> Result<()> {
         let mut b = Batch::default();
         b.put(MEMBER_DEVICES, id, enc(d).as_slice());
+        self.commit(b)
+    }
+
+    pub fn put_webgpu(&self, id: &str, w: &pumasi_proto::webgpu::SignedWebGpu) -> Result<()> {
+        let mut b = Batch::default();
+        b.put(MEMBER_WEBGPU, id, enc(w).as_slice());
         self.commit(b)
     }
 

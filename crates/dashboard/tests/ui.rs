@@ -132,6 +132,7 @@ async fn dashboard_pages_api_and_guards() {
         store_cache_bytes: None,
         gpus: false,
         fake_gpus: None,
+        webgpu: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,

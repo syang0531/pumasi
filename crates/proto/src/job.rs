@@ -348,11 +348,14 @@ impl JobSubmission {
             }
         }
         if let Some(g) = &self.gpu {
-            ensure!(
-                self.executor.runs_images(),
-                "GPUs are for docker and microvm jobs"
-            );
             g.validate()?;
+            if self.executor == Executor::Wasm {
+                g.validate_webgpu()?;
+                ensure!(
+                    !self.deterministic,
+                    "GPU results differ from GPU to GPU, so a wasm job with a GPU cannot be deterministic"
+                );
+            }
         }
         for f in self
             .files
@@ -497,8 +500,9 @@ pub struct JobFile {
     pub tier: Tier,
     pub max_attempts: Option<u32>,
     pub max_price_per_hour: Option<f64>,
-    /// Deterministic mode (wasm only, default on): a virtual clock and
-    /// seeded random numbers, so results can be checked by re-running.
+    /// Deterministic mode (wasm only, default on unless the job asks for a
+    /// GPU): a virtual clock and seeded random numbers, so results can be
+    /// checked by re-running.
     pub deterministic: Option<bool>,
     /// Higher runs first and may preempt lower (-1000 to 1000, default 0).
     pub priority: Option<i32>,
@@ -744,10 +748,6 @@ impl JobFile {
                     !self.network,
                     "wasm tasks cannot use the network; use a docker or microvm job"
                 );
-                ensure!(
-                    self.gpus.is_none() && self.gpu.is_none(),
-                    "GPUs are for docker and microvm jobs"
-                );
                 let m = self.module.as_ref().context("wasm job needs `module`")?;
                 (read(m)?, None)
             }
@@ -915,6 +915,7 @@ impl JobFile {
                 })
             }
         };
+        let wants_gpu = gpu.is_some();
         let output_dataset = match &self.output {
             Some(o) => {
                 let name = o
@@ -954,7 +955,8 @@ impl JobFile {
             max_price_per_hour: self.max_price_per_hour,
             account: None,
             deterministic: match executor {
-                Executor::Wasm => self.deterministic.unwrap_or(true),
+                // GPU results are not bit-identical across GPUs.
+                Executor::Wasm => self.deterministic.unwrap_or(!wants_gpu),
                 Executor::Docker | Executor::Microvm => {
                     ensure!(
                         self.deterministic != Some(true),
@@ -1201,8 +1203,22 @@ mod tests {
             assert!(JobFile::parse(bad).unwrap().resolve(&dir).is_err(), "{bad}");
         }
         write_module(&dir);
-        let wasm = JobFile::parse("module = \"m.wasm\"\ngpus = 1").unwrap();
-        assert!(wasm.resolve(&dir).is_err());
+        // A wasm job gets one GPU through WebGPU.
+        let wasm = JobFile::parse("module = \"m.wasm\"\ngpus = 1\ngpu = { vendor = \"intel\" }")
+            .unwrap()
+            .resolve(&dir)
+            .unwrap();
+        assert_eq!(wasm.gpu.as_ref().map(|g| g.count), Some(1));
+        wasm.validate().unwrap();
+        for bad in [
+            "module = \"m.wasm\"\ngpus = 2",
+            "module = \"m.wasm\"\ngpus = \"all\"",
+            "module = \"m.wasm\"\ngpus = 1\ngpu = { min_vram_gb = 4 }",
+            "module = \"m.wasm\"\ngpus = 1\ndeterministic = true",
+        ] {
+            let resolved = JobFile::parse(bad).unwrap().resolve(&dir);
+            assert!(resolved.is_err(), "{bad}");
+        }
     }
 
     #[test]

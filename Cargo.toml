@@ -52,5 +52,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1"
+# WebGPU executor (phase 14): compute shaders on Vulkan, Metal, DX12 or GL.
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "dx12", "gles", "wgsl"] }
+pollster = "0.4"
 # Control plane high availability (phase 13).
 openraft = { version = "=0.9.25", default-features = false, features = ["serde", "storage-v2"] }

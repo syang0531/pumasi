@@ -323,6 +323,8 @@ pub struct State {
     pub(crate) files: FileState,
     /// Nodes' device profiles (GPUs) and the cluster's GPU checks.
     pub(crate) devices: HashMap<String, DeviceRecord>,
+    /// Nodes' signed WebGPU adapters (phase 14).
+    pub(crate) webgpu: HashMap<String, pumasi_proto::webgpu::SignedWebGpu>,
     /// Labels, quotas, access tickets, schedules and the rest of cluster
     /// management.
     pub(crate) mgmt: Mgmt,
@@ -400,6 +402,7 @@ impl State {
             upgrading: HashMap::new(),
             files: FileState::default(),
             devices: snap.devices.into_iter().collect(),
+            webgpu: snap.webgpu.into_iter().collect(),
             mgmt: Mgmt::default(),
             monitor: Monitor::default(),
         };
@@ -637,6 +640,7 @@ impl State {
         );
         self.members.remove(id);
         self.devices.remove(id);
+        self.webgpu.remove(id);
         self.mgmt.node_config.remove(id);
         self.store.remove_member(id)?;
         if let Some(n) = self.nodes.get_mut(id)
@@ -1241,7 +1245,7 @@ impl State {
         let consumer = job.meta.account.clone();
         let billed_wall_ms = signed.usage.wall_ms.min(observed_ms);
         let cpu_score = self.billing_score_of(node_id);
-        let mut gpu = self.gpu_billing(node_id, gpus);
+        let mut gpu = self.gpu_billing(node_id, signed.usage.executor, gpus);
         let metered = Metered {
             executor: signed.usage.executor,
             fuel_used: signed.usage.fuel_used,
@@ -1579,10 +1583,7 @@ impl State {
                 }
                 n.perf.protocol >= DEVICES_PROTOCOL
                     && !n.gpu.checking()
-                    && self
-                        .devices
-                        .get(id)
-                        .is_some_and(|d| req.pick(d.gpus(), &busy, need.executor).is_some())
+                    && self.pick_gpus(id, req, need.executor, &busy).is_some()
             })
             && tolerated(
                 config.map(|c| c.taints.as_slice()).unwrap_or_default(),
@@ -1746,9 +1747,14 @@ impl State {
             .gpu
             .as_ref()
             .and_then(|req| {
-                self.devices
-                    .get(node_id)
-                    .and_then(|d| req.pick(d.gpus(), &node.gpu.busy_set(), need.executor))
+                crate::gpu::pick_gpus(
+                    &self.devices,
+                    &self.webgpu,
+                    node_id,
+                    req,
+                    need.executor,
+                    &node.gpu.busy_set(),
+                )
             })
             .unwrap_or_default();
         let assignment = TaskAssignment {
@@ -1869,6 +1875,7 @@ impl State {
                     rtt_us: online.and_then(|n| n.perf.rtt_us),
                     relayed: online.is_some_and(|n| n.perf.relayed),
                     gpus: self.gpu_views(m),
+                    webgpu: self.webgpu_views(m),
                     microvm_network: self
                         .devices
                         .get(&m.id)
@@ -2380,6 +2387,153 @@ mod tests {
             pumasi_proto::gpu::REFERENCE_GPU_GFLOPS
         );
         assert!(node.gpus[0].note.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // WebGPU (phase 14)
+    // -----------------------------------------------------------------------
+
+    fn adapter(index: u32, gpu: Option<u32>, gflops: u32) -> pumasi_proto::webgpu::WebGpuAdapter {
+        pumasi_proto::webgpu::WebGpuAdapter {
+            index,
+            name: format!("Test adapter {index}"),
+            vendor: GpuVendor::Nvidia,
+            backend: pumasi_proto::webgpu::WebGpuBackend::Vulkan,
+            device_type: pumasi_proto::webgpu::WebGpuDeviceType::Discrete,
+            driver: String::new(),
+            gpu,
+            pci: String::new(),
+            max_buffer_mib: 1024,
+            max_binding_mib: 128,
+            fp32_gflops: gflops,
+        }
+    }
+
+    fn send_webgpu(
+        st: &mut State,
+        id: &str,
+        key: &SecretKey,
+        adapters: Vec<pumasi_proto::webgpu::WebGpuAdapter>,
+    ) {
+        let generation = st.nodes[id].generation;
+        let profile = pumasi_proto::webgpu::WebGpuProfile {
+            bench_version: pumasi_proto::webgpu::WEBGPU_BENCH_VERSION,
+            node: *key.public().as_bytes(),
+            measured_unix: 0,
+            adapters,
+            notes: vec![],
+        };
+        st.on_webgpu(
+            id,
+            generation,
+            pumasi_proto::webgpu::SignedWebGpu::sign(profile, key),
+        )
+        .unwrap();
+    }
+
+    fn webgpu_job(tasks: usize) -> JobSubmission {
+        JobSubmission {
+            gpu: Some(GpuRequest {
+                count: 1,
+                vendor: None,
+                min_vram_mib: 0,
+            }),
+            deterministic: false,
+            ..job(Executor::Wasm, tasks)
+        }
+    }
+
+    #[test]
+    fn webgpu_jobs_share_gpu_slots_and_are_billed() {
+        use pumasi_proto::webgpu::{UNCHECKED_WEBGPU_GFLOPS, WEBGPU_SLOT_BASE};
+        let mut st = state();
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        // A provider with one NVIDIA GPU (also reachable over WebGPU) and an
+        // integrated GPU that only WebGPU reaches.
+        let (bob_id, bob_key, mut rx) =
+            join_gpus(&mut st, "bob", vec![gpu(0, 20_000, 0)], bob(true));
+        let (_, _, mut plain_rx) = join_gpus(&mut st, "plain", vec![], None);
+        let id = st.submit(webgpu_job(3)).unwrap();
+        assert!(assigned(&mut rx).is_empty(), "no WebGPU profile yet");
+        send_webgpu(
+            &mut st,
+            &bob_id,
+            &bob_key,
+            vec![adapter(0, Some(0), 5_000), adapter(1, None, 800)],
+        );
+        let got = assigned(&mut rx);
+        assert_eq!(got.len(), 2, "one task per adapter: {got:?}");
+        assert_eq!(got[0].gpus, vec![0], "fastest first, in its GPU's slot");
+        assert_eq!(got[1].gpus, vec![WEBGPU_SLOT_BASE + 1]);
+        assert!(assigned(&mut plain_rx).is_empty(), "no WebGPU there");
+        assert_eq!(st.jobs[&id].tasks[2].state, TaskState::Pending);
+
+        // The GPU is taken by the WebGPU task, so a Docker GPU job waits.
+        let docker = st.submit(gpu_job(1, 1)).unwrap();
+        assert!(assigned(&mut rx).is_empty());
+        assert_eq!(st.jobs[&docker].tasks[0].state, TaskState::Pending);
+        let view = st.status();
+        let node = view.nodes.iter().find(|n| n.id == bob_id).unwrap();
+        assert_eq!(node.webgpu.len(), 2);
+        assert_eq!(node.webgpu[0].busy, Some(got[0].task));
+        assert_eq!(node.webgpu[0].billed_gflops, UNCHECKED_WEBGPU_GFLOPS);
+        assert!(node.webgpu[0].note.is_some());
+        assert_eq!(node.webgpu[1].billed_gflops, 800, "under the cap");
+        assert!(node.labels["webgpu"].contains(&"2".to_string()));
+
+        // The run on the GPU's adapter ends: billed at the WebGPU cap, and
+        // the freed slot goes to the waiting WebGPU task first (same
+        // priority, submitted earlier).
+        let a = &got[0];
+        let outcome = Outcome::Exited(0);
+        let digest = pumasi_proto::receipt::result_digest(&outcome, b"ok", &[]);
+        let usage = pumasi_proto::receipt::Usage {
+            cluster: *st.key.public().as_bytes(),
+            node: *bob_key.public().as_bytes(),
+            task: a.task,
+            executor: Executor::Wasm,
+            outcome: outcome.clone(),
+            fuel_used: 1000,
+            wall_ms: 100,
+            memory_limit_bytes: a.limits.memory_bytes,
+            peak_memory_bytes: Some(65536),
+            cpu_millis: None,
+            result_digest: digest,
+            finished_unix: now_unix(),
+        };
+        std::thread::sleep(Duration::from_millis(120));
+        let generation = st.nodes[&bob_id].generation;
+        st.on_report(
+            &bob_id,
+            generation,
+            TaskReport {
+                task: a.task,
+                outcome,
+                stdout: b"ok".to_vec(),
+                stderr: vec![],
+                files: vec![],
+                fuel_used: 1000,
+                wall_ms: 100,
+                usage: Some(pumasi_proto::receipt::SignedUsage::sign(usage, &bob_key)),
+            },
+        );
+        let receipts = st.receipts(id).unwrap();
+        let r = &receipts[0];
+        r.verify().unwrap();
+        let g = r.gpu.as_ref().expect("GPU billing on the receipt");
+        assert_eq!(g.names, vec!["Test adapter 0 (WebGPU, vulkan)".to_string()]);
+        assert_eq!(g.gflops, UNCHECKED_WEBGPU_GFLOPS as u64);
+        assert!(g.exact_ucu > 0);
+        let next = assigned(&mut rx);
+        assert_eq!(next.len(), 1, "{next:?}");
+        assert_eq!(next[0].task.job, id);
+        assert_eq!(next[0].gpus, vec![0]);
+
+        // A node that stops offering WebGPU gets no more of these tasks.
+        send_webgpu(&mut st, &bob_id, &bob_key, vec![]);
+        let view = st.status();
+        let node = view.nodes.iter().find(|n| n.id == bob_id).unwrap();
+        assert!(node.webgpu.is_empty());
     }
 
     #[test]

@@ -50,6 +50,12 @@ jobs:
           echo "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a  $RUNNER_TEMP/prom.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/prom.tgz" -C "$RUNNER_TEMP" --strip-components=1 "prometheus-$v.linux-amd64/promtool"
           echo "PUMASI_PROMTOOL=$RUNNER_TEMP/promtool" >> "$GITHUB_ENV"
+      - name: Software Vulkan driver (lavapipe), for the WebGPU tests
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+          echo "PUMASI_TEST_WEBGPU=require" >> "$GITHUB_ENV"
       - name: Unit and end-to-end tests
         run: cargo test --workspace
       - name: Build sample module
@@ -61,6 +67,115 @@ jobs:
             examples/montecarlo/target/wasm32-wasip1/release/montecarlo.wasm sample 1 100000 \
             | tee sample.txt
           grep -q "^1 " sample.txt
+
+  # WebGPU (phase 14): the same wasm modules on each OS's GPU API (Vulkan
+  # with lavapipe on Linux, DX12 on Windows, Metal on macOS), checked
+  # against the CPU and compared across the OSes in `webgpu-compare`.
+  # Hosted runners have no real GPUs, so software rasterizers stand in;
+  # where a runner has no usable adapter at all, the job says so and the
+  # comparison goes on without it.
+  webgpu:
+    name: webgpu (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            require: true
+          - os: windows-latest
+            require: false
+          - os: macos-latest
+            require: false
+          - os: macos-15-intel
+            require: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: webgpu
+          workspaces: |
+            .
+            examples/webgpu
+      - name: Software Vulkan driver (lavapipe)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+      - run: cargo build --release -p pumasi-cli
+      - name: Build the example modules
+        run: cargo build --release --target wasm32-wasip1 --manifest-path examples/webgpu/Cargo.toml
+      - name: Adapters
+        shell: bash
+        run: |
+          bin=target/release/pumasi
+          "$bin" gpu webgpu --software | tee adapters.txt
+          if grep -q "^WebGPU " adapters.txt; then
+            echo "HAS_GPU=true" >> "$GITHUB_ENV"
+          elif [ "${{ matrix.require }}" = true ]; then
+            echo "no WebGPU adapter on ${{ matrix.os }}"; exit 1
+          else
+            echo "::notice::no WebGPU adapter on ${{ matrix.os }}; its examples are skipped"
+          fi
+      - name: Matrix multiplication and blur on the GPU, checked against the CPU
+        if: env.HAS_GPU == 'true'
+        shell: bash
+        run: |
+          bin=target/release/pumasi
+          mods=examples/webgpu/target/wasm32-wasip1/release
+          mkdir -p out
+          "$bin" exec --gpu --webgpu-software --memory-mb 512 --out out "$mods/matmul.wasm" 512 | tee matmul.txt
+          grep -q ": ok$" matmul.txt
+          "$bin" exec --gpu --webgpu-software --memory-mb 512 --out out "$mods/blur.wasm" 6 | tee blur.txt
+          grep -q ": ok$" blur.txt
+          test -s out/blurred.ppm
+          mkdir -p report
+          cp out/matmul.json "report/matmul-${{ matrix.os }}.json"
+          grep "^adapter: " matmul.txt | head -n1 > "report/adapter-${{ matrix.os }}.txt"
+          grep "^blur " blur.txt > "report/blur-${{ matrix.os }}.txt"
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_GPU == 'true'
+        with:
+          name: webgpu-${{ matrix.os }}
+          path: report
+          if-no-files-found: error
+
+  webgpu-compare:
+    name: webgpu (same results on every OS)
+    needs: webgpu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: webgpu-*
+          merge-multiple: true
+          path: report
+      - name: Compare the runs
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, json, os, sys
+          runs = {}
+          for f in sorted(glob.glob("report/matmul-*.json")):
+              os_name = f[len("report/matmul-"):-len(".json")]
+              runs[os_name] = json.load(open(f))
+          assert "ubuntu-latest" in runs, "the Linux run is missing"
+          print("| OS | adapter | GPU ms | CPU ms | speedup | max rel. error |")
+          print("| --- | --- | ---: | ---: | ---: | ---: |")
+          for name, r in runs.items():
+              print(f"| {name} | {r['adapter']} ({r['backend']}) | {r['gpu_ms']:.1f} | {r['cpu_ms']:.1f} | "
+                    f"{r['cpu_ms'] / max(r['gpu_ms'], 1e-3):.1f}x | {r['max_relative_error']:.1e} |")
+          ok = all(r["ok"] for r in runs.values())
+          cpu = {r["checksum_cpu"] for r in runs.values()}
+          gpu = [r["checksum_gpu"] for r in runs.values()]
+          ref = next(iter(cpu))
+          spread = max(abs(g - ref) / abs(ref) for g in gpu)
+          print()
+          print(f"CPU checksums identical on every OS: {len(cpu) == 1}; GPU checksums within {spread:.1e} of them")
+          sys.exit(0 if ok and len(cpu) == 1 and spread <= 1e-3 else 1)
+          PY
 
   # The web dashboard in a real browser against a real local cluster
   # (control plane, two WASM agents, `pumasi ui`). Node is only for the

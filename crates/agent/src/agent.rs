@@ -88,6 +88,9 @@ pub struct AgentConfig {
     /// `PUMASI_GPUS`. Never set this in real use.
     #[doc(hidden)]
     pub fake_gpus: Option<Vec<pumasi_proto::gpu::GpuInfo>>,
+    /// Offer this machine's WebGPU adapters to wasm jobs that ask for a
+    /// GPU (phase 14, experimental). `None`: none.
+    pub webgpu: Option<crate::webgpu::Options>,
 }
 
 /// What the agent remembers about the cluster it joined.
@@ -133,6 +136,9 @@ pub struct Agent {
     node_store: NodeStore,
     /// GPUs and microVM networking, signed; sent after the welcome.
     devices: Option<pumasi_proto::gpu::SignedDevices>,
+    /// WebGPU adapters wasm tasks may use, and their signed profile.
+    webgpu: Option<Arc<crate::webgpu::WebGpu>>,
+    webgpu_profile: pumasi_proto::webgpu::SignedWebGpu,
     /// Samples the machine for the cluster's monitoring.
     sampler: Arc<Mutex<Sampler>>,
     _router: Router,
@@ -305,6 +311,38 @@ impl Agent {
             let profile = crate::gpu::profile(*key.public().as_bytes(), gpus, network, notes);
             Some(pumasi_proto::gpu::SignedDevices::sign(profile, &key))
         };
+        let (webgpu, webgpu_profile) = {
+            let listed = devices
+                .as_ref()
+                .map(|d| d.profile.gpus.clone())
+                .unwrap_or_default();
+            let node = *key.public().as_bytes();
+            match config.webgpu {
+                Some(opts) => {
+                    let (gpu, notes) = tokio::task::spawn_blocking(move || {
+                        let mut notes = Vec::new();
+                        let gpu = crate::webgpu::WebGpu::detect(opts, &listed, &mut notes);
+                        (gpu, notes)
+                    })
+                    .await?;
+                    if gpu.is_empty() {
+                        warn!("no WebGPU adapter can run compute shaders here: {notes:?}");
+                    }
+                    let profile = gpu.profile(node, notes);
+                    (
+                        (!gpu.is_empty()).then(|| Arc::new(gpu)),
+                        pumasi_proto::webgpu::SignedWebGpu::sign(profile, &key),
+                    )
+                }
+                None => (
+                    None,
+                    pumasi_proto::webgpu::SignedWebGpu::sign(
+                        crate::webgpu::profile(node, Vec::new(), Vec::new()),
+                        &key,
+                    ),
+                ),
+            }
+        };
         if docker.is_some() {
             info.executors.push(Executor::Docker);
         }
@@ -337,6 +375,8 @@ impl Agent {
             rebench: Arc::new(Notify::new()),
             node_store,
             devices,
+            webgpu,
+            webgpu_profile,
             sampler: Arc::new(Mutex::new(sampler)),
             _router: router,
         })
@@ -345,6 +385,11 @@ impl Agent {
     /// The signed device profile (GPUs, microVM networking).
     pub fn devices(&self) -> Option<&pumasi_proto::gpu::SignedDevices> {
         self.devices.as_ref()
+    }
+
+    /// The signed WebGPU profile (empty when the node offers none).
+    pub fn webgpu(&self) -> &pumasi_proto::webgpu::SignedWebGpu {
+        &self.webgpu_profile
     }
 
     /// The latest signed performance profile, if the machine was measured.
@@ -671,6 +716,8 @@ impl Agent {
         if let Some(d) = &self.devices {
             let _ = out_tx.send(FromAgent::Devices(Box::new(d.clone())));
         }
+        // The control plane is never older than its agents, so it knows this.
+        let _ = out_tx.send(FromAgent::WebGpu(Box::new(self.webgpu_profile.clone())));
         let benchmarks = self.config.bench.clone().map(|config| {
             let out_tx = out_tx.clone();
             let running = running.clone();
@@ -951,19 +998,40 @@ impl Agent {
         let out_tx = out_tx.clone();
         let key = self.key.clone();
         let corrupt = self.config.corrupt_results;
-        let gpus: Vec<pumasi_proto::gpu::GpuInfo> = self
-            .devices
-            .as_ref()
-            .map(|d| {
-                d.profile
-                    .gpus
-                    .iter()
-                    .filter(|g| a.gpus.contains(&g.index))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        if gpus.len() != a.gpus.len() {
+        // A wasm task's GPU is a WebGPU adapter, named by its slot.
+        let mut webgpu = None;
+        let gpus: Vec<pumasi_proto::gpu::GpuInfo> = if a.executor == Executor::Wasm {
+            if let Some(&slot) = a.gpus.first() {
+                webgpu = self.webgpu.as_ref().and_then(|g| {
+                    g.by_slot(slot).map(|adapter| crate::webgpu::WebGpuTask {
+                        gpu: g.clone(),
+                        adapter,
+                    })
+                });
+                if webgpu.is_none() || a.gpus.len() != 1 {
+                    running.lock().unwrap().remove(&a.task);
+                    let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
+                        a.task,
+                        format!("this node has no WebGPU adapter {:?}", a.gpus),
+                    ))));
+                    return;
+                }
+            }
+            Vec::new()
+        } else {
+            self.devices
+                .as_ref()
+                .map(|d| {
+                    d.profile
+                        .gpus
+                        .iter()
+                        .filter(|g| a.gpus.contains(&g.index))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if a.executor != Executor::Wasm && gpus.len() != a.gpus.len() {
             running.lock().unwrap().remove(&a.task);
             let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
                 a.task,
@@ -993,6 +1061,7 @@ impl Agent {
                 }
             };
             io.gpus = gpus;
+            io.webgpu = webgpu;
             // What the task prints goes to the cluster as it comes (not for
             // check runs: only the task's own run is shown).
             let streamer = (!task.check).then(|| {

@@ -1,0 +1,13 @@
+# Gaussian blur on a GPU through WebGPU (experimental). Put a binary PPM
+# (P6) image in examples/webgpu/images/ to blur it; without one the
+# module blurs a test pattern. The blurred image comes back as
+# pumasi-out/<job>/task-0/blurred.ppm.
+#   cargo build --release --target wasm32-wasip1 --manifest-path examples/webgpu/Cargo.toml
+name = "webgpu-blur"
+module = "target/wasm32-wasip1/release/blur.wasm"
+args = ["8"]
+gpus = 1
+
+[resources]
+memory_mb = 256
+timeout = "5m"

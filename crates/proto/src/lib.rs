@@ -19,6 +19,7 @@ pub mod registry;
 pub mod release;
 pub mod store;
 pub mod ticket;
+pub mod webgpu;
 pub mod wire;
 
 /// ALPN for the agent <-> control plane protocol.
@@ -43,11 +44,14 @@ pub const MONITOR_PROTOCOL: u32 = 10;
 /// told where the leader is ([`msg::HelloReply::NotLeader`]) and which
 /// replicas there are ([`msg::ToAgent::Replicas`]).
 pub const HA_PROTOCOL: u32 = 11;
+/// The first agent protocol with WebGPU: it reports its adapters
+/// ([`msg::FromAgent::WebGpu`]) and runs wasm tasks that ask for a GPU.
+pub const WEBGPU_PROTOCOL: u32 = 12;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        11
+        12
     };
 }
 
@@ -64,7 +68,7 @@ pub const PROTOCOL_VERSION: u32 = protocol_version!();
 /// a network. Protocol 9 agents send no metrics and no live output.
 /// Protocol 10 agents know only the control plane they joined: a replica
 /// that is not the leader closes their connection, and they keep retrying
-/// it.
+/// it. Protocol 11 agents have no WebGPU: they get no wasm jobs with GPUs.
 pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi

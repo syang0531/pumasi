@@ -30,6 +30,20 @@ pub enum GpuCmd {
         #[arg(long, default_value = "docker")]
         docker: String,
     },
+    /// List the WebGPU adapters (Vulkan, Metal, DX12, OpenGL) that wasm
+    /// jobs with `gpus = 1` could use here, benchmarked the way the agent
+    /// does (`pumasi agent --allow-webgpu` offers them).
+    Webgpu {
+        /// Include software rasterizers (lavapipe, llvmpipe, WARP).
+        #[arg(long)]
+        software: bool,
+        /// Skip the benchmark.
+        #[arg(long)]
+        no_bench: bool,
+        /// Print the list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(cmd: GpuCmd) -> Result<i32> {
@@ -68,7 +82,68 @@ pub async fn run(cmd: GpuCmd) -> Result<i32> {
             Ok(0)
         }
         GpuCmd::Check { gpu: only, docker } => check(only, &docker).await,
+        GpuCmd::Webgpu {
+            software,
+            no_bench,
+            json,
+        } => webgpu(software, !no_bench, json).await,
     }
+}
+
+async fn webgpu(software: bool, bench: bool, json: bool) -> Result<i32> {
+    let (adapters, notes) = tokio::task::spawn_blocking(move || {
+        let mut notes = Vec::new();
+        let gpus = gpu::detect(&GpuEnv::default(), &mut notes);
+        let w = pumasi_agent::webgpu::WebGpu::detect(
+            pumasi_agent::webgpu::Options { software, bench },
+            &gpus,
+            &mut notes,
+        );
+        (w.adapters(), notes)
+    })
+    .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "adapters": adapters,
+                "notes": notes,
+            }))?
+        );
+        return Ok(0);
+    }
+    if adapters.is_empty() {
+        println!(
+            "no WebGPU adapter can run compute shaders here{}",
+            if software {
+                ""
+            } else {
+                " (--software includes software rasterizers)"
+            }
+        );
+    }
+    for a in &adapters {
+        println!("WebGPU {} {}", a.index, a.describe());
+        let mut facts = vec![format!("vendor {}", a.vendor)];
+        if let Some(g) = a.gpu {
+            facts.push(format!("GPU {g} of `pumasi gpu list`"));
+        }
+        if !a.pci.is_empty() {
+            facts.push(format!("pci {}", a.pci));
+        }
+        if !a.driver.is_empty() {
+            facts.push(format!("driver {}", a.driver));
+        }
+        facts.push(format!(
+            "buffers up to {} MiB (bindings {} MiB)",
+            a.max_buffer_mib, a.max_binding_mib
+        ));
+        println!("  {}", facts.join(", "));
+    }
+    for n in &notes {
+        println!("note: {n}");
+    }
+    Ok(0)
 }
 
 fn print_gpu(g: &GpuInfo) {

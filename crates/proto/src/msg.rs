@@ -34,6 +34,7 @@ use crate::{
         BlobHash, DatasetView, ImageBlob, Mount, OutputMode, StoragePolicy, StoreItem, StoreTarget,
         StoreUsageView, StoredOutput,
     },
+    webgpu::{SignedWebGpu, WebGpuAdapter},
 };
 
 /// What a member machine is to the cluster.
@@ -403,6 +404,9 @@ pub enum FromAgent {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
+    /// The node's signed WebGPU adapters, sent after the welcome (protocol
+    /// 12). Empty when the node offers none.
+    WebGpu(Box<SignedWebGpu>),
 }
 
 // ---------------------------------------------------------------------------
@@ -966,6 +970,21 @@ pub struct NodeView {
     pub config: NodeConfig,
     /// Every label: the built-in ones and the admin's.
     pub labels: LabelSet,
+    // Phase 14 from here.
+    /// WebGPU adapters wasm jobs can use (protocol 12 agents).
+    pub webgpu: Vec<WebGpuView>,
+}
+
+/// A WebGPU adapter in the cluster status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebGpuView {
+    pub adapter: WebGpuAdapter,
+    /// FP32 GFLOPS its runs are billed at.
+    pub billed_gflops: u32,
+    /// Why the billed figure differs from the profile's.
+    pub note: Option<String>,
+    /// The task using it (or the GPU it is) right now.
+    pub busy: Option<TaskRef>,
 }
 
 /// A GPU in the cluster status.

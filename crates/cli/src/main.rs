@@ -444,6 +444,13 @@ enum Cmd {
         /// and random numbers seeded from this text.
         #[arg(long)]
         seed: Option<String>,
+        /// Give the module this machine's best WebGPU adapter (the
+        /// `pumasi_webgpu` imports), as a wasm job with `gpus = 1` gets.
+        #[arg(long, conflicts_with = "seed")]
+        gpu: bool,
+        /// With --gpu, accept a software rasterizer when there is no GPU.
+        #[arg(long, requires = "gpu")]
+        webgpu_software: bool,
     },
 }
 
@@ -811,6 +818,15 @@ struct AgentOpts {
     /// Needs `pumasi vm setup` first.
     #[arg(long)]
     allow_microvm: bool,
+    /// Also offer this machine's GPUs to wasm jobs that ask for one, through
+    /// WebGPU (Vulkan, Metal, DX12 or OpenGL): experimental. The only way
+    /// to use GPUs without CUDA, such as integrated GPUs and old Macs'.
+    #[arg(long, env = "PUMASI_ALLOW_WEBGPU")]
+    allow_webgpu: bool,
+    /// With --allow-webgpu, offer a software rasterizer (lavapipe,
+    /// llvmpipe, WARP) too when the machine has one. Slow; for testing.
+    #[arg(long, env = "PUMASI_WEBGPU_SOFTWARE")]
+    webgpu_software: bool,
     #[command(flatten)]
     vm: VmArgs,
     /// Accept agent upgrades the cluster rolls out (`pumasi upgrade
@@ -1338,6 +1354,8 @@ async fn run(cli: Cli) -> Result<i32> {
             input,
             out,
             seed,
+            gpu,
+            webgpu_software,
         } => {
             exec_local(
                 &module,
@@ -1348,6 +1366,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 input.as_deref(),
                 &out,
                 seed.map(|s| pumasi_proto::module_hash(s.as_bytes())),
+                gpu.then_some(webgpu_software),
             )
             .await
         }
@@ -1518,6 +1537,10 @@ async fn agent(
         corrupt_results: false,
         gpus: !opts.no_gpus,
         fake_gpus: None,
+        webgpu: (opts.allow_webgpu && !opts.no_gpus).then_some(pumasi_agent::webgpu::Options {
+            software: opts.webgpu_software,
+            bench: !opts.no_benchmark,
+        }),
         store_cache_bytes: opts.store_cache.as_deref().map(parse_size).transpose()?,
     };
     let exe = config.upgrade.as_ref().map(|u| u.exe.clone());
@@ -1805,6 +1828,11 @@ fn print_status(s: &ClusterStatus) {
             println!("{:<16} {}", truncate(&n.info.name, 16), gpu_line(g));
         }
     }
+    for n in s.nodes.iter() {
+        for w in &n.webgpu {
+            println!("{:<16} {}", truncate(&n.info.name, 16), webgpu_line(w));
+        }
+    }
     for n in s.nodes.iter().filter(|n| n.online) {
         if let Some(reason) = &n.paused {
             println!("{} is paused: {reason}", truncate(&n.info.name, 16));
@@ -1960,6 +1988,24 @@ fn print_job(v: &JobView, output: bool) {
 }
 
 /// `GPU 0 NVIDIA GeForce RTX 3060 (12 GiB, 12.7 TFLOPS) docker [busy 3f2a…/0]`.
+fn webgpu_line(w: &pumasi_proto::msg::WebGpuView) -> String {
+    let a = &w.adapter;
+    let mut s = format!("WebGPU {} {} wasm", a.index, a.describe());
+    if let Some(g) = a.gpu {
+        s.push_str(&format!(" (GPU {g})"));
+    }
+    if w.billed_gflops != a.fp32_gflops {
+        s.push_str(&format!(
+            " billed {} TFLOPS",
+            pumasi_proto::gpu::format_tflops(w.billed_gflops)
+        ));
+    }
+    if let Some(t) = &w.busy {
+        s.push_str(&format!(" [running {t}]"));
+    }
+    s
+}
+
 fn gpu_line(g: &pumasi_proto::msg::GpuView) -> String {
     let i = &g.info;
     let mut uses = Vec::new();
@@ -2316,6 +2362,7 @@ async fn exec_local(
     input_dir: Option<&Path>,
     out_dir: &Path,
     seed: Option<[u8; 32]>,
+    gpu: Option<bool>,
 ) -> Result<i32> {
     let bytes = std::fs::read(module).with_context(|| format!("read {}", module.display()))?;
     let hash = pumasi_proto::module_hash(&bytes);
@@ -2348,10 +2395,50 @@ async fn exec_local(
         stdin,
         ..Default::default()
     };
+    let webgpu = match gpu {
+        Some(software) => {
+            let (gpu, notes) = tokio::task::spawn_blocking(move || {
+                let mut notes = Vec::new();
+                let gpu = pumasi_agent::webgpu::WebGpu::detect(
+                    pumasi_agent::webgpu::Options {
+                        software,
+                        bench: false,
+                    },
+                    &[],
+                    &mut notes,
+                );
+                (gpu, notes)
+            })
+            .await?;
+            for n in &notes {
+                eprintln!("[pumasi] note: {n}");
+            }
+            let Some(a) = gpu.adapters().into_iter().next() else {
+                bail!(
+                    "no WebGPU adapter can run compute shaders here{}",
+                    if software {
+                        ""
+                    } else {
+                        " (--webgpu-software accepts a software rasterizer)"
+                    }
+                );
+            };
+            eprintln!("[pumasi] GPU: {}", a.describe());
+            Some(pumasi_agent::webgpu::WebGpuTask {
+                gpu: Arc::new(gpu),
+                adapter: a.index,
+            })
+        }
+        None => None,
+    };
     let result = tokio::task::spawn_blocking(move || -> Result<_> {
         let ex = WasmExecutor::new()?;
         ex.load_module(hash, &bytes)?;
-        Ok(ex.run(
+        let io = pumasi_agent::executor::TaskIo {
+            webgpu,
+            ..Default::default()
+        };
+        Ok(ex.run_io(
             &hash,
             &program,
             &input,
@@ -2359,6 +2446,7 @@ async fn exec_local(
             &limits,
             seed,
             Arc::new(AtomicBool::new(false)),
+            &io,
         ))
     })
     .await??;
@@ -3136,6 +3224,22 @@ fn print_node(n: &NodeView) {
         if !facts.is_empty() {
             println!("    {}", facts.join(", "));
         }
+    }
+    for w in &n.webgpu {
+        println!("  {}", webgpu_line(w));
+        if let Some(note) = &w.note {
+            println!("    {note}");
+        }
+        let a = &w.adapter;
+        let mut facts = vec![format!("vendor {}", a.vendor)];
+        if !a.driver.is_empty() {
+            facts.push(format!("driver {}", a.driver));
+        }
+        facts.push(format!(
+            "buffers up to {} MiB (bindings {} MiB)",
+            a.max_buffer_mib, a.max_binding_mib
+        ));
+        println!("    {}", facts.join(", "));
     }
     match &n.perf {
         Some(p) => {

@@ -1979,8 +1979,8 @@ remotely; install a current binary on them once.
   at the control plane, the audit log is never pruned (pruning behind a
   signed checkpoint), no SCIM provisioning (people appear when they first
   sign in and their sessions simply expire), no SAML, the control plane
-  has no service installer of its own, and the 1.0 tag waits for a
-  green long-checks run. The internal security review is done (threat
+  has no service installer of its own. 1.0 was tagged after a green
+  long-checks run on the tagged commit. The internal security review is done (threat
   model, "Internal review for 1.0"); no third-party audit yet.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).

@@ -234,5 +234,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Written notes in docs/releases/<tag>.md come first, with
+          # GitHub's list of merged pull requests after them.
+          notes=()
+          if [[ -f "docs/releases/$GITHUB_REF_NAME.md" ]]; then notes=(--notes-file "docs/releases/$GITHUB_REF_NAME.md"); fi
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+            --title "$GITHUB_REF_NAME" "${notes[@]}" --generate-notes --verify-tag

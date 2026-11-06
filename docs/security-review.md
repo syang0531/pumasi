@@ -101,6 +101,6 @@ timing advisories in verification-only code (`deny.toml`).
 - Findings with severity, a reproduction and a suggested fix.
 - A read of `access.rs`'s role table against the list of `AdminOp`s.
 - Whether the threat model misses a boundary or an attacker.
-- Retest of the fixes before the 1.0 tag.
+- Retest of the fixes made for 1.0 (threat model, "Internal review for 1.0").
 
 Contact and reporting: [SECURITY.md](../SECURITY.md).

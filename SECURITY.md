@@ -12,8 +12,8 @@ disclosure date within 14 days, and credit reporters who want it.
 
 ## Supported versions
 
-Security fixes go to the latest release. Before 1.0, upgrade to the
-latest release to get them.
+Security fixes go to the latest 1.x release; upgrade to it to get them
+(the install script, or `pumasi upgrade rollout` across a cluster).
 
 ## What we do
 

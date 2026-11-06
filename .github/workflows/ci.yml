@@ -287,14 +287,6 @@ jobs:
               -drive id=d0,file="$RUNNER_TEMP/disk.img",format=raw,if=none,readonly=off \
               -device virtio-blk-device,drive=d0 2>&1 | head -n 400
             echo "=== exit ${PIPESTATUS[0]} ==="
-            echo "=== the same run with main's guest init ==="
-            git fetch --depth 1 origin main
-            git worktree add "$RUNNER_TEMP/main" FETCH_HEAD
-            (cd "$RUNNER_TEMP/main" && cargo build --release -p pumasi-guest --target x86_64-unknown-linux-musl)
-            ./target/debug/pumasi vm setup --vm-dir "$RUNNER_TEMP/vm-main" \
-              --guest "$RUNNER_TEMP/main/target/x86_64-unknown-linux-musl/release/pumasi-guest"
-            ./target/debug/pumasi vm run --vm-dir "$RUNNER_TEMP/vm-main" --vm-backend qemu \
-              busybox:1.36 -- uname -a < /dev/null || true
           fi
 
   guest:

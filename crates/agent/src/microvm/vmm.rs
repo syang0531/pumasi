@@ -465,6 +465,12 @@ pub fn initramfs(init: &[u8]) -> Vec<u8> {
     add("dev/console", 0o020600, (5, 1), &[]);
     add("init", 0o100755, (0, 0), init);
     add("TRAILER!!!", 0, (0, 0), &[]);
+    // QEMU's microvm machine loads the initramfs at the top of memory,
+    // page aligned below `RAM - size`, which is also where its ACPI tables
+    // go: with some sizes the archive's last page covers them, the kernel
+    // finds no ACPI and so no virtio disks. A whole number of pages keeps
+    // the last page free. The kernel skips the zeros after the trailer.
+    out.resize(out.len().next_multiple_of(4096), 0);
     out
 }
 
@@ -476,7 +482,7 @@ mod tests {
     fn initramfs_layout() {
         let cpio = initramfs(b"\x7fELF-fake");
         assert!(cpio.starts_with(b"070701"));
-        assert_eq!(cpio.len() % 4, 0);
+        assert_eq!(cpio.len() % 4096, 0);
         let text = String::from_utf8_lossy(&cpio);
         for name in ["dev/console", "init", "newroot", "TRAILER!!!"] {
             assert!(text.contains(name), "{name} missing");

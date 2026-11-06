@@ -1558,6 +1558,136 @@ them (see Persistence). The admin protocol gains
 `NodeView`, `JobView` and `QuotaView`, so the CLI and `pumasi ui` must
 match the control plane's version, as before.
 
+## Phase 16: the confidential tier
+
+Jobs carry a `Tier` (`crates/proto/src/job.rs`). `open` runs anywhere.
+`trusted` runs only on a *trusted host*: an owner machine (role `Owner`)
+or a provider an admin trusts (`pumasi trust NODE`, the `trusted_nodes`
+table; `Refusal::Untrusted` otherwise). `confidential` is a microVM job
+(no GPUs, no network: `JobSubmission::validate`) that runs in a SEV-SNP
+or TDX guest and is hidden from the node's owner. The rest of this
+section is about that tier.
+
+### Sealing
+
+The control plane is the key broker. A job's key is
+`blake3::derive_key("pumasi 2026 confidential job key v1", cluster key ||
+job id)` (`confidential::job_key`), so every replica derives the same key
+and nothing new is stored. `pumasi_guest::seal` derives the image key and
+each task's key from it with HKDF-SHA256 and seals streams with
+XChaCha20-Poly1305 in 64 KiB chunks (the STREAM construction: a random
+19-byte prefix, a chunk counter and a last-chunk flag make each nonce; the
+header, with its length field zeroed, and a caller's context are the
+associated data, so chunks cannot be reordered, dropped or cut off, and a
+stream of one kind or run cannot pass for another).
+
+A confidential job always goes through the private image path:
+`prepare_store` sets `private_image`, `want_images` asks only for `amd64`,
+and the store worker pulls the image and replaces the plain collection
+under the same tag with `config.sealed` (the image manifest with its
+config, sealed with the image key) and `image.sealed` (the layers tar the
+guest unpacks, sealed). Each task's input is sealed on demand, at most
+four at a time (`StoreCmd::SealInput`, `confidential::seal_input`): the
+worker opens the sealed config, builds the run spec as an agent would
+(`vmdisk::run_spec`, shared with the agent), places the mounted datasets'
+files, and writes the input tar (run spec, stdin, job and task files,
+mounts) through a `SealWriter` with the task key into `input.sealed`,
+tagged under the job's `in/` tags. Sealed inputs are kept in memory; after
+a restart they are sealed again. `Need::confidential` holds a run back
+with `Refusal::Sealing` until both are there.
+
+### Placement and attestation
+
+A node reports the TEEs it starts VMs in with `FromAgent::Tee` (protocol
+14): `sev-snp`, `tdx`, or the test stand-in `test`, which counts only on a
+control plane started with `--insecure-test-tee`. `refusal` sends a
+confidential run only to protocol 14 agents with a usable TEE. `place`
+gives the run a *lease* (node, TEE, a random 32-byte nonce, used flag) and
+sends an assignment with the image, command, environment, files and
+mounts left out: `TaskAssignment::confidential` names the TEE, the nonce,
+the sealed image and input collections, the output disk's size and the
+memory the VM needs on top of the task (the root file system, input and
+output live in the guest's encrypted memory).
+
+The agent fetches the two sealed files and boots QEMU with
+`confidential-guest-support` (`sev-snp-guest` with `kernel-hashes=on`, or
+`tdx-guest` with the host's quote generation socket) and OVMF built for
+it, so the firmware measures the kernel, initramfs (with the guest init)
+and command line. Its disks are the sealed image, the sealed input, an
+output disk and a 1 MiB *attest disk* whose first sector holds the TEE and
+nonce. The guest init (mode `sealed`) makes an X25519 key pair, asks the
+kernel's TSM interface (`/sys/kernel/config/tsm/report`) for a report
+whose 64 bytes of report data are `SHA-512("pumasi/attest/v1\0" || nonce
+|| public key)`, and writes it to the attest disk at 4 KiB (with `O_DIRECT`,
+so the host sees it). The agent passes it on as `FromAgent::Attest`.
+
+`State::begin_attest` uses the lease up (one try per run): it must exist,
+be this node's, for a run the node is running, and the evidence must be
+from the TEE it was placed for. Off the state lock, `attest::Verifier`
+checks it:
+
+- SEV-SNP (`check_snp`): the VCEK comes from the report's extended
+  certificate table, or from AMD's key distribution service by chip id
+  and reported TCB (cached). It must chain to AMD's ARK and ASK for its
+  generation (Milan, Genoa, Turin; built into the `sev` crate), its TCB
+  and hardware id extensions must match the report, the report's ECDSA
+  P-384 signature must check out with it, the guest policy must not allow
+  debugging, and the report data must be this run's. The measurement is
+  the report's `MEASUREMENT`.
+- TDX (`check_tdx`): `dcap-qvl` checks the quote with collateral the
+  control plane fetches from Intel's PCS (PCK CRL, TCB info and QE
+  identity for the quote's FMSPC, Intel's root CRL; cached for six hours):
+  the PCK chain to Intel's root, the QE report, the quote's signature and
+  the TCB status. Only `UpToDate`, `SWHardeningNeeded` and the configuration
+  statuses pass; the TD must not be debuggable, and its report data must
+  be this run's. The measurement is SHA-384 of MRTD, RTMR1 and RTMR2.
+- Test (`check_test`): only with `--insecure-test-tee`; the "measurement"
+  is the guest init's SHA-384, so the trust flow is the same.
+
+`finish_attest` records the measurement (`measurements` table: TEE,
+node, agent version, vCPUs, first and last seen, count, details) and
+releases the keys only if an admin trusts it (`pumasi confidential
+trust`, at least 8 characters of its id): the image and task keys,
+wrapped for the guest's public key (an ephemeral X25519 exchange, HKDF
+bound to the nonce, XChaCha20-Poly1305). Anything else gets
+`ToAgent::Keys` with the reason, which the agent writes back to the attest
+disk; the guest then reports only that it failed. Each outcome is a
+`confidential.*` event. Recorded SEV-SNP reports and TDX quotes, with
+forgeries (another run's report data, flipped bytes, the wrong
+generation's VCEK, a self-signed VCEK, an out-of-date platform), are unit
+tests in `attest.rs`; the lease rules, replays, untrusted and changed
+measurements are state tests.
+
+### Results
+
+With its keys, the guest unpacks the sealed layers into a tmpfs root,
+reads the sealed input, runs the command and writes its output tar
+through a `SealWriter` with the task key and the run's nonce as context.
+The agent copies the sealed stream from the output disk and uploads it as
+`output.sealed` (confidential runs always use the store for output). The
+control plane checks the receipt against the report as the node sent it,
+then opens the stream (`confidential::open_output`) and records the
+guest's own outcome, stdout, stderr and files instead
+(`State::on_report_opened`); with an output dataset, the opened files are
+imported into the store. A sealed output that does not open (the wrong
+key or nonce, or a changed byte) strikes the node and the run is done
+again. A run with no sealed output failed before it had keys and can only
+be an error. Live output is not sent for confidential runs.
+
+### What it does not protect
+
+The control plane holds every key, so it, its replicas, backups and the
+admin ticket can read confidential jobs, and datasets in its store are
+stored in the clear (members of the cluster can fetch a collection whose
+hash they know). The node sees sizes, timings and memory use, and can
+stop a run or withhold its result. Leases live in memory, so runs in
+flight are done again after a restart or failover. The SEV-SNP check
+does not enforce a minimum TCB beyond what AMD still certifies; RTMR0
+(the TDX firmware's own configuration) is not pinned; there is no
+encrypted scratch disk (tasks are limited by the VM's memory); NVIDIA
+confidential computing (H100 and later) is not supported, so confidential
+jobs have no GPUs.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -1627,7 +1757,12 @@ gained two fields, so `migrate_v6` re-encodes each stored schedule
 like every table they come last in the `tables!` list, so Raft batches
 from replicas of the same version agree on table numbers.
 
-`PROTOCOL_VERSION` is 13 (phase 15, above): protocol 5 (phase 4) added `UpgradeHello` and the
+Phase 16 keeps layout 7. `Tier::Confidential` was appended to the enum,
+so stored jobs decode unchanged; the tables `measurements` (by
+measurement id) and `trusted_nodes` (by node id) come last. Job keys are
+derived, and sealed inputs and leases are not stored.
+
+`PROTOCOL_VERSION` is 14 (phase 16, above): protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
 `BenchResult` and `ToAgent::Benchmark` and `Rebenchmark`, which the control
@@ -1643,7 +1778,10 @@ itself, an agent sends them only to a control plane that knows them. The hello i
 `ToAgent::Replicas`; a protocol 10 agent talking to a follower sees an
 unknown reply and retries, so it reaches the cluster only while the replica
 it joined leads. Protocol 12 adds `FromAgent::WebGpu`; protocol 11 agents
-get no wasm jobs with GPUs. Protocol 13 is described under phase 15. The control plane accepts hellos from
+get no wasm jobs with GPUs. Protocol 13 is described under phase 15.
+Protocol 14 (phase 16) appends `TaskAssignment::confidential` and adds
+`FromAgent::Tee`, `FromAgent::Attest` and `ToAgent::Keys`; confidential
+runs go only to protocol 14 agents. The control plane accepts hellos from
 `MIN_AGENT_PROTOCOL` (5) up: `AgentHello::decode` tries the current layout
 and falls back to the protocol 5 one (available), so phase 4 and 5 agents
 keep working and can take a rollout. Upgrade the control plane first; it
@@ -1692,9 +1830,14 @@ remotely; install a current binary on them once.
   never end are stopped by the driver's watchdog rather than the job's
   timeout, no GPU metrics for adapters that are not listed GPUs, and core
   modules only (no `wasi:webgpu` components until Wasmtime runs them).
-- Remaining roadmap phases (15 to 18): the confidential
-  tier, self-hosting 1.0 (SSO, audit log, external security review), the
-  hub, buying CU. See the roadmap in the README.
+- Confidential tier: no NVIDIA confidential computing (no GPUs in
+  confidential jobs), no network, x86-64 only, no encrypted scratch disk,
+  no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
+  restart or failover, and real SEV-SNP and TDX hosts checked by hand only
+  (CI uses the test stand-in and recorded reports).
+- Remaining roadmap phases (17 to 19): self-hosting 1.0 (SSO, audit log,
+  external security review), the hub, buying CU. See the roadmap in the
+  README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node
@@ -1705,7 +1848,7 @@ remotely; install a current binary on them once.
   moves must be removed and invited again), and replicas take no reads
   (followers serve nothing; the leader does all the work).
 - Access tickets are handed out by the admin; signing in with SSO and
-  mapping groups to roles is phase 16.
+  mapping groups to roles is phase 17.
 - CU cannot be bought or exchanged, and there is no platform fee; both
   belong to the hub.
 - "Honeypot" tasks with known answers (needed for non-deterministic Docker

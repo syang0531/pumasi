@@ -1183,6 +1183,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
     .await
     .unwrap();
     let docker_id = docker_agent.id().to_string();
+    let docker_label = format!("label=pumasi.agent={}", docker_agent.id().fmt_short());
     let d = spawn_join(docker_agent, ticket);
     wait_online(&cluster, 2).await;
     let client = admin(&cluster).await;
@@ -1261,9 +1262,17 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         "{view:#?}"
     );
 
-    // No leftover containers.
+    // No leftover containers from this agent (other tests run Docker in
+    // parallel, so look only at this agent's label).
     let out = std::process::Command::new("docker")
-        .args(["ps", "-aq", "--filter", "label=pumasi=1"])
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            "label=pumasi=1",
+            "--filter",
+            &docker_label,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -1290,6 +1299,7 @@ fn microvm_config() -> Option<pumasi_agent::MicrovmConfig> {
     Some(pumasi_agent::MicrovmConfig {
         dir: dir.into(),
         backend,
+        confidential: Default::default(),
     })
 }
 
@@ -1494,6 +1504,142 @@ async fn microvm_jobs_run_on_an_invited_provider() {
     wasm_only.kill().await;
     p.kill().await;
     cluster.shutdown().await.unwrap();
+}
+
+/// Phase 16 with the test TEE (no SEV-SNP or TDX on CI runners): a
+/// confidential job's guest attests, the control plane refuses the keys
+/// while no admin trusts the measurement, and releases them once it does.
+/// The run's input and output cross the node only sealed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_confidential_jobs_get_keys_only_for_a_trusted_measurement() {
+    let Some(mut vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    init_tracing();
+    let mut config = ClusterConfig::new(tempdir("c"));
+    config.name = "test-cluster".into();
+    config.net = NetMode::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.heartbeat = Duration::from_millis(200);
+    config.node_timeout = Duration::from_secs(2);
+    config.insecure_test_tee = true;
+    let cluster = Cluster::start(config).await.unwrap();
+    let client = admin(&cluster).await;
+    deposit(&client, "owner", 100_000).await;
+
+    vm.confidential = pumasi_agent::microvm::tee::TeeOptions {
+        enabled: false,
+        test: true,
+    };
+    let agent_dir = tempdir("t");
+    let mut ac = agent_config("tee-node", 2, agent_dir.clone());
+    ac.microvm = Some(vm);
+    let agent = Agent::new(ac).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let _a = spawn_join(agent, ticket);
+    wait_online(&cluster, 1).await;
+
+    let job = || {
+        let mut sub = docker_job(
+            &[
+                "sh",
+                "-c",
+                "cat shared.txt mine.txt > /output/out.txt && echo top-$0-secret",
+            ],
+            vec![TaskInput {
+                args: vec!["arg0".into()],
+                files: vec![FileEntry {
+                    path: "mine.txt".into(),
+                    data: b"task-secret".to_vec(),
+                }],
+                ..Default::default()
+            }],
+        );
+        sub.executor = Executor::Microvm;
+        sub.tier = Tier::Confidential;
+        sub.max_attempts = 1;
+        sub.docker.as_mut().unwrap().image = microvm_image();
+        sub.limits.timeout_ms = 180_000;
+        sub
+    };
+
+    // No admin trusts the guest's measurement yet: no keys.
+    let id = submit(&client, job()).await;
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Failed, "{view:#?}");
+    let TaskState::Failed(pumasi_proto::msg::Outcome::Error(why)) = &view.tasks[0].state else {
+        panic!("{view:#?}");
+    };
+    assert!(why.contains("not trusted"), "{why}");
+    let AdminResponse::Confidential(v) = client.call(AdminOp::Confidential).await.unwrap() else {
+        panic!("expected the confidential view");
+    };
+    assert!(v.test_tee);
+    assert_eq!(v.measurements.len(), 1, "{v:#?}");
+    let m = v.measurements[0].clone();
+    assert!(!m.trusted);
+    assert_eq!(
+        v.nodes[0].tees,
+        vec![pumasi_proto::confidential::TeeKind::Test]
+    );
+
+    // Trusted: the run gets its keys, and its result is opened.
+    let r = client
+        .call(AdminOp::TrustMeasurement {
+            id: m.id[..12].to_string(),
+            trusted: true,
+            note: "e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(r, AdminResponse::Confidential(_)), "{r:?}");
+    let id = submit(&client, job()).await;
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    assert_eq!(view.tier, Tier::Confidential);
+    assert_eq!(
+        view.tasks[0].stdout.as_deref(),
+        Some(&b"top-arg0-secret\n"[..]),
+        "{view:#?}"
+    );
+    let AdminResponse::Files(files) = client
+        .call(AdminOp::TaskFiles { id, index: 0 })
+        .await
+        .unwrap()
+    else {
+        panic!("expected files");
+    };
+    assert_eq!(
+        files,
+        vec![FileEntry {
+            path: "out.txt".into(),
+            data: b"shared+task-secret".to_vec(),
+        }]
+    );
+    // Nothing the agent kept holds the input or the output in the clear.
+    let mut leaked = Vec::new();
+    find_in_files(&agent_dir, b"task-secret", &mut leaked);
+    assert!(leaked.is_empty(), "plaintext on the node: {leaked:?}");
+}
+
+/// Files under `dir` that contain `needle`.
+fn find_in_files(dir: &std::path::Path, needle: &[u8], out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            find_in_files(&p, needle, out);
+        } else if let Ok(b) = std::fs::read(&p)
+            && b.windows(needle.len()).any(|w| w == needle)
+        {
+            out.push(p);
+        }
+    }
 }
 
 async fn microvm_network(client: &AdminClient, node: &pumasi_proto::msg::NodeView) {

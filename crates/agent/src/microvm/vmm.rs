@@ -68,6 +68,20 @@ pub struct VmSpec {
     /// PCI devices bound to `vfio-pci` to pass through (QEMU on Linux
     /// only). The VM then gets a PCI machine (q35) instead of `microvm`.
     pub pci: Vec<String>,
+    /// Start it as a confidential VM (QEMU with KVM on Linux only): its
+    /// memory encrypted, the kernel, initramfs and command line measured
+    /// by the firmware (phase 16).
+    pub tee: Option<TeeVm>,
+}
+
+/// A SEV-SNP or TDX guest's firmware and settings.
+#[derive(Debug, Clone)]
+pub struct TeeVm {
+    pub kind: pumasi_guest::seal::TeeKind,
+    /// OVMF built for it (AMD SEV's `AmdSev` build, or TDX's).
+    pub firmware: PathBuf,
+    /// SEV-SNP: the C-bit position (51 on Milan, Genoa and Turin).
+    pub cbitpos: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +114,9 @@ pub const SERIAL_LOG: &str = "serial.log";
 impl Vmm {
     /// The VMM command for `spec`. Writes any config file into `dir`.
     pub fn command(&self, spec: &VmSpec, dir: &Path) -> Result<tokio::process::Command> {
-        if self.backend != Backend::Qemu && (spec.net.is_some() || !spec.pci.is_empty()) {
+        if self.backend != Backend::Qemu
+            && (spec.net.is_some() || !spec.pci.is_empty() || spec.tee.is_some())
+        {
             bail!(
                 "{} cannot give a VM a network card or GPUs; QEMU can",
                 self.backend
@@ -207,9 +223,11 @@ impl Vmm {
         let x86 = cfg!(target_arch = "x86_64");
         // Passed-through GPUs need a PCI bus; the other devices then sit on
         // it too.
-        let pci = !spec.pci.is_empty();
+        let pci = !spec.pci.is_empty() || spec.tee.is_some();
         let transport = if pci { "pci" } else { "device" };
-        if pci {
+        if let Some(t) = &spec.tee {
+            tee_machine(&mut cmd, t, spec.mem_mib);
+        } else if pci {
             cmd.args(["-M", if x86 { "q35" } else { "virt" }]);
         } else if x86 && self.accelerated && cfg!(target_os = "linux") {
             // KVM's in-kernel 8259 is never programmed by this kernel (no
@@ -244,8 +262,16 @@ impl Vmm {
         // WHPX takes CPUID leaf 1 from QEMU's CPU model, and `max` there is
         // TCG's feature list; Nehalem is the x86-64-v2 baseline every
         // machine with WHPX has.
-        let cpu = std::env::var("PUMASI_QEMU_CPU")
-            .unwrap_or_else(|_| if whpx { "Nehalem" } else { "max" }.into());
+        let cpu = std::env::var("PUMASI_QEMU_CPU").unwrap_or_else(|_| {
+            match spec.tee.as_ref().map(|t| t.kind) {
+                // SEV-SNP guests take the host's CPUID as the firmware
+                // checks it; TDX's module filters it.
+                Some(_) => "host",
+                None if whpx => "Nehalem",
+                None => "max",
+            }
+            .into()
+        });
         cmd.args(["-cpu", &cpu])
             .args(["-m", &spec.mem_mib.to_string()])
             .args(["-smp", &spec.vcpus.to_string()])
@@ -288,12 +314,19 @@ impl Vmm {
             // QEMU wants commas in file names doubled.
             let file = d.path.display().to_string().replace(',', ",,");
             let ro = if d.read_only { "on" } else { "off" };
+            // A confidential guest's devices reach only shared memory,
+            // through the IOMMU (bounce buffers).
+            let iommu = if spec.tee.is_some() {
+                ",disable-legacy=on,iommu_platform=on"
+            } else {
+                ""
+            };
             cmd.arg("-drive")
                 .arg(format!(
                     "id=d{i},file={file},format=raw,if=none,readonly={ro}"
                 ))
                 .arg("-device")
-                .arg(format!("virtio-blk-{transport},drive=d{i}"));
+                .arg(format!("virtio-blk-{transport},drive=d{i}{iommu}"));
         }
         if let Some(gw) = spec.net {
             cmd.arg("-netdev")
@@ -313,6 +346,41 @@ impl Vmm {
         }
         cmd
     }
+}
+
+/// The machine of a confidential VM: q35 with its memory in a memfd the
+/// TEE encrypts, and the firmware that measures the kernel, initramfs and
+/// command line (`kernel-hashes`) before it boots them.
+fn tee_machine(cmd: &mut tokio::process::Command, t: &TeeVm, mem_mib: u64) {
+    use pumasi_guest::seal::TeeKind;
+    let mem = format!("memory-backend-memfd,id=ram0,size={mem_mib}M,share=true,prealloc=false");
+    match t.kind {
+        TeeKind::SevSnp => {
+            cmd.args([
+                "-M",
+                "q35,confidential-guest-support=sev0,memory-backend=ram0,vmport=off",
+            ])
+            .args(["-object", &mem])
+            .arg("-object")
+            .arg(format!(
+                "sev-snp-guest,id=sev0,cbitpos={},reduced-phys-bits=1,kernel-hashes=on",
+                t.cbitpos
+            ));
+        }
+        TeeKind::Tdx | TeeKind::Test => {
+            // TDX quotes come from the host's quote generation service
+            // (QGS on vsock port 4050).
+            cmd.args([
+                "-M",
+                "q35,kernel-irqchip=split,confidential-guest-support=tdx0,hpet=off",
+            ])
+            .args([
+                "-object",
+                r#"{"qom-type":"tdx-guest","id":"tdx0","quote-generation-socket":{"type":"vsock","cid":"2","port":"4050"}}"#,
+            ]);
+        }
+    }
+    cmd.arg("-bios").arg(&t.firmware);
 }
 
 fn cmdline(base: &[&str], mode: &str) -> String {
@@ -435,6 +503,7 @@ mod tests {
             mem_mib: 300,
             net: None,
             pci: vec![],
+            tee: None,
         };
         let args = |spec: &VmSpec| -> String {
             let cmd = vmm.command(spec, Path::new("/tmp")).unwrap();
@@ -500,6 +569,7 @@ mod tests {
             mem_mib: 300,
             net: None,
             pci: vec![],
+            tee: None,
         };
         let cmd = vmm.command(&spec, dir.path()).unwrap();
         let args: Vec<String> = cmd

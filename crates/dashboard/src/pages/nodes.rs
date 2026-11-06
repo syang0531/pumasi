@@ -70,13 +70,88 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
             "아직 노드가 없습니다. 초대 화면에서 티켓을 만들거나 `pumasi token`과 `pumasi agent join`을 쓰세요.",
         ),
     );
+    let conf = match ctx.call(AdminOp::Confidential).await {
+        Ok(AdminResponse::Confidential(v)) => confidential(ctx, &v),
+        _ => html! {},
+    };
     Ok(ctx.page(
         l.t("Nodes", "노드"),
         Nav::Nodes,
         html! { div class="page-head" { h1 { (l.t("Nodes", "노드")) } } },
         Some(("5s", live)),
-        html! {},
+        conf,
     ))
+}
+
+/// The confidential tier: which nodes start TEE VMs, and the launch
+/// measurements their guests attested with (an admin trusts them here).
+fn confidential(ctx: &Ctx, v: &pumasi_proto::confidential::ConfidentialView) -> Markup {
+    let l = ctx.l;
+    let tee_nodes: Vec<_> = v
+        .nodes
+        .iter()
+        .filter(|n| !n.tees.is_empty() || n.unavailable.is_some() || n.trusted_by_admin)
+        .collect();
+    if tee_nodes.is_empty() && v.measurements.is_empty() && !v.test_tee {
+        return html! {};
+    }
+    let admin = ctx.me.is_admin();
+    html! {
+        section class="card" {
+            h2 { (l.t("Confidential tier", "기밀 등급")) }
+            @if v.test_tee {
+                p class="warn" { (l.t(
+                    "The control plane accepts the test TEE (--insecure-test-tee): nothing confidential is protected.",
+                    "컨트롤 플레인이 테스트용 TEE(--insecure-test-tee)를 받습니다. 기밀 작업이 보호되지 않습니다.")) }
+            }
+            @if !tee_nodes.is_empty() {
+                (table(&[l.t("Node", "노드"), "TEE", l.t("Trusted host", "신뢰 호스트"), ""],
+                    tee_nodes.iter().map(|n| html! {
+                        tr {
+                            td { a href={"/nodes/" (n.id)} { (n.name) } }
+                            td {
+                                @if n.tees.is_empty() { span class="dim" { (n.unavailable.as_deref().unwrap_or("—")) } }
+                                @else { (n.tees.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")) }
+                            }
+                            td { @if n.trusted_host { (l.t("yes", "예")) } @else { (l.t("no", "아니오")) } }
+                            td {
+                                @if admin && n.trusted_by_admin {
+                                    button hx-post={"/nodes/" (n.id) "/untrust"} hx-target="#flash" { (l.t("Untrust", "신뢰 해제")) }
+                                }
+                            }
+                        }
+                    }).collect(), ""))
+            }
+            h3 { (l.t("Launch measurements", "부팅 측정값")) }
+            p class="dim" { (l.t(
+                "Keys go only to guests whose measurement is trusted. Trust a measurement only for a guest you expect: this agent version's firmware, kernel and guest init.",
+                "측정값을 신뢰한 게스트에만 키를 줍니다. 예상한 게스트(이 에이전트 버전의 펌웨어·커널·게스트 init)의 측정값만 신뢰하세요.")) }
+            (table(&[l.t("Measurement", "측정값"), "TEE", l.t("Trusted", "신뢰"), l.t("Seen", "횟수"), l.t("Node", "노드"), l.t("Details", "내용"), ""],
+                v.measurements.iter().map(|m| html! {
+                    tr {
+                        td { code title=(m.id) { (&m.id[..m.id.len().min(16)]) } }
+                        td { (m.tee.to_string()) }
+                        td { @if m.trusted { (l.t("yes", "예")) } @else { (l.t("no", "아니오")) } }
+                        td { (m.seen) }
+                        td { (m.node) }
+                        td { span class="dim" { @if m.note.is_empty() { "agent " (m.agent_version) ", " (m.vcpus) " vCPU; " (m.detail) } @else { (m.note) } } }
+                        td {
+                            @if admin {
+                                @if m.trusted {
+                                    button hx-post={"/nodes/" (m.id) "/untrust-measurement"} hx-target="#flash" { (l.t("Untrust", "신뢰 해제")) }
+                                } @else {
+                                    button class="warn" hx-post={"/nodes/" (m.id) "/trust-measurement"} hx-target="#flash"
+                                        hx-confirm=(l.t("Trust this launch measurement? Guests that attest with it get the keys of confidential jobs.",
+                                                        "이 부팅 측정값을 신뢰할까요? 이 값으로 증명한 게스트가 기밀 작업의 키를 받습니다."))
+                                        { (l.t("Trust", "신뢰")) }
+                                }
+                            }
+                        }
+                    }
+                }).collect(),
+                l.t("None seen yet: they appear once a confidential task attests.", "아직 없습니다. 기밀 태스크가 증명하면 나타납니다.")))
+        }
+    }
 }
 
 fn row(l: Lang, n: &NodeView, mv: Option<&NodeMetricsView>) -> Markup {
@@ -162,6 +237,11 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
                         { (l.t("Drain", "비우기(drain)")) }
                     @if n.online {
                         button hx-post={"/nodes/" (n.id) "/benchmark"} hx-target="#flash" { (l.t("Benchmark again", "벤치마크 다시")) }
+                    }
+                    @if n.role != pumasi_proto::msg::Role::Owner {
+                        button hx-post={"/nodes/" (n.id) "/trust"} hx-target="#flash"
+                            title=(l.t("Run tier = \"trusted\" jobs here", "tier = \"trusted\" 작업을 여기서 실행"))
+                            { (l.t("Trust host", "신뢰 호스트로")) }
                     }
                     @if !n.online {
                         button class="danger" hx-post={"/nodes/" (n.id) "/remove"} hx-target="#flash"
@@ -447,6 +527,44 @@ async fn do_action(ctx: &Ctx, node: &str, action: &str, f: EditForm) -> anyhow::
         "remove" => {
             ctx.call(AdminOp::RemoveNode { id: node.into() }).await?;
             Ok(l.t("Removed.", "제거했습니다.").into())
+        }
+        "trust" | "untrust" => {
+            ctx.call(AdminOp::TrustNode {
+                node: node.into(),
+                trusted: action == "trust",
+            })
+            .await?;
+            Ok(if action == "trust" {
+                l.t(
+                    "It now runs tier = \"trusted\" jobs.",
+                    "이제 tier = \"trusted\" 작업을 실행합니다.",
+                )
+            } else {
+                l.t(
+                    "It no longer runs tier = \"trusted\" jobs.",
+                    "더 이상 tier = \"trusted\" 작업을 실행하지 않습니다.",
+                )
+            }
+            .into())
+        }
+        // `node` is the measurement's id here.
+        "trust-measurement" | "untrust-measurement" => {
+            let trusted = action == "trust-measurement";
+            ctx.call(AdminOp::TrustMeasurement {
+                id: node.into(),
+                trusted,
+                note: String::new(),
+            })
+            .await?;
+            Ok(if trusted {
+                l.t("Measurement trusted.", "측정값을 신뢰합니다.")
+            } else {
+                l.t(
+                    "Measurement no longer trusted.",
+                    "측정값 신뢰를 해제했습니다.",
+                )
+            }
+            .into())
         }
         "label" => {
             let k = key()?;

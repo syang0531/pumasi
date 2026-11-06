@@ -106,6 +106,12 @@ const ACCOUNT_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("acc
 /// Who submitted a job, its queue timeout, GPU capabilities and the image
 /// digests its tasks ran, by job id.
 const JOB_ORIGIN: TableDefinition<u128, &[u8]> = TableDefinition::new("job_origin");
+/// The confidential tier (phase 16). Launch measurements seen in checked
+/// attestations and whether an admin trusts them, by measurement id.
+const MEASUREMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("measurements");
+/// Providers' nodes an admin trusts with `tier = "trusted"` jobs, by node
+/// id (the value is empty).
+const TRUSTED_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("trusted_nodes");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -159,7 +165,9 @@ macro_rules! tables {
             WEBHOOKS,
             MEMBER_WEBGPU,
             ACCOUNT_POLICIES,
-            JOB_ORIGIN
+            JOB_ORIGIN,
+            MEASUREMENTS,
+            TRUSTED_NODES
         )
     };
 }
@@ -417,6 +425,8 @@ pub struct Snapshot {
     pub schedules: Vec<ScheduleRecord>,
     pub account_policies: Vec<(String, AccountPolicy)>,
     pub job_origin: Vec<(u128, JobOrigin)>,
+    pub measurements: Vec<(String, crate::confidential::MeasurementRecord)>,
+    pub trusted_nodes: Vec<String>,
     pub members: Vec<Member>,
     pub tokens: Vec<TokenRecord>,
     pub jobs: Vec<(JobMeta, Vec<TaskRecord>)>,
@@ -548,6 +558,8 @@ impl Store {
         tx.open_table(MEMBER_WEBGPU)?;
         tx.open_table(ACCOUNT_POLICIES)?;
         tx.open_table(JOB_ORIGIN)?;
+        tx.open_table(MEASUREMENTS)?;
+        tx.open_table(TRUSTED_NODES)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1029,6 +1041,15 @@ impl Store {
             let (k, v) = row?;
             snap.job_origin.push((k.value(), dec(v.value())?));
         }
+        for row in tx.open_table(MEASUREMENTS)?.iter()? {
+            let (k, v) = row?;
+            snap.measurements
+                .push((k.value().to_string(), dec(v.value())?));
+        }
+        for row in tx.open_table(TRUSTED_NODES)?.iter()? {
+            let (k, _) = row?;
+            snap.trusted_nodes.push(k.value().to_string());
+        }
         snap.next_ledger_seq = tx
             .open_table(LEDGER)?
             .last()?
@@ -1053,6 +1074,7 @@ impl Store {
         b.del(MEMBER_DEVICES, id);
         b.del(MEMBER_WEBGPU, id);
         b.del(NODE_CONFIG, id);
+        b.del(TRUSTED_NODES, id);
         self.commit(b)
     }
 
@@ -1169,6 +1191,18 @@ impl Store {
 
     pub fn put_account_policy(&self, account: &str, p: Option<&AccountPolicy>) -> Result<()> {
         self.put_str_row(ACCOUNT_POLICIES, account, p.map(enc))
+    }
+
+    pub fn put_measurement(
+        &self,
+        id: &str,
+        m: Option<&crate::confidential::MeasurementRecord>,
+    ) -> Result<()> {
+        self.put_str_row(MEASUREMENTS, id, m.map(enc))
+    }
+
+    pub fn put_trusted_node(&self, id: &str, trusted: bool) -> Result<()> {
+        self.put_str_row(TRUSTED_NODES, id, trusted.then(Vec::new))
     }
 
     pub fn put_job_origin(&self, job: u128, o: &JobOrigin) -> Result<()> {

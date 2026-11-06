@@ -276,6 +276,11 @@ pub struct TaskAssignment {
     // capabilities.
     /// NVIDIA driver capabilities beyond compute and utility.
     pub gpu_capabilities: Vec<crate::job::GpuCapability>,
+    // Protocol 14 from here; only protocol 14 agents get confidential
+    // tasks.
+    /// A confidential task: the job's image, command, environment and
+    /// inputs above are left out, and come sealed instead.
+    pub confidential: Option<crate::confidential::ConfidentialTask>,
 }
 
 /// Which executors a node can run right now, and why the others it was
@@ -312,6 +317,12 @@ pub enum ToAgent {
     /// change; the agent tries them when the connection drops (protocol
     /// 11).
     Replicas(Vec<EndpointAddr>),
+    /// The answer to [`FromAgent::Attest`]: the task's keys sealed to the
+    /// guest, or why the control plane refused (protocol 14).
+    Keys {
+        task: TaskRef,
+        reply: Result<Vec<u8>, String>,
+    },
 }
 
 /// How a task ended.
@@ -435,6 +446,15 @@ pub enum FromAgent {
         task: TaskRef,
         image: String,
         digest: String,
+    },
+    /// The TEEs the node starts confidential VMs in, sent after the
+    /// welcome (protocol 14).
+    Tee(Box<crate::confidential::TeeReport>),
+    /// A confidential task's guest asks for its keys with this evidence
+    /// (protocol 14). Answered with [`ToAgent::Keys`].
+    Attest {
+        task: TaskRef,
+        evidence: Box<crate::confidential::Evidence>,
     },
 }
 
@@ -673,6 +693,21 @@ pub enum AdminOp {
         account: String,
         policy: Box<AccountPolicy>,
     },
+    // Phase 16 from here.
+    /// TEE nodes, trusted hosts and the launch measurements seen.
+    Confidential,
+    /// Trusts (or stops trusting) a launch measurement, by id or a unique
+    /// prefix of at least 8 characters.
+    TrustMeasurement {
+        id: String,
+        trusted: bool,
+        note: String,
+    },
+    /// Lets a provider's node run `tier = "trusted"` jobs, or stops it.
+    TrustNode {
+        node: String,
+        trusted: bool,
+    },
 }
 
 /// Terms of an invite for someone else's machine.
@@ -768,6 +803,8 @@ pub enum AdminResponse {
         digest: [u8; 32],
         bytes: Vec<u8>,
     },
+    // Phase 16 from here.
+    Confidential(Box<crate::confidential::ConfidentialView>),
 }
 
 /// A secret's name and when it was set; the value never leaves the
@@ -1166,6 +1203,8 @@ pub struct JobView {
     pub image_digests: Vec<String>,
     pub queue_timeout_ms: Option<u64>,
     pub gpu_capabilities: Vec<crate::job::GpuCapability>,
+    // Phase 16 from here.
+    pub tier: crate::job::Tier,
 }
 
 #[cfg(test)]

@@ -48,6 +48,15 @@ flate2 = "1"
 ruzstd = "0.8"
 libc = "0.2"
 sha2 = "0.10"
+# Confidential tasks (phase 16): sealed streams and key release.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+x25519-dalek = { version = "3", default-features = false }
+hkdf = "0.12"
+getrandom = "0.3"
+# Attestation checks on the control plane: SEV-SNP reports and TDX quotes.
+sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
+x509-cert = { version = "0.2", default-features = false }
+dcap-qvl = { version = "0.7", default-features = false, features = ["std", "ring", "default-x509"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"

@@ -878,6 +878,58 @@ and the node gets the label `gpu.graphics=true`.
 [examples/blender-render](examples/blender-render) renders a scene with
 Cycles and with EEVEE.
 
+### Confidential jobs: hidden even from the machine's owner
+
+Every job has a confidentiality tier (`tier` in job.toml):
+
+| `tier` | Runs on | Who can read the job |
+| --- | --- | --- |
+| `open` (default) | any node that takes the executor | the machine's owner |
+| `trusted` | your own machines, and providers you trust (`pumasi trust NODE`) | only owners you trust |
+| `confidential` | microVMs in AMD SEV-SNP or Intel TDX on nodes started with `--allow-confidential` | nobody but the job: the node's owner sees only sealed bytes |
+
+A confidential job is a microVM job whose image, command, environment,
+input files and mounted datasets never reach the node in the clear. The
+control plane pulls the image and seals it and each task's input with
+keys only it has. The node boots a VM whose memory its CPU encrypts; the
+guest asks the TEE for a signed report that measures the firmware, kernel
+and guest init it booted and binds a fresh key and the run's nonce. The
+control plane checks the report against AMD's or Intel's certificates,
+and releases the keys, sealed to that guest, only when the report is
+genuine, current, for this run, and its launch measurement is one an
+admin trusts. The guest seals its result the same way; the control plane
+opens it before it counts.
+
+```toml
+name = "payroll"
+image = "ghcr.io/acme/payroll@sha256:..."
+executor = "microvm"
+tier = "confidential"
+files = ["salaries.csv"]
+```
+
+```sh
+# On a SEV-SNP or TDX server (bare metal: cloud confidential VMs cannot nest):
+pumasi agent start --allow-microvm --allow-confidential
+pumasi confidential ls                 # TEE nodes, and launch measurements seen
+pumasi confidential trust 3f9a1c0b2e7d --note "agent 0.17, OVMF 2025.02, 4 vCPUs"
+```
+
+The first confidential task on a new guest (a new agent version, firmware
+or vCPU count) fails with "launch measurement ... is not trusted" and the
+measurement shows up in `pumasi confidential ls` and on the Nodes page;
+trust it once you know it is your guest. The node needs SEV-SNP or TDX
+turned on in the BIOS and KVM, QEMU 9.1 or later (TDX: 10.1), and in the
+VM directory's `tee/` an OVMF built for it (`OVMF-snp.fd` from the
+`AmdSevX64` build, or `OVMF-tdx.fd`) and a guest kernel with the
+SEV-SNP or TDX guest drivers and `CONFIG_TSM_REPORTS` (`vmlinuz`).
+Confidential tasks have no network and no GPUs, run on x86-64 only, and
+keep their root file system, input and output in the VM's encrypted
+memory, so the node needs memory for the image (about three times its
+compressed size) on top of the task's. Their output is not streamed while
+they run. See [docs/architecture.md](docs/architecture.md#phase-16-the-confidential-tier)
+for the protocol and what it does not protect.
+
 ## Commands
 
 | Command | What it does |
@@ -885,7 +937,7 @@ Cycles and with EEVEE.
 | `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR] [--metrics-addr ADDR]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. `--metrics-addr` serves Prometheus metrics. |
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
-| `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |
+| `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-confidential] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-confidential` confidential jobs in SEV-SNP or TDX microVMs, `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
 | `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- AGENT OPTIONS]` | Run the agent as a service that starts at boot (systemd, launchd, Windows service). `status` and `uninstall` too. |
 | `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
@@ -907,6 +959,8 @@ Cycles and with EEVEE.
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
 | `pumasi remove-node <ID>` | Revoke a node. It needs a new ticket to come back. |
 | `pumasi login <TICKET>` | Manage a remote cluster from this machine, with the admin ticket or an access ticket. |
+| `pumasi confidential ls [--json]` / `confidential trust ID [--note N]` / `confidential untrust ID` | TEE nodes and the launch measurements their guests attested with; keys go only to guests whose measurement is trusted. |
+| `pumasi trust \| untrust <NODE>` | Let a provider's node run `tier = "trusted"` jobs, or stop it (your own machines always do). |
 | `pumasi cordon \| uncordon \| drain <NODE>` | Stop new tasks going to a node, take it back, or also move its running tasks elsewhere. |
 | `pumasi label <NODE> k=v... \| k-` / `taint <NODE> key[=value]... \| key-` | Node labels for job selectors; taints keep away jobs that do not tolerate them. |
 | `pumasi quota [ACCOUNT --slots N --gpus N --cu-per-day CU --max-priority N --storage SIZE --images P,.. --require-digest yes --executors E,.. --network deny --selector S --tolerations T,.. --max-timeout D --max-gpus-per-task N] [--clear]` | Show every account's limits, job policy and usage, or change one (`none` or `any` lifts a limit). |
@@ -1004,6 +1058,10 @@ memory_mb = 256                       # the VM gets this plus ~96 MiB for its ke
 cpus = 1                              # rounded up to whole vCPUs
 timeout = "2m"                        # covers boot and run, not the first image pull
 ```
+
+Any job may set `tier = "trusted"` (only your machines and providers you
+trust run it) and a microVM job `tier = "confidential"` (see
+[Confidential jobs](#confidential-jobs-hidden-even-from-the-machines-owner)).
 
 Paths in `files` are relative to the job file; directories are copied
 recursively and keep their relative path under `/input`. Larger inputs go
@@ -1125,7 +1183,8 @@ checked.
   machine or network). A passed-through GPU is behind the IOMMU, and only
   GPUs whose whole IOMMU group can go with them are passed through.
   Image layers are unpacked inside a VM, never on the host. The provider
-  still sees everything the task does (open tier).
+  still sees everything the task does (open tier) unless the job is
+  confidential.
 - Provider machines (other people's, admitted with `pumasi invite`) get WASM
   and microVM tasks, Docker only if the invite allowed it, and never settle a
   check: only your own machines are trusted to arbitrate. MicroVM results are
@@ -1135,9 +1194,19 @@ checked.
   rate, a provider faking 20 results is caught with 88% probability, loses
   every held earning that a check rejects, and is suspended after 3 strikes.
   Earnings are held for an hour so a later check can still claw them back.
-- Tasks are **not** hidden from the machine's owner: only the `open`
-  confidentiality tier exists. Do not send secrets to machines you do not
-  trust.
+- Open and trusted tasks are **not** hidden from the machine's owner: do
+  not send secrets to machines you do not trust (`tier = "trusted"` keeps a
+  job on your own machines and providers you trust). Confidential tasks
+  are: their image, inputs and outputs reach the node only sealed, and the
+  keys go only to a SEV-SNP or TDX guest whose signed report the control
+  plane checked against AMD's or Intel's certificates, for that very run,
+  with a launch measurement the admin trusts (`pumasi confidential
+  trust`). The node can still see that a task ran, how long, how much it
+  read and wrote, and its memory size; it can stop it or return no
+  result, but not read or change it. The control plane holds the keys, so
+  it, its replicas and backups, and whoever holds the admin ticket can read
+  confidential jobs: run the control plane on a machine you trust.
+  `--insecure-test-tee` (tests only) turns all of this into a show.
 - Agent upgrades are signed by the control plane's key, which agents learned
   when they joined, and checked against the signed SHA-256 before they run.
   Whoever holds the admin ticket can roll out a binary to your machines (and
@@ -1169,8 +1238,8 @@ with other clusters.
 | 12 | Web dashboard built into the binary (`pumasi ui`): overview, nodes with charts, cordon and drain, jobs with submit, live output, cancel and output downloads, storage with uploads and downloads, CU and ledger, invites and access tickets, prices, events and alerts; sign-in with access tickets and their roles, Korean and English, JSON API with OpenAPI, Playwright tests in CI | done |
 | 13 | Control plane high availability: state replicated over Raft (openraft) to 3 or 5 control planes, automatic failover with nodes, CLI and dashboard following the leader, tickets listing every replica, replicas catching up from snapshots, `pumasi backup` and `cluster restore` | done |
 | 14 | WebGPU executor (experimental): wasm jobs with `gpus = 1` run WGSL compute shaders on any GPU through wgpu (Vulkan, Metal, DX12, GL) and the `pumasi_webgpu` imports, signed adapter profiles with a WGSL benchmark, adapters sharing slots with listed GPUs, GPU time billed in CU, matrix multiplication and blur examples checked against the CPU on Linux, Windows and macOS in CI, glibc Linux binaries that can load GPU drivers | done |
-| 15 | Remote API clients: per-account job policies (images and digests, executors, no network, forced selector, tolerations, longest timeout, GPUs per task), who submitted each job and the image digests it ran, `queue_timeout`, the nodes that can take an account's work now (and why the others cannot), Docker re-checked by running agents, `pumasi ui --api-only` with HTTPS (`--tls-cert`) and failed sign-in limits, a Cloudflare Tunnel guide, `?wait=` long polling, curl examples run in CI, GPU driver capabilities for drawing (`gpu.graphics`, `gpu check --docker-run`) and a Blender example | this release |
-| 16 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
+| 15 | Remote API clients: per-account job policies (images and digests, executors, no network, forced selector, tolerations, longest timeout, GPUs per task), who submitted each job and the image digests it ran, `queue_timeout`, the nodes that can take an account's work now (and why the others cannot), Docker re-checked by running agents, `pumasi ui --api-only` with HTTPS (`--tls-cert`) and failed sign-in limits, a Cloudflare Tunnel guide, `?wait=` long polling, curl examples run in CI, GPU driver capabilities for drawing (`gpu.graphics`, `gpu check --docker-run`) and a Blender example | done |
+| 16 | Confidentiality tiers: `trusted` (owner machines and trusted providers) and `confidential` (SEV-SNP and TDX microVMs): images and inputs sealed on the control plane, remote attestation checked against AMD's and Intel's certificates (recorded reports and forgeries tested in CI), keys released only to a fresh guest with an admin-trusted launch measurement, sealed results, `pumasi confidential` and the dashboard's measurement list | this release |
 | 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag | planned |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
@@ -1212,7 +1281,18 @@ its failed sign-in counts live in each `pumasi ui` process, uploads
 through Cloudflare stop at its plan's body limit, and `?wait=` follows a
 job by polling the control plane. Drawing in Docker is checked on real
 GPUs by hand; EEVEE on a Linux host runs under Xvfb and so on the CPU
-unless the image brings its own GPU display (Cycles is not affected).
+unless the image brings its own GPU display (Cycles is not affected). Confidential VMs are checked in CI with a
+test stand-in for the TEE (an ordinary microVM that cannot attest for
+real) and against recorded SEV-SNP reports and TDX quotes; real SEV-SNP
+and TDX servers are checked by hand, since hosted runners and cloud
+confidential VMs cannot start them. Confidential tasks cannot use GPUs
+(NVIDIA's confidential computing mode needs H100-class GPUs and is not
+supported yet) or a network, run on x86-64 only, keep everything in the
+VM's memory (no encrypted scratch disk yet), and are run again if the
+control plane restarts or fails over while they run. The SEV-SNP check
+does not yet enforce a minimum firmware (TCB) version beyond what AMD
+still certifies, and TDX measurements cover MRTD, RTMR1 and RTMR2 (the
+firmware's own RTMR0 is not pinned).
 
 ## Development
 

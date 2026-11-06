@@ -87,6 +87,58 @@ pub struct TaskIo {
     pub gpu_capabilities: Vec<pumasi_proto::job::GpuCapability>,
     /// Where the image's digest goes once it is known (phase 15).
     pub image_report: Option<ImageReport>,
+    /// A confidential task's sealed image and input, and the way to the
+    /// key broker (phase 16).
+    pub confidential: Option<ConfidentialIo>,
+}
+
+/// What a confidential task runs from: everything sealed.
+#[derive(Debug, Clone)]
+pub struct ConfidentialIo {
+    pub task: pumasi_proto::confidential::ConfidentialTask,
+    /// The sealed layers tar and the sealed input tar, as files.
+    pub image: PathBuf,
+    pub input: PathBuf,
+    pub keys: KeyLink,
+}
+
+/// Replies to key requests the agent sent, by run.
+pub type KeyWaiters = Arc<
+    Mutex<
+        std::collections::HashMap<
+            pumasi_proto::msg::TaskRef,
+            tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+        >,
+    >,
+>;
+
+/// Passes a guest's evidence to the control plane and its answer back.
+#[derive(Debug, Clone)]
+pub struct KeyLink {
+    pub task: pumasi_proto::msg::TaskRef,
+    pub tx: tokio::sync::mpsc::UnboundedSender<pumasi_proto::msg::FromAgent>,
+    pub waiters: KeyWaiters,
+}
+
+impl KeyLink {
+    /// The wrapped keys, or why the control plane refused them.
+    pub async fn ask(
+        &self,
+        evidence: pumasi_proto::confidential::Evidence,
+    ) -> Result<Vec<u8>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.waiters.lock().unwrap().insert(self.task, tx);
+        let sent = self.tx.send(pumasi_proto::msg::FromAgent::Attest {
+            task: self.task,
+            evidence: Box::new(evidence),
+        });
+        if sent.is_err() {
+            self.waiters.lock().unwrap().remove(&self.task);
+            return Err("the connection to the cluster is gone".into());
+        }
+        rx.await
+            .map_err(|_| "the connection to the cluster is gone".to_string())?
+    }
 }
 
 /// Sends the image a task runs, by digest, to the cluster.

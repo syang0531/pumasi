@@ -333,6 +333,18 @@ impl NodeStore {
         Ok(total)
     }
 
+    /// Writes one file of a cached collection under `dir`.
+    pub async fn export_one(&self, used: &InUse, name: &str, dir: &Path) -> Result<u64> {
+        anyhow::ensure!(
+            used.entries.iter().any(|e| e.name == name),
+            "{name} is not in the collection"
+        );
+        blobs::export(&self.store, &used.entries, dir, false, |n| {
+            (n == name).then(|| n.to_string())
+        })
+        .await
+    }
+
     /// Writes the files of a cached collection under `dir`.
     pub async fn export_all(&self, used: &InUse, dir: &Path) -> Result<u64> {
         blobs::export(&self.store, &used.entries, dir, false, |n| {

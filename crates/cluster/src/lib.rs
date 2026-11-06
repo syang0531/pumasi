@@ -1,8 +1,10 @@
 //! Pumasi cluster control plane: membership, job queue, scheduler.
 
 mod access;
+pub mod attest;
 pub mod backup;
 mod check;
+pub mod confidential;
 mod datasets;
 pub mod files;
 pub mod gpu;

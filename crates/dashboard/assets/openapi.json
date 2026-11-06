@@ -618,7 +618,7 @@
     },
     "/api/v1/nodes/{node}/{action}": {
       "post": {
-        "summary": "Drain, cordon, uncordon or benchmark a node",
+        "summary": "Drain, cordon, uncordon, benchmark, trust or untrust a node (trust: it runs tier = \"trusted\" jobs)",
         "tags": [
           "nodes"
         ],
@@ -669,7 +669,9 @@
                 "drain",
                 "cordon",
                 "uncordon",
-                "benchmark"
+                "benchmark",
+                "trust",
+                "untrust"
               ]
             }
           }
@@ -850,6 +852,41 @@
         "summary": "CU rates and settlement policy (micro-CU rates)",
         "tags": [
           "cu"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/confidential": {
+      "get": {
+        "summary": "TEE nodes, trusted hosts and the launch measurements seen (confidential tier); trust one with the TrustMeasurement op",
+        "tags": [
+          "nodes"
         ],
         "responses": {
           "200": {

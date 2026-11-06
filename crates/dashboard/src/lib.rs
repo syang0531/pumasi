@@ -7,6 +7,12 @@
 //! (maud templates compiled into the binary) with htmx for live updates
 //! and forms; there is no JavaScript build. The same server offers a JSON
 //! API under `/api/v1` (described at `/api/openapi.json`).
+//!
+//! Phase 15 lets programs elsewhere use that API: `--api-only` serves
+//! just the API (bearer tickets, no pages, no cookies), `--tls-cert` and
+//! `--tls-key` serve HTTPS, and failed sign-ins are rate limited per
+//! client address (see [`limit`]). A Cloudflare Tunnel or a reverse proxy
+//! in front works too.
 
 mod api;
 mod auth;
@@ -14,7 +20,9 @@ mod backend;
 mod charts;
 mod fmt;
 mod i18n;
+mod limit;
 mod pages;
+mod tls;
 mod uploads;
 mod zip;
 
@@ -35,7 +43,13 @@ use axum::{
 use pumasi_proto::{net::NetMode, ticket::AdminTicket};
 use tokio::net::TcpListener;
 
-use crate::{auth::Sessions, backend::Backend};
+use crate::{
+    auth::Sessions,
+    backend::Backend,
+    limit::{AuthLimiter, ClientAddr},
+};
+
+pub use tls::server_config as tls_config;
 
 pub struct UiConfig {
     /// The ticket the dashboard connects with (and, unless `login_only`,
@@ -48,6 +62,16 @@ pub struct UiConfig {
     pub login_only: bool,
     /// Largest upload (job inputs, datasets) in bytes.
     pub upload_limit: u64,
+    /// Only the JSON API (`/api/v1`, `/api/openapi.json`, `/healthz`),
+    /// for programs: bearer tickets only, no pages, no sessions, and no
+    /// Host check (a tunnel or proxy sends its own host name).
+    pub api_only: bool,
+    /// Serve HTTPS with this certificate (from [`tls_config`]).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// A header that carries the client's address when the connection
+    /// comes from loopback (a tunnel or reverse proxy on this machine),
+    /// such as `CF-Connecting-IP`; used to rate limit failed sign-ins.
+    pub real_ip_header: Option<String>,
 }
 
 pub(crate) struct AppState {
@@ -60,6 +84,8 @@ pub(crate) struct AppState {
     hosts: Option<Vec<String>>,
     cluster_name: Mutex<String>,
     upload_limit: u64,
+    api_only: bool,
+    limiter: AuthLimiter,
 }
 
 pub(crate) type St = Arc<AppState>;
@@ -68,6 +94,7 @@ pub(crate) type St = Arc<AppState>;
 pub struct Ui {
     addr: SocketAddr,
     token: Option<String>,
+    https: bool,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
@@ -85,9 +112,10 @@ impl Ui {
         } else {
             self.addr.ip().to_string()
         };
+        let scheme = if self.https { "https" } else { "http" };
         match &self.token {
-            Some(t) => format!("http://{host}:{}/login?token={t}", self.addr.port()),
-            None => format!("http://{host}:{}/", self.addr.port()),
+            Some(t) => format!("{scheme}://{host}:{}/login?token={t}", self.addr.port()),
+            None => format!("{scheme}://{host}:{}/", self.addr.port()),
         }
     }
 
@@ -113,8 +141,8 @@ pub async fn start(config: UiConfig) -> Result<Ui> {
 pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
     let addr = listener.local_addr()?;
     let loopback = addr.ip().is_loopback();
-    let token = (!config.login_only && loopback).then(auth::random_token);
-    let hosts = loopback.then(|| {
+    let token = (!config.login_only && !config.api_only && loopback).then(auth::random_token);
+    let hosts = (loopback && !config.api_only).then(|| {
         let p = addr.port();
         vec![
             format!("127.0.0.1:{p}"),
@@ -129,24 +157,42 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
         hosts,
         cluster_name: Mutex::new(String::new()),
         upload_limit: config.upload_limit,
+        api_only: config.api_only,
+        limiter: AuthLimiter::new(config.real_ip_header),
     });
-    let app = router(state);
-    let task = tokio::spawn(async move { axum::serve(listener, app).await });
-    Ok(Ui { addr, token, task })
+    let app = router(state).into_make_service_with_connect_info::<ClientAddr>();
+    let https = config.tls.is_some();
+    let task = match config.tls {
+        Some(tls) => {
+            let listener = tls::TlsListener::new(listener, tls)?;
+            tokio::spawn(async move { axum::serve(listener, app).await })
+        }
+        None => tokio::spawn(async move { axum::serve(listener, app).await }),
+    };
+    Ok(Ui {
+        addr,
+        token,
+        https,
+        task,
+    })
 }
 
 fn router(state: St) -> Router {
     let uploads = DefaultBodyLimit::max(state.upload_limit.min(usize::MAX as u64) as usize);
-    Router::new()
-        .merge(pages::routes())
+    let api = Router::new()
         .nest("/api/v1", api::routes())
         .route("/api/openapi.json", get(api::openapi))
-        .route("/login", get(pages::login::page).post(pages::login::submit))
-        .route("/logout", post(pages::login::logout))
-        .route("/lang/{lang}", get(pages::login::set_lang))
-        .route("/static/{file}", get(asset))
-        .route("/healthz", get(|| async { "ok" }))
-        .layer(uploads)
+        .route("/healthz", get(|| async { "ok" }));
+    let app = if state.api_only {
+        api
+    } else {
+        api.merge(pages::routes())
+            .route("/login", get(pages::login::page).post(pages::login::submit))
+            .route("/logout", post(pages::login::logout))
+            .route("/lang/{lang}", get(pages::login::set_lang))
+            .route("/static/{file}", get(asset))
+    };
+    app.layer(uploads)
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -182,6 +228,15 @@ async fn guard(State(st): State<St>, req: Request, next: Next) -> Response {
     set(h, "referrer-policy", "same-origin");
     set(h, "cache-control", "no-store");
     resp
+}
+
+/// Aborts a background task when dropped.
+pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 const HTMX: &[u8] = include_bytes!("../assets/htmx.min.js");

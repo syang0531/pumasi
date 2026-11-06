@@ -8,7 +8,10 @@
 //!   browser in with the ticket `pumasi ui` runs with (unless
 //!   `--login-only`).
 //! - The sign-in page takes any ticket of the same cluster.
-//! - The JSON API also takes `Authorization: Bearer <ticket>`.
+//! - The JSON API also takes `Authorization: Bearer <ticket>` (and, with
+//!   `--api-only`, nothing else).
+//! - Failed sign-ins and wrong bearer tickets count against the client's
+//!   address ([`crate::limit`]).
 //!
 //! Sessions live in memory (a restart signs everyone out) behind an
 //! HttpOnly, SameSite=Strict cookie, and requests that change something
@@ -152,6 +155,45 @@ pub fn parse_ticket(st: &St, text: &str) -> anyhow::Result<AdminTicket> {
     Ok(t)
 }
 
+/// The control plane's answer for a wrong, expired or revoked ticket.
+pub fn is_bad_credentials(msg: &str) -> bool {
+    msg.contains("invalid admin credentials")
+}
+
+/// Who a bearer ticket is, counting failures against the client.
+async fn bearer(st: &St, parts: &Parts, text: &str) -> Result<Identity, Response> {
+    let ip = st.limiter.client_ip(parts);
+    st.limiter.check(ip)?;
+    let t = match parse_ticket(st, text) {
+        Ok(t) => t,
+        Err(e) => {
+            st.limiter.failed(ip);
+            return Err(crate::api::error(
+                StatusCode::UNAUTHORIZED,
+                &format!("{e:#}"),
+            ));
+        }
+    };
+    if let Some(ident) = st.limiter.identity(&t.secret) {
+        return Ok(ident);
+    }
+    match identify(st, t.secret).await {
+        Ok(ident) => {
+            st.limiter.remember(&ident);
+            Ok(ident)
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if is_bad_credentials(&msg) {
+                st.limiter.failed(ip);
+                Err(crate::api::error(StatusCode::UNAUTHORIZED, &msg))
+            } else {
+                Err(crate::api::error(crate::pages::status_for(&msg), &msg))
+            }
+        }
+    }
+}
+
 /// Asks the control plane who `secret` is; fails for revoked or unknown
 /// tickets.
 pub async fn identify(st: &St, secret: Secret) -> anyhow::Result<Identity> {
@@ -219,20 +261,15 @@ impl FromRequestParts<St> for Api {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         if let Some(text) = bearer {
-            return match parse_ticket(st, text) {
-                // The control plane checks the secret and its role on
-                // every call; an unknown one fails there.
-                Ok(t) => Ok(Api(Identity {
-                    secret: t.secret,
-                    name: String::new(),
-                    role: AccessRole::Viewer,
-                    csrf: String::new(),
-                })),
-                Err(e) => Err(crate::api::error(
-                    StatusCode::UNAUTHORIZED,
-                    &format!("{e:#}"),
-                )),
-            };
+            // The control plane still checks the secret and its role on
+            // every call.
+            return self::bearer(st, parts, text).await.map(Api);
+        }
+        if st.api_only {
+            return Err(crate::api::error(
+                StatusCode::UNAUTHORIZED,
+                "send Authorization: Bearer <ticket>",
+            ));
         }
         match session_of(st, parts) {
             Some(ident) if csrf_ok(parts, &ident) => Ok(Api(ident)),

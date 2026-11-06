@@ -37,6 +37,28 @@ pub struct UiArgs {
     /// Largest upload from the browser (job inputs, datasets).
     #[arg(long, default_value = "4GiB")]
     max_upload: String,
+    /// Serve only the JSON API (`/api/v1`) for programs elsewhere: bearer
+    /// tickets only, no pages and no sign-in link. Put it behind a
+    /// Cloudflare Tunnel, a TLS reverse proxy, or `--tls-cert`.
+    #[arg(long)]
+    api_only: bool,
+    /// Serve HTTPS with this certificate chain (PEM).
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// The certificate's private key (PEM).
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// A header with the client's address, trusted only on connections
+    /// from this machine (a tunnel or reverse proxy here), for limiting
+    /// failed sign-ins per client: `CF-Connecting-IP` behind Cloudflare
+    /// Tunnel, `X-Forwarded-For` behind most proxies.
+    #[arg(long)]
+    real_ip_header: Option<String>,
+    /// Allow `--api-only` on an address other than loopback without
+    /// `--tls-cert` (tickets then cross the network unencrypted; only for
+    /// a TLS proxy on another machine of a private network).
+    #[arg(long)]
+    insecure_http: bool,
     #[command(flatten)]
     admin: AdminArgs,
 }
@@ -45,6 +67,10 @@ pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
     let ticket = load_ticket(home, &args.admin)?;
     let net = net_for(&ticket.cluster, None);
     let upload_limit = parse_size(&args.max_upload)?;
+    let tls = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Some(pumasi_dashboard::tls_config(cert, key)?),
+        _ => None,
+    };
     let listener = match args.listen {
         Some(addr) => tokio::net::TcpListener::bind(addr)
             .await
@@ -58,7 +84,12 @@ pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
         }
     };
     let addr = listener.local_addr()?;
-    if !addr.ip().is_loopback() {
+    if !addr.ip().is_loopback() && tls.is_none() && args.api_only && !args.insecure_http {
+        anyhow::bail!(
+            "refusing to serve the API on {addr} over plain HTTP: bearer tickets would cross the network unencrypted. Give --tls-cert and --tls-key, listen on 127.0.0.1 behind a tunnel or TLS proxy, or pass --insecure-http"
+        );
+    }
+    if !addr.ip().is_loopback() && tls.is_none() {
         eprintln!(
             "warning: serving on {addr} over plain HTTP; tickets typed into the sign-in page cross the network unencrypted. Put a TLS reverse proxy in front."
         );
@@ -71,6 +102,9 @@ pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
             listen: addr,
             login_only: args.login_only,
             upload_limit,
+            api_only: args.api_only,
+            tls,
+            real_ip_header: args.real_ip_header.clone(),
         },
     )
     .await?;
@@ -78,9 +112,14 @@ pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
     if let Some(path) = &args.url_file {
         pumasi_proto::net::write_private(path, url.as_bytes())?;
     }
-    eprintln!("dashboard: {url}");
+    if args.api_only {
+        eprintln!("API: {}api/v1 (Authorization: Bearer <ticket>)", url);
+        eprintln!("described at {url}api/openapi.json");
+    } else {
+        eprintln!("dashboard: {url}");
+    }
     eprintln!("(Ctrl-C stops it)");
-    if !args.no_open {
+    if !args.no_open && !args.api_only {
         open_browser(&url);
     }
     tokio::select! {

@@ -227,6 +227,8 @@ impl Ctx {
 pub fn status_for(msg: &str) -> StatusCode {
     if msg.contains("cannot reach the control plane") || msg.contains("connection") {
         StatusCode::BAD_GATEWAY
+    } else if crate::auth::is_bad_credentials(msg) {
+        StatusCode::UNAUTHORIZED
     } else if msg.contains("ticket cannot") || msg.contains("belongs to") {
         StatusCode::FORBIDDEN
     } else if msg.starts_with("no such") {

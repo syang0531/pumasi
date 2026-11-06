@@ -3,7 +3,7 @@
   "info": {
     "title": "Pumasi dashboard API",
     "version": "1",
-    "description": "Served by `pumasi ui`. Every call is made with the caller's Pumasi ticket (admin, submitter or viewer), whose role the control plane enforces. Authenticate with `Authorization: Bearer <ticket>` (a `pumasiadmin...` admin or access ticket), or with a signed-in browser session plus the `X-Pumasi-CSRF` header on POST. Job ids are hex strings; CU amounts are integers in milli-CU, rates in micro-CU."
+    "description": "Served by `pumasi ui`. Every call is made with the caller's Pumasi ticket (admin, submitter or viewer), whose role the control plane enforces. Authenticate with `Authorization: Bearer <ticket>` (a `pumasiadmin...` admin or access ticket), or with a signed-in browser session plus the `X-Pumasi-CSRF` header on POST. Job ids are hex strings; CU amounts are integers in milli-CU, rates in micro-CU. With `pumasi ui --api-only` only bearer tickets are taken. After 10 failed sign-ins or wrong tickets within a minute, a client address gets 429 for 5 minutes."
   },
   "servers": [
     {
@@ -68,6 +68,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -99,6 +102,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -132,6 +138,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -185,6 +194,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -247,6 +259,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -283,6 +298,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -350,6 +368,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         },
         "parameters": [
@@ -361,8 +382,18 @@
               "type": "string"
             },
             "description": "Job id (hex, as `pumasi status` shows it)"
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Long poll: wait up to this long for the job to finish (`30s`, `2m`; a bare number is seconds; at most 90s)"
           }
-        ]
+        ],
+        "description": "With `?wait=`, answers as soon as the job finishes (succeeded, failed or cancelled) or when the wait runs out, whichever comes first; check `summary.state`. Waits of more than 90s are cut to 90s, under the 100s a Cloudflare Tunnel allows."
       }
     },
     "/api/v1/jobs/{id}/cancel": {
@@ -392,6 +423,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -435,6 +469,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -481,6 +518,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         },
         "description": "Inline outputs and outputs kept in the file store, as `task-<index>/<path>`.",
@@ -524,6 +564,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -601,6 +644,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         },
         "parameters": [
@@ -658,6 +704,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -689,6 +738,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -741,6 +793,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         },
         "parameters": [
@@ -783,6 +838,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -815,6 +873,9 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -846,6 +907,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -903,6 +967,9 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         },

@@ -1005,8 +1005,10 @@ pub fn add_to_linker<T: 'static>(
                 }
                 let r = range(data, bufs, (count * 4) as i32)?;
                 let handles: Vec<i32> = data[r]
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes(c.try_into().expect("4 bytes")))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_le_bytes(*c))
                     .collect();
                 let dim =
                     |v: i32| u32::try_from(v).map_err(|_| Stop::from("negative workgroup count"));

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     economy::{MilliCu, format_cu, parse_cu, validate_account},
-    job::{JobFile, JobSubmission},
+    job::{Executor, JobFile, JobSubmission},
     monitor::{AlertPolicy, WebhookFormat, WebhookSpec},
     store::{format_size, parse_size},
 };
@@ -28,7 +28,16 @@ pub const MAX_PRIORITY: i32 = 1000;
 /// Labels the cluster derives from what a node reports; they cannot be set
 /// by hand. `executor` and `gpu` may have several values.
 pub const BUILTIN_LABELS: &[&str] = &[
-    "name", "os", "arch", "role", "account", "executor", "gpu", "gpus", "disk",
+    "name",
+    "os",
+    "arch",
+    "role",
+    "account",
+    "executor",
+    "gpu",
+    "gpus",
+    "disk",
+    "gpu.graphics",
 ];
 
 /// A node's labels: each key has one or more values.
@@ -447,6 +456,280 @@ pub struct QuotaView {
     pub storage_bytes: u64,
     /// Tasks of its jobs waiting in the queue.
     pub queued: u32,
+    // Phase 15 from here.
+    /// What its jobs may be, for its submitter tickets.
+    pub policy: AccountPolicy,
+}
+
+// ---------------------------------------------------------------------------
+// Job policies (phase 15)
+// ---------------------------------------------------------------------------
+
+/// What jobs of one account may be, for submitter tickets of that account
+/// (`pumasi quota NAME --images ... --executors docker --network deny`).
+/// Admin tickets are not held to it. Every field left empty is no limit,
+/// so the default policy allows everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountPolicy {
+    /// Images the account's image jobs may use, as patterns (`*` any
+    /// characters, `?` one). Matched against the image as written and as
+    /// its full name (`python:3.12` is also `docker.io/library/python:3.12`).
+    /// A pattern with `@sha256:` pins one image digest. Empty: any image.
+    pub images: Vec<String>,
+    /// Images must be named by digest (`name@sha256:...`), so a tag moved
+    /// on the registry cannot change what runs.
+    pub require_digest: bool,
+    /// Executors its jobs may use. Empty: any.
+    pub executors: Vec<Executor>,
+    /// Refuse jobs that ask for the network (`network = true`).
+    pub deny_network: bool,
+    /// Added to every job's selector: its jobs run only on nodes that also
+    /// match this.
+    pub selector: Selector,
+    /// Tolerations its jobs may carry (each one of the job's must be
+    /// covered by one of these). `None`: any; `Some(empty)`: none, so its
+    /// jobs never run on tainted nodes.
+    pub tolerations: Option<Vec<Toleration>>,
+    /// Longest task timeout its jobs may ask for, in milliseconds.
+    pub max_timeout_ms: Option<u64>,
+    /// Most GPUs one task may ask for (`gpus = "all"` is refused when set).
+    pub max_gpus_per_task: Option<u32>,
+}
+
+impl AccountPolicy {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.images.len() <= 64, "at most 64 image patterns");
+        for i in &self.images {
+            ensure!(
+                !i.trim().is_empty() && !i.contains(char::is_whitespace) && i.len() <= 512,
+                "invalid image pattern {i:?}"
+            );
+        }
+        self.selector.validate()?;
+        if let Some(t) = &self.tolerations {
+            ensure!(t.len() <= 32, "at most 32 tolerations");
+            for t in t {
+                t.validate()?;
+            }
+        }
+        if let Some(t) = self.max_timeout_ms {
+            ensure!(t > 0, "max_timeout must be positive");
+        }
+        if let Some(g) = self.max_gpus_per_task {
+            ensure!(
+                g <= crate::gpu::MAX_GPUS_PER_TASK,
+                "max_gpus_per_task is at most {}",
+                crate::gpu::MAX_GPUS_PER_TASK
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether `image` is one this policy allows.
+    pub fn allows_image(&self, image: &str) -> bool {
+        if self.require_digest && !image.contains("@sha256:") {
+            return false;
+        }
+        if self.images.is_empty() {
+            return true;
+        }
+        let full = full_image_name(image);
+        self.images
+            .iter()
+            .any(|p| glob_match(p, image) || glob_match(p, &full))
+    }
+
+    /// Checks a job against the policy and adds its selector. The error
+    /// says what the policy refuses.
+    pub fn admit(&self, sub: &mut JobSubmission) -> Result<()> {
+        if !self.executors.is_empty() {
+            ensure!(
+                self.executors.contains(&sub.executor),
+                "this account's policy allows only {} jobs, not {}",
+                self.executors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                sub.executor
+            );
+        }
+        if let Some(d) = &sub.docker {
+            if !self.allows_image(&d.image) {
+                if self.require_digest && !d.image.contains("@sha256:") {
+                    bail!(
+                        "this account's policy needs images named by digest (name@sha256:...), not {}",
+                        d.image
+                    );
+                }
+                bail!(
+                    "this account's policy does not allow the image {} (allowed: {})",
+                    d.image,
+                    self.images.join(", ")
+                );
+            }
+            ensure!(
+                !(self.deny_network && d.network),
+                "this account's policy does not allow network access (network = true)"
+            );
+        }
+        if let Some(allowed) = &self.tolerations {
+            for t in &sub.tolerations {
+                ensure!(
+                    allowed.iter().any(|a| a.tolerates(t)),
+                    "this account's policy does not allow the toleration {t}"
+                );
+            }
+        }
+        if let Some(max) = self.max_timeout_ms {
+            ensure!(
+                sub.limits.timeout_ms <= max,
+                "the timeout {} is above the {} this account's policy allows",
+                crate::job::format_duration_ms(sub.limits.timeout_ms),
+                crate::job::format_duration_ms(max)
+            );
+        }
+        if let (Some(max), Some(g)) = (self.max_gpus_per_task, &sub.gpu) {
+            ensure!(
+                g.count != 0,
+                "this account's policy allows at most {max} GPUs per task, so `gpus = \"all\"` is refused"
+            );
+            ensure!(
+                g.count <= max,
+                "{} GPUs per task is above the {max} this account's policy allows",
+                g.count
+            );
+        }
+        if !self.selector.is_empty() {
+            for t in &self.selector.0 {
+                if !sub.selector.0.contains(t) {
+                    sub.selector.0.push(t.clone());
+                }
+            }
+            sub.selector.validate()?;
+        }
+        Ok(())
+    }
+
+    /// `images ghcr.io/x/*, executors docker, no network, selector gpu=nvidia`.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.images.is_empty() {
+            parts.push(format!("images {}", self.images.join(" ")));
+        }
+        if self.require_digest {
+            parts.push("digests only".into());
+        }
+        if !self.executors.is_empty() {
+            parts.push(format!(
+                "executors {}",
+                self.executors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if self.deny_network {
+            parts.push("no network".into());
+        }
+        if !self.selector.is_empty() {
+            parts.push(format!("selector {}", self.selector));
+        }
+        match &self.tolerations {
+            Some(t) if t.is_empty() => parts.push("no tolerations".into()),
+            Some(t) => parts.push(format!(
+                "tolerations {}",
+                t.iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            None => {}
+        }
+        if let Some(t) = self.max_timeout_ms {
+            parts.push(format!("timeout <= {}", crate::job::format_duration_ms(t)));
+        }
+        if let Some(g) = self.max_gpus_per_task {
+            parts.push(format!("gpus/task <= {g}"));
+        }
+        if parts.is_empty() {
+            "none".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
+/// An image reference with Docker's defaults filled in:
+/// `python:3.12` is `docker.io/library/python:3.12`, `me/app` is
+/// `docker.io/me/app:latest`.
+pub fn full_image_name(image: &str) -> String {
+    let (name, digest) = match image.split_once('@') {
+        Some((n, d)) => (n, Some(d)),
+        None => (image, None),
+    };
+    let (repo, tag) = match name.rsplit_once(':') {
+        // A colon after the last slash is a tag; before it, a port.
+        Some((r, t)) if !t.contains('/') => (r, Some(t)),
+        _ => (name, None),
+    };
+    let first = repo.split('/').next().unwrap_or("");
+    let has_registry =
+        repo.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
+    let repo = if has_registry {
+        repo.to_string()
+    } else if repo.contains('/') {
+        format!("docker.io/{repo}")
+    } else {
+        format!("docker.io/library/{repo}")
+    };
+    let mut out = repo;
+    match (tag, digest) {
+        (Some(t), _) => {
+            out.push(':');
+            out.push_str(t);
+        }
+        (None, None) => out.push_str(":latest"),
+        (None, Some(_)) => {}
+    }
+    if let Some(d) = digest {
+        out.push('@');
+        out.push_str(d);
+    }
+    out
+}
+
+/// Matches `text` against a pattern where `*` is any run of characters
+/// and `?` one character.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +1044,9 @@ pub struct ApplySpec {
     /// The whole alert policy, when the file has an `[alerts]` table.
     pub alerts: Option<AlertPolicy>,
     pub webhooks: Vec<WebhookSpec>,
+    // Phase 15 from here.
+    /// The job policy of every account in `accounts`.
+    pub policies: Vec<(String, AccountPolicy)>,
 }
 
 impl ApplySpec {
@@ -781,6 +1067,9 @@ impl ApplySpec {
             validate_account(a)?;
             ensure!(seen.insert(a), "account {a} is listed twice");
             q.validate().with_context(|| format!("account {a}"))?;
+        }
+        for (a, p) in &self.policies {
+            p.validate().with_context(|| format!("account {a}"))?;
         }
         let mut seen = BTreeSet::new();
         for s in &self.schedules {
@@ -992,6 +1281,69 @@ pub struct AccountFile {
     pub cu_per_day: Option<NumberOrText>,
     pub max_priority: Option<i32>,
     pub storage: Option<String>,
+    // Phase 15: the account's job policy.
+    #[serde(default)]
+    pub images: Vec<String>,
+    #[serde(default)]
+    pub require_digest: bool,
+    #[serde(default)]
+    pub executors: Vec<Executor>,
+    /// `"deny"` refuses jobs with `network = true`; `"allow"` (default).
+    pub network: Option<String>,
+    /// Added to every job's selector: `"gpu=nvidia,os=windows"`.
+    pub selector: Option<String>,
+    /// Tolerations its jobs may carry; `[]` for none.
+    pub tolerations: Option<Vec<String>>,
+    pub max_timeout: Option<String>,
+    pub max_gpus_per_task: Option<u32>,
+}
+
+/// `allow` or `deny` (`--network`, `network =` in cluster.toml): whether
+/// a policy refuses jobs that ask for the network.
+pub fn parse_network_rule(s: &str) -> Result<bool> {
+    match s.trim() {
+        "deny" => Ok(true),
+        "allow" => Ok(false),
+        other => bail!("network is `allow` or `deny`, not {other:?}"),
+    }
+}
+
+impl AccountFile {
+    /// The `[accounts.NAME]` policy fields.
+    pub fn policy(&self) -> Result<AccountPolicy> {
+        let mut executors = self.executors.clone();
+        executors.sort_by_key(|e| e.to_string());
+        executors.dedup();
+        let p = AccountPolicy {
+            images: self.images.clone(),
+            require_digest: self.require_digest,
+            executors,
+            deny_network: self
+                .network
+                .as_deref()
+                .map(parse_network_rule)
+                .transpose()?
+                .unwrap_or(false),
+            selector: match &self.selector {
+                Some(s) => s.parse()?,
+                None => Selector::default(),
+            },
+            tolerations: self
+                .tolerations
+                .as_ref()
+                .map(|v| v.iter().map(|t| t.parse::<Toleration>()).collect())
+                .transpose()?,
+            max_timeout_ms: self
+                .max_timeout
+                .as_deref()
+                .map(crate::job::parse_duration_ms)
+                .transpose()
+                .context("max_timeout")?,
+            max_gpus_per_task: self.max_gpus_per_task,
+        };
+        p.validate()?;
+        Ok(p)
+    }
 }
 
 /// `100`, `12.5` or `"12.5"`.
@@ -1058,6 +1410,9 @@ impl ClusterFile {
             });
         }
         for (account, a) in self.accounts {
+            let policy = a
+                .policy()
+                .with_context(|| format!("account {account}: policy"))?;
             let q = AccountQuota {
                 slots: a.slots,
                 gpus: a.gpus,
@@ -1074,6 +1429,7 @@ impl ClusterFile {
                     .transpose()
                     .with_context(|| format!("account {account}: storage"))?,
             };
+            spec.policies.push((account.clone(), policy));
             spec.accounts.push((account, q));
         }
         for (name, s) in self.schedules {

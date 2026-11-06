@@ -122,6 +122,10 @@ pub(crate) struct Mgmt {
     pub waiting: HashSet<JobId>,
     pub access: Vec<AccessRecord>,
     pub schedules: BTreeMap<String, ScheduleRecord>,
+    /// What each account's jobs may be (phase 15).
+    pub policies: HashMap<String, pumasi_proto::manage::AccountPolicy>,
+    /// When jobs with a queue timeout could first run (phase 15).
+    pub ready_since: HashMap<JobId, std::time::Instant>,
 }
 
 /// Who made an admin call.
@@ -171,6 +175,7 @@ impl State {
     pub(crate) fn load_mgmt(&mut self, snap: MgmtSnapshot) -> Result<()> {
         self.mgmt.node_config = snap.node_config.into_iter().collect();
         self.mgmt.quotas = snap.account_quotas.into_iter().collect();
+        self.mgmt.policies = snap.account_policies.into_iter().collect();
         self.mgmt.preempted = snap
             .preempted
             .into_iter()
@@ -588,6 +593,7 @@ impl State {
             .accounts
             .keys()
             .chain(self.mgmt.quotas.keys())
+            .chain(self.mgmt.policies.keys())
             .chain(self.files.quotas.keys())
             .collect();
         names.sort();
@@ -604,6 +610,7 @@ impl State {
                     spent_day: self.spent_day(a),
                     storage_bytes: storage.get(a).map_or(0, |(b, _)| *b),
                     queued: queued.get(a.as_str()).copied().unwrap_or(0),
+                    policy: self.mgmt.policies.get(a).cloned().unwrap_or_default(),
                 }
             })
             .collect()
@@ -969,6 +976,19 @@ impl State {
                 }
             }
         }
+        for (account, p) in &spec.policies {
+            let cur = self.account_policy(account);
+            if cur != *p {
+                changes.push(format!(
+                    "account {account}: policy {} -> {}",
+                    cur.describe(),
+                    p.describe()
+                ));
+                if !dry {
+                    self.set_account_policy(account, p.clone())?;
+                }
+            }
+        }
         for s in &spec.schedules {
             match self.mgmt.schedules.get(&s.name) {
                 Some(r) if r.spec == *s => continue,
@@ -1066,6 +1086,7 @@ pub(crate) struct MgmtSnapshot {
     pub preempted: Vec<((u128, u32, bool), u32)>,
     pub access: Vec<AccessRecord>,
     pub schedules: Vec<ScheduleRecord>,
+    pub account_policies: Vec<(String, pumasi_proto::manage::AccountPolicy)>,
 }
 
 /// Fills in what a submission leaves to the cluster.

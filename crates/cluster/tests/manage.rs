@@ -106,6 +106,7 @@ async fn spawn_agent(name: &str, slots: u32, ticket: JoinTicket) -> RunningAgent
         gpus: false,
         fake_gpus: None,
         webgpu: None,
+        gpu_graphics: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -164,6 +165,8 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         selector: Default::default(),
         tolerations: vec![],
         after: vec![],
+        queue_timeout_ms: None,
+        gpu_capabilities: vec![],
     }
 }
 

@@ -47,11 +47,17 @@ pub const HA_PROTOCOL: u32 = 11;
 /// The first agent protocol with WebGPU: it reports its adapters
 /// ([`msg::FromAgent::WebGpu`]) and runs wasm tasks that ask for a GPU.
 pub const WEBGPU_PROTOCOL: u32 = 12;
+/// The first agent protocol for remote API clients (phase 15): it reports
+/// its executors as Docker comes and goes and whether Docker GPU tasks can
+/// draw ([`msg::FromAgent::Executors`]), the image digest each task ran
+/// ([`msg::FromAgent::Image`]), and runs GPU tasks with driver
+/// capabilities.
+pub const REMOTE_PROTOCOL: u32 = 13;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {
     () => {
-        12
+        13
     };
 }
 
@@ -69,6 +75,8 @@ pub const PROTOCOL_VERSION: u32 = protocol_version!();
 /// Protocol 10 agents know only the control plane they joined: a replica
 /// that is not the leader closes their connection, and they keep retrying
 /// it. Protocol 11 agents have no WebGPU: they get no wasm jobs with GPUs.
+/// Protocol 12 agents report their executors only when they connect and
+/// no image digests: they get no GPU jobs with driver capabilities.
 pub const MIN_AGENT_PROTOCOL: u32 = 5;
 
 /// Marker baked into every binary: its version and protocol. `pumasi

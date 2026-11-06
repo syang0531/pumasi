@@ -1085,6 +1085,16 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     st.on_heartbeat(&node_id, generation);
                     st.on_logs(&node_id, generation, task, stdout, stderr);
                 }
+                Ok(Some(FromAgent::Executors(r))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_executors(&node_id, generation, *r);
+                }
+                Ok(Some(FromAgent::Image { task, image, digest })) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_image(&node_id, generation, task, image, digest);
+                }
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),
             },
@@ -1480,10 +1490,20 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
         }
         AdminOp::Submit(sub) => {
             let submitter = matches!(caller, Caller::Submitter { .. });
-            let id = inner.state().submit_from(*sub, submitter, None)?;
+            let id = inner
+                .state()
+                .submit_by(*sub, submitter, None, caller.name().to_string())?;
             Ok(AdminResponse::Submitted { id })
         }
-        AdminOp::Status => Ok(AdminResponse::Status(inner.state().status())),
+        AdminOp::Status => {
+            let account = match caller {
+                Caller::Submitter { account, .. } => account.as_str(),
+                _ => pumasi_proto::msg::OWNER_ACCOUNT,
+            };
+            Ok(AdminResponse::Status(
+                inner.state().status_for(Some(account)),
+            ))
+        }
         AdminOp::Job { id, with_output } => match inner.state().job_view(id, with_output) {
             Some(v) => Ok(AdminResponse::Job(Box::new(v))),
             None => Ok(AdminResponse::Error(format!("no job {id}"))),
@@ -1565,6 +1585,10 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             Ok(AdminResponse::Ok)
         }
         AdminOp::Quotas => Ok(AdminResponse::Quotas(inner.state().quotas())),
+        AdminOp::SetAccountPolicy { account, policy } => {
+            inner.state().set_account_policy(&account, *policy)?;
+            Ok(AdminResponse::Ok)
+        }
         AdminOp::CreateAccess {
             name,
             role,

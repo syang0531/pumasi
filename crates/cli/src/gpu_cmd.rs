@@ -29,6 +29,17 @@ pub enum GpuCmd {
         /// Docker binary to ask about NVIDIA Container Toolkit support.
         #[arg(long, default_value = "docker")]
         docker: String,
+        /// Also start a container with the GPUs to see what Docker GPU
+        /// tasks can do here: CUDA, OptiX, and drawing (EGL, OpenGL,
+        /// Vulkan). Saves the answer for the agent, which then offers
+        /// graphics to jobs that ask for it (label `gpu.graphics`).
+        #[arg(long = "docker-run")]
+        docker_run: bool,
+        /// The image to probe with --docker-run (it needs `sh`). One with
+        /// `eglinfo` or `vulkaninfo`, such as the examples/blender-render
+        /// image, also shows which renderer drawing gets.
+        #[arg(long, requires = "docker_run", default_value = pumasi_agent::gpu::docker_check::DEFAULT_PROBE_IMAGE)]
+        image: String,
     },
     /// List the WebGPU adapters (Vulkan, Metal, DX12, OpenGL) that wasm
     /// jobs with `gpus = 1` could use here, benchmarked the way the agent
@@ -46,7 +57,7 @@ pub enum GpuCmd {
     },
 }
 
-pub async fn run(cmd: GpuCmd) -> Result<i32> {
+pub async fn run(home: &std::path::Path, cmd: GpuCmd) -> Result<i32> {
     match cmd {
         GpuCmd::List { no_bench, json } => {
             let mut notes = Vec::new();
@@ -81,7 +92,18 @@ pub async fn run(cmd: GpuCmd) -> Result<i32> {
             }
             Ok(0)
         }
-        GpuCmd::Check { gpu: only, docker } => check(only, &docker).await,
+        GpuCmd::Check {
+            gpu: only,
+            docker,
+            docker_run,
+            image,
+        } => {
+            let code = check(only, &docker).await?;
+            if docker_run {
+                return docker_probe(home, &docker, &image).await;
+            }
+            Ok(code)
+        }
         GpuCmd::Webgpu {
             software,
             no_bench,
@@ -283,6 +305,59 @@ async fn check(only: Option<String>, docker: &str) -> Result<i32> {
         "{usable} GPU(s) usable by jobs here (the agent offers them unless started with --no-gpus)"
     );
     Ok(0)
+}
+
+/// `pumasi gpu check --docker-run`: what Docker GPU tasks can do here.
+async fn docker_probe(home: &std::path::Path, docker: &str, image: &str) -> Result<i32> {
+    use pumasi_agent::gpu::docker_check;
+    println!();
+    println!("docker GPU tasks ({image}):");
+    let c = match docker_check::probe(docker, image).await {
+        Ok(c) => c,
+        Err(e) => {
+            println!("  failed: {e:#}");
+            return Ok(1);
+        }
+    };
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    if c.cuda.is_empty() {
+        println!("  CUDA: no GPU in the container");
+    } else {
+        println!("  CUDA: {}", c.cuda.join("; "));
+    }
+    println!("  OptiX: {}", yes_no(c.optix));
+    let how = if c.nvidia_graphics {
+        "NVIDIA EGL/Vulkan drivers"
+    } else if c.wsl {
+        "WSL 2, through Mesa's D3D12 driver"
+    } else {
+        "no driver for drawing"
+    };
+    println!("  EGL/OpenGL/Vulkan: {} ({how})", yes_no(c.graphics));
+    if let Some(r) = &c.egl_renderer {
+        println!("  EGL renderer: {r}");
+    }
+    if let Some(d) = &c.vulkan_device {
+        println!("  Vulkan device: {d}");
+    }
+    for n in &c.notes {
+        println!("  note: {n}");
+    }
+    let dir = home.join("agent");
+    c.save(&dir)?;
+    println!();
+    if c.graphics {
+        println!(
+            "saved: the agent offers graphics to Docker GPU jobs (label gpu.graphics=true) from its next check, within 30 s ({})",
+            dir.join(docker_check::CHECK_FILE).display()
+        );
+    } else {
+        println!(
+            "saved: jobs that ask for graphics do not come here ({}); `pumasi agent start --gpu-graphics yes` overrides it",
+            dir.join(docker_check::CHECK_FILE).display()
+        );
+    }
+    Ok(if c.cuda.is_empty() { 1 } else { 0 })
 }
 
 fn rand_seed() -> u64 {

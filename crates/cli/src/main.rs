@@ -281,9 +281,12 @@ enum Cmd {
         /// File store space, e.g. 50G.
         #[arg(long)]
         storage: Option<String>,
-        /// Start from no limits instead of the current quota.
+        /// Start from no limits instead of the current quota (and job
+        /// policy).
         #[arg(long)]
         clear: bool,
+        #[command(flatten)]
+        policy: manage::PolicyArgs,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -776,6 +779,13 @@ enum AgentCmd {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
+enum GraphicsArg {
+    Auto,
+    Yes,
+    No,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum LedgerArg {
     Prepaid,
     Mutual,
@@ -813,6 +823,11 @@ struct AgentOpts {
     /// Docker-compatible CLI to use for docker jobs.
     #[arg(long, default_value = "docker")]
     docker_bin: String,
+    /// Whether Docker GPU tasks here can draw (OpenGL, EGL, Vulkan), so
+    /// jobs with `capabilities = ["graphics"]` come here: `auto` goes by
+    /// the last `pumasi gpu check --docker-run`.
+    #[arg(long, value_enum, default_value = "auto")]
+    gpu_graphics: GraphicsArg,
     /// Also run image jobs in microVMs. Each task gets its own VM and
     /// kernel, so this is safe on machines you share with a cluster.
     /// Needs `pumasi vm setup` first.
@@ -1116,7 +1131,7 @@ async fn run(cli: Cli) -> Result<i32> {
             json,
             cpus,
         } => bench(&home, dir, quick, json, cpus).await,
-        Cmd::Gpu(cmd) => gpu_cmd::run(cmd).await,
+        Cmd::Gpu(cmd) => gpu_cmd::run(&home, cmd).await,
         Cmd::Node {
             id,
             rebenchmark,
@@ -1313,6 +1328,7 @@ async fn run(cli: Cli) -> Result<i32> {
             max_priority,
             storage,
             clear,
+            policy,
             admin,
         } => {
             manage::quota(
@@ -1325,6 +1341,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 max_priority,
                 storage,
                 clear,
+                policy,
             )
             .await
         }
@@ -1542,6 +1559,11 @@ async fn agent(
             bench: !opts.no_benchmark,
         }),
         store_cache_bytes: opts.store_cache.as_deref().map(parse_size).transpose()?,
+        gpu_graphics: match opts.gpu_graphics {
+            GraphicsArg::Auto => None,
+            GraphicsArg::Yes => Some(true),
+            GraphicsArg::No => Some(false),
+        },
     };
     let exe = config.upgrade.as_ref().map(|u| u.exe.clone());
     let agent = Agent::new(config).await?;
@@ -1550,8 +1572,11 @@ async fn agent(
         agent.info().name,
         agent.id().fmt_short(),
         agent.info().slots,
-        executor_list(&agent.info().executors)
+        executor_list(&agent.executors_now().executors)
     );
+    for (e, why) in agent.executors_now().unavailable {
+        eprintln!("{e} jobs wait until it is usable: {why} (checked every 30 s)");
+    }
     let serve = async move {
         match ticket {
             Some(t) => agent.join(t).await,
@@ -1837,6 +1862,12 @@ fn print_status(s: &ClusterStatus) {
         if let Some(reason) = &n.paused {
             println!("{} is paused: {reason}", truncate(&n.info.name, 16));
         }
+        for (e, why) in &n.unavailable {
+            println!("{}: {e} unavailable: {why}", truncate(&n.info.name, 16));
+        }
+    }
+    if let Some(c) = &s.capacity {
+        print_capacity(c);
     }
     if s.nodes.iter().any(|n| n.role == Role::Provider) {
         println!(
@@ -1866,6 +1897,27 @@ fn print_status(s: &ClusterStatus) {
     }
     if s.jobs.is_empty() {
         println!("(no jobs yet: submit one with `pumasi run job.toml`)");
+    }
+}
+
+/// Which nodes take the account's work now.
+fn print_capacity(c: &pumasi_proto::msg::Capacity) {
+    let ready: Vec<String> = c.ready.iter().map(|(e, n)| format!("{e} {n}")).collect();
+    let mut line = format!(
+        "ready for account {} now: {}, GPU {}",
+        c.account,
+        ready.join(", "),
+        c.ready_gpu
+    );
+    if c.ready_gpu_graphics > 0 {
+        line.push_str(&format!(" (graphics {})", c.ready_gpu_graphics));
+    }
+    println!();
+    println!("{line}");
+    for n in &c.nodes {
+        if let Some(why) = &n.reason {
+            println!("  {}: {why}", truncate(&n.node, 16));
+        }
     }
 }
 
@@ -1899,8 +1951,24 @@ fn print_job(v: &JobView, output: bool) {
     if let Some(w) = &v.waiting {
         println!("  {w}");
     }
+    if v.schedule.is_none() && !v.submitted_by.is_empty() {
+        println!("  submitted by {}", v.submitted_by);
+    }
     if let Some(name) = &v.schedule {
         println!("  submitted by schedule {name}");
+    }
+    for d in &v.image_digests {
+        println!("  image digest {d}");
+    }
+    if let Some(t) = v.queue_timeout_ms {
+        println!(
+            "  queue timeout {}",
+            pumasi_proto::job::format_duration_ms(t)
+        );
+    }
+    if !v.gpu_capabilities.is_empty() {
+        let c: Vec<String> = v.gpu_capabilities.iter().map(|c| c.to_string()).collect();
+        println!("  gpu capabilities {}", c.join(","));
     }
     println!(
         "  account {}  cost {} CU{}",

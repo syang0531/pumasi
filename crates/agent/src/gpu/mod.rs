@@ -11,6 +11,7 @@
 //!   be passed through to microVMs ([`vfio`]).
 
 pub mod cuda;
+pub mod docker_check;
 pub mod nvml;
 pub mod vfio;
 
@@ -67,17 +68,8 @@ pub fn detect(env: &GpuEnv, notes: &mut Vec<String>) -> Vec<GpuInfo> {
     for (i, g) in gpus.iter_mut().enumerate() {
         g.index = i as u32;
     }
+    mark_docker(&mut gpus, env);
     for g in gpus.iter_mut() {
-        match g.vendor {
-            GpuVendor::Nvidia => g.docker = env.docker_nvidia && g.driver != "vfio-pci",
-            GpuVendor::Amd => {
-                g.docker = env.docker_amd
-                    && !g.render_node.is_empty()
-                    && Path::new("/dev/kfd").exists()
-                    && Path::new(&g.render_node).exists()
-            }
-            _ => {}
-        }
         if cfg!(target_os = "linux") && env.vfio && matches!(g.vendor, GpuVendor::Nvidia) {
             match vfio::ready(&g.pci) {
                 Ok(()) if g.display => notes.push(format!(
@@ -118,6 +110,23 @@ pub fn detect(env: &GpuEnv, notes: &mut Vec<String>) -> Vec<GpuInfo> {
         }
     }
     gpus
+}
+
+/// Marks which GPUs Docker tasks can use, as `env` says (again when
+/// Docker starts after the agent).
+pub fn mark_docker(gpus: &mut [GpuInfo], env: &GpuEnv) {
+    for g in gpus.iter_mut() {
+        match g.vendor {
+            GpuVendor::Nvidia => g.docker = env.docker_nvidia && g.driver != "vfio-pci",
+            GpuVendor::Amd => {
+                g.docker = env.docker_amd
+                    && !g.render_node.is_empty()
+                    && Path::new("/dev/kfd").exists()
+                    && Path::new(&g.render_node).exists()
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The device profile (unsigned): GPUs and microVM networking.

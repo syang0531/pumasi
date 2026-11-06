@@ -103,14 +103,16 @@ impl DockerExecutor {
         .context("docker did not answer within 15s")?
         .with_context(|| format!("could not run `{bin}`; is Docker installed?"))?;
         if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
             let hint = if cfg!(windows) {
                 " (is Docker Desktop running? It must be started once in the signed-in session, and the agent's account must be in the docker-users group)"
             } else {
                 " (is the Docker daemon running?)"
             };
             bail!(
-                "`{bin} version` failed{hint}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                "{} (`{bin} version` failed{hint}: {})",
+                not_running(&stderr),
+                stderr.trim()
             );
         }
         let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -129,6 +131,48 @@ impl DockerExecutor {
         };
         exec.cleanup_stale().await;
         Ok(exec)
+    }
+
+    /// Whether the daemon still answers and runs Linux containers (Docker
+    /// Desktop can stop while the agent runs). The error says why not.
+    pub async fn alive(&self) -> Result<()> {
+        let out = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(&self.bin)
+                .args(["version", "--format", "{{.Server.Os}}"])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .context("docker did not answer within 15s")?
+        .with_context(|| format!("could not run `{}`", self.bin))?;
+        if !out.status.success() {
+            bail!("{}", not_running(&String::from_utf8_lossy(&out.stderr)));
+        }
+        let os = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if os != "linux" {
+            bail!("the Docker daemon runs {os} containers, not Linux ones");
+        }
+        Ok(())
+    }
+
+    /// The image's digest: `repo@sha256:...` from the registry it came
+    /// from, or its image id when it has none (built locally).
+    pub async fn image_digest(&self, image: &str) -> Option<String> {
+        let out = self
+            .cli(&[
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RepoDigests}} {{.Id}}",
+                image,
+            ])
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        pick_digest(image, String::from_utf8_lossy(&out.stdout).trim())
     }
 
     /// Removes containers this agent left behind (e.g. after a crash).
@@ -395,6 +439,17 @@ impl DockerExecutor {
                 spec
             }
         };
+        if let Some(r) = &io.image_report {
+            match &io.image {
+                // A private image from the store is named by its digest.
+                Some(img) => r.send(&spec.image, img.digest.clone()),
+                None => {
+                    if let Some(d) = self.image_digest(&spec.image).await {
+                        r.send(&spec.image, d);
+                    }
+                }
+            }
+        }
         // The timeout covers the run itself, not the image pull.
         let run_start = Instant::now();
 
@@ -407,7 +462,7 @@ impl DockerExecutor {
         );
         let mut args = create_args(&name, &self.label, spec, input, limits, self.cpu_cap);
         let image_at = args.len() - 1 - spec.command.len() - input.args.len();
-        let gpu_args = gpu_args(&io.gpus);
+        let gpu_args = gpu_args(&io.gpus, &io.gpu_capabilities);
         args.splice(image_at..image_at, gpu_args);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let created = self.cli(&arg_refs).await?;
@@ -707,7 +762,47 @@ fn create_args(
 /// GPUs' UUIDs (NVIDIA Container Toolkit, or Docker Desktop), AMD GPUs as
 /// `/dev/kfd` plus their render nodes, and `PUMASI_GPUS` with the node's
 /// numbers for them either way.
-fn gpu_args(gpus: &[pumasi_proto::gpu::GpuInfo]) -> Vec<String> {
+/// A short reason for `docker version` failing, for the cluster's status.
+fn not_running(stderr: &str) -> String {
+    let s = stderr.to_ascii_lowercase();
+    if cfg!(windows) || s.contains("dockerdesktop") || s.contains("docker_engine") {
+        "Docker Desktop is not running".into()
+    } else if s.contains("permission denied") {
+        "no permission to use the Docker daemon".into()
+    } else {
+        "the Docker daemon is not running".into()
+    }
+}
+
+/// Picks the digest from `docker image inspect`'s `RepoDigests` (as JSON)
+/// and `Id`: the repo digest of the image's own repository, any repo
+/// digest, or the id.
+fn pick_digest(image: &str, answer: &str) -> Option<String> {
+    let (json, id) = answer.rsplit_once(' ').unwrap_or((answer, ""));
+    let digests: Vec<String> = serde_json::from_str(json.trim()).unwrap_or_default();
+    let repo = image.split('@').next().unwrap_or(image);
+    let repo = match repo.rsplit_once(':') {
+        Some((r, t)) if !t.contains('/') => r,
+        _ => repo,
+    };
+    // Without a tag, the full name ends in `:latest`.
+    let full_repo = |r: &str| {
+        let f = pumasi_proto::manage::full_image_name(r);
+        f.strip_suffix(":latest").unwrap_or(&f).to_string()
+    };
+    let want = full_repo(repo);
+    digests
+        .iter()
+        .find(|d| full_repo(d.split('@').next().unwrap_or("")) == want)
+        .or(digests.first())
+        .cloned()
+        .or_else(|| (!id.trim().is_empty()).then(|| id.trim().to_string()))
+}
+
+fn gpu_args(
+    gpus: &[pumasi_proto::gpu::GpuInfo],
+    caps: &[pumasi_proto::job::GpuCapability],
+) -> Vec<String> {
     use pumasi_proto::gpu::GpuVendor;
     if gpus.is_empty() {
         return Vec::new();
@@ -725,6 +820,17 @@ fn gpu_args(gpus: &[pumasi_proto::gpu::GpuInfo]) -> Vec<String> {
         } else {
             // Docker's CSV syntax: the quotes keep the commas in one value.
             a.push(format!("\"device={}\"", nvidia.join(",")));
+        }
+        // The NVIDIA Container Toolkit mounts the driver libraries for
+        // these (graphics: EGL, OpenGL and Vulkan; video: NVENC).
+        if !caps.is_empty() {
+            a.extend([
+                "--env".into(),
+                format!(
+                    "NVIDIA_DRIVER_CAPABILITIES={}",
+                    pumasi_proto::job::GpuCapability::driver_env(caps)
+                ),
+            ]);
         }
     }
     let amd: Vec<&str> = gpus
@@ -1152,14 +1258,20 @@ mod tests {
             vfio: false,
             render_node: render.into(),
         };
-        assert!(gpu_args(&[]).is_empty());
-        let a = gpu_args(&[
+        assert!(gpu_args(&[], &[]).is_empty());
+        let two = [
             g(0, GpuVendor::Nvidia, "GPU-a", ""),
             g(2, GpuVendor::Nvidia, "GPU-b", ""),
-        ])
-        .join(" ");
+        ];
+        let a = gpu_args(&two, &[]).join(" ");
         assert_eq!(a, "--gpus \"device=GPU-a,GPU-b\" --env PUMASI_GPUS=0,2");
-        let a = gpu_args(&[g(1, GpuVendor::Amd, "", "/dev/dri/renderD129")]).join(" ");
+        // Graphics: the toolkit's capabilities, compute and utility kept.
+        let a = gpu_args(&two, &[pumasi_proto::job::GpuCapability::Graphics]).join(" ");
+        assert_eq!(
+            a,
+            "--gpus \"device=GPU-a,GPU-b\" --env NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics --env PUMASI_GPUS=0,2"
+        );
+        let a = gpu_args(&[g(1, GpuVendor::Amd, "", "/dev/dri/renderD129")], &[]).join(" ");
         assert!(
             a.starts_with("--device /dev/kfd --device /dev/dri/renderD129"),
             "{a}"
@@ -1167,8 +1279,31 @@ mod tests {
         assert!(a.ends_with("--env PUMASI_GPUS=1"));
         // Test GPUs (vendor Other) only get the variable.
         assert_eq!(
-            gpu_args(&[g(0, GpuVendor::Other, "", "")]).join(" "),
+            gpu_args(&[g(0, GpuVendor::Other, "", "")], &[]).join(" "),
             "--env PUMASI_GPUS=0"
         );
+    }
+
+    #[test]
+    fn image_digests_prefer_the_images_own_repository() {
+        let d = r#"["mirror.example/library/python@sha256:aa","python@sha256:bb"] sha256:cc"#;
+        assert_eq!(
+            pick_digest("python:3.12", d).as_deref(),
+            Some("python@sha256:bb")
+        );
+        assert_eq!(
+            pick_digest("docker.io/library/python:3.12", d).as_deref(),
+            Some("python@sha256:bb")
+        );
+        assert_eq!(
+            pick_digest("other:1", d).as_deref(),
+            Some("mirror.example/library/python@sha256:aa")
+        );
+        // Built here: no registry digest, the image id.
+        assert_eq!(
+            pick_digest("mine:dev", "[] sha256:cc").as_deref(),
+            Some("sha256:cc")
+        );
+        assert_eq!(pick_digest("x", "null "), None);
     }
 }

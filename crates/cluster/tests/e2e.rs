@@ -115,6 +115,7 @@ fn agent_config(name: &str, slots: u32, dir: PathBuf) -> AgentConfig {
         gpus: false,
         fake_gpus: None,
         webgpu: None,
+        gpu_graphics: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -175,6 +176,8 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         selector: Default::default(),
         tolerations: vec![],
         after: vec![],
+        queue_timeout_ms: None,
+        gpu_capabilities: vec![],
     }
 }
 
@@ -558,6 +561,7 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         gpus: false,
         fake_gpus: None,
         webgpu: None,
+        gpu_graphics: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1140,6 +1144,8 @@ fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
         selector: Default::default(),
         tolerations: vec![],
         after: vec![],
+        queue_timeout_ms: None,
+        gpu_capabilities: vec![],
     }
 }
 
@@ -1169,6 +1175,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         gpus: false,
         fake_gpus: None,
         webgpu: None,
+        gpu_graphics: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1332,6 +1339,7 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         gpus: false,
         fake_gpus: None,
         webgpu: None,
+        gpu_graphics: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1701,6 +1709,7 @@ async fn upgradable(name: &str, dir: PathBuf, exe: PathBuf, auto: Option<bool>) 
         gpus: false,
         fake_gpus: None,
         webgpu: None,
+        gpu_graphics: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,

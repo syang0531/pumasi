@@ -111,6 +111,7 @@ async fn spawn_agent(name: &str, ticket: JoinTicket) -> RunningAgent {
         gpus: false,
         fake_gpus: None,
         webgpu: None,
+        gpu_graphics: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -225,6 +226,8 @@ async fn metrics_live_logs_events_and_prometheus() {
             selector: Default::default(),
             tolerations: vec![],
             after: vec![],
+            queue_timeout_ms: None,
+            gpu_capabilities: vec![],
         };
         let AdminResponse::Submitted { id } =
             client.call(AdminOp::Submit(Box::new(sub))).await.unwrap()

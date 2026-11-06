@@ -1149,6 +1149,30 @@ impl Store {
         self.commit(b)
     }
 
+    /// Deletes old jobs (each with its task count) and the content blobs
+    /// no remaining job uses, in one transaction. Receipts and holds stay:
+    /// they are billing records.
+    pub fn delete_jobs(&self, jobs: &[(u128, u32)], blobs: &[ModuleHash]) -> Result<()> {
+        let mut b = Batch::default();
+        for &(job, tasks) in jobs {
+            b.del(JOBS, job);
+            b.del(JOB_EXT, job);
+            b.del(JOB_GPU, job);
+            b.del(JOB_SCHED, job);
+            b.del(JOB_ORIGIN, job);
+            for i in 0..tasks {
+                b.del(TASKS, (job, i));
+                b.del(TASK_EXT, (job, i));
+                b.del(PREEMPTED, (job, i, false));
+                b.del(PREEMPTED, (job, i, true));
+            }
+        }
+        for hash in blobs {
+            b.del(MODULES, hash.as_slice());
+        }
+        self.commit(b)
+    }
+
     pub fn put_job_meta(&self, meta: &JobMeta) -> Result<()> {
         let mut b = Batch::default();
         b.put(JOBS, meta.id.0, enc(meta).as_slice());

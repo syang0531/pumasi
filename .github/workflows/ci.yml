@@ -305,6 +305,75 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/pumasi-guest
           if-no-files-found: error
 
+  # Phase 17: advisories, licenses and sources of every dependency
+  # (deny.toml), and RustSec once more through cargo-audit
+  # (.cargo/audit.toml carries the same justified ignores).
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  # Phase 17: every fuzz target (fuzz/) for a minute. A crash fails the
+  # job and keeps the input that caused it.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo fuzz build -O --debug-assertions
+        working-directory: fuzz
+      - name: Run each target for 60 seconds
+        working-directory: fuzz
+        run: |
+          for t in $(cargo fuzz list); do
+            echo "::group::$t"
+            cargo fuzz run -O --debug-assertions "$t" -- -max_total_time=60 -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  # Phase 17: a short soak (scripts/soak.sh): jobs through the API while
+  # agents and the control plane are killed and restarted. The 72-hour
+  # run before a release uses the same script.
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: soak
+      - run: cargo build --release -p pumasi-cli
+      - run: |
+          scripts/soak.sh --bin target/release/pumasi --duration 10m --agents 3 \
+            --agent-restart-every 90s --cluster-restart-every 4m --report soak-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-report
+          path: soak-report
+          if-no-files-found: ignore
+
   # macOS: the binary's minimum OS, and the Virtualization.framework
   # helper (signing, loading the framework at run time). Hosted Mac
   # runners are VMs without nested virtualization, so booting a guest is

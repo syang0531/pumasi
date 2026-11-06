@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "crates/dashboard", "crates/cli"]
+# Fuzz targets need nightly; they have their own workspace.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -45,7 +47,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # microVM executor: image layers, the guest's disks and registry pulls.
 tar = { version = "0.4.44", default-features = false }
 flate2 = "1"
-ruzstd = "0.8"
+ruzstd = "0.9.1"
 libc = "0.2"
 sha2 = "0.10"
 # Confidential tasks (phase 16): sealed streams and key release.

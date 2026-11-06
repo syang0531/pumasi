@@ -797,6 +797,11 @@ struct MetricsArgs {
     /// How long node metrics and events are kept, e.g. 7d.
     #[arg(long, default_value = "7d")]
     metrics_retention: String,
+    /// How long finished jobs are kept (counted from submission), e.g.
+    /// 90d; 0 keeps them forever. Older ones are deleted with their logs
+    /// and small outputs; receipts and the audit log stay.
+    #[arg(long, default_value = "30d")]
+    keep_jobs: String,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1468,6 +1473,7 @@ async fn cluster_start(
     config.metrics_token = metrics.metrics_token.filter(|t| !t.is_empty());
     config.metrics_retention =
         Duration::from_millis(parse_duration_ms(&metrics.metrics_retention)?);
+    config.keep_jobs = Duration::from_millis(parse_duration_ms(&metrics.keep_jobs)?);
     config.disk_class = match storage_class {
         Some(StorageClassArg::Hdd) => DiskClass::Hdd,
         Some(StorageClassArg::Ssd) => DiskClass::Ssd,

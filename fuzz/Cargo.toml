@@ -1,0 +1,96 @@
+# Fuzz targets for every parser that reads bytes from outside the trust
+# boundary (phase 17). Run one with `cargo +nightly fuzz run <target>`;
+# CI runs each for a minute. See docs/security-review.md.
+[package]
+name = "pumasi-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a member of the main workspace: it needs nightly and libFuzzer.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pumasi-proto = { path = "../crates/proto" }
+pumasi-guest = { path = "../crates/guest" }
+pumasi-cluster = { path = "../crates/cluster" }
+postcard = { version = "1", features = ["use-std"] }
+serde_json = "1"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "admin_wire"
+path = "fuzz_targets/admin_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_wire"
+path = "fuzz_targets/agent_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tickets"
+path = "fuzz_targets/tickets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_files"
+path = "fuzz_targets/config_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_stream"
+path = "fuzz_targets/sealed_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attestation"
+path = "fuzz_targets/attestation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "receipt"
+path = "fuzz_targets/receipt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "guest_output"
+path = "fuzz_targets/guest_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_sso"
+path = "fuzz_targets/audit_sso.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release_binary"
+path = "fuzz_targets/release_binary.rs"
+test = false
+doc = false
+bench = false

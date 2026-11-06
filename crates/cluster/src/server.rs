@@ -89,6 +89,8 @@ pub struct ClusterConfig {
     pub metrics_retention: Duration,
     /// How often a follower copies the leader's file store.
     pub mirror_every: Duration,
+    /// How long finished jobs are kept (zero: forever).
+    pub keep_jobs: Duration,
     /// Accept the test stand-in for a TEE, so confidential jobs run on
     /// machines without SEV-SNP or TDX (tests only: nothing is protected).
     pub insecure_test_tee: bool,
@@ -109,6 +111,7 @@ impl ClusterConfig {
             metrics_addr: None,
             metrics_token: None,
             metrics_retention: Duration::from_secs(7 * 86_400),
+            keep_jobs: crate::retention::DEFAULT_KEEP_JOBS,
             mirror_every: Duration::from_secs(30),
             insecure_test_tee: false,
         }
@@ -357,6 +360,13 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
                     {
                         inner.state().monitor_cp_disk(disk);
                     }
+                }
+                // Old finished jobs, every 10 minutes (the first a minute
+                // after taking over).
+                if ticks % 1200 == 120 {
+                    inner
+                        .state()
+                        .expire_jobs(inner.config.keep_jobs, crate::state::now_unix());
                 }
                 ticks += 1;
                 inner.state().tick(inner.config.node_timeout);

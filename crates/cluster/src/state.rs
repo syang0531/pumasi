@@ -2325,6 +2325,63 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn old_finished_jobs_are_forgotten() {
+        let path =
+            std::env::temp_dir().join(format!("pumasi-state-{}.redb", rand::random::<u64>()));
+        let key = SecretKey::generate();
+        let open = |key: &SecretKey| {
+            State::load(
+                "t".into(),
+                key.public().to_string(),
+                Store::open(&path).unwrap(),
+                key.clone(),
+            )
+            .unwrap()
+        };
+        let mut st = open(&key);
+        let mut unique = job(Executor::Wasm, 2);
+        unique.module = b"\0asm\x01\0\0\0\0".to_vec();
+        let old = st.submit(unique).unwrap();
+        let old_shared = st.submit(job(Executor::Wasm, 1)).unwrap();
+        let queued = st.submit(job(Executor::Wasm, 1)).unwrap();
+        let recent = st.submit(job(Executor::Wasm, 1)).unwrap();
+        for id in [old, old_shared, recent] {
+            st.cancel(id).unwrap();
+        }
+        let long_ago = now_unix() - 40 * 86_400;
+        for id in [old, old_shared, queued] {
+            st.jobs.get_mut(&id).unwrap().meta.submitted_unix = long_ago;
+        }
+        let unique_hash = st.jobs[&old].meta.module_hash.unwrap();
+        let shared_hash = st.jobs[&queued].meta.module_hash.unwrap();
+        let day = Duration::from_secs(86_400);
+
+        assert_eq!(st.expire_jobs(Duration::ZERO, now_unix()), 0);
+        assert_eq!(st.expire_jobs(30 * day, now_unix()), 2);
+        assert!(!st.jobs.contains_key(&old) && !st.jobs.contains_key(&old_shared));
+        // Not finished, or not old enough.
+        assert!(st.jobs.contains_key(&queued) && st.jobs.contains_key(&recent));
+        assert!(!st.modules.contains_key(&unique_hash));
+        assert!(
+            st.modules.contains_key(&shared_hash),
+            "a queued job still uses it"
+        );
+        assert_eq!(st.expire_jobs(30 * day, now_unix()), 0);
+        let entries = st.audit_entries(0, 10).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == "jobs.expire" && e.target == "2 jobs")
+        );
+
+        // Gone from the database too.
+        drop(st);
+        let st = open(&key);
+        assert!(!st.jobs.contains_key(&old) && st.jobs.contains_key(&queued));
+        assert!(!st.modules.contains_key(&unique_hash) && st.modules.contains_key(&shared_hash));
+    }
+
     fn info(name: &str, executors: Vec<Executor>) -> NodeInfo {
         NodeInfo {
             name: name.into(),

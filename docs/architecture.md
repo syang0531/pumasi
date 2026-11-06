@@ -1803,8 +1803,16 @@ sweep.
   (also checks that any flipped byte of a sealed stream is detected),
   `attestation`, `receipt`, `guest_output`, `audit_sso`,
   `release_binary`. CI's `fuzz` job runs each for 60 seconds.
-- `scripts/soak.sh` (CI's `soak` job runs it for 10 minutes; a release
-  waits for 72 hours).
+- `scripts/soak.sh` (CI's `soak` job runs it for 10 minutes; the Long
+  checks workflow, `.github/workflows/long-checks.yml`, for 5h20m on
+  Linux and macOS every Sunday and before a release, with 20 minutes per
+  fuzz target).
+- `scripts/sso-e2e.sh` (CI's `sso-e2e` job): the OIDC browser and device
+  flows against Keycloak and LDAP against OpenLDAP, in Docker, with the
+  realm and directory in `scripts/sso-e2e/`. It found that Keycloak's
+  "PKCE Method" client setting also demands PKCE on the device flow, so
+  operations.md says to leave it empty.
+- CodeQL (`.github/workflows/codeql.yml`) for Rust and the workflows.
 
 ### Compatibility
 
@@ -1972,7 +1980,8 @@ remotely; install a current binary on them once.
   signed checkpoint), no SCIM provisioning (people appear when they first
   sign in and their sessions simply expire), no SAML, the control plane
   has no service installer of its own, and the 1.0 tag waits for the
-  external review and a 72-hour soak.
+  internal security review and a green long-checks run. No third-party
+  audit yet.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node

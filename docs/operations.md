@@ -114,11 +114,18 @@ rm /tmp/oidc-secret
 | --- | --- | --- |
 | Google Workspace | `https://accounts.google.com` | Google's ID tokens carry no groups: map `domain:acme.com` or `email:` rules. Google does not offer the device flow for web clients; CLI users sign in with LDAP or an access ticket. |
 | Microsoft Entra ID | `https://login.microsoftonline.com/<tenant-id>/v2.0` | Add the `groups` claim to the ID token (Token configuration → Add groups claim); groups arrive as object ids, so map `group:<object-id>`. Enable "Allow public client flows" for `pumasi login --sso`. |
-| Keycloak | `https://keycloak.example.com/realms/<realm>` | Add a "Group Membership" mapper to the client (claim `groups`, full group path off). Enable "OAuth 2.0 Device Authorization Grant" in the client's capabilities. |
+| Keycloak | `https://keycloak.example.com/realms/<realm>` | Add a "Group Membership" mapper to the client (claim `groups`, full group path off). Enable "OAuth 2.0 Device Authorization Grant" in the client's capabilities. Leave the client's "PKCE Method" empty: Pumasi sends PKCE on the browser flow anyway, and with the setting on Keycloak also demands it on the device flow, which refuses `pumasi login --sso`. |
 | Okta | `https://<org>.okta.com/oauth2/default` | Add a `groups` claim to the authorization server. |
 
 `--groups-claim` changes the claim's name, `--scopes` adds scopes (some
 providers need `groups`).
+
+To try SSO before touching the organization's provider,
+`scripts/sso-e2e.sh --keep` starts Keycloak and OpenLDAP in Docker with
+a ready realm and directory (`scripts/sso-e2e/`), signs test users in
+every way, and leaves both running (Keycloak admin console on
+http://127.0.0.1:18080, admin/admin). CI runs the same script on every
+pull request.
 
 ### LDAP and Active Directory
 
@@ -291,18 +298,36 @@ restore the latest backup on a new machine at the same address (step 4).
 control plane: lower `--keep-jobs`, remove datasets, or move
 `PUMASI_HOME` to a bigger disk while it is stopped.
 
-## 8. Before a release: the soak test
+## 8. Before a release
 
 `scripts/soak.sh` runs a local cluster under a steady stream of jobs
 through the API while it kills agents and the control plane, and fails on
 lost or stuck jobs, an audit log that stops verifying, or memory and open
-files that keep growing. CI runs it for 10 minutes on every pull request;
-a release waits for 72 hours on a real machine:
+files that keep growing. It runs on Linux and macOS (bash 4 or later,
+curl, jq). CI runs it for 10 minutes on every pull request.
+
+A release needs, on the commit being tagged:
+
+- CI green, including `supply-chain`, `fuzz`, `soak`, `sso-e2e` and
+  CodeQL, and no open high or critical alerts under Security → Code
+  scanning or Dependabot.
+- A green run of the **Long checks** workflow
+  (`.github/workflows/long-checks.yml`: Actions → Long checks → Run
+  workflow). It soaks for 5h20m on Linux and on macOS, restarting an
+  agent every 15 minutes and the control plane every hour, and runs every
+  fuzz target for 20 minutes. It also runs every Sunday. The soak reports
+  are the run's artifacts.
+
+A longer soak on hardware you own is worth doing when you can, but no
+longer blocks a release. Any Mac or Linux machine works; on a Mac, keep it
+awake with `caffeinate`:
 
 ```sh
 cargo build --release -p pumasi-cli
-scripts/soak.sh --duration 72h --report soak-$(date +%F)
+caffeinate -dims scripts/soak.sh --duration 72h --report soak-$(date +%F)   # Linux: drop caffeinate -dims
 ```
 
 The report directory has `summary.txt`, `samples.csv` (RSS and open files
-every 30 seconds) and `jobs.csv`.
+every 30 seconds) and `jobs.csv`. With no machine to spare, a Linux VM on
+a Mac (UTM, Lima, OrbStack) or a free cloud VM (Oracle Cloud's Always
+Free Ampere instances) can run it too.

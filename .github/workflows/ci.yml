@@ -379,6 +379,19 @@ jobs:
           path: soak-report
           if-no-files-found: ignore
 
+  # SSO against real identity software (scripts/sso-e2e.sh): Keycloak for
+  # the OIDC browser and device flows, OpenLDAP for LDAP, in Docker.
+  sso-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: soak
+      - run: cargo build --release -p pumasi-cli
+      - run: scripts/sso-e2e.sh --bin target/release/pumasi
+
   # macOS: the binary's minimum OS, and the Virtualization.framework
   # helper (signing, loading the framework at run time). Hosted Mac
   # runners are VMs without nested virtualization, so booting a guest is

@@ -205,7 +205,10 @@ jobs:
           merge-multiple: true
       - name: Check build markers
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then want="v=${GITHUB_REF_NAME#v};"; else want="v=0"; fi
+          # A tag build carries the tag's version; any other build the crate
+          # version with +ci.<commit>.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then want="v=${GITHUB_REF_NAME#v};"
+          else want="v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)+ci.${GITHUB_SHA::7};"; fi
           for f in dist/pumasi-*; do
             grep -aqo "pumasi-build-info:$want" "$f" || { echo "$f: no build marker $want"; exit 1; }
           done
@@ -234,5 +237,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Written notes in docs/releases/<tag>.md come first, with
+          # GitHub's list of merged pull requests after them.
+          notes=()
+          if [[ -f "docs/releases/$GITHUB_REF_NAME.md" ]]; then notes=(--notes-file "docs/releases/$GITHUB_REF_NAME.md"); fi
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+            --title "$GITHUB_REF_NAME" "${notes[@]}" --generate-notes --verify-tag

@@ -316,6 +316,22 @@ fn perf(l: Lang, n: &NodeView) -> Markup {
                     }
                 }
             }
+            @if !n.webgpu.is_empty() {
+                h3 { "WebGPU" }
+                p class="dim" { (l.t("Wasm jobs with gpus = 1 run compute shaders here (experimental).", "gpus = 1 인 wasm 작업이 여기서 컴퓨트 셰이더를 실행합니다(실험).")) }
+                ul class="plain" {
+                    @for w in &n.webgpu {
+                        li {
+                            strong { "#" (w.adapter.index) " " (w.adapter.name) } " · "
+                            (w.adapter.backend) " · " (w.adapter.device_type) " · "
+                            (w.billed_gflops) " GFLOPS"
+                            @if let Some(g) = w.adapter.gpu { " · GPU #" (g) }
+                            @if let Some(t) = &w.busy { " · " span class="badge info" { (l.t("busy", "사용 중")) } " " a href={"/jobs/" (t.job)} { code { (t.job) } } }
+                            @if let Some(note) = &w.note { br; span class="dim" { (note) } }
+                        }
+                    }
+                }
+            }
         }
     }
 }

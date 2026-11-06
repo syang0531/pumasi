@@ -81,6 +81,8 @@ pub struct TaskIo {
     pub gpus: Vec<pumasi_proto::gpu::GpuInfo>,
     /// Where the task's output goes while it runs (phase 11).
     pub live: Option<LiveOutput>,
+    /// The WebGPU adapter of a wasm task that asked for a GPU (phase 14).
+    pub webgpu: Option<crate::webgpu::WebGpuTask>,
 }
 
 /// What a running task printed that the agent has not sent on yet. The
@@ -168,6 +170,7 @@ pub struct LocalImage {
 struct StoreState {
     wasi: WasiP1Ctx,
     limits: PeakLimiter,
+    gpu: crate::webgpu::GpuState,
 }
 
 /// Enforces the store limits and remembers the largest memory granted.
@@ -289,6 +292,7 @@ impl WasmExecutor {
 
         let mut linker = Linker::new(&engine);
         p1::add_to_linker_sync(&mut linker, |s: &mut StoreState| &mut s.wasi)?;
+        crate::webgpu::add_to_linker(&mut linker, |s: &mut StoreState| &mut s.gpu)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         // The epoch ticker drives every store's wall-clock deadline.
@@ -468,6 +472,8 @@ impl WasmExecutor {
             .instances(4)
             .trap_on_grow_failure(true)
             .build();
+        // Every epoch tick, check for cancellation and the wall-clock deadline.
+        let deadline = Instant::now() + Duration::from_millis(limits.timeout_ms);
         let mut store = Store::new(
             &self.engine,
             StoreState {
@@ -476,6 +482,12 @@ impl WasmExecutor {
                     inner: store_limits,
                     peak: 0,
                 },
+                gpu: crate::webgpu::GpuState::new(
+                    io.webgpu.clone(),
+                    deadline,
+                    cancel.clone(),
+                    limits.memory_bytes,
+                ),
             },
         );
         store.limiter(|s| &mut s.limits);
@@ -484,8 +496,6 @@ impl WasmExecutor {
         if let Err(e) = store.set_fuel(fuel_budget) {
             return RunResult::error(&format!("set fuel: {e}"), start);
         }
-        // Every epoch tick, check for cancellation and the wall-clock deadline.
-        let deadline = Instant::now() + Duration::from_millis(limits.timeout_ms);
         store.epoch_deadline_callback(move |_| {
             if cancel.load(Ordering::Relaxed) {
                 return Err(wasmtime::Error::msg(CANCELLED));
@@ -505,6 +515,7 @@ impl WasmExecutor {
 
         let fuel_used = fuel_budget.saturating_sub(store.get_fuel().unwrap_or(0));
         let peak = store.data().limits.peak as u64;
+        let gpu_note = store.data().gpu.summary();
         drop(store);
 
         let outcome = match result {
@@ -512,6 +523,9 @@ impl WasmExecutor {
             Err(e) => classify(e),
         };
         let mut stderr = stderr.contents().to_vec();
+        if let Some(note) = gpu_note {
+            stderr.extend_from_slice(format!("\n[pumasi] {note}\n").as_bytes());
+        }
         let files = match kept_out {
             Some(_) => Vec::new(),
             None => collect_output(&out_dir, &mut stderr),
@@ -529,7 +543,7 @@ impl WasmExecutor {
     }
 }
 
-const CANCELLED: &str = "pumasi: task cancelled";
+pub(crate) const CANCELLED: &str = "pumasi: task cancelled";
 
 /// Reads `/output` back, noting on stderr if the size cap cut it short.
 pub(crate) fn collect_output(out_dir: &std::path::Path, stderr: &mut Vec<u8>) -> Vec<FileEntry> {
@@ -845,6 +859,180 @@ mod tests {
         let y = run(None);
         assert_ne!(x.stdout[..16], y.stdout[..16], "real randomness by default");
         assert_eq!(a.peak_memory_bytes, Some(2 * 65536));
+    }
+
+    /// Runs a WGSL shader that turns `v[i]` into `3 * v[i] + 1` over 256
+    /// numbers through the `pumasi_webgpu` imports and checks the result.
+    /// Exit codes name the failed step; failures print the host's message
+    /// on stderr; success prints the adapter's JSON.
+    fn gpu_wat(shader: &str, buffer_bytes: u32) -> String {
+        let src = shader.replace('\n', "\\n");
+        let len = shader.len();
+        format!(
+            r#"
+    (module
+      (import "pumasi_webgpu" "adapter" (func $adapter (param i32 i32) (result i32)))
+      (import "pumasi_webgpu" "shader" (func $shader (param i32 i32 i32 i32) (result i32)))
+      (import "pumasi_webgpu" "buffer" (func $buffer (param i64) (result i32)))
+      (import "pumasi_webgpu" "write" (func $write (param i32 i64 i32 i32) (result i32)))
+      (import "pumasi_webgpu" "read" (func $read (param i32 i64 i32 i32) (result i32)))
+      (import "pumasi_webgpu" "dispatch" (func $dispatch (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "pumasi_webgpu" "wait" (func $wait (result i32)))
+      (import "pumasi_webgpu" "release" (func $release (param i32) (result i32)))
+      (import "pumasi_webgpu" "error" (func $error (param i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 1024) "{src}")
+      (data (i32.const 4000) "main")
+      (func $fail (param $code i32)
+        (i32.store (i32.const 0) (i32.const 20000))
+        (i32.store (i32.const 4) (call $error (i32.const 20000) (i32.const 4000)))
+        (drop (call $fd_write (i32.const 2) (i32.const 0) (i32.const 1) (i32.const 8)))
+        (call $exit (local.get $code)))
+      (func (export "_start")
+        (local $sh i32) (local $b i32) (local $i i32) (local $n i32)
+        (local.set $n (call $adapter (i32.const 16000) (i32.const 4000)))
+        (if (i32.lt_s (local.get $n) (i32.const 0)) (then (call $fail (i32.const 2))))
+        (local.set $sh (call $shader (i32.const 1024) (i32.const {len}) (i32.const 4000) (i32.const 4)))
+        (if (i32.lt_s (local.get $sh) (i32.const 0)) (then (call $fail (i32.const 3))))
+        (block $done (loop $fill
+          (br_if $done (i32.ge_u (local.get $i) (i32.const 256)))
+          (i32.store (i32.add (i32.const 8192) (i32.shl (local.get $i) (i32.const 2))) (local.get $i))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $fill)))
+        (local.set $b (call $buffer (i64.const {buffer_bytes})))
+        (if (i32.lt_s (local.get $b) (i32.const 0)) (then (call $fail (i32.const 4))))
+        (if (i32.lt_s (call $write (local.get $b) (i64.const 0) (i32.const 8192) (i32.const 1024)) (i32.const 0))
+          (then (call $fail (i32.const 5))))
+        (i32.store (i32.const 100) (local.get $b))
+        (if (i32.lt_s (call $dispatch (local.get $sh) (i32.const 100) (i32.const 1) (i32.const 4) (i32.const 1) (i32.const 1)) (i32.const 0))
+          (then (call $fail (i32.const 6))))
+        (if (i32.lt_s (call $wait) (i32.const 0)) (then (call $fail (i32.const 6))))
+        (if (i32.lt_s (call $read (local.get $b) (i64.const 0) (i32.const 12288) (i32.const 1024)) (i32.const 0))
+          (then (call $fail (i32.const 7))))
+        (local.set $i (i32.const 0))
+        (block $ok (loop $check
+          (br_if $ok (i32.ge_u (local.get $i) (i32.const 256)))
+          (if (i32.ne
+                (i32.load (i32.add (i32.const 12288) (i32.shl (local.get $i) (i32.const 2))))
+                (i32.add (i32.mul (local.get $i) (i32.const 3)) (i32.const 1)))
+            (then (call $exit (i32.const 8))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $check)))
+        (if (i32.lt_s (call $release (local.get $b)) (i32.const 0)) (then (call $fail (i32.const 9))))
+        (if (i32.ge_s (call $read (local.get $b) (i64.const 0) (i32.const 12288) (i32.const 4)) (i32.const 0))
+          (then (call $exit (i32.const 10))))
+        (i32.store (i32.const 0) (i32.const 16000))
+        (i32.store (i32.const 4) (local.get $n))
+        (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))
+    "#
+        )
+    }
+
+    const TRIPLE_WGSL: &str = "@group(0) @binding(0) var<storage, read_write> v: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x < arrayLength(&v)) { v[id.x] = v[id.x] * 3u + 1u; }
+}";
+
+    /// The machine's first WebGPU adapter, software ones included.
+    /// `PUMASI_TEST_WEBGPU=require` makes a missing one a failure (CI
+    /// installs a software Vulkan driver on Linux).
+    fn test_gpu() -> Option<crate::webgpu::WebGpuTask> {
+        let mut notes = Vec::new();
+        let gpu = crate::webgpu::WebGpu::detect(
+            crate::webgpu::Options {
+                software: true,
+                bench: false,
+            },
+            &[],
+            &mut notes,
+        );
+        if gpu.is_empty() {
+            assert!(
+                std::env::var("PUMASI_TEST_WEBGPU").as_deref() != Ok("require"),
+                "no WebGPU adapter: {notes:?}"
+            );
+            eprintln!("skipped: no WebGPU adapter here ({notes:?})");
+            return None;
+        }
+        eprintln!("WebGPU adapter: {}", gpu.adapters()[0].describe());
+        Some(crate::webgpu::WebGpuTask {
+            gpu: Arc::new(gpu),
+            adapter: 0,
+        })
+    }
+
+    fn run_gpu(wat: &str, gpu: Option<crate::webgpu::WebGpuTask>, limits: Limits) -> RunResult {
+        let bytes = wat::parse_str(wat).unwrap();
+        let hash = pumasi_proto::module_hash(&bytes);
+        let ex = WasmExecutor::new().unwrap();
+        ex.load_module(hash, &bytes).unwrap();
+        let io = TaskIo {
+            webgpu: gpu,
+            ..Default::default()
+        };
+        ex.run_io(
+            &hash,
+            "t",
+            &TaskInput::default(),
+            &[],
+            &limits,
+            None,
+            Default::default(),
+            &io,
+        )
+    }
+
+    #[test]
+    fn webgpu_without_a_gpu_fails_politely() {
+        let r = run_gpu(&gpu_wat(TRIPLE_WGSL, 1024), None, Limits::default());
+        assert_eq!(r.outcome, Outcome::Exited(2));
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(err.contains("gpus = 1"), "{err}");
+    }
+
+    #[test]
+    fn webgpu_runs_a_compute_shader() {
+        let Some(gpu) = test_gpu() else { return };
+        let r = run_gpu(
+            &gpu_wat(TRIPLE_WGSL, 1024),
+            Some(gpu.clone()),
+            Limits::default(),
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let info: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+        assert_eq!(info["name"], gpu.info().unwrap().name.as_str());
+        assert!(info["max_buffer_size"].as_u64().unwrap() >= 1024);
+
+        // WGSL errors come back with the compiler's message.
+        let r = run_gpu(
+            &gpu_wat("fn main() { nope }", 1024),
+            Some(gpu.clone()),
+            Limits::default(),
+        );
+        assert_eq!(r.outcome, Outcome::Exited(3));
+        assert!(!r.stderr.is_empty());
+
+        // GPU buffers count against the job's memory limit.
+        let limits = Limits {
+            memory_bytes: 1 << 20,
+            ..Default::default()
+        };
+        let r = run_gpu(&gpu_wat(TRIPLE_WGSL, 2 << 20), Some(gpu.clone()), limits);
+        assert_eq!(r.outcome, Outcome::Exited(4));
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(err.contains("memory limit"), "{err}");
+
+        // Unaligned sizes are refused before they reach the GPU.
+        let r = run_gpu(&gpu_wat(TRIPLE_WGSL, 1023), Some(gpu), Limits::default());
+        assert_eq!(r.outcome, Outcome::Exited(4));
     }
 
     #[test]

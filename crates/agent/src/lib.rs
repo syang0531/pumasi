@@ -13,6 +13,7 @@ pub mod platform;
 pub mod store;
 pub mod tempdir;
 pub mod upgrade;
+pub mod webgpu;
 
 pub use agent::{Agent, AgentConfig, Membership, default_node_name};
 pub use availability::AvailabilityConfig;

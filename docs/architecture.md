@@ -7,8 +7,9 @@ releases, OS services and signed agent upgrades of phase 4, the
 Windows support of phase 5, the Mac support and availability policy of
 phase 6, the benchmarks and compute units of phase 7, the cluster
 file store of phase 8, the GPUs and microVM devices of phase 9, the
-cluster management of phase 10, the monitoring of phase 11 and the web
-dashboard of phase 12. The
+cluster management of phase 10, the monitoring of phase 11, the web
+dashboard of phase 12, the control plane replicas of phase 13 and the
+WebGPU executor of phase 14. The
 product-level research and the decisions behind it (dual executor, fiat-only
 billing, honest confidentiality tiers) live in the research doc shared with
 the project; this file covers the code.
@@ -19,7 +20,7 @@ the project; this file covers the code.
 | --- | --- |
 | `pumasi-proto` | Job spec (`job.toml`), wire messages, framing, tickets, endpoint helpers, receipts (signing and verification), price list and policy, the OCI registry client, and `blobs.rs` (iroh-blobs helpers: collections from files and back, resumable push and fetch). No business logic. |
 | `pumasi-guest` | `pumasi-guest`, the init process inside every microVM (a static musl binary), and the disk protocol the agent shares with it. |
-| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `NodeStore` (the node's file store cache), `MicrovmExecutor` (ext4 formatter, Firecracker/QEMU/Virtualization.framework), `availability` (power, idle and hours policy), `platform` (sparse files, Windows Job Objects, the WHPX check) and the `Agent` session loop, which signs usage. |
+| `pumasi-agent` | `WasmExecutor` (Wasmtime sandbox, deterministic mode), `DockerExecutor` (Docker CLI), `NodeStore` (the node's file store cache), `MicrovmExecutor` (ext4 formatter, Firecracker/QEMU/Virtualization.framework), `availability` (power, idle and hours policy), `webgpu` (WebGPU adapters and the `pumasi_webgpu` host API), `platform` (sparse files, Windows Job Objects, the WHPX check) and the `Agent` session loop, which signs usage. |
 | `pumasi-cluster` | `State` (membership, queue, scheduler), `ledger.rs` (accounts, holds), `check.rs` (result checks), `datasets.rs` (datasets, quotas, secrets, storage billing), `files.rs` (the blob store, its access rules and tags), `transfer.rs` (the CLI's uploads and downloads), `Store` (redb), `Cluster` (iroh server), `AdminClient`. |
 | `pumasi-dashboard` | The web dashboard and JSON API behind `pumasi ui` (axum, maud templates, vendored htmx): one admin connection to the control plane, browser sessions holding a ticket each, pages, downloads as zip, live task output as server-sent events. |
 | `pumasi-cli` | The `pumasi` binary. Thin: parses args, calls the crates above, prints. `service.rs` installs the agent as an OS service, `upgrade.rs` drives rollouts. |
@@ -414,8 +415,12 @@ keeps its earnings reclaimable meanwhile.
 ### Release builds
 
 `.github/workflows/release.yml` runs on a `v*` tag. It builds `pumasi-cli`
-in release mode for six targets: `x86_64`/`aarch64-unknown-linux-musl`
-with cargo-zigbuild (static, so one binary covers every distribution),
+in release mode for six targets: `x86_64`/`aarch64-unknown-linux-gnu`
+with cargo-zigbuild against glibc 2.28 (one binary for every distribution
+since 2018; until phase 14 these were static musl binaries, but a static
+binary cannot `dlopen` the GPU drivers, Vulkan's loader, NVML or CUDA, so
+WebGPU and NVIDIA detection never worked in them; the release checks that
+no symbol newer than 2.28 is linked and that the binary finds lavapipe),
 `x86_64`/`aarch64-apple-darwin` with `MACOSX_DEPLOYMENT_TARGET=10.15` (Apple Silicon builds start at 11.0), and
 `x86_64`/`aarch64-pc-windows-msvc`. Assets are raw binaries named
 `pumasi-<os>-<arch>[.exe]` (what `pumasi upgrade rollout` takes as is),
@@ -1315,6 +1320,106 @@ exactly the job's cost; then the old leader returns as a follower, catches
 up, and a third job runs. A second test restores a backup and compares
 every row.
 
+## Phase 14: the WebGPU executor (experimental)
+
+A wasm task that asked for a GPU (`gpus = 1`, a `GpuRequest` on a wasm
+job) runs WGSL compute shaders on one WebGPU adapter. It is the way to use
+GPUs that have no CUDA (Intel and AMD integrated GPUs, old Intel Macs'
+GPUs, Apple Silicon) and works on NVIDIA and AMD cards too.
+
+### Host API
+
+`crates/agent/src/webgpu.rs` adds nine imports in the `pumasi_webgpu`
+module to the executor's linker, so every module links whether or not its
+task has a GPU (they fail with "this task has no GPU" when it does not):
+`adapter`, `shader`, `buffer`, `write`, `read`, `dispatch`, `wait`,
+`release` and `error`. They are plain core-module functions over the
+module's exported `memory`, because the executor runs WASI preview 1
+modules; each is one or two WebGPU calls (`createShaderModule` plus
+`createComputePipeline` with `layout: "auto"`, `createBuffer` with
+`STORAGE | UNIFORM | COPY_SRC | COPY_DST`, `queue.writeBuffer`, a compute
+pass with one bind group, `copyBufferToBuffer` plus `mapAsync`), so a
+module written against them moves to the component model's `wasi:webgpu`
+(wasi-gfx) without changing its shaders once Wasmtime runs that. Handles
+are small integers into a per-task table (4096 objects at most).
+Failures return -1 and keep the message for `error`; wgpu's validation and
+out-of-memory errors are caught with error scopes, everything else with an
+uncaptured-error handler and the device-lost callback, and a panic inside
+wgpu or a driver drops the device and fails the call.
+
+Limits: the job's `memory_mb` caps the sum of its GPU buffers (separately
+from its linear memory), and a buffer must fit the device's
+`max_buffer_size`. Waiting on the GPU (`read`, `wait`) polls the device in
+50 ms steps and stops at the task's deadline (a timeout) or when it is
+cancelled, like the epoch callback does for wasm code. Shaders themselves
+cannot be interrupted: a shader that never ends is stopped by the
+driver's watchdog (TDR on Windows, the kernel's hang check on Linux,
+macOS's GPU timeout). Fuel counts only wasm instructions. The device is
+opened at the task's first call with the adapter's own limits and no
+optional features, and dropped with the task. When the module used the
+GPU, a line on its stderr says how many dispatches it ran and how long it
+waited for the GPU.
+
+### Adapters and profiles
+
+`WebGpu::detect` enumerates adapters on Vulkan, Metal and DX12 (plus
+OpenGL on Linux, for GPUs without Vulkan; `WGPU_BACKEND` overrides it),
+drops those that cannot run compute shaders, keeps one entry per physical
+GPU on its best backend (Metal or DX12, then Vulkan, then OpenGL only when
+nothing else reaches the GPU), and leaves out software rasterizers
+(lavapipe, llvmpipe, WARP) unless `--webgpu-software` is given. Each
+adapter is matched to the device profile's GPU with the same PCI address
+(or the only GPU of its vendor with a matching name) and benchmarked: a
+WGSL shader of independent FMA chains, grown until a dispatch takes about
+150 ms, gives FP32 GFLOPS of the same kind as the CUDA benchmark's.
+
+The agent sends `FromAgent::WebGpu(SignedWebGpu)` after the welcome
+(protocol 12), signed with its node key, every time it connects, with no
+adapters when it was started without `--allow-webgpu`. The control plane
+checks the signature, that no two adapters claim one GPU, and stores it in
+the `member_webgpu` table (replicated like every other write).
+
+### Scheduling and billing
+
+An adapter's slot is the index of its GPU when it is one of the node's
+listed GPUs, otherwise `WEBGPU_SLOT_BASE + index` (65536 + index). The
+busy set of a node holds slots, so a Docker job and a WebGPU job never get
+the same GPU. A wasm task with a GPU request goes to a node whose WebGPU
+profile has a free adapter of the right vendor (hardware before software,
+then the fastest), and the assignment names the slot; the agent maps it
+back to its adapter. Wasm GPU requests take exactly one GPU and no memory
+minimum (WebGPU does not report VRAM). Nodes with adapters get the label
+`webgpu=<count>`.
+
+The run's receipt carries a `GpuBilling` naming the adapter
+(`<name> (WebGPU, <backend>)`) at the GFLOPS it is billed at: trusted
+nodes at what they measured; untrusted ones at the CUDA GPU's checked
+figure when the adapter is a GPU the cluster timed (a wrong answer bills
+nothing), else at most `UNCHECKED_WEBGPU_GFLOPS` (1 TFLOPS), since no
+challenge runs over WebGPU yet (the challenge hash uses only 32-bit
+integer operations, so a WGSL version is the obvious next step). GPU
+float results differ between GPUs, so a wasm job with a GPU is not
+deterministic (`deterministic` defaults to off for it and cannot be
+turned on) and is never re-run to check it.
+
+### Examples and CI
+
+`examples/webgpu` builds `matmul.wasm` (a 16 x 16 tiled matrix
+multiplication) and `blur.wasm` (a two-pass Gaussian blur of a PPM image)
+for `wasm32-wasip1`, with `src/lib.rs` as a small safe wrapper of the
+imports. Both compute the same thing on the CPU inside the sandbox, where
+Wasmtime's canonical NaNs make the result bit-identical on every machine,
+compare the GPU's answer within a relative tolerance of 1e-3 and print both
+times. CI's `webgpu` job runs them on Linux (lavapipe), Windows and macOS
+(whatever adapter the hosted runner has; a runner without one is noted and
+skipped), and `webgpu-compare` checks that the CPU checksums are identical
+across the OSes and the GPU ones within the tolerance, with a table of the
+speeds in the job summary. The unit tests run a WAT module through the
+imports on the first adapter, and the end-to-end test runs a wasm GPU job
+through a real control plane and agent (`PUMASI_TEST_WEBGPU=require` makes
+a missing adapter a failure; CI sets it on Linux). Old Intel Macs (Metal
+on macOS 10.15, Haswell-era Intel and Kepler GPUs) are checked by hand.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -1377,7 +1482,7 @@ Phase 13 keeps layout 6 and adds the table `raft_sm` (applied log id and
 membership) to `state.redb`, and `raft.redb`, `snapshot.bin`,
 `endpoint.key` and `join.peers` beside it on replicas.
 
-`PROTOCOL_VERSION` is 11: protocol 5 (phase 4) added `UpgradeHello` and the
+`PROTOCOL_VERSION` is 12: protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
 `BenchResult` and `ToAgent::Benchmark` and `Rebenchmark`, which the control
@@ -1392,7 +1497,8 @@ tasks and challenges. Protocol 10 adds `FromAgent::Metrics` and
 itself, an agent sends them only to a control plane that knows them. The hello is unchanged. Protocol 11 adds `HelloReply::NotLeader` and
 `ToAgent::Replicas`; a protocol 10 agent talking to a follower sees an
 unknown reply and retries, so it reaches the cluster only while the replica
-it joined leads. The control plane accepts hellos from
+it joined leads. Protocol 12 adds `FromAgent::WebGpu`; protocol 11 agents
+get no wasm jobs with GPUs. The control plane accepts hellos from
 `MIN_AGENT_PROTOCOL` (5) up: `AgentHello::decode` tries the current layout
 and falls back to the protocol 5 one (available), so phase 4 and 5 agents
 keep working and can take a rollout. Upgrade the control plane first; it
@@ -1406,8 +1512,7 @@ remotely; install a current binary on them once.
   per-node quotas for caches beyond the size cap. Private images are pulled
   from the registry again for each job (nodes that already loaded the
   digest skip the download from the store).
-- GPUs: Intel and Apple GPUs are listed but no executor uses them (the
-  WebGPU executor of phase 14 will); AMD GPUs are not benchmarked, only
+- GPUs: Intel and Apple GPUs are used only through WebGPU; AMD GPUs are not benchmarked, only
   estimated, and cannot take the GPU challenge (billed at the reference at
   most on providers); passthrough is NVIDIA-only and untested in CI; MIG
   and vGPU slices are not scheduled separately.
@@ -1430,7 +1535,14 @@ remotely; install a current binary on them once.
   sessions are in memory only; there is no TLS of its own (use a reverse
   proxy when serving other machines); charts are server-drawn snapshots
   that refresh every 10 seconds rather than streaming.
-- Remaining roadmap phases (14 to 18): WebGPU, the confidential
+- WebGPU: compute shaders only (no textures, samplers or render
+  passes), one bind group, no optional features such as `shader-f16` or
+  subgroups, one adapter per task, no GPU challenge over WebGPU (so an
+  untrusted node's adapter is billed at 1 TFLOPS at most), shaders that
+  never end are stopped by the driver's watchdog rather than the job's
+  timeout, no GPU metrics for adapters that are not listed GPUs, and core
+  modules only (no `wasi:webgpu` components until Wasmtime runs them).
+- Remaining roadmap phases (15 to 18): the confidential
   tier, self-hosting 1.0 (SSO, audit log, external security review), the
   hub, buying CU. See the roadmap in the README.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker

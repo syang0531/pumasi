@@ -114,6 +114,7 @@ fn agent_config(name: &str, slots: u32, dir: PathBuf) -> AgentConfig {
         store_cache_bytes: None,
         gpus: false,
         fake_gpus: None,
+        webgpu: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -556,6 +557,7 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         store_cache_bytes: None,
         gpus: false,
         fake_gpus: None,
+        webgpu: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1166,6 +1168,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         store_cache_bytes: None,
         gpus: false,
         fake_gpus: None,
+        webgpu: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1328,6 +1331,7 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         store_cache_bytes: None,
         gpus: false,
         fake_gpus: None,
+        webgpu: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1467,7 +1471,15 @@ async fn microvm_jobs_run_on_an_invited_provider() {
     }
 
     // Network (phase 9): only with `network = true`, only public
-    // addresses, never this host or private ranges.
+    // addresses, never this host or private ranges. The node's device
+    // profile (with its microVM networking) arrives after it is online, so
+    // read the node again rather than trust the view from the start.
+    let node = cluster
+        .status()
+        .nodes
+        .into_iter()
+        .find(|n| n.id == provider_id)
+        .unwrap();
     microvm_network(&client, &node).await;
 
     client.close().await;
@@ -1688,6 +1700,7 @@ async fn upgradable(name: &str, dir: PathBuf, exe: PathBuf, auto: Option<bool>) 
         store_cache_bytes: None,
         gpus: false,
         fake_gpus: None,
+        webgpu: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1951,5 +1964,155 @@ async fn device_profiles_reach_the_control_plane() {
     assert_eq!(gpus[0].busy, None);
     assert!(!node_named(&cluster, "gpu-box").microvm_network);
     node.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+/// Triples 256 numbers with a WGSL shader through the `pumasi_webgpu`
+/// imports, checks them and prints "ok"; exits 2 without a GPU, 3 when
+/// the GPU calls fail (the host's message on stderr), 4 on a wrong result.
+fn webgpu_wat() -> String {
+    let shader = "@group(0) @binding(0) var<storage, read_write> v: array<u32>;\\n\
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\\n\
+if (id.x < arrayLength(&v)) { v[id.x] = v[id.x] * 3u + 1u; } }";
+    let len = shader.replace("\\n", "\n").len();
+    format!(
+        r#"
+(module
+  (import "pumasi_webgpu" "adapter" (func $adapter (param i32 i32) (result i32)))
+  (import "pumasi_webgpu" "shader" (func $shader (param i32 i32 i32 i32) (result i32)))
+  (import "pumasi_webgpu" "buffer" (func $buffer (param i64) (result i32)))
+  (import "pumasi_webgpu" "write" (func $write (param i32 i64 i32 i32) (result i32)))
+  (import "pumasi_webgpu" "read" (func $read (param i32 i64 i32 i32) (result i32)))
+  (import "pumasi_webgpu" "dispatch" (func $dispatch (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "pumasi_webgpu" "error" (func $error (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{shader}")
+  (data (i32.const 4000) "main")
+  (data (i32.const 4010) "ok")
+  (func $fail (param $code i32)
+    (i32.store (i32.const 0) (i32.const 20000))
+    (i32.store (i32.const 4) (call $error (i32.const 20000) (i32.const 4000)))
+    (drop (call $fd_write (i32.const 2) (i32.const 0) (i32.const 1) (i32.const 8)))
+    (call $exit (local.get $code)))
+  (func (export "_start")
+    (local $sh i32) (local $b i32) (local $i i32)
+    (if (i32.lt_s (call $adapter (i32.const 16000) (i32.const 3000)) (i32.const 0)) (then (call $fail (i32.const 2))))
+    (local.set $sh (call $shader (i32.const 1024) (i32.const {len}) (i32.const 4000) (i32.const 4)))
+    (if (i32.lt_s (local.get $sh) (i32.const 0)) (then (call $fail (i32.const 3))))
+    (block $done (loop $fill
+      (br_if $done (i32.ge_u (local.get $i) (i32.const 256)))
+      (i32.store (i32.add (i32.const 8192) (i32.shl (local.get $i) (i32.const 2))) (local.get $i))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $fill)))
+    (local.set $b (call $buffer (i64.const 1024)))
+    (if (i32.lt_s (local.get $b) (i32.const 0)) (then (call $fail (i32.const 3))))
+    (if (i32.lt_s (call $write (local.get $b) (i64.const 0) (i32.const 8192) (i32.const 1024)) (i32.const 0))
+      (then (call $fail (i32.const 3))))
+    (i32.store (i32.const 100) (local.get $b))
+    (if (i32.lt_s (call $dispatch (local.get $sh) (i32.const 100) (i32.const 1) (i32.const 4) (i32.const 1) (i32.const 1)) (i32.const 0))
+      (then (call $fail (i32.const 3))))
+    (if (i32.lt_s (call $read (local.get $b) (i64.const 0) (i32.const 12288) (i32.const 1024)) (i32.const 0))
+      (then (call $fail (i32.const 3))))
+    (local.set $i (i32.const 0))
+    (block $ok (loop $check
+      (br_if $ok (i32.ge_u (local.get $i) (i32.const 256)))
+      (if (i32.ne
+            (i32.load (i32.add (i32.const 12288) (i32.shl (local.get $i) (i32.const 2))))
+            (i32.add (i32.mul (local.get $i) (i32.const 3)) (i32.const 1)))
+        (then (call $exit (i32.const 4))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $check)))
+    (i32.store (i32.const 0) (i32.const 4010))
+    (i32.store (i32.const 4) (i32.const 2))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))
+"#
+    )
+}
+
+/// A wasm job with `gpus = 1` runs only on the node that offers a WebGPU
+/// adapter, one task at a time per adapter, and its receipts name the
+/// adapter. Uses a software rasterizer when the machine has no GPU
+/// (`PUMASI_TEST_WEBGPU=require` makes a missing adapter a failure).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webgpu_jobs_run_on_nodes_that_offer_a_gpu() {
+    init_tracing();
+    let mut config = agent_config("gpu", 4, tempdir("gpu"));
+    config.webgpu = Some(pumasi_agent::webgpu::Options {
+        software: true,
+        bench: true,
+    });
+    let gpu_agent = Agent::new(config).await.unwrap();
+    let adapters = gpu_agent.webgpu().profile.adapters.clone();
+    if adapters.is_empty() {
+        assert!(
+            std::env::var("PUMASI_TEST_WEBGPU").as_deref() != Ok("require"),
+            "no WebGPU adapter: {:?}",
+            gpu_agent.webgpu().profile.notes
+        );
+        eprintln!("skipped: no WebGPU adapter here");
+        return;
+    }
+    eprintln!("WebGPU adapter: {}", adapters[0].describe());
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let g = spawn_join(gpu_agent, ticket.clone());
+    let p = spawn_join(agent("plain", 4, tempdir("plain")).await, ticket);
+    wait_online(&cluster, 2).await;
+    for _ in 0..100 {
+        if !node_named(&cluster, "gpu").webgpu.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let node = node_named(&cluster, "gpu");
+    assert_eq!(node.webgpu.len(), adapters.len());
+    assert!(node_named(&cluster, "plain").webgpu.is_empty());
+
+    let client = admin(&cluster).await;
+    let mut sub = submission(vec![vec![]; 4]);
+    sub.name = "webgpu".into();
+    sub.module = wat::parse_str(webgpu_wat()).unwrap();
+    sub.gpu = Some(pumasi_proto::gpu::GpuRequest {
+        count: 1,
+        vendor: None,
+        min_vram_mib: 0,
+    });
+    sub.max_attempts = 1;
+    let id = submit(&client, sub).await;
+    let view = wait_job(&client, id, 120).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    for t in &view.tasks {
+        assert_eq!(t.stdout.as_deref(), Some(&b"ok"[..]));
+        assert_eq!(
+            t.node.as_deref(),
+            Some(node.id.as_str()),
+            "only the GPU node"
+        );
+        let err = String::from_utf8_lossy(t.stderr.as_deref().unwrap_or_default());
+        assert!(err.contains("[pumasi] WebGPU"), "{err}");
+    }
+    let r = receipts(&client, id).await;
+    assert_eq!(r.len(), 4);
+    for r in &r {
+        r.verify().unwrap();
+        let g = r.gpu.as_ref().expect("GPU billing on the receipt");
+        assert!(g.names[0].contains("WebGPU"), "{g:?}");
+    }
+
+    // Without an adapter the same module fails politely (exit 2).
+    let mut plain = submission(vec![vec![]]);
+    plain.module = wat::parse_str(webgpu_wat()).unwrap();
+    plain.max_attempts = 1;
+    let id = submit(&client, plain).await;
+    let view = wait_job(&client, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Failed);
+
+    client.close().await;
+    g.kill().await;
+    p.kill().await;
     cluster.shutdown().await.unwrap();
 }

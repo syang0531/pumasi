@@ -6,7 +6,7 @@
 
 ## 설치
 
-릴리스마다 Linux(x86_64, aarch64, 정적 링크), macOS(x86_64는 10.15부터, Apple Silicon), Windows(x86_64, ARM64)용 `pumasi` 바이너리와 `SHA256SUMS`, 그리고 맞는 바이너리를 받아 체크섬까지 확인하는 설치 스크립트 두 개가 올라갑니다.
+릴리스마다 Linux(x86_64, aarch64, glibc 2.28 이상이라 2018년 이후 배포판 전부. Alpine은 `--target x86_64-unknown-linux-musl`로 직접 빌드하며 GPU는 못 씀), macOS(x86_64는 10.15부터, Apple Silicon), Windows(x86_64, ARM64)용 `pumasi` 바이너리와 `SHA256SUMS`, 그리고 맞는 바이너리를 받아 체크섬까지 확인하는 설치 스크립트 두 개가 올라갑니다.
 
 ```sh
 # Linux, macOS: root면 /usr/local/bin, 아니면 ~/.local/bin에 설치
@@ -95,10 +95,32 @@ pumasi run examples/pytorch-cuda/job.toml --output
 
 - **NVIDIA**: NVML(드라이버에 들어 있는 라이브러리, 있으면 실행 중에 불러옴)로 찾고 CUDA 드라이버로 벤치마크합니다(FP32 처리량, 메모리 대역폭, 클러스터 GPU 검증용 해시 속도). Docker 작업에는 `--gpus device=...`로 넘기므로 Linux는 NVIDIA Container Toolkit이 필요하고, Windows Docker Desktop(WSL 2)은 기본으로 지원합니다.
 - **AMD**(Linux): sysfs로 찾고, FP32는 연산 유닛 수와 클럭으로 추정합니다. Docker 작업에는 `/dev/kfd`와 그 GPU의 render 노드를 넘깁니다(ROCm 이미지).
-- **Intel·Apple GPU**는 정보로만 표시하고 아직 어떤 실행기도 쓰지 않습니다.
+- **Intel·Apple GPU**를 비롯해 CUDA가 없는 GPU는 wasm 작업이 WebGPU로 씁니다(아래).
 - **microVM(실험)**: Linux에서 `vfio-pci`에 묶여 있고 IOMMU 그룹이 깨끗하며 화면에 연결되지 않은 GPU는 microVM에 패스스루할 수 있습니다. VM은 GPU용 게스트 커널로 부팅해 자기 NVIDIA 드라이버를 올립니다(`scripts/kernel/build-gpu.sh`로 번들을 만들고 `pumasi vm setup --gpu-bundle DIR`로 설치, 바인딩 명령은 `pumasi gpu check`가 알려 줌). 제공자가 커널을 공유하지 않고 GPU를 빌려줄 수 있습니다.
 
 GPU 시간은 CPU·메모리에 더해 `gpu-tflops-hour`(기본 FP32 1 TFLOPS·1시간당 0.1 CU)와 `gpu-vram-gib-hour`(GPU 메모리 1 GiB·1시간당 0.3 CU)로 과금하므로, 12 GiB·12.7 TFLOPS 카드는 시간당 약 4.9 CU입니다. 내 기기는 잰 값 그대로 과금합니다. 제공자의 GPU는 컨트롤 플레인이 먼저 그 GPU만 빨리 풀 수 있는 챌린지로 시간을 잽니다. 틀린 답은 스트라이크이고 과금도 0, 주장보다 느린 GPU는 잰 만큼만, 챌린지를 못 받는 GPU(CUDA 없음)는 최대 10 TFLOPS로 과금합니다. 검증은 결과 검증 비율로 반복합니다. GPU 결과 자체는 결정적이지 않아 재실행 검증은 하지 않습니다. `pumasi node <id>`로 GPU별 과금 기준을 볼 수 있고, `--no-gpus`로 에이전트의 GPU를 클러스터에서 뺄 수 있습니다.
+
+### WebGPU: wasm 작업에서 어떤 GPU든 (실험)
+
+`gpus = 1`을 요청한 wasm 작업은 WebGPU로 GPU 하나를 받습니다. 에이전트가 [wgpu](https://wgpu.rs)로 기기에 있는 API(Linux는 Vulkan, macOS는 Metal, Windows는 DX12, 대안으로 OpenGL)를 열고, 모듈은 작은 호스트 API인 `pumasi_webgpu` 임포트로 WGSL 컴퓨트 셰이더를 실행합니다. CUDA가 없는 GPU(Intel·AMD 내장 GPU, 구형 Intel Mac의 GPU, Apple Silicon)를 쓰는 유일한 길입니다. 샌드박스는 그대로이고(네트워크 없음, `/input`·`/output` 밖 파일 없음), 작업의 메모리 한도와 제한 시간이 GPU에도 적용됩니다.
+
+```sh
+pumasi gpu webgpu                     # 이 기기가 제공하는 어댑터와 벤치마크
+cargo build --release --target wasm32-wasip1 --manifest-path examples/webgpu/Cargo.toml
+pumasi exec --gpu examples/webgpu/target/wasm32-wasip1/release/matmul.wasm 1024
+pumasi agent start --allow-webgpu     # 이 기기의 어댑터를 클러스터에 제공
+pumasi run examples/webgpu/matmul.toml --output
+```
+
+```toml
+module = "matmul.wasm"
+gpus = 1                              # 태스크마다 WebGPU 어댑터 하나
+gpu = { vendor = "intel" }            # 선택: nvidia, amd, intel, apple, any
+```
+
+`examples/webgpu`의 두 예제(타일 행렬곱, PPM 이미지 가우시안 블러)는 GPU 결과를 CPU에서 같은 계산을 돌린 결과와 비교하고 두 속도를 출력합니다. 그 안의 `src/lib.rs`는 호스트 API의 작은 Rust 래퍼라 가져다 쓰면 됩니다. 호출은 `adapter`(GPU 정보 JSON), `shader`(WGSL 컴파일), `buffer`, `write`/`read`, `dispatch`(`@group(0) @binding(0..n)`에 버퍼를 묶고 워크그룹 실행), `wait`, `release`, `error`(실패 이유, WGSL 컴파일 오류 포함)이고, 실패하면 음수를 돌려줍니다. WebGPU와 1:1로 대응하므로 Wasmtime이 컴포넌트 모델의 `wasi:webgpu`(wasi-gfx)를 지원하면 그쪽으로 옮길 수 있습니다.
+
+에이전트는 `--allow-webgpu`일 때만 WebGPU를 제공합니다(제공자도 마찬가지. WebGPU는 브라우저처럼 셰이더를 모두 검증하고 메모리 접근 범위를 검사하지만 GPU 드라이버에 닿기는 합니다). 노드의 GPU 목록에 있는 GPU와 같은 어댑터는 슬롯을 공유하므로 Docker 작업과 WebGPU 작업이 한 GPU를 동시에 쓰지 않습니다. 시간은 다른 GPU처럼 에이전트가 WGSL 셰이더로 잰 FP32 성능으로 과금합니다. WebGPU용 GPU 챌린지는 아직 없어서, 제공자의 어댑터는 클러스터가 이미 시간을 잰 CUDA GPU가 아니면 최대 1 TFLOPS로 과금합니다. GPU마다 결과가 조금씩 달라 이 작업은 결정적이지 않고 재실행 검증도 하지 않습니다. CI는 두 예제를 Linux(소프트웨어 Vulkan 드라이버 lavapipe), Windows, macOS에서 돌려 OS 간 결과를 비교하고, 실제 GPU는 손으로 확인합니다.
 
 ### Windows
 
@@ -417,14 +439,14 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi cluster start [--metrics-addr ADDR]` | 컨트롤 플레인 실행. 처음 실행하면 클러스터를 만들고, 상태는 `~/.pumasi/cluster`에 저장합니다. `--metrics-addr`는 Prometheus 지표 제공 |
 | `pumasi token [--ttl 24h] [--uses N]` | 내 다른 기기용 참가 티켓 발급 |
 | `pumasi invite <계정> [--ttl 7d] [--uses 1] [--allow-docker]` | 다른 사람의 기기를 `계정` 몫으로 버는 제공자로 초대 |
-| `pumasi agent join <티켓> [--allow-docker] [--allow-microvm] [--no-gpus]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`). `--no-gpus`가 아니면 GPU도 제공 |
+| `pumasi agent join <티켓> [--allow-docker] [--allow-microvm] [--allow-webgpu] [--no-gpus]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업, `--allow-webgpu`면 GPU를 쓰는 wasm 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`, 테스트용 `--webgpu-software`). `--no-gpus`가 아니면 GPU도 제공 |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | 이전에 참가한 클러스터에 티켓 없이 재접속 |
 | `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- 에이전트 옵션]` | 부팅 시 시작하는 서비스로 에이전트 설치 (systemd, launchd, Windows 서비스). `status`, `uninstall`도 있음 |
 | `pumasi upgrade rollout 파일... [--wait] [--force]` | 클러스터 키로 서명한 새 에이전트 바이너리를 노드에 배포. `upgrade status`로 노드별 상태, `upgrade cancel`로 중단 |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치. `--gpu-bundle`은 패스스루용 GPU 게스트 커널과 드라이버 추가 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
 | `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
-| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄 |
+| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` / `gpu webgpu [--software]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄. `webgpu`는 wasm 작업이 쓸 수 있는 WebGPU 어댑터 목록 |
 | `pumasi store put 이름 경로... [--account A]` / `get 이름[@버전] \| --job ID [-o DIR]` / `ls [이름]` / `rm 이름[@버전]` / `usage` / `quota 계정 크기\|none` | 클러스터 파일 저장소: 버전 있는 데이터셋, 작업 출력, 이어받기, 쿼터 |
 | `pumasi secret set 이름 [값]` / `ls` / `rm 이름` | 클러스터 비밀. `registry/<호스트>`는 비공개 레지스트리 로그인 |
 | `pumasi run job.toml [--account A] [--priority N] [--after 작업] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
@@ -456,7 +478,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi cluster replica <티켓> [--net public\|local] [--bind ADDR]` | 이 기기를 컨트롤 플레인 복제본으로 실행 (나중에는 `pumasi cluster start`로 다시 시작) |
 | `pumasi backup FILE` / `pumasi cluster restore FILE` | 컨트롤 플레인 상태와 클러스터 키의 일관된 사본, 그리고 그 사본으로 컨트롤 플레인 만들기 |
 | `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB]` | 이 기기에서 웹 대시보드와 JSON API 제공(기본 127.0.0.1:7400) |
-| `pumasi exec module.wasm [--input DIR] [--seed S] [인자...]` | 에이전트와 같은 샌드박스로 로컬 실행 (`DIR`이 `/input`으로 보이고 `/output`은 `pumasi-out/exec`에 저장, `--seed`는 결정적 모드) |
+| `pumasi exec module.wasm [--input DIR] [--seed S] [--gpu] [인자...]` | 에이전트와 같은 샌드박스로 로컬 실행 (`DIR`이 `/input`으로 보이고 `/output`은 `pumasi-out/exec`에 저장, `--seed`는 결정적 모드, `--gpu`는 이 기기의 가장 좋은 WebGPU 어댑터를 줌) |
 
 `--home DIR` 또는 `PUMASI_HOME`으로 상태 디렉터리를 바꾸면 한 기기에서 클러스터와 에이전트 여러 개를 띄워 시험할 수 있습니다.
 
@@ -470,7 +492,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | 실행 위치 | 모든 노드 | `--allow-docker`로 시작한 노드만 (제공자는 초대에도 `--allow-docker` 필요) | `--allow-microvm`으로 시작한 노드 (제공자 포함) |
 | 격리 | Wasmtime 샌드박스, 모르는 코드도 안전 | 컨테이너, 내 기기나 믿는 사람끼리만 | 태스크마다 자기 커널을 가진 VM |
 | 네트워크 | 불가 | 기본 차단, `network = true`로 허용 | 기본 차단, `network = true`면 공인 주소에만 |
-| GPU | 불가 | `gpus = N` 또는 `gpu = {...}` (NVIDIA, Linux의 AMD) | `gpus = N`, VFIO 패스스루 (Linux, 실험) |
+| GPU | `gpus = 1`: WebGPU로 어떤 GPU든 (`--allow-webgpu` 노드, 실험) | `gpus = N` 또는 `gpu = {...}` (NVIDIA, Linux의 AMD) | `gpus = N`, VFIO 패스스루 (Linux, 실험) |
 | 파일 | `/input`, `/output` | `/input`, `/output` | `/input`, `/output` |
 
 WASM 작업:
@@ -481,7 +503,8 @@ module = "montecarlo.wasm"            # wasm32-wasip1 모듈
 shards = 16                           # 태스크 N개, {shard}·{shards} 치환
 args = ["sample", "{shard}", "5000000"]
 files = ["data/"]                     # 선택, /input 아래에 보임
-deterministic = true                  # 기본값: 가상 시계 + 시드 고정 난수, 결과 검증 가능
+deterministic = true                  # 기본값(gpus가 있으면 꺼짐): 가상 시계 + 시드 고정 난수, 결과 검증 가능
+# gpus = 1                            # WebGPU로 GPU 하나 (pumasi_webgpu 임포트)
 priority = 0                          # -1000~1000, 높을수록 먼저 돌고 낮은 것을 선점할 수 있음
 after = []                            # 먼저 성공해야 하는 작업 ID
 tolerations = []                      # 허용하는 노드 테인트, 예: ["gpu-only"]
@@ -569,14 +592,14 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 10 | 클러스터 관리: 노드 라벨·테인트, 작업 selector·toleration, cordon·drain, 우선순위와 선점, 계정별 쿼터(슬롯, GPU, 하루 CU, 우선순위, 저장 용량), 역할 티켓(admin, submitter, viewer), 선언적 `apply`와 `get`·`describe`, cron 스케줄, 작업 의존성 | 완료 |
 | 11 | 모니터링·경보: 노드 지표(CPU, 메모리, 디스크, 네트워크, 온도, GPU)를 다운샘플링해 7일 보관, `top`, 실시간 `logs -f`, `events`, 선택형 Prometheus 엔드포인트와 Grafana 대시보드, 경보 규칙(노드 오프라인, 실패율, 디스크, 온도, 벤치마크 저하, SMART, 검증 불일치)을 Slack·Discord·JSON 웹훅으로 | 완료 |
 | 12 | 바이너리에 내장한 웹 대시보드(`pumasi ui`): 개요, 차트·cordon·drain이 있는 노드, 제출·실시간 출력·취소·출력 다운로드가 되는 작업, 업로드·다운로드가 되는 저장소, CU와 원장, 초대와 액세스 티켓, 요금, 이벤트와 경보. 액세스 티켓과 역할로 로그인, 한국어·영어, OpenAPI가 있는 JSON API, CI의 Playwright 테스트 | 완료 |
-| 13 | 컨트롤 플레인 고가용성: 상태를 Raft(openraft)로 3대 또는 5대에 복제, 자동 장애 전환과 리더를 따라가는 노드·CLI·대시보드, 모든 복제본이 담긴 티켓, 스냅숏으로 따라잡는 복제본, `pumasi backup`과 `cluster restore` | 이번 릴리스 |
-| 14 | WebGPU 실행기(실험) | 예정 |
+| 13 | 컨트롤 플레인 고가용성: 상태를 Raft(openraft)로 3대 또는 5대에 복제, 자동 장애 전환과 리더를 따라가는 노드·CLI·대시보드, 모든 복제본이 담긴 티켓, 스냅숏으로 따라잡는 복제본, `pumasi backup`과 `cluster restore` | 완료 |
+| 14 | WebGPU 실행기(실험): `gpus = 1`인 wasm 작업이 wgpu(Vulkan, Metal, DX12, GL)와 `pumasi_webgpu` 임포트로 어떤 GPU에서든 WGSL 컴퓨트 셰이더 실행, WGSL 벤치마크가 담긴 서명된 어댑터 프로필, GPU 목록과 슬롯 공유, GPU 시간 CU 과금, CI에서 Linux·Windows·macOS 결과를 CPU와 비교하는 행렬곱·블러 예제, GPU 드라이버를 불러올 수 있는 glibc Linux 바이너리 | 이번 릴리스 |
 | 15 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
 | 16 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델, CI에 cargo-audit·cargo-deny·퍼징, 외부 보안 점검, 운영 문서, 72시간 장기 안정성 테스트 뒤 1.0 태그 | 예정 |
 | 17 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
 | 18 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: 파일 저장소의 데이터는 쓰기마다가 아니라 30초마다 다른 컨트롤 플레인 복제본에 복사되므로, 리더가 죽기 직전에 올린 파일은 그 리더가 돌아올 때까지 없을 수 있습니다. `pumasi upgrade rollout`으로 올린 에이전트 바이너리는 받은 복제본에만 있습니다(장애 전환 뒤에는 다시 배포). 이번 릴리스보다 오래된 에이전트는 처음 참가한 복제본만 따라갑니다. CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 표시만 합니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. microVM 태스크 출력은 끝날 때에야 `pumasi logs`에 나타나고(게스트가 출력 디스크에 쓰기 때문), Intel·Apple GPU는 지표가 없고 Windows 노드는 온도를 보고하지 않으며, 최근 1시간의 10초 단위 지표는 컨트롤 플레인을 다시 시작하면 사라집니다. 대시보드는 요금과 경보 규칙을 보여 주기만 하고 바꾸지는 않으며(CLI와 `apply`로 바꿈), 로그인 세션을 메모리에만 두므로 `pumasi ui`를 다시 시작하면 모두 로그아웃됩니다.
+알려진 한계: 파일 저장소의 데이터는 쓰기마다가 아니라 30초마다 다른 컨트롤 플레인 복제본에 복사되므로, 리더가 죽기 직전에 올린 파일은 그 리더가 돌아올 때까지 없을 수 있습니다. `pumasi upgrade rollout`으로 올린 에이전트 바이너리는 받은 복제본에만 있습니다(장애 전환 뒤에는 다시 배포). 이번 릴리스보다 오래된 에이전트는 처음 참가한 복제본만 따라갑니다. CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 WebGPU로만 씁니다. WebGPU는 실험 기능입니다. CI에서는 소프트웨어 래스터라이저로, 실제 GPU는 손으로 확인하며, 컴퓨트 셰이더만 되고(텍스처·샘플러 없음, 바인드 그룹 하나, f16 없음), 폭주하는 셰이더는 작업 제한 시간이 아니라 GPU 드라이버의 감시 타이머가 멈추고, WebGPU용 GPU 챌린지는 아직 없습니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. microVM 태스크 출력은 끝날 때에야 `pumasi logs`에 나타나고(게스트가 출력 디스크에 쓰기 때문), Intel·Apple GPU는 지표가 없고 Windows 노드는 온도를 보고하지 않으며, 최근 1시간의 10초 단위 지표는 컨트롤 플레인을 다시 시작하면 사라집니다. 대시보드는 요금과 경보 규칙을 보여 주기만 하고 바꾸지는 않으며(CLI와 `apply`로 바꿈), 로그인 세션을 메모리에만 두므로 `pumasi ui`를 다시 시작하면 모두 로그아웃됩니다.
 
 ## 라이선스
 

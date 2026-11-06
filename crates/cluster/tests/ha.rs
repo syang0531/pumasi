@@ -251,6 +251,7 @@ async fn provider(name: &str, slots: u32, ticket: JoinTicket) -> RunningAgent {
         store_cache_bytes: None,
         gpus: false,
         fake_gpus: None,
+        webgpu: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,

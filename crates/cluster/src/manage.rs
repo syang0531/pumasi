@@ -416,6 +416,13 @@ impl State {
         if !gpus.is_empty() {
             put("gpus", gpus.len().to_string());
         }
+        if let Some(w) = self
+            .webgpu
+            .get(id)
+            .filter(|w| !w.profile.adapters.is_empty())
+        {
+            put("webgpu", w.profile.adapters.len().to_string());
+        }
         if let Some(d) = m.perf.as_ref().and_then(|p| p.profile.disk.as_ref()) {
             put("disk", d.class.to_string());
         }

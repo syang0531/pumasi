@@ -33,8 +33,10 @@ use pumasi_proto::{
         GPU_CHALLENGE_SOLUTIONS, GpuChallenge, GpuInfo, REFERENCE_GPU_GFLOPS, SignedDevices,
         check_answer, expected_hashes, target_for,
     },
-    msg::{GpuView, TaskRef, ToAgent},
+    job::Executor,
+    msg::{GpuView, TaskRef, ToAgent, WebGpuView},
     receipt::GpuBilling,
+    webgpu::{SignedWebGpu, UNCHECKED_WEBGPU_GFLOPS, WebGpuAdapter},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -163,7 +165,151 @@ pub fn billed_gflops(m: &Member, rec: &DeviceRecord, g: &GpuInfo) -> (u32, Optio
     }
 }
 
+/// The FP32 GFLOPS a WebGPU adapter's runs are billed at. No challenge
+/// runs over WebGPU yet, so an untrusted node's adapter is billed at most
+/// [`UNCHECKED_WEBGPU_GFLOPS`], unless it is a listed GPU the cluster
+/// timed, whose checked figure then caps it.
+pub fn billed_webgpu_gflops(
+    m: &Member,
+    rec: Option<&DeviceRecord>,
+    a: &WebGpuAdapter,
+) -> (u32, Option<String>) {
+    if m.trusted() {
+        return (a.fp32_gflops, None);
+    }
+    let linked = a
+        .gpu
+        .and_then(|i| rec.and_then(|r| r.gpus().iter().find(|g| g.index == i).map(|g| (r, g))));
+    if let Some((r, g)) = linked
+        && r.check(g).is_some_and(|c| c.correct)
+    {
+        let (cap, note) = billed_gflops(m, r, g);
+        return if a.fp32_gflops > cap {
+            (cap, note)
+        } else {
+            (a.fp32_gflops, None)
+        };
+    }
+    if linked.is_some_and(|(r, g)| r.check(g).is_some_and(|c| !c.correct)) {
+        return (
+            0,
+            Some("gave a wrong answer to the cluster's GPU check".into()),
+        );
+    }
+    if a.fp32_gflops > UNCHECKED_WEBGPU_GFLOPS {
+        (
+            UNCHECKED_WEBGPU_GFLOPS,
+            Some(format!(
+                "cannot be checked over WebGPU: billed at {} TFLOPS",
+                pumasi_proto::gpu::format_tflops(UNCHECKED_WEBGPU_GFLOPS)
+            )),
+        )
+    } else {
+        (a.fp32_gflops, None)
+    }
+}
+
+/// [`State::pick_gpus`] on the maps alone, for callers that hold other
+/// parts of the state.
+pub(crate) fn pick_gpus(
+    devices: &std::collections::HashMap<String, DeviceRecord>,
+    webgpu: &std::collections::HashMap<String, SignedWebGpu>,
+    id: &str,
+    req: &pumasi_proto::gpu::GpuRequest,
+    executor: Executor,
+    busy: &HashSet<u32>,
+) -> Option<Vec<u32>> {
+    match executor {
+        Executor::Wasm => webgpu
+            .get(id)
+            .and_then(|w| req.pick_webgpu(&w.profile.adapters, busy)),
+        Executor::Docker | Executor::Microvm => devices
+            .get(id)
+            .and_then(|d| req.pick(d.gpus(), busy, executor)),
+    }
+}
+
 impl State {
+    /// Stores a node's signed WebGPU adapters (phase 14).
+    pub fn on_webgpu(&mut self, id: &str, generation: u64, signed: SignedWebGpu) -> Result<()> {
+        if !self
+            .nodes
+            .get(id)
+            .is_some_and(|n| n.generation == generation)
+        {
+            return Ok(());
+        }
+        signed.verify()?;
+        let key: iroh::PublicKey = id.parse()?;
+        ensure!(
+            &signed.profile.node == key.as_bytes(),
+            "WebGPU profile is for another node"
+        );
+        if !self.members.contains_key(id) {
+            return Ok(());
+        }
+        for a in &signed.profile.adapters {
+            info!(
+                node = %id,
+                adapter = a.index,
+                name = %a.describe(),
+                gpu = ?a.gpu,
+                "WebGPU adapter"
+            );
+        }
+        if self.webgpu.get(id) != Some(&signed) {
+            self.store.put_webgpu(id, &signed)?;
+            self.webgpu.insert(id.to_string(), signed);
+        }
+        self.schedule();
+        Ok(())
+    }
+
+    /// GPUs for one run on a node: listed GPUs for image jobs, a WebGPU
+    /// adapter (by slot) for wasm jobs.
+    pub(crate) fn pick_gpus(
+        &self,
+        id: &str,
+        req: &pumasi_proto::gpu::GpuRequest,
+        executor: Executor,
+        busy: &HashSet<u32>,
+    ) -> Option<Vec<u32>> {
+        pick_gpus(&self.devices, &self.webgpu, id, req, executor, busy)
+    }
+
+    /// The WebGPU views of a member for the status.
+    pub(crate) fn webgpu_views(&self, m: &Member) -> Vec<WebGpuView> {
+        let Some(w) = self.webgpu.get(&m.id) else {
+            return Vec::new();
+        };
+        let busy: Vec<(TaskRef, u32)> = self
+            .nodes
+            .get(&m.id)
+            .filter(|n| n.online)
+            .map(|n| {
+                n.gpu
+                    .busy
+                    .iter()
+                    .flat_map(|(t, gs)| gs.iter().map(move |g| (*t, *g)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rec = self.devices.get(&m.id);
+        w.profile
+            .adapters
+            .iter()
+            .map(|a| {
+                let (billed, note) = billed_webgpu_gflops(m, rec, a);
+                WebGpuView {
+                    adapter: a.clone(),
+                    billed_gflops: billed,
+                    note,
+                    busy: busy.iter().find(|(_, s)| *s == a.slot()).map(|(t, _)| *t),
+                }
+            })
+            .collect()
+    }
+
     /// Stores a node's signed device profile. New GPUs of an untrusted
     /// node are timed by challenges.
     pub fn on_devices(&mut self, id: &str, generation: u64, signed: SignedDevices) -> Result<()> {
@@ -275,18 +421,34 @@ impl State {
     }
 
     /// What a run's GPUs cost per hour and what goes on its receipt.
-    pub(crate) fn gpu_billing(&self, node_id: &str, gpus: &[u32]) -> Option<GpuBilling> {
+    pub(crate) fn gpu_billing(
+        &self,
+        node_id: &str,
+        executor: Executor,
+        gpus: &[u32],
+    ) -> Option<GpuBilling> {
         if gpus.is_empty() {
             return None;
         }
         let m = self.members.get(node_id)?;
-        let rec = self.devices.get(node_id)?;
         let mut b = GpuBilling {
             names: Vec::new(),
             gflops: 0,
             vram_mib: 0,
             exact_ucu: 0,
         };
+        if executor == Executor::Wasm {
+            let w = self.webgpu.get(node_id)?;
+            for slot in gpus {
+                let Some(a) = w.profile.adapters.iter().find(|a| a.slot() == *slot) else {
+                    continue;
+                };
+                b.names.push(format!("{} (WebGPU, {})", a.name, a.backend));
+                b.gflops += billed_webgpu_gflops(m, self.devices.get(node_id), a).0 as u64;
+            }
+            return Some(b);
+        }
+        let rec = self.devices.get(node_id)?;
         for i in gpus {
             let Some(g) = rec.gpus().iter().find(|g| g.index == *i) else {
                 continue;

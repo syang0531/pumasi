@@ -173,6 +173,107 @@ impl AuthLimiter {
     }
 }
 
+/// Requests one ticket may make in a burst (phase 17)...
+pub const TICKET_BURST: f64 = 120.0;
+/// ...and per second after it. A dashboard page with live regions makes
+/// well under one a second; a script that loops faster than this is
+/// slowed down rather than allowed to load the control plane.
+pub const TICKET_RATE: f64 = 20.0;
+/// `?wait=` long polls one ticket may hold open at once.
+pub const MAX_WAITS: u32 = 8;
+/// Sign-ins one client address may start in a burst, and per minute.
+pub const SIGN_IN_BURST: f64 = 10.0;
+pub const SIGN_IN_PER_MIN: f64 = 10.0;
+
+/// Token buckets, one per key (a ticket's secret, a client address).
+pub struct Buckets<K> {
+    burst: f64,
+    per_sec: f64,
+    map: Mutex<HashMap<K, (f64, Instant)>>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> Buckets<K> {
+    pub fn new(burst: f64, per_sec: f64) -> Self {
+        Self {
+            burst,
+            per_sec,
+            map: Mutex::default(),
+        }
+    }
+
+    /// Takes one token, or says how long until there is one.
+    pub fn take(&self, key: &K) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut map = self.map.lock().unwrap();
+        if map.len() >= MAX_TRACKED && !map.contains_key(key) {
+            // Full buckets are the same as none.
+            let (burst, rate) = (self.burst, self.per_sec);
+            map.retain(|_, (t, at)| *t + now.duration_since(*at).as_secs_f64() * rate < burst);
+            if map.len() >= MAX_TRACKED
+                && let Some(k) = map.keys().next().cloned()
+            {
+                map.remove(&k);
+            }
+        }
+        let (tokens, at) = map.entry(key.clone()).or_insert((self.burst, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * self.per_sec).min(self.burst);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64((1.0 - *tokens) / self.per_sec))
+        }
+    }
+}
+
+/// `429` for a ticket that is going too fast.
+pub fn slow_down(wait: Duration, msg: &str) -> Response {
+    let mut r = crate::api::error(StatusCode::TOO_MANY_REQUESTS, msg);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&wait.as_secs().max(1).to_string()) {
+        r.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    r
+}
+
+/// Counts open long polls per ticket; the guard gives the slot back.
+#[derive(Default)]
+pub struct Waits {
+    map: Mutex<HashMap<Secret, u32>>,
+}
+
+pub struct WaitSlot<'a> {
+    waits: &'a Waits,
+    secret: Secret,
+}
+
+impl Waits {
+    pub fn enter(&self, secret: Secret) -> Option<WaitSlot<'_>> {
+        let mut map = self.map.lock().unwrap();
+        let n = map.entry(secret).or_default();
+        if *n >= MAX_WAITS {
+            return None;
+        }
+        *n += 1;
+        Some(WaitSlot {
+            waits: self,
+            secret,
+        })
+    }
+}
+
+impl Drop for WaitSlot<'_> {
+    fn drop(&mut self) {
+        let mut map = self.waits.map.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.secret) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.secret);
+            }
+        }
+    }
+}
+
 /// The client's address, for handlers that count failures themselves.
 pub struct ClientIp(pub Option<IpAddr>);
 
@@ -217,6 +318,35 @@ mod tests {
         assert!(r.headers().contains_key(header::RETRY_AFTER));
         assert!(l.check(Some(other)).is_ok());
         assert!(l.check(None).is_ok());
+    }
+
+    #[test]
+    fn buckets_refill() {
+        let b = Buckets::new(3.0, 1000.0);
+        let k = 1u8;
+        for _ in 0..3 {
+            b.take(&k).unwrap();
+        }
+        let wait = b.take(&k).unwrap_err();
+        assert!(wait <= Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        b.take(&k).unwrap();
+        b.take(&2u8).unwrap();
+        let slow = Buckets::new(1.0, 0.5);
+        slow.take(&k).unwrap();
+        assert!(slow.take(&k).unwrap_err() > Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn wait_slots() {
+        let w = Waits::default();
+        let s = [7u8; 32];
+        let held: Vec<_> = (0..MAX_WAITS).map(|_| w.enter(s).unwrap()).collect();
+        assert!(w.enter(s).is_none());
+        assert!(w.enter([8; 32]).is_some());
+        drop(held);
+        assert!(w.enter(s).is_some());
+        assert!(w.map.lock().unwrap().is_empty());
     }
 
     #[test]

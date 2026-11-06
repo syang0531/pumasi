@@ -35,6 +35,7 @@ use crate::{
     remote::JobOrigin,
     state::{DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord},
 };
+use pumasi_proto::audit::AuditEntry;
 use pumasi_proto::manage::{AccountPolicy, AccountQuota, NodeConfig};
 use pumasi_proto::monitor::{AlertPolicy, EventView, MetricPoint, WebhookSpec};
 
@@ -112,6 +113,9 @@ const MEASUREMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("measure
 /// Providers' nodes an admin trusts with `tier = "trusted"` jobs, by node
 /// id (the value is empty).
 const TRUSTED_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("trusted_nodes");
+/// Self-hosting 1.0 (phase 17). The audit log, a hash chain, by sequence
+/// number.
+const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -120,6 +124,8 @@ const CREDIT_RATE_META: &str = "credit_cpu_hour";
 /// Set once the credit receipts were countersigned again in CU.
 const CREDIT_RECEIPTS_DONE_META: &str = "credit_receipts_converted";
 const ALERT_POLICY_META: &str = "alert_policy";
+/// SSO settings (phase 17).
+const SSO_META: &str = "sso";
 /// Layout version written by this build.
 const SCHEMA: u32 = 7;
 
@@ -167,7 +173,8 @@ macro_rules! tables {
             ACCOUNT_POLICIES,
             JOB_ORIGIN,
             MEASUREMENTS,
-            TRUSTED_NODES
+            TRUSTED_NODES,
+            AUDIT
         )
     };
 }
@@ -560,6 +567,7 @@ impl Store {
         tx.open_table(JOB_ORIGIN)?;
         tx.open_table(MEASUREMENTS)?;
         tx.open_table(TRUSTED_NODES)?;
+        tx.open_table(AUDIT)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1141,6 +1149,30 @@ impl Store {
         self.commit(b)
     }
 
+    /// Deletes old jobs (each with its task count) and the content blobs
+    /// no remaining job uses, in one transaction. Receipts and holds stay:
+    /// they are billing records.
+    pub fn delete_jobs(&self, jobs: &[(u128, u32)], blobs: &[ModuleHash]) -> Result<()> {
+        let mut b = Batch::default();
+        for &(job, tasks) in jobs {
+            b.del(JOBS, job);
+            b.del(JOB_EXT, job);
+            b.del(JOB_GPU, job);
+            b.del(JOB_SCHED, job);
+            b.del(JOB_ORIGIN, job);
+            for i in 0..tasks {
+                b.del(TASKS, (job, i));
+                b.del(TASK_EXT, (job, i));
+                b.del(PREEMPTED, (job, i, false));
+                b.del(PREEMPTED, (job, i, true));
+            }
+        }
+        for hash in blobs {
+            b.del(MODULES, hash.as_slice());
+        }
+        self.commit(b)
+    }
+
     pub fn put_job_meta(&self, meta: &JobMeta) -> Result<()> {
         let mut b = Batch::default();
         b.put(JOBS, meta.id.0, enc(meta).as_slice());
@@ -1460,6 +1492,58 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    // -- audit log and SSO (phase 17) ----------------------------------------
+
+    pub fn put_audit(&self, e: &AuditEntry) -> Result<()> {
+        let mut b = Batch::default();
+        b.put(AUDIT, e.seq, enc(e).as_slice());
+        self.commit(b)
+    }
+
+    /// The newest audit entry.
+    pub fn last_audit(&self) -> Result<Option<AuditEntry>> {
+        let tx = self.read()?;
+        let t = tx.open_table(AUDIT)?;
+        t.last()?.map(|(_, v)| dec(v.value())).transpose()
+    }
+
+    /// Up to `limit` audit entries after `after`, oldest first; with
+    /// `after` 0, the newest `limit`.
+    pub fn audit(&self, after: u64, limit: usize) -> Result<Vec<AuditEntry>> {
+        let tx = self.read()?;
+        let t = tx.open_table(AUDIT)?;
+        let mut out = Vec::new();
+        if after == 0 {
+            for row in t.iter()?.rev().take(limit) {
+                out.push(dec(row?.1.value())?);
+            }
+            out.reverse();
+        } else {
+            for row in t.range(after + 1..)?.take(limit) {
+                out.push(dec(row?.1.value())?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Walks every audit entry in order, in one read transaction.
+    pub fn each_audit(&self, mut f: impl FnMut(AuditEntry) -> Result<()>) -> Result<()> {
+        let tx = self.read()?;
+        let t = tx.open_table(AUDIT)?;
+        for row in t.iter()? {
+            f(dec(row?.1.value())?)?;
+        }
+        Ok(())
+    }
+
+    pub fn sso(&self) -> Result<Option<crate::sso::SsoConfig>> {
+        self.get_meta(SSO_META)?.map(|b| dec(&b)).transpose()
+    }
+
+    pub fn put_sso(&self, c: &crate::sso::SsoConfig) -> Result<()> {
+        self.put_meta(SSO_META, &enc(c))
     }
 
     /// Every receipt of one job, in task order.

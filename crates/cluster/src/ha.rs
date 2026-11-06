@@ -991,15 +991,28 @@ impl Ha {
                 }
             }
         }
-        let mut voters = BTreeSet::new();
-        voters.insert(id);
-        match self
-            .raft
-            .change_membership(ChangeMembers::AddVoterIds(voters), false)
-            .await
-        {
-            Ok(_) => info!(replica = %peer.fmt_short(), "a control plane replica joined"),
-            Err(e) => warn!(replica = %peer.fmt_short(), "could not make the replica a voter: {e}"),
+        // Replicas joining at the same time each change the membership,
+        // and Raft takes one change at a time: wait for the other one.
+        loop {
+            let voters = BTreeSet::from([id]);
+            match self
+                .raft
+                .change_membership(ChangeMembers::AddVoterIds(voters), false)
+                .await
+            {
+                Ok(_) => {
+                    info!(replica = %peer.fmt_short(), "a control plane replica joined");
+                    break;
+                }
+                Err(e) if Instant::now() < deadline => {
+                    debug!(replica = %peer.fmt_short(), "making the replica a voter: {e}");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    warn!(replica = %peer.fmt_short(), "could not make the replica a voter: {e}");
+                    break;
+                }
+            }
         }
     }
 

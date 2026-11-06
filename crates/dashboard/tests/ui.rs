@@ -234,6 +234,7 @@ async fn dashboard_pages_api_and_guards() {
             api_only: false,
             tls: None,
             real_ip_header: None,
+            public_url: None,
         },
     )
     .await
@@ -466,6 +467,7 @@ async fn api_only_over_tls_with_rate_limit_and_long_poll() {
             api_only: true,
             tls: Some(tls),
             real_ip_header: Some("CF-Connecting-IP".into()),
+            public_url: None,
         },
     )
     .await
@@ -606,4 +608,303 @@ async fn api_only_over_tls_with_rate_limit_and_long_poll() {
 
     ui.stop();
     agent_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17: SSO sign-in through the dashboard, and request limits
+// ---------------------------------------------------------------------------
+
+/// A stand-in OpenID Connect provider that signs everyone in as
+/// alice@corp.example (verified), in group `ops`.
+mod idp {
+    use std::{
+        collections::HashMap,
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::{
+        Form, Json, Router,
+        extract::{Query, State},
+        http::{StatusCode, header},
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
+    use serde_json::{Value, json};
+
+    pub struct Idp {
+        pub issuer: String,
+        pkcs8: Vec<u8>,
+        point: Vec<u8>,
+        codes: HashMap<String, String>,
+    }
+
+    type S = Arc<Mutex<Idp>>;
+
+    fn b64(b: &[u8]) -> String {
+        data_encoding::BASE64URL_NOPAD.encode(b)
+    }
+
+    async fn discovery(State(s): State<S>) -> Json<Value> {
+        let i = s.lock().unwrap().issuer.clone();
+        Json(
+            json!({"issuer": i, "authorization_endpoint": format!("{i}/authorize"),
+                    "token_endpoint": format!("{i}/token"), "jwks_uri": format!("{i}/jwks")}),
+        )
+    }
+
+    async fn jwks(State(s): State<S>) -> Json<Value> {
+        let i = s.lock().unwrap();
+        let (x, y) = i.point[1..].split_at(32);
+        Json(json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k", "x": b64(x), "y": b64(y)}]}))
+    }
+
+    async fn authorize(State(s): State<S>, Query(q): Query<HashMap<String, String>>) -> Response {
+        let code = format!("c{}", rand::random::<u32>());
+        s.lock()
+            .unwrap()
+            .codes
+            .insert(code.clone(), q["nonce"].clone());
+        let to = format!("{}?code={code}&state={}", q["redirect_uri"], q["state"]);
+        (StatusCode::FOUND, [(header::LOCATION, to)]).into_response()
+    }
+
+    async fn token(State(s): State<S>, Form(f): Form<HashMap<String, String>>) -> Response {
+        let mut i = s.lock().unwrap();
+        let Some(nonce) = i.codes.remove(&f["code"]) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_grant"})),
+            )
+                .into_response();
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = json!({"iss": i.issuer, "aud": "dash", "sub": "1", "email": "alice@corp.example",
+                            "email_verified": true, "groups": ["ops"], "nonce": nonce,
+                            "iat": now, "exp": now + 300});
+        let mut h = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        h.kid = Some("k".into());
+        let t = jsonwebtoken::encode(
+            &h,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_ec_der(&i.pkcs8),
+        )
+        .unwrap();
+        Json(json!({"id_token": t})).into_response()
+    }
+
+    pub async fn start() -> SocketAddr {
+        use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s = Arc::new(Mutex::new(Idp {
+            issuer: format!("http://{addr}"),
+            pkcs8: pkcs8.as_ref().to_vec(),
+            point: pair.public_key().as_ref().to_vec(),
+            codes: HashMap::new(),
+        }));
+        let app = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery))
+            .route("/jwks", get(jwks))
+            .route("/authorize", get(authorize))
+            .route("/token", post(token))
+            .with_state(s);
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        addr
+    }
+}
+
+/// The `name=value` of a Set-Cookie header named `name`.
+fn set_cookie(r: &Resp, name: &str) -> Option<String> {
+    r.headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+        .map(|(_, v)| v.split(';').next().unwrap_or("").to_string())
+        .find(|kv| kv.starts_with(&format!("{name}=")) && kv.len() > name.len() + 1)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sso_sign_in_and_request_limits() {
+    use pumasi_proto::{
+        manage::AccessRole,
+        msg::AdminOp,
+        sso::{Hidden, OidcSettings, RoleMap, SsoUpdate, Subject},
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let idp_addr = idp::start().await;
+    let (cluster, agent_task) = start_cluster().await;
+    let admin = cluster.admin_ticket();
+    let client = pumasi_cluster::AdminClient::connect(&admin, NetMode::Local)
+        .await
+        .unwrap();
+    let oidc = OidcSettings {
+        name: "Corp".into(),
+        issuer: format!("http://{idp_addr}"),
+        client_id: "dash".into(),
+        client_secret: Hidden("x".into()),
+        scopes: vec!["email".into()],
+        groups_claim: "groups".into(),
+    };
+    client
+        .call(AdminOp::SsoSet(Box::new(SsoUpdate::Oidc(Some(Box::new(
+            oidc,
+        ))))))
+        .await
+        .unwrap();
+    client
+        .call(AdminOp::SsoSet(Box::new(SsoUpdate::Map(RoleMap {
+            subject: "group:ops".parse::<Subject>().unwrap(),
+            role: AccessRole::Viewer,
+        }))))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ui = pumasi_dashboard::start_on(
+        listener,
+        UiConfig {
+            ticket: admin.clone(),
+            net: NetMode::Local,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            login_only: true,
+            upload_limit: 64 << 20,
+            api_only: false,
+            tls: None,
+            real_ip_header: None,
+            public_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let addr = ui.addr();
+
+    // The sign-in page offers the provider.
+    let page = request(addr, "GET", "/login", &[], b"").await;
+    assert!(page.text().contains("Sign in with Corp"), "{}", page.text());
+
+    // Off to the provider, with the state in a Lax cookie.
+    let start = request(addr, "GET", "/sso/start", &[], b"").await;
+    assert_eq!(start.status, 303, "{}", start.text());
+    let raw = start
+        .headers
+        .iter()
+        .find(|(k, v)| k.eq_ignore_ascii_case("set-cookie") && v.starts_with("pumasi_sso="))
+        .unwrap()
+        .1
+        .clone();
+    assert!(
+        raw.contains("SameSite=Lax") && raw.contains("HttpOnly"),
+        "{raw}"
+    );
+    let sso = set_cookie(&start, "pumasi_sso").unwrap();
+    let to = start.header("location").unwrap().to_string();
+    let redirect = format!(
+        "redirect_uri=http%3A%2F%2F127.0.0.1%3A{}%2Fsso%2Fcallback",
+        addr.port()
+    );
+    assert!(to.contains(&redirect), "{to}");
+    let at_idp = request(
+        idp_addr,
+        "GET",
+        to.strip_prefix(&format!("http://{idp_addr}")).unwrap(),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(at_idp.status, 302);
+    let back = at_idp.header("location").unwrap().to_string();
+    let path = back
+        .strip_prefix(&format!("http://127.0.0.1:{}", addr.port()))
+        .unwrap()
+        .to_string();
+
+    // Coming back without this browser's state is refused.
+    let foreign = request(
+        addr,
+        "GET",
+        &path,
+        &[("Cookie", "pumasi_sso=other".into())],
+        b"",
+    )
+    .await;
+    assert_eq!(foreign.status, 400);
+    assert!(set_cookie(&foreign, "pumasi_session").is_none());
+
+    // With it, a session (and a page that moves on, for the Strict cookie).
+    let done = request(addr, "GET", &path, &[("Cookie", sso.clone())], b"").await;
+    assert_eq!(done.status, 200, "{}", done.text());
+    assert!(done.text().contains("http-equiv=\"refresh\""));
+    let session = set_cookie(&done, "pumasi_session").unwrap();
+    let home = request(
+        addr,
+        "GET",
+        "/api/v1/whoami",
+        &[("Cookie", session.clone())],
+        b"",
+    )
+    .await;
+    assert_eq!(home.status, 200, "{}", home.text());
+    assert_eq!(home.json()["name"], "sso:alice@corp.example");
+    assert_eq!(home.json()["role"], "Viewer");
+    // The code was used up.
+    let again = request(addr, "GET", &path, &[("Cookie", sso)], b"").await;
+    assert_eq!(again.status, 401);
+
+    // Bodies: a sign-in form larger than 1 MiB is refused before it is read.
+    let big = vec![b'a'; (1 << 20) + 10];
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /login HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
+        addr.port(),
+        big.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    let _ = s.write_all(&big).await;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    assert!(
+        String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 413"),
+        "{}",
+        String::from_utf8_lossy(&buf[..buf.len().min(200)])
+    );
+
+    // A ticket that goes too fast is slowed down.
+    let bearer = ("Authorization", format!("Bearer {admin}"));
+    let mut limited = None;
+    for _ in 0..250 {
+        let r = request(
+            addr,
+            "GET",
+            "/api/v1/whoami",
+            std::slice::from_ref(&bearer),
+            b"",
+        )
+        .await;
+        if r.status == 429 {
+            limited = Some(r);
+            break;
+        }
+        assert_eq!(r.status, 200);
+    }
+    let limited = limited.expect("never slowed down");
+    assert!(limited.header("retry-after").is_some());
+    assert!(
+        limited
+            .text()
+            .contains("too many requests with this ticket")
+    );
+    // Other tickets are not affected.
+    let other = request(addr, "GET", "/api/v1/whoami", &[("Cookie", session)], b"").await;
+    assert_eq!(other.status, 200);
+
+    ui.stop();
+    client.close().await;
+    agent_task.abort();
+    cluster.shutdown().await.unwrap();
 }

@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "pumasi-dashboard"
 version.workspace = true
 edition.workspace = true
@@ -19,7 +20,7 @@ data-encoding.workspace = true
 n0-future.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 # The web server and its HTML templates, compiled into the binary.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "form", "json", "multipart"] }
+axum.workspace = true
 maud = "0.27"
 crc32fast = "1"
 # HTTPS without a proxy (`--tls-cert`), on the same ring provider iroh uses.
@@ -28,5 +29,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 
 [dev-dependencies]
 pumasi-agent.workspace = true
+jsonwebtoken.workspace = true
+ring.workspace = true
 wat.workspace = true
 tracing-subscriber.workspace = true

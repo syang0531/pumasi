@@ -1,0 +1,74 @@
+# cargo-deny (phase 17): CI checks every dependency's security advisories,
+# licenses and source. `cargo deny check` runs it locally.
+
+[graph]
+# Every platform the release builds for (Windows and macOS dependencies
+# count too).
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Each ignored advisory says why it does not apply. Review them when the
+# dependency that pulls the crate in is upgraded.
+ignore = [
+  # rsa (Marvin): timing leaks of an RSA *private* key. Pumasi only
+  # verifies RSA signatures (OIDC ID tokens via jsonwebtoken, AMD's
+  # certificate chain via sev) with public keys; it never decrypts or
+  # signs with RSA. No fixed release exists.
+  { id = "RUSTSEC-2023-0071", reason = "RSA is used for signature verification with public keys only" },
+  # crypto-bigint 0.5 timing: pulled in by p256/p384 (elliptic-curve 0.13)
+  # for ECDSA verification of ID tokens and SEV-SNP reports, which handles
+  # public data only. The fix is in 0.7, which the 0.13 curve crates do
+  # not use; revisit when jsonwebtoken and sev move to elliptic-curve 0.14.
+  { id = "RUSTSEC-2026-0387", reason = "only public-key verification runs on these integers" },
+  # Unmaintained proc-macros run at build time only, pulled in by iroh
+  # (netlink-packet-core -> paste; bao-tree -> genawaiter ->
+  # proc-macro-error). Nothing of theirs ships in the binary.
+  { id = "RUSTSEC-2024-0436", reason = "build-time proc-macro via iroh, not ours to replace" },
+  { id = "RUSTSEC-2024-0370", reason = "build-time proc-macro via iroh-blobs, not ours to replace" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licenses, plus MPL-2.0 (file-level copyleft: using an
+# unmodified crate puts no obligation on Pumasi's own code).
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "Unicode-3.0",
+  "Unlicense",
+  "CC0-1.0",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+]
+
+[bans]
+# A tree this size (Wasmtime, wgpu, iroh) has duplicate versions that are
+# not ours to fix; they are allowed, wildcards are not.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

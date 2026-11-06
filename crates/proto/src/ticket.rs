@@ -22,6 +22,7 @@ use crate::Secret;
 const JOIN_PREFIX: &str = "pumasijoin";
 const ADMIN_PREFIX: &str = "pumasiadmin";
 const REPLICA_PREFIX: &str = "pumasireplica";
+const SIGNIN_PREFIX: &str = "pumasisignin";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Payload {
@@ -221,6 +222,50 @@ impl FromStr for ReplicaTicket {
     }
 }
 
+/// Where to sign in with SSO (phase 17): the cluster's addresses and no
+/// secret, so it can be posted anywhere people of the organization see
+/// it. `pumasi login --sso` and `--ldap` take it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInTicket {
+    pub cluster: EndpointAddr,
+    pub replicas: Vec<EndpointAddr>,
+}
+
+impl fmt::Display for SignInTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&encode(
+            SIGNIN_PREFIX,
+            &self.cluster,
+            &[0; 32],
+            &self.replicas,
+        ))
+    }
+}
+
+impl FromStr for SignInTicket {
+    type Err = anyhow::Error;
+    /// Also takes an admin or access ticket (an expired one is fine): only
+    /// its addresses are used.
+    fn from_str(s: &str) -> Result<Self> {
+        let p = decode(SIGNIN_PREFIX, s).or_else(|_| decode(ADMIN_PREFIX, s))?;
+        Ok(Self {
+            cluster: p.cluster,
+            replicas: p.replicas,
+        })
+    }
+}
+
+impl SignInTicket {
+    /// An admin ticket with no valid secret, for the sign-in calls.
+    pub fn anonymous(&self) -> AdminTicket {
+        AdminTicket {
+            cluster: self.cluster.clone(),
+            secret: [0; 32],
+            replicas: self.replicas.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +330,25 @@ mod tests {
         };
         assert_eq!(r.to_string().parse::<ReplicaTicket>().unwrap(), r);
         assert!(r.to_string().parse::<AdminTicket>().is_err());
+    }
+
+    #[test]
+    fn sign_in_tickets_carry_no_secret() {
+        let cluster = EndpointAddr::new(SecretKey::generate().public());
+        let t = SignInTicket {
+            cluster: cluster.clone(),
+            replicas: vec![],
+        };
+        let s = t.to_string();
+        assert!(s.starts_with("pumasisignin"));
+        assert_eq!(s.parse::<SignInTicket>().unwrap(), t);
+        assert!(s.parse::<AdminTicket>().is_err());
+        assert_eq!(t.anonymous().secret, [0; 32]);
+        let admin = AdminTicket {
+            cluster,
+            secret: crate::new_secret(),
+            replicas: vec![],
+        };
+        assert_eq!(admin.to_string().parse::<SignInTicket>().unwrap(), t);
     }
 }

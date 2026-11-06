@@ -72,6 +72,10 @@ pub struct UiConfig {
     /// comes from loopback (a tunnel or reverse proxy on this machine),
     /// such as `CF-Connecting-IP`; used to rate limit failed sign-ins.
     pub real_ip_header: Option<String>,
+    /// The address browsers reach the dashboard at (behind a tunnel or
+    /// proxy, its public URL), for the SSO redirect URI
+    /// `<public_url>/sso/callback`. Default: the listening address.
+    pub public_url: Option<String>,
 }
 
 pub(crate) struct AppState {
@@ -86,6 +90,14 @@ pub(crate) struct AppState {
     upload_limit: u64,
     api_only: bool,
     limiter: AuthLimiter,
+    /// Requests per ticket (phase 17).
+    tickets: limit::Buckets<pumasi_proto::Secret>,
+    /// Sign-ins started per client address.
+    sign_ins: limit::Buckets<std::net::IpAddr>,
+    /// Open `?wait=` long polls per ticket.
+    waits: limit::Waits,
+    /// Where the provider sends browsers back to.
+    public_url: String,
 }
 
 pub(crate) type St = Arc<AppState>;
@@ -150,6 +162,19 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
             format!("[::1]:{p}"),
         ]
     });
+    let scheme = if config.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let public_url = match &config.public_url {
+        Some(u) => u.trim_end_matches('/').to_string(),
+        None if addr.ip().is_unspecified() || addr.ip().is_loopback() => {
+            format!("{scheme}://127.0.0.1:{}", addr.port())
+        }
+        None if addr.is_ipv6() => format!("{scheme}://[{}]:{}", addr.ip(), addr.port()),
+        None => format!("{scheme}://{addr}"),
+    };
     let state = Arc::new(AppState {
         backend: Backend::new(config.ticket, config.net),
         sessions: Sessions::default(),
@@ -159,6 +184,10 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
         upload_limit: config.upload_limit,
         api_only: config.api_only,
         limiter: AuthLimiter::new(config.real_ip_header),
+        tickets: limit::Buckets::new(limit::TICKET_BURST, limit::TICKET_RATE),
+        sign_ins: limit::Buckets::new(limit::SIGN_IN_BURST, limit::SIGN_IN_PER_MIN / 60.0),
+        waits: limit::Waits::default(),
+        public_url,
     });
     let app = router(state).into_make_service_with_connect_info::<ClientAddr>();
     let https = config.tls.is_some();
@@ -177,22 +206,32 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
     })
 }
 
+/// Largest request body except uploads and `/api/v1/op` (phase 17):
+/// forms and small JSON. Without it, anyone could make the dashboard
+/// buffer a body as large as the upload limit before signing in.
+pub const BODY_LIMIT: usize = 1 << 20;
+/// Largest `/api/v1/op` body (an admin call as JSON).
+pub const OP_BODY_LIMIT: usize = 32 << 20;
+
 fn router(state: St) -> Router {
     let uploads = DefaultBodyLimit::max(state.upload_limit.min(usize::MAX as u64) as usize);
     let api = Router::new()
-        .nest("/api/v1", api::routes())
+        .nest("/api/v1", api::routes(uploads))
         .route("/api/openapi.json", get(api::openapi))
         .route("/healthz", get(|| async { "ok" }));
     let app = if state.api_only {
         api
     } else {
-        api.merge(pages::routes())
+        api.merge(pages::routes(uploads))
             .route("/login", get(pages::login::page).post(pages::login::submit))
+            .route("/login/ldap", post(pages::login::ldap))
+            .route("/sso/start", get(pages::login::sso_start))
+            .route("/sso/callback", get(pages::login::sso_callback))
             .route("/logout", post(pages::login::logout))
             .route("/lang/{lang}", get(pages::login::set_lang))
             .route("/static/{file}", get(asset))
     };
-    app.layer(uploads)
+    app.layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }

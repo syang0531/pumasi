@@ -416,10 +416,20 @@ async fn three_replicas_survive_losing_the_leader() {
     let v = ha_view(&client).await;
     assert_eq!(v.voters_up(5_000), 2, "{v:#?}");
 
-    // The old leader comes back as a follower and catches up.
-    let a = Cluster::start(config(dir_a.clone(), &bind_a))
-        .await
-        .unwrap();
+    // The old leader comes back as a follower and catches up. Windows
+    // can take a moment to release the crashed endpoint's UDP port.
+    let mut tries = 0;
+    let a = loop {
+        match Cluster::start(config(dir_a.clone(), &bind_a)).await {
+            Ok(a) => break a,
+            Err(e) if tries < 20 => {
+                tries += 1;
+                eprintln!("restarting the old leader: {e:#}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("restarting the old leader: {e:#}"),
+        }
+    };
     let v = wait_replicated(&client, 3).await;
     assert_eq!(v.voters_up(5_000), 3, "{v:#?}");
     assert!(!a.is_leader());

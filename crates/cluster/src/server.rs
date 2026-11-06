@@ -89,6 +89,8 @@ pub struct ClusterConfig {
     pub metrics_retention: Duration,
     /// How often a follower copies the leader's file store.
     pub mirror_every: Duration,
+    /// How long finished jobs are kept (zero: forever).
+    pub keep_jobs: Duration,
     /// Accept the test stand-in for a TEE, so confidential jobs run on
     /// machines without SEV-SNP or TDX (tests only: nothing is protected).
     pub insecure_test_tee: bool,
@@ -109,6 +111,7 @@ impl ClusterConfig {
             metrics_addr: None,
             metrics_token: None,
             metrics_retention: Duration::from_secs(7 * 86_400),
+            keep_jobs: crate::retention::DEFAULT_KEEP_JOBS,
             mirror_every: Duration::from_secs(30),
             insecure_test_tee: false,
         }
@@ -214,7 +217,10 @@ impl Shared {
 pub(crate) struct Inner {
     shared: Arc<Shared>,
     state: Mutex<State>,
-    admin_secret: Secret,
+    /// Replaced by `pumasi admin rotate` (phase 17).
+    admin_secret: Mutex<Secret>,
+    /// SSO sign-ins under way and the providers' keys (phase 17).
+    sso: crate::sso::Runtime,
     /// Set when this term ends; sessions close.
     stopped: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -229,6 +235,10 @@ impl std::ops::Deref for Inner {
 }
 
 impl Inner {
+    pub(crate) fn admin_secret(&self) -> Secret {
+        *self.admin_secret.lock().unwrap()
+    }
+
     pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("state lock poisoned")
     }
@@ -273,6 +283,13 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
         store,
         shared.key.clone(),
     )?;
+    state.audit(
+        &crate::audit::Actor::system(),
+        "control-plane.start",
+        shared.key.public().fmt_short().to_string(),
+        format!("version {}", pumasi_proto::version()),
+        true,
+    );
     state.set_metrics_retention(config.metrics_retention);
     if config.insecure_test_tee {
         warn!(
@@ -302,7 +319,8 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
     let inner = Arc::new(Inner {
         shared: shared.clone(),
         state: Mutex::new(state),
-        admin_secret,
+        admin_secret: Mutex::new(admin_secret),
+        sso: Default::default(),
         stopped,
         tasks: Mutex::new(Vec::new()),
         metrics_addr: prometheus.as_ref().map(|(_, a)| *a),
@@ -342,6 +360,13 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
                     {
                         inner.state().monitor_cp_disk(disk);
                     }
+                }
+                // Old finished jobs, every 10 minutes (the first a minute
+                // after taking over).
+                if ticks % 1200 == 120 {
+                    inner
+                        .state()
+                        .expire_jobs(inner.config.keep_jobs, crate::state::now_unix());
                 }
                 ticks += 1;
                 inner.state().tick(inner.config.node_timeout);
@@ -539,7 +564,7 @@ impl Cluster {
         let (cluster, replicas) = self.shared.ticket_addrs();
         AdminTicket {
             cluster,
-            secret: self.inner().admin_secret,
+            secret: self.inner().admin_secret(),
             replicas,
         }
     }
@@ -707,7 +732,7 @@ async fn enable_ha(inner: &Arc<Inner>) -> Result<Arc<Ha>> {
     ha.compact().await?;
     *shared.ha.write().unwrap() = Some(ha.clone());
     *shared.lead.lock().unwrap() = Some(tokio::spawn(lead(shared.clone(), ha.clone())));
-    shared.write_admin_ticket(inner.admin_secret);
+    shared.write_admin_ticket(inner.admin_secret());
     Ok(ha)
 }
 
@@ -780,7 +805,7 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
                 let now = ha.replica_addrs();
                 if now != replicas {
                     inner.state().send_replicas(&now);
-                    shared.write_admin_ticket(inner.admin_secret);
+                    shared.write_admin_ticket(inner.admin_secret());
                     replicas = now;
                 }
             }
@@ -1249,12 +1274,15 @@ impl std::fmt::Debug for AdminHandler {
 
 impl ProtocolHandler for AdminHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        // Who is calling, for the audit log.
+        let peer = conn.remote_id().fmt_short().to_string();
         loop {
             let (mut send, mut recv) = match conn.accept_bi().await {
                 Ok(s) => s,
                 Err(_) => return Ok(()),
             };
             let shared = self.0.clone();
+            let peer = peer.clone();
             tokio::spawn(async move {
                 let res: Result<()> = async {
                     let Some(req) = read_msg::<_, AdminRequest>(&mut recv).await? else {
@@ -1272,33 +1300,10 @@ impl ProtocolHandler for AdminHandler {
                         send.finish()?;
                         return Ok(());
                     };
-                    let caller = if secrets_eq(&req.secret, &inner.admin_secret) {
-                        Some(Caller::Admin {
-                            name: "cluster admin".into(),
-                        })
+                    let resp = if req.op.is_sign_in() {
+                        handle_sign_in(&inner, req.op, &peer).await
                     } else {
-                        inner.state().access_caller(&req.secret)
-                    };
-                    let resp = match caller {
-                        None => AdminResponse::Error(
-                            "invalid admin credentials (a wrong, expired or revoked ticket)".into(),
-                        ),
-                        Some(caller) => {
-                            let admitted = {
-                                let st = inner.state();
-                                access::admit(&st, &caller, req.op)
-                            };
-                            let resp = match admitted {
-                                Err(e) => AdminResponse::Error(format!("{e:#}")),
-                                Ok(op) => match handle_store_admin(&inner, op).await {
-                                    Ok(r) => {
-                                        r.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))
-                                    }
-                                    Err(op) => handle_admin(&inner, &caller, op),
-                                },
-                            };
-                            access::scope(&caller, resp)
-                        }
+                        admin_call(&inner, &req.secret, req.op, &peer).await
                     };
                     write_msg(&mut send, &resp).await?;
                     send.finish()?;
@@ -1311,6 +1316,141 @@ impl ProtocolHandler for AdminHandler {
             });
         }
     }
+}
+
+/// Runs one ticket-holding admin call: checks the ticket and its role,
+/// runs the call, filters the reply, and writes the audit log.
+async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str) -> AdminResponse {
+    let caller = if secrets_eq(secret, &inner.admin_secret()) {
+        Some(Caller::Admin {
+            name: "cluster admin".into(),
+        })
+    } else {
+        inner.state().access_caller(secret)
+    };
+    let Some(caller) = caller else {
+        return AdminResponse::Error(
+            "invalid admin credentials (a wrong, expired or revoked ticket)".into(),
+        );
+    };
+    let who = crate::audit::Actor::caller(&caller, peer);
+    let admitted = {
+        let st = inner.state();
+        let refused = crate::audit::refused_action(&op);
+        let target = crate::audit::describe(&op).map(|d| d.1).unwrap_or_default();
+        access::admit(&st, &caller, op).map_err(|e| (e, refused, target))
+    };
+    let resp = match admitted {
+        Err((e, action, target)) => {
+            let msg = format!("{e:#}");
+            inner.state().audit(&who, &action, target, &msg, false);
+            AdminResponse::Error(msg)
+        }
+        Ok(op) => {
+            let described = crate::audit::describe(&op);
+            let resp = match handle_store_admin(inner, op).await {
+                Ok(r) => r.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}"))),
+                Err(op) => handle_admin(inner, &caller, op),
+            };
+            if let Some((action, target, detail)) = described {
+                match &resp {
+                    AdminResponse::Error(e) => {
+                        let detail = if detail.is_empty() {
+                            e.clone()
+                        } else {
+                            format!("{detail}; {e}")
+                        };
+                        inner.state().audit(&who, action, target, detail, false)
+                    }
+                    _ => inner.state().audit(&who, action, target, detail, true),
+                }
+            }
+            resp
+        }
+    };
+    access::scope(&caller, resp)
+}
+
+/// Sign-in calls (phase 17), which need no ticket: the control plane
+/// checks the identity provider's or directory's answer instead.
+async fn handle_sign_in(inner: &Arc<Inner>, op: AdminOp, peer: &str) -> AdminResponse {
+    let res: Result<AdminResponse> = async {
+        let config = inner.state().sso_config();
+        let oidc = || {
+            config
+                .oidc
+                .clone()
+                .context("this cluster has no OpenID Connect sign-in (pumasi sso oidc)")
+        };
+        match op {
+            // No network here: the sign-in page asks on every visit.
+            AdminOp::SsoInfo => Ok(AdminResponse::SsoInfo(inner.state().sso_info())),
+            AdminOp::SsoStart { redirect_uri } => {
+                let (url, state) = inner.sso.start(&oidc()?, &redirect_uri).await?;
+                Ok(AdminResponse::SsoRedirect { url, state })
+            }
+            AdminOp::SsoFinish { state, code } => {
+                let o = oidc()?;
+                let who = inner.sso.finish(&o, &state, &code).await?;
+                session_ticket(inner, &who, "sso", peer)
+            }
+            AdminOp::SsoDeviceStart => Ok(AdminResponse::SsoDevice(Box::new(
+                inner.sso.device_start(&oidc()?).await?,
+            ))),
+            AdminOp::SsoDevicePoll { handle } => {
+                match inner.sso.device_poll(&oidc()?, &handle).await? {
+                    Ok(who) => session_ticket(inner, &who, "sso", peer),
+                    Err(interval_secs) => Ok(AdminResponse::SsoPending { interval_secs }),
+                }
+            }
+            AdminOp::LdapLogin { user, password } => {
+                let l = config
+                    .ldap
+                    .clone()
+                    .context("this cluster has no LDAP sign-in (pumasi sso ldap)")?;
+                match inner.sso.ldap_login(&l, &user, password.expose()).await {
+                    Ok(who) => session_ticket(inner, &who, "ldap", peer),
+                    Err((e, known)) => {
+                        if let Some(name) = known {
+                            inner
+                                .state()
+                                .sso_refused(&name, "ldap", peer, "wrong password");
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            other => anyhow::bail!(
+                "not a sign-in call: {}",
+                crate::audit::refused_action(&other)
+            ),
+        }
+    }
+    .await;
+    res.unwrap_or_else(|e| {
+        debug!("sign-in failed: {e:#}");
+        AdminResponse::Error(format!("{e:#}"))
+    })
+}
+
+/// An access ticket for a checked identity.
+fn session_ticket(
+    inner: &Arc<Inner>,
+    who: &pumasi_proto::sso::Identity,
+    method: &str,
+    peer: &str,
+) -> Result<AdminResponse> {
+    let r = inner.state().sso_session(who, method, peer)?;
+    let (cluster, replicas) = inner.ticket_addrs();
+    let ticket = AdminTicket {
+        cluster,
+        secret: r.secret,
+        replicas,
+    };
+    Ok(AdminResponse::AccessTicket {
+        ticket: ticket.to_string(),
+        view: r.view(),
+    })
 }
 
 /// Opens a confidential run's sealed result and hands both the report as
@@ -1814,7 +1954,34 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             inner.state().remove_webhook(&name)?;
             Ok(AdminResponse::Ok)
         }
-        other => anyhow::bail!("unexpected admin call {other:?}"),
+        AdminOp::Audit { after, limit } => Ok(AdminResponse::Audit(
+            inner.state().audit_entries(after, limit)?,
+        )),
+        AdminOp::AuditVerify => Ok(AdminResponse::AuditHead(Box::new(
+            inner.state().audit_verify()?,
+        ))),
+        AdminOp::RotateAdminSecret => {
+            let secret = pumasi_proto::new_secret();
+            inner.state().store.put_meta(ADMIN_SECRET_META, &secret)?;
+            *inner.admin_secret.lock().unwrap() = secret;
+            inner.write_admin_ticket(secret);
+            let (cluster, replicas) = inner.ticket_addrs();
+            let ticket = AdminTicket {
+                cluster,
+                secret,
+                replicas,
+            };
+            warn!("the admin secret was replaced; older admin tickets no longer work");
+            Ok(AdminResponse::AdminTicket {
+                ticket: ticket.to_string(),
+            })
+        }
+        AdminOp::SsoGet => Ok(AdminResponse::Sso(Box::new(inner.state().sso_view()))),
+        AdminOp::SsoSet(u) => Ok(AdminResponse::Sso(Box::new(inner.state().sso_update(*u)?))),
+        other => anyhow::bail!(
+            "unexpected admin call {}",
+            crate::audit::refused_action(&other)
+        ),
     })();
     result.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))
 }

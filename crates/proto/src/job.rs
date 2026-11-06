@@ -1179,7 +1179,8 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
         .trim()
         .parse()
         .with_context(|| format!("invalid duration {s:?}"))?;
-    Ok(n * mult)
+    n.checked_mul(mult)
+        .with_context(|| format!("duration {s:?} is too long"))
 }
 
 /// `90s`, `5m`, `1h30m`, `2d`: the shortest of [`parse_duration_ms`]'s
@@ -1587,6 +1588,9 @@ mod tests {
         assert_eq!(parse_duration_ms("7").unwrap(), 7000);
         assert_eq!(parse_duration_ms("2d").unwrap(), 172_800_000);
         assert!(parse_duration_ms("abc").is_err());
+        // Found by the config_files fuzz target: it used to overflow.
+        assert!(parse_duration_ms("006726510560476608740").is_err());
+        assert!(parse_duration_ms("18446744073709551615d").is_err());
     }
 
     #[test]

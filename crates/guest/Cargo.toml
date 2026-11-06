@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "pumasi-guest"
 description = "PID 1 inside a pumasi microVM, and the format the agent uses to talk to it."
 version.workspace = true

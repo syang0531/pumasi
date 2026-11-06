@@ -930,11 +930,44 @@ compressed size) on top of the task's. Their output is not streamed while
 they run. See [docs/architecture.md](docs/architecture.md#phase-16-the-confidential-tier)
 for the protocol and what it does not protect.
 
+### Running it for an organization: SSO, audit log, operations
+
+People sign in with the accounts they already have, through OpenID
+Connect (Google Workspace, Microsoft Entra ID, Keycloak, Okta) or LDAP
+and Active Directory. Rules map their groups, emails or domain to a role,
+and each sign-in becomes an access ticket that lasts a session:
+
+```sh
+pumasi sso oidc --issuer https://login.microsoftonline.com/<tenant>/v2.0 \
+  --client-id ... --client-secret-file oidc-secret --name "Acme SSO"
+pumasi sso map group:<admins-group-id> admin
+pumasi sso map group:<research-group-id> submitter:research
+pumasi sso map domain:acme.com viewer
+pumasi ui --public-url https://pumasi.acme.com     # "Sign in with Acme SSO"
+pumasi sso ticket                                  # for the CLI: pumasi login --sso <ticket>
+```
+
+Every change, refusal, sign-in and node join goes into a tamper-evident
+audit log, a hash chain whose head the cluster key signs:
+
+```sh
+pumasi audit ls --follow
+pumasi audit verify --json > head.json            # keep it elsewhere; later: --against head.json
+pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --follow
+```
+
+`pumasi admin rotate` retires a leaked admin ticket, `pumasi ui` limits
+requests per ticket and per address, and finished jobs are deleted after
+`--keep-jobs` (30 days by default). [docs/operations.md](docs/operations.md)
+covers installing, upgrading, backups, the audit log and incident
+response; [docs/threat-model.md](docs/threat-model.md) what Pumasi
+defends against, including the API exposed to the internet.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR] [--metrics-addr ADDR]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. `--metrics-addr` serves Prometheus metrics. |
+| `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR] [--metrics-addr ADDR] [--keep-jobs 30d]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. `--metrics-addr` serves Prometheus metrics; `--keep-jobs` is how long finished jobs are kept (`0`: forever). |
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-confidential] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-confidential` confidential jobs in SEV-SNP or TDX microVMs, `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |
@@ -958,7 +991,10 @@ for the protocol and what it does not protect.
 | `pumasi verify-receipts FILE [--cluster ID]` | Check exported receipts offline. |
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
 | `pumasi remove-node <ID>` | Revoke a node. It needs a new ticket to come back. |
-| `pumasi login <TICKET>` | Manage a remote cluster from this machine, with the admin ticket or an access ticket. |
+| `pumasi login <TICKET> [--sso \| --ldap USER]` | Manage a remote cluster from this machine, with the admin ticket or an access ticket; `--sso` (device flow) and `--ldap` sign in with a sign-in ticket from `pumasi sso ticket`. |
+| `pumasi sso status` / `sso oidc --issuer URL --client-id ID --client-secret-file F` / `sso ldap --url ldaps://... --user-base DN` / `sso map RULE ROLE` / `sso unmap RULE` / `sso session 12h` / `sso ticket` | Single sign-on: an OpenID Connect provider or an LDAP directory, rules (`group:`, `email:`, `domain:`, `anyone`) giving `admin`, `viewer` or `submitter:ACCOUNT`, how long a sign-in lasts, and the ticket people sign in with. `--off` turns a method off. |
+| `pumasi audit ls [--after N] [--limit N] [--json] [-f]` / `audit verify [--json] [--against HEAD]` / `audit export [--syslog udp://\|tcp://HOST:PORT] [--state F] [-f]` | The audit log: entries, a check of the whole hash chain with a head signed by the cluster key, and syslog (RFC 5424) export. |
+| `pumasi admin rotate` | Replace the admin secret: every copy of the old admin ticket stops working. |
 | `pumasi confidential ls [--json]` / `confidential trust ID [--note N]` / `confidential untrust ID` | TEE nodes and the launch measurements their guests attested with; keys go only to guests whose measurement is trusted. |
 | `pumasi trust \| untrust <NODE>` | Let a provider's node run `tier = "trusted"` jobs, or stop it (your own machines always do). |
 | `pumasi cordon \| uncordon \| drain <NODE>` | Stop new tasks going to a node, take it back, or also move its running tasks elsewhere. |
@@ -977,7 +1013,7 @@ for the protocol and what it does not protect.
 | `pumasi ha status [-o json]` / `ha invite [--ttl 1h]` / `ha remove ID` | Control plane replicas: who leads and how far each has the log, a ticket for one more replica, take one out. |
 | `pumasi cluster replica <TICKET> [--net public\|local] [--bind ADDR]` | Run this machine as a control plane replica (restart it later with `pumasi cluster start`). |
 | `pumasi backup FILE` / `pumasi cluster restore FILE` | A consistent copy of the control plane's state and cluster key, and a control plane made from one. |
-| `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB] [--api-only] [--tls-cert F --tls-key F] [--real-ip-header H]` | The web dashboard and its JSON API, served from this machine (default 127.0.0.1:7400); `--api-only` for programs elsewhere (bearer tickets only), `--tls-cert` for HTTPS. |
+| `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB] [--api-only] [--tls-cert F --tls-key F] [--real-ip-header H] [--public-url URL]` | The web dashboard and its JSON API, served from this machine (default 127.0.0.1:7400); `--api-only` for programs elsewhere (bearer tickets only), `--tls-cert` for HTTPS, `--public-url` the address browsers use (SSO sends them back to it). |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [--gpu] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode, `--gpu` gives it this machine's best WebGPU adapter). |
 
 `--home DIR` or `PUMASI_HOME` changes the state directory, which lets you run
@@ -1169,6 +1205,18 @@ checked.
   account's policy allows (on Docker nodes, containers that share the
   host kernel), so keep policies narrow (pinned images, no network) and
   revoke tickets with `pumasi access revoke`.
+- SSO sign-ins become access tickets with the role their rules give and
+  the session length (`pumasi sso session`); `pumasi access revoke NAME`
+  signs a person out everywhere. OIDC uses the code flow with PKCE, state
+  and nonce and checks ID tokens against the provider's keys; LDAP binds
+  over LDAPS or StartTLS. `pumasi admin rotate` retires a leaked admin
+  ticket.
+- Every change, refusal, sign-in and node join is in a hash-chained audit
+  log (`pumasi audit verify` checks it and signs its head); export it to
+  syslog to keep a copy out of the cluster's reach. The full threat model,
+  including the API exposed to the internet, is in
+  [docs/threat-model.md](docs/threat-model.md); report vulnerabilities as
+  [SECURITY.md](SECURITY.md) says.
 - WASM tasks are sandboxed from the machine running them (only their own
   `/input` and `/output`, no network, memory and CPU caps).
 - Docker tasks are only as isolated as a container: they share the host
@@ -1217,10 +1265,10 @@ checked.
 
 ## Roadmap
 
-Phases 1 to 16 are enough to run Pumasi on your own machines, alone or as
-an organization, and to use it from anywhere. Phase 17 finishes what an
-organization needs to adopt it, and phases 18 and 19 are only for trading
-with other clusters.
+Phases 1 to 17 are what an organization needs to run Pumasi on its own
+machines and use it from anywhere; the 1.0 tag waits for phase 17's
+external security review and a 72-hour soak on real hardware. Phases 18
+and 19 are only for trading with other clusters.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
@@ -1240,7 +1288,7 @@ with other clusters.
 | 14 | WebGPU executor (experimental): wasm jobs with `gpus = 1` run WGSL compute shaders on any GPU through wgpu (Vulkan, Metal, DX12, GL) and the `pumasi_webgpu` imports, signed adapter profiles with a WGSL benchmark, adapters sharing slots with listed GPUs, GPU time billed in CU, matrix multiplication and blur examples checked against the CPU on Linux, Windows and macOS in CI, glibc Linux binaries that can load GPU drivers | done |
 | 15 | Remote API clients: per-account job policies (images and digests, executors, no network, forced selector, tolerations, longest timeout, GPUs per task), who submitted each job and the image digests it ran, `queue_timeout`, the nodes that can take an account's work now (and why the others cannot), Docker re-checked by running agents, `pumasi ui --api-only` with HTTPS (`--tls-cert`) and failed sign-in limits, a Cloudflare Tunnel guide, `?wait=` long polling, curl examples run in CI, GPU driver capabilities for drawing (`gpu.graphics`, `gpu check --docker-run`) and a Blender example | done |
 | 16 | Confidentiality tiers: `trusted` (owner machines and trusted providers) and `confidential` (SEV-SNP and TDX microVMs): images and inputs sealed on the control plane, remote attestation checked against AMD's and Intel's certificates (recorded reports and forgeries tested in CI), keys released only to a fresh guest with an admin-trusted launch measurement, sealed results, `pumasi confidential` and the dashboard's measurement list | this release |
-| 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag | planned |
+| 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag. Also: job retention (`--keep-jobs`), admin secret rotation, per-ticket request limits | this release (review, soak and tag pending) |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
@@ -1254,8 +1302,8 @@ checked on software rasterizers in CI and on real GPUs by hand, offers
 compute shaders only (no textures or samplers, one bind group, no f16), a
 runaway shader is stopped by the GPU driver's watchdog rather than the
 job's timeout, and there is no GPU challenge over WebGPU yet. Accounts
-exist only inside one cluster (no SSO yet: access tickets are handed out
-by the admin), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
+exist only inside one cluster (SSO signs people in, but there is no SCIM
+or SAML, and nobody is removed until their session ends or is revoked), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
 (only each node's round trip to the control plane), the file store lives
 only on the control plane (no replicas on owner nodes yet, no S3-compatible
 gateway). GPUs are checked on real hardware by hand, not in CI (hosted
@@ -1277,7 +1325,9 @@ but does not change them (the CLI and `apply` do), and keeps its sign-ins
 in memory (restarting `pumasi ui` signs everyone out). The remote API has
 no built-in tunnel or certificate renewal (Cloudflare Tunnel, a reverse
 proxy or certbot do that; there is no iroh-based proxy for the CLI yet),
-its failed sign-in counts live in each `pumasi ui` process, uploads
+its failed sign-in counts and request limits live in each `pumasi ui`
+process (and the control plane itself does not limit unauthenticated
+sign-in calls per peer), the audit log is never pruned, uploads
 through Cloudflare stop at its plan's body limit, and `?wait=` follows a
 job by polling the control plane. Drawing in Docker is checked on real
 GPUs by hand; EEVEE on a Linux host runs under Xvfb and so on the CPU

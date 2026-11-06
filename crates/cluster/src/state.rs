@@ -421,6 +421,10 @@ pub struct State {
     pub(crate) monitor: Monitor,
     /// TEE nodes, leases, sealed inputs and measurements (phase 16).
     pub(crate) conf: crate::confidential::ConfState,
+    /// The audit log's next number and newest hash (phase 17).
+    pub(crate) audit_tip: crate::audit::AuditTip,
+    /// SSO settings and sign-ins under way (phase 17).
+    pub(crate) sso: crate::sso::SsoState,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -497,6 +501,8 @@ impl State {
             mgmt: Mgmt::default(),
             monitor: Monitor::default(),
             conf: Default::default(),
+            audit_tip: Default::default(),
+            sso: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -588,6 +594,8 @@ impl State {
         })?;
         state.load_monitor(Duration::from_secs(7 * 86_400))?;
         state.load_conf(snap.measurements, snap.trusted_nodes);
+        state.load_audit()?;
+        state.load_sso()?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(
@@ -718,7 +726,13 @@ impl State {
             info.name, member.role, member.account
         );
         self.members.insert(id.to_string(), member);
-        self.event(EventLevel::Info, "node.joined", Some(id), None, msg);
+        self.event(EventLevel::Info, "node.joined", Some(id), None, msg.clone());
+        let who = crate::audit::Actor {
+            name: format!("node:{}", info.name),
+            role: "node".into(),
+            peer: id.chars().take(10).collect(),
+        };
+        self.audit(&who, "node.join", id, msg, true);
         Ok(out)
     }
 
@@ -2309,6 +2323,63 @@ mod tests {
             key,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn old_finished_jobs_are_forgotten() {
+        let path =
+            std::env::temp_dir().join(format!("pumasi-state-{}.redb", rand::random::<u64>()));
+        let key = SecretKey::generate();
+        let open = |key: &SecretKey| {
+            State::load(
+                "t".into(),
+                key.public().to_string(),
+                Store::open(&path).unwrap(),
+                key.clone(),
+            )
+            .unwrap()
+        };
+        let mut st = open(&key);
+        let mut unique = job(Executor::Wasm, 2);
+        unique.module = b"\0asm\x01\0\0\0\0".to_vec();
+        let old = st.submit(unique).unwrap();
+        let old_shared = st.submit(job(Executor::Wasm, 1)).unwrap();
+        let queued = st.submit(job(Executor::Wasm, 1)).unwrap();
+        let recent = st.submit(job(Executor::Wasm, 1)).unwrap();
+        for id in [old, old_shared, recent] {
+            st.cancel(id).unwrap();
+        }
+        let long_ago = now_unix() - 40 * 86_400;
+        for id in [old, old_shared, queued] {
+            st.jobs.get_mut(&id).unwrap().meta.submitted_unix = long_ago;
+        }
+        let unique_hash = st.jobs[&old].meta.module_hash.unwrap();
+        let shared_hash = st.jobs[&queued].meta.module_hash.unwrap();
+        let day = Duration::from_secs(86_400);
+
+        assert_eq!(st.expire_jobs(Duration::ZERO, now_unix()), 0);
+        assert_eq!(st.expire_jobs(30 * day, now_unix()), 2);
+        assert!(!st.jobs.contains_key(&old) && !st.jobs.contains_key(&old_shared));
+        // Not finished, or not old enough.
+        assert!(st.jobs.contains_key(&queued) && st.jobs.contains_key(&recent));
+        assert!(!st.modules.contains_key(&unique_hash));
+        assert!(
+            st.modules.contains_key(&shared_hash),
+            "a queued job still uses it"
+        );
+        assert_eq!(st.expire_jobs(30 * day, now_unix()), 0);
+        let entries = st.audit_entries(0, 10).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == "jobs.expire" && e.target == "2 jobs")
+        );
+
+        // Gone from the database too.
+        drop(st);
+        let st = open(&key);
+        assert!(!st.jobs.contains_key(&old) && st.jobs.contains_key(&queued));
+        assert!(!st.modules.contains_key(&unique_hash) && st.modules.contains_key(&shared_hash));
     }
 
     fn info(name: &str, executors: Vec<Executor>) -> NodeInfo {

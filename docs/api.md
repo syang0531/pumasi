@@ -227,8 +227,25 @@ jq -r .error refused.json
 | `401` | no ticket, or a wrong, expired or revoked one |
 | `403` | the ticket's role or the account's policy does not allow it |
 | `404` | no such job (or not this account's) |
-| `429` | too many wrong tickets from this address; see `Retry-After` |
+| `429` | too many wrong tickets from this address, or too many requests from this ticket (120 at once, then 20 a second); see `Retry-After` |
 | `502` | `pumasi ui` cannot reach the control plane |
+
+### The audit log
+
+Every call that changes something, and every refusal (like the one
+above), is in the cluster's audit log, with the ticket's name. Reading it
+takes an admin ticket, so this client's ticket is refused:
+
+```sh
+curl -sS -H "Authorization: Bearer $PUMASI_TICKET" -o /dev/null -w '%{http_code}\n' \
+  "$PUMASI_URL/api/v1/audit"
+```
+<!-- ci: test "$(curl -sS -H "Authorization: Bearer $PUMASI_TICKET" -o /dev/null -w '%{http_code}' "$PUMASI_URL/api/v1/audit")" = 403 -->
+
+With an admin ticket, `GET /api/v1/audit?after=N&limit=N` returns the
+entries (oldest first, with their hashes) and `GET /api/v1/audit/verify`
+checks the whole chain and returns its head signed by the cluster key,
+the same as `pumasi audit ls --json` and `pumasi audit verify --json`.
 
 ### Cancel
 

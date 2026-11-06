@@ -2,6 +2,7 @@
 
 mod access;
 pub mod attest;
+pub mod audit;
 pub mod backup;
 mod check;
 pub mod confidential;
@@ -15,8 +16,10 @@ pub mod monitor;
 pub mod perf;
 mod prometheus;
 pub mod remote;
+pub mod retention;
 pub mod rollout;
 pub mod server;
+pub mod sso;
 pub mod state;
 pub mod store;
 pub mod transfer;

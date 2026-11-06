@@ -1688,6 +1688,131 @@ encrypted scratch disk (tasks are limited by the VM's memory); NVIDIA
 confidential computing (H100 and later) is not supported, so confidential
 jobs have no GPUs.
 
+## Phase 17: self-hosting 1.0
+
+What an organization needs before it trusts the cluster with its people
+and its data: knowing who did what, signing people in with the accounts
+they already have, limits on whatever reaches the internet, and evidence
+that the code holds up. The [threat model](threat-model.md) and the
+[operations guide](operations.md) are part of this phase.
+
+### Audit log
+
+Every mutating admin call, every refusal, node joins, sign-ins and their
+failures, secret reads, admin rotations, job expiry and control plane
+starts append an `AuditEntry` to the `audit` table: sequence number, time,
+actor (ticket name, role, iroh peer), action (`job.submit`,
+`access.revoke`, `call.Status` for a refused read, ...), target, detail,
+success, and two hashes. `hash = BLAKE3("pumasi/audit/v1\0" ||
+postcard(entry without hash))` covers the previous entry's hash, so the
+log is a chain (`pumasi_proto::audit`). `audit::describe` maps each
+`AdminOp` to an action, or to nothing for reads; refused calls get one
+from `refused_action`. Unknown secrets are refused before anything is
+written, so strangers cannot add to the log. The tip (next sequence
+number and last hash) is kept in memory and reloaded from the last row.
+
+`AdminOp::AuditVerify` walks the whole chain, checks it ends at the tip,
+and returns an `AuditHead` (cluster id, entry count, last sequence and
+hash, time) signed with the cluster key over `"pumasi/audit-head/v1\0" ||
+seq || hash || unix`. `pumasi audit verify --against head.json` checks
+the signature of a head saved earlier and that the log still contains it
+at that sequence number. `pumasi audit export` writes RFC 5424 syslog
+(`<85>1 TIME HOST pumasi - audit [pumasi@32473 seq=".." action=".."]
+{json}`, facility authpriv, severity notice or warning for failures) to
+standard output, UDP, or TCP with octet counting (RFC 6587), resuming
+from a state file.
+
+### Admin secret rotation
+
+`AdminOp::RotateAdminSecret` makes a new admin secret, stores it under
+`meta.admin_secret`, swaps it in memory (`Inner::admin_secret` is behind a
+mutex now), rewrites `admin.ticket`, and returns the new ticket once.
+Access tickets and SSO sessions are separate secrets and keep working.
+
+### SSO
+
+Settings (`SsoConfig`: OIDC provider, LDAP directory, rules, session
+length) live in `meta.sso`; secrets in them are `Hidden` (redacted in
+`Debug` and never in views). Sign-in calls are the only admin calls
+accepted without a secret (`AdminOp::is_sign_in`; clients send
+`SignInTicket`s, which are admin tickets with a zero secret and their own
+`pumasisignin` prefix). Each successful sign-in becomes an ordinary access
+ticket named after the person (their verified email, else the subject or
+LDAP user) with the most powerful role their rules give
+(`sso::role_for`: admin > submitter > viewer), valid for the session
+length; at most 10 sessions per person are kept. No matching rule, no
+ticket.
+
+- **OIDC browser flow.** `SsoStart { redirect_uri }` (the dashboard's
+  `--public-url` + `/sso/callback`, HTTPS or loopback) fetches the
+  issuer's discovery document (cached 1 hour), makes `state`, `nonce` and
+  a PKCE verifier, and returns the authorization URL; the dashboard keeps
+  `state` in a `SameSite=Lax` cookie scoped to `/sso`. `SsoFinish { state,
+  code }` takes the pending login (10 minutes, used once, at most 1000),
+  exchanges the code with the client secret, and checks the ID token with
+  `jsonwebtoken` against the JWKS (fetched again for an unknown key id, at
+  most once a minute):
+  asymmetric algorithms only, `iss`, `aud`, `azp`, `exp` and `nonce`.
+  Groups come from `--groups-claim`; emails count only when
+  `email_verified`.
+- **OIDC device flow** (RFC 8628) for the CLI: `SsoDeviceStart` asks the
+  provider for a device code and returns the user code with a handle;
+  `SsoDevicePoll { handle }` polls the token endpoint for the client,
+  honouring `slow_down`, so the device code never leaves the control
+  plane.
+- **LDAP.** `LdapLogin { user, password }` binds as the service account,
+  finds the user with the filter (`{user}` escaped per RFC 4515), binds
+  as the user (empty passwords refused), and reads groups from
+  `memberOf` or a group search. Five wrong passwords in five minutes lock
+  that user out of Pumasi for the rest of the window; at most four binds
+  run at once. LDAPS or StartTLS with the Mozilla roots; plain LDAP only
+  to loopback.
+
+The control plane makes these outbound calls itself, from the leader; the
+runtime state (caches, pending logins) is per leader term.
+
+### Request limits
+
+`pumasi ui` gives every ticket a token bucket (120 requests, refilled at
+20 per second; `429` with `Retry-After`) and at most 8 concurrent
+`?wait=` polls, and every client address a sign-in bucket (10, then 10 a
+minute). Bodies are capped per route: 1 MiB by default, 32 MiB for
+`/api/v1/op`, `--max-upload` only for job submissions and file store
+uploads. The session cookie is `Secure` when the dashboard's public URL
+is HTTPS.
+
+### Job retention
+
+Jobs, their tasks (with stdout, stderr and small outputs) and their
+modules stayed in memory and in `state.redb` forever. Every 10 minutes the
+leader deletes up to 2000 finished jobs submitted more than `--keep-jobs`
+ago (30 days by default; 0 keeps everything), skipping jobs a waiting job
+depends on, jobs with earnings on hold, and jobs whose outputs are still
+being stored (`retention.rs`). Their rows go in one batch with the
+modules and file bundles no remaining job uses; receipts, holds, the
+ledger and the audit log stay. One `jobs.expire` audit entry records each
+sweep.
+
+### Supply chain, fuzzing, soak
+
+- `deny.toml` (advisories, licenses, sources, wildcards; every workspace
+  crate is `publish = false`) and `.cargo/audit.toml`, both run in CI's
+  `supply-chain` job. Each ignored advisory has its reason.
+- `fuzz/` is a cargo-fuzz crate outside the workspace with ten targets:
+  `admin_wire`, `agent_wire`, `tickets`, `config_files`, `sealed_stream`
+  (also checks that any flipped byte of a sealed stream is detected),
+  `attestation`, `receipt`, `guest_output`, `audit_sso`,
+  `release_binary`. CI's `fuzz` job runs each for 60 seconds.
+- `scripts/soak.sh` (CI's `soak` job runs it for 10 minutes; a release
+  waits for 72 hours).
+
+### Compatibility
+
+Protocol stays 14: agents see nothing new. Admin ops and responses are
+appended at the end of their enums, so older CLIs keep working against
+this control plane (and get an unknown-response error for the new
+calls). Storage layout stays 7.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -1762,6 +1887,11 @@ so stored jobs decode unchanged; the tables `measurements` (by
 measurement id) and `trusted_nodes` (by node id) come last. Job keys are
 derived, and sealed inputs and leases are not stored.
 
+Phase 17 keeps layout 7 and adds the table `audit` (by sequence number,
+last in `tables!`) and the meta key `sso`. Expired jobs are deleted from
+`jobs`, `job_ext`, `job_gpu`, `job_sched`, `job_origin`, `tasks`,
+`task_ext`, `preempted` and `modules`.
+
 `PROTOCOL_VERSION` is 14 (phase 16, above): protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
@@ -1835,9 +1965,14 @@ remotely; install a current binary on them once.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Remaining roadmap phases (17 to 19): self-hosting 1.0 (SSO, audit log,
-  external security review), the hub, buying CU. See the roadmap in the
-  README.
+- Remaining roadmap phases (18 and 19): the hub and buying CU. See the
+  roadmap in the README.
+- Phase 17 leftovers: no per-peer limit on unauthenticated sign-in calls
+  at the control plane, the audit log is never pruned (pruning behind a
+  signed checkpoint), no SCIM provisioning (people appear when they first
+  sign in and their sessions simply expire), no SAML, the control plane
+  has no service installer of its own, and the 1.0 tag waits for the
+  external review and a 72-hour soak.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
   path for machines nobody is signed into (dockerd inside a WSL distro).
 - Rollouts go to every node; there is no canary group or per-node
@@ -1847,8 +1982,6 @@ remotely; install a current binary on them once.
   address in the membership is the one it joined with (a replica that
   moves must be removed and invited again), and replicas take no reads
   (followers serve nothing; the leader does all the work).
-- Access tickets are handed out by the admin; signing in with SSO and
-  mapping groups to roles is phase 17.
 - CU cannot be bought or exchanged, and there is no platform fee; both
   belong to the hub.
 - "Honeypot" tasks with known answers (needed for non-deterministic Docker
@@ -1858,4 +1991,4 @@ remotely; install a current binary on them once.
 - MicroVM: a snapshot pool for faster boots.
 - Availability: running tasks are not stopped when a node pauses, and
   idle detection under a Windows service is not possible yet.
-- WASI preview 2 components, job garbage collection.
+- WASI preview 2 components.

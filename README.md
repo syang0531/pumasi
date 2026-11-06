@@ -817,6 +817,67 @@ curl -H "Authorization: Bearer $(cat ~/.pumasi/admin.ticket)" http://127.0.0.1:7
 curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm http://127.0.0.1:7400/api/v1/jobs
 ```
 
+### Using the cluster from anywhere (HTTP API)
+
+Scripts on machines without Pumasi (a laptop at home, a CI job, another
+team's service) can submit jobs and fetch results over HTTPS with `curl`.
+The admin gives each client a submitter ticket and a job policy for its
+account, serves the API alone, and puts it behind a Cloudflare Tunnel, a
+reverse proxy or its own certificate:
+
+```sh
+pumasi access create "lab scripts" --role submitter --account lab
+pumasi quota lab --executors docker --images 'ghcr.io/lab/*' --network deny \
+  --max-timeout 30m --max-gpus-per-task 1
+pumasi ui --api-only --listen 127.0.0.1:7400 --real-ip-header CF-Connecting-IP
+cloudflared tunnel run pumasi          # https://pumasi.example.com -> 127.0.0.1:7400
+```
+
+and the client:
+
+```sh
+curl -H "Authorization: Bearer $PUMASI_TICKET" -F files=@job.toml -F files=@scene.py \
+  https://pumasi.example.com/api/v1/jobs
+curl -H "Authorization: Bearer $PUMASI_TICKET" "https://pumasi.example.com/api/v1/jobs/$JOB?wait=60s"
+curl -H "Authorization: Bearer $PUMASI_TICKET" -o out.zip "https://pumasi.example.com/api/v1/jobs/$JOB/outputs.zip"
+```
+
+- **Job policies** per account: allowed images (patterns or pinned
+  digests), executors, no network, a selector added to every job, allowed
+  tolerations, the longest timeout and the most GPUs per task. Anything
+  else is refused with `403` and the reason, whoever submits it. Every
+  job records the ticket that submitted it and the digest of each image
+  its tasks ran.
+- **`--api-only`** serves `/api/v1` and `/api/openapi.json` only, with
+  bearer tickets (no pages, no cookies). Ten wrong tickets in a minute
+  from one address block it for five minutes (`429`). `--tls-cert` and
+  `--tls-key` serve HTTPS directly; on an address other than loopback
+  `--api-only` refuses plain HTTP.
+- **`?wait=60s`** on a job answers as soon as it finishes (at most 90
+  seconds, under Cloudflare's 100). **`queue_timeout = "10m"`** in
+  job.toml fails a job no node has started in that time, with each node's
+  reason, instead of leaving it queued. **`capacity`** in
+  `/api/v1/status` (and `pumasi status`) says how many nodes would take
+  the account's work right now, per executor and with GPUs, and why each
+  other node would not.
+- Agents re-check Docker every 30 seconds, so a Windows machine whose
+  Docker Desktop starts late, or stops, is offered Docker work (or not)
+  without a restart.
+
+[docs/api.md](docs/api.md) walks through it with curl examples that CI
+runs against a real cluster, including the Cloudflare Tunnel setup and
+its limits (100 MB request bodies on the free plan).
+
+**Blender and other GPU drawing.** CUDA jobs need only `gpus = 1`. Jobs
+that draw (Blender EEVEE, OpenGL or Vulkan renderers) add `capabilities
+= ["graphics"]` to `[gpu]` and go only to nodes whose Docker GPUs can
+draw: `pumasi gpu check --docker-run --image IMAGE` on a node starts a
+container and reports CUDA, OptiX and drawing (NVIDIA's EGL and Vulkan
+drivers on Linux, Mesa's D3D12 driver on Windows with Docker Desktop),
+and the node gets the label `gpu.graphics=true`.
+[examples/blender-render](examples/blender-render) renders a scene with
+Cycles and with EEVEE.
+
 ## Commands
 
 | Command | What it does |
@@ -831,7 +892,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
-| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` / `gpu webgpu [--software]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally; `webgpu` lists the WebGPU adapters wasm jobs can use. |
+| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image IMAGE]]` / `gpu webgpu [--software]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally, and with `--docker-run` starts a container to see whether CUDA, OptiX and drawing (EGL, OpenGL, Vulkan) work in Docker (saved for the agent: `gpu.graphics`); `webgpu` lists the WebGPU adapters wasm jobs can use. |
 | `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
 | `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
 | `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
@@ -848,7 +909,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi login <TICKET>` | Manage a remote cluster from this machine, with the admin ticket or an access ticket. |
 | `pumasi cordon \| uncordon \| drain <NODE>` | Stop new tasks going to a node, take it back, or also move its running tasks elsewhere. |
 | `pumasi label <NODE> k=v... \| k-` / `taint <NODE> key[=value]... \| key-` | Node labels for job selectors; taints keep away jobs that do not tolerate them. |
-| `pumasi quota [ACCOUNT --slots N --gpus N --cu-per-day CU --max-priority N --storage SIZE] [--clear]` | Show every account's limits and usage, or change one (`none` lifts a limit). |
+| `pumasi quota [ACCOUNT --slots N --gpus N --cu-per-day CU --max-priority N --storage SIZE --images P,.. --require-digest yes --executors E,.. --network deny --selector S --tolerations T,.. --max-timeout D --max-gpus-per-task N] [--clear]` | Show every account's limits, job policy and usage, or change one (`none` or `any` lifts a limit). |
 | `pumasi access create NAME --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|NAME` | Tickets with a role for other people; `pumasi whoami` shows the one in use. |
 | `pumasi schedule add NAME job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm NAME` / `run NAME` | Jobs submitted on a cron schedule. |
 | `pumasi apply -f cluster.toml [--dry-run] [--prune]` | Make labels, taints, cordons, quotas, schedules, alert rules and webhooks match a file; applying twice changes nothing. |
@@ -862,7 +923,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi ha status [-o json]` / `ha invite [--ttl 1h]` / `ha remove ID` | Control plane replicas: who leads and how far each has the log, a ticket for one more replica, take one out. |
 | `pumasi cluster replica <TICKET> [--net public\|local] [--bind ADDR]` | Run this machine as a control plane replica (restart it later with `pumasi cluster start`). |
 | `pumasi backup FILE` / `pumasi cluster restore FILE` | A consistent copy of the control plane's state and cluster key, and a control plane made from one. |
-| `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB]` | The web dashboard and its JSON API, served from this machine (default 127.0.0.1:7400). |
+| `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB] [--api-only] [--tls-cert F --tls-key F] [--real-ip-header H]` | The web dashboard and its JSON API, served from this machine (default 127.0.0.1:7400); `--api-only` for programs elsewhere (bearer tickets only), `--tls-cert` for HTTPS. |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [--gpu] [ARGS...]` | Run a module locally in the agent's sandbox (stdin is passed through, `DIR` appears at `/input`, `/output` is saved to `pumasi-out/exec`, `--seed` for deterministic mode, `--gpu` gives it this machine's best WebGPU adapter). |
 
 `--home DIR` or `PUMASI_HOME` changes the state directory, which lets you run
@@ -898,6 +959,7 @@ deterministic = true                  # default (off with gpus): virtual clock +
 priority = 0                          # -1000..1000; higher runs first and may preempt lower
 after = []                            # job ids that must succeed before this job starts
 tolerations = []                      # taints of nodes it may run on, e.g. ["gpu-only"]
+# queue_timeout = "30m"               # fail (with each node's reason) if no node starts it by then
 
 [selector]                            # only nodes whose labels match (see Cluster management)
 os = "linux"
@@ -919,6 +981,7 @@ shards = 4
 network = false                       # default; true allows outbound network
 # gpus = 1                            # GPUs per task ("all": every GPU of the node)
 # gpu = { vendor = "nvidia", min_vram_gb = 16 }  # which GPUs (vendor: nvidia, amd, any)
+# gpu = { vendor = "nvidia", capabilities = ["graphics"] }  # drawing (EGL, OpenGL, Vulkan) or "video" (NVENC)
 
 [resources]
 memory_mb = 512
@@ -1040,6 +1103,14 @@ checked.
   jobs, schedules and datasets and see only those, `viewer` tickets only
   read. Every request is checked against the ticket's role on the control
   plane; revoked and expired tickets stop working at once.
+- `pumasi ui --api-only` on the internet (through a tunnel, a proxy or
+  `--tls-cert`) takes bearer tickets only and rate limits wrong ones per
+  client address; refuses plain HTTP on other addresses than loopback;
+  and gives each client only what its ticket's role and its account's job
+  policy allow. A submitter ticket that leaks can still run whatever that
+  account's policy allows (on Docker nodes, containers that share the
+  host kernel), so keep policies narrow (pinned images, no network) and
+  revoke tickets with `pumasi access revoke`.
 - WASM tasks are sandboxed from the machine running them (only their own
   `/input` and `/output`, no network, memory and CPU caps).
 - Docker tasks are only as isolated as a container: they share the host
@@ -1077,9 +1148,9 @@ checked.
 
 ## Roadmap
 
-Phases 1 to 15 are enough to run Pumasi on your own machines, alone or as
-an organization. Phase 16 finishes what an
-organization needs to adopt it, and phases 17 and 18 are only for trading
+Phases 1 to 16 are enough to run Pumasi on your own machines, alone or as
+an organization, and to use it from anywhere. Phase 17 finishes what an
+organization needs to adopt it, and phases 18 and 19 are only for trading
 with other clusters.
 
 | Phase | Scope | Status |
@@ -1097,11 +1168,12 @@ with other clusters.
 | 11 | Monitoring and alerts: node metrics (CPU, memory, disk, network, temperature, GPUs) kept 7 days with downsampling, `top`, live `logs -f`, `events`, opt-in Prometheus endpoint with a Grafana dashboard, alert rules (node offline, failure rate, disk, temperature, benchmark drop, SMART, check mismatch) sent to Slack, Discord or JSON webhooks | done |
 | 12 | Web dashboard built into the binary (`pumasi ui`): overview, nodes with charts, cordon and drain, jobs with submit, live output, cancel and output downloads, storage with uploads and downloads, CU and ledger, invites and access tickets, prices, events and alerts; sign-in with access tickets and their roles, Korean and English, JSON API with OpenAPI, Playwright tests in CI | done |
 | 13 | Control plane high availability: state replicated over Raft (openraft) to 3 or 5 control planes, automatic failover with nodes, CLI and dashboard following the leader, tickets listing every replica, replicas catching up from snapshots, `pumasi backup` and `cluster restore` | done |
-| 14 | WebGPU executor (experimental): wasm jobs with `gpus = 1` run WGSL compute shaders on any GPU through wgpu (Vulkan, Metal, DX12, GL) and the `pumasi_webgpu` imports, signed adapter profiles with a WGSL benchmark, adapters sharing slots with listed GPUs, GPU time billed in CU, matrix multiplication and blur examples checked against the CPU on Linux, Windows and macOS in CI, glibc Linux binaries that can load GPU drivers | this release |
-| 15 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
-| 16 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model, cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag | planned |
-| 17 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
-| 18 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
+| 14 | WebGPU executor (experimental): wasm jobs with `gpus = 1` run WGSL compute shaders on any GPU through wgpu (Vulkan, Metal, DX12, GL) and the `pumasi_webgpu` imports, signed adapter profiles with a WGSL benchmark, adapters sharing slots with listed GPUs, GPU time billed in CU, matrix multiplication and blur examples checked against the CPU on Linux, Windows and macOS in CI, glibc Linux binaries that can load GPU drivers | done |
+| 15 | Remote API clients: per-account job policies (images and digests, executors, no network, forced selector, tolerations, longest timeout, GPUs per task), who submitted each job and the image digests it ran, `queue_timeout`, the nodes that can take an account's work now (and why the others cannot), Docker re-checked by running agents, `pumasi ui --api-only` with HTTPS (`--tls-cert`) and failed sign-in limits, a Cloudflare Tunnel guide, `?wait=` long polling, curl examples run in CI, GPU driver capabilities for drawing (`gpu.graphics`, `gpu check --docker-run`) and a Blender example | this release |
+| 16 | Confidential tier on SEV-SNP / TDX servers with remote attestation | planned |
+| 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny and fuzzing in CI, an external security review, operations guide, 72-hour soak test, then the 1.0 tag | planned |
+| 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
+| 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 
 Known gaps: the file store's data is copied to the other control plane
 replicas every 30 seconds rather than as part of each write (a file
@@ -1133,7 +1205,14 @@ guest writes it to its output disk), Intel and Apple GPUs report no
 metrics, Windows nodes report no temperature, and the 10-second metric steps of the last hour are not kept
 across a control plane restart. The dashboard shows prices and alert rules
 but does not change them (the CLI and `apply` do), and keeps its sign-ins
-in memory (restarting `pumasi ui` signs everyone out).
+in memory (restarting `pumasi ui` signs everyone out). The remote API has
+no built-in tunnel or certificate renewal (Cloudflare Tunnel, a reverse
+proxy or certbot do that; there is no iroh-based proxy for the CLI yet),
+its failed sign-in counts live in each `pumasi ui` process, uploads
+through Cloudflare stop at its plan's body limit, and `?wait=` follows a
+job by polling the control plane. Drawing in Docker is checked on real
+GPUs by hand; EEVEE on a Linux host runs under Xvfb and so on the CPU
+unless the image brings its own GPU display (Cycles is not affected).
 
 ## Development
 
@@ -1161,7 +1240,8 @@ cluster's timing, mutual-mode lending and borrowing that adds up to zero, microV
 jobs on an invited provider, and an agent upgrade rollout (opt-in, forged
 signature and tampered binary refused). `crates/cluster/tests/manage.rs`
 covers selectors, drain and preemption, quotas, access tickets, `apply`
-twice, and dependent jobs across a control plane restart. The microVM test runs when `PUMASI_TEST_VM_DIR`
+twice, dependent jobs across a control plane restart, and account job
+policies, queue timeouts and capacity. The microVM test runs when `PUMASI_TEST_VM_DIR`
 points at a directory prepared with `pumasi vm setup` (CI does this on Linux
 with KVM, for Firecracker and for QEMU, and on Windows with QEMU in software
 emulation, using a binary built with the guest init embedded through
@@ -1183,6 +1263,12 @@ call the JSON API:
 cargo build -p pumasi-cli
 cd crates/dashboard/e2e && npm ci && npx playwright install chromium && npx playwright test
 ```
+
+`scripts/ci/api-doc.sh` runs every `sh` example of
+[docs/api.md](docs/api.md), in order, against a control plane, an agent
+and `pumasi ui --api-only` from the debug build (CI runs it in the
+dashboard job; it needs `curl`, `jq` and `unzip`). `crates/dashboard/tests/ui.rs`
+covers `--api-only` over TLS, the failed sign-in limit and `?wait=`.
 
 ## License
 

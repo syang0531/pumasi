@@ -274,12 +274,18 @@ impl Upgrader {
                 !chunk.is_empty() && chunk.len() as u64 <= (file.size - offset),
                 "bad chunk at {offset}"
             );
-            std::io::Write::write_all(&mut out, &chunk)?;
-            hasher.update(&chunk);
             offset += chunk.len() as u64;
+            // Hashing and writing megabytes off the async threads, which
+            // also carry the heartbeats: a slow machine otherwise misses
+            // enough of them to be dropped mid-upgrade.
+            (out, hasher) = blocking(move || {
+                std::io::Write::write_all(&mut out, &chunk)?;
+                hasher.update(&chunk);
+                Ok((out, hasher))
+            })
+            .await?;
         }
-        out.sync_all()?;
-        drop(out);
+        blocking(move || Ok(out.sync_all()?)).await?;
         let got = hasher.finish();
         if got != file.sha256 {
             let _ = std::fs::remove_file(&path);
@@ -297,24 +303,32 @@ impl Upgrader {
         let file = staged.release.file().clone();
         let new = sibling_tmp(&self.config.exe, "new");
         let res = async {
-            std::fs::copy(&staged.path, &new)
-                .with_context(|| format!("copy the new binary to {}", new.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))?;
-            }
+            let (from, to) = (staged.path.clone(), new.clone());
+            let copied = blocking(move || {
+                std::fs::copy(&from, &to)
+                    .with_context(|| format!("copy the new binary to {}", to.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755))?;
+                }
+                sha256_file(&to)
+            })
+            .await?;
             // The copy must still be the verified binary.
-            ensure!(
-                sha256_file(&new)? == file.sha256,
-                "new binary changed while copying"
-            );
+            ensure!(copied == file.sha256, "new binary changed while copying");
             if self.config.smoke_test {
                 smoke_test(&new, &file.version).await?;
             }
             let previous = self.dir.join(previous_name());
-            std::fs::copy(&self.config.exe, &previous)
-                .with_context(|| format!("back up the current binary to {}", previous.display()))?;
+            let exe = self.config.exe.clone();
+            blocking(move || {
+                std::fs::copy(&exe, &previous).with_context(|| {
+                    format!("back up the current binary to {}", previous.display())
+                })?;
+                Ok(())
+            })
+            .await?;
             self.save_pending(&Pending {
                 from_sha256: hex(&self.exe_sha256),
                 to_sha256: hex(&file.sha256),
@@ -337,6 +351,13 @@ impl Upgrader {
         info!(version = %file.version, "installed a new agent binary; restarting");
         Ok(file.version)
     }
+}
+
+/// Runs `f` on the blocking thread pool.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .context("blocking task failed")?
 }
 
 async fn fetch_chunk(

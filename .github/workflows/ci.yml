@@ -470,6 +470,8 @@ jobs:
       - name: Install the guest kernel and the pinned QEMU
         shell: bash
         run: |
+          # The host CPU, to tell runner machines apart when a boot fails.
+          powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name" || true
           ./target/debug/pumasi vm setup --vm-dir "$VM_DIR"
           ./target/debug/pumasi vm status --vm-dir "$VM_DIR" | tee status.txt
           grep -q "built into this binary" status.txt
@@ -514,7 +516,7 @@ jobs:
           qemu="$VM_DIR/qemu/qemu-system-x86_64.exe"
           initrd=$(ls "$VM_DIR"/initrd-*.cpio | head -n1)
           echo "=== bare boot (no disks), TCG"
-          timeout 120 "$qemu" -M microvm -accel tcg -cpu max -m 256 -nodefaults -no-user-config \
+          timeout 120 "$qemu" -M microvm,pic=off,pit=off -accel tcg -cpu max -m 256 -nodefaults -no-user-config \
             -no-reboot -display none -serial file:bare.log -kernel "$VM_DIR/vmlinux" -initrd "$initrd" \
             -append "console=ttyS0 reboot=t panic=1 earlyprintk=serial,ttyS0 loglevel=8 rdinit=/init tsc_early_khz=2000000" \
             < /dev/null; echo "exit $?"

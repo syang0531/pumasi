@@ -167,7 +167,7 @@ or QEMU on Windows, and the guest init (release binaries embed it). Backends:
 | Backend | Where | Notes |
 | --- | --- | --- |
 | Firecracker | Linux with `/dev/kvm` | default when installed; `--no-api --config-file`, its own seccomp filters |
-| QEMU | Linux, macOS, Windows | `-M microvm` on x86_64, `-M virt` on ARM64; KVM, HVF or WHPX when available, else TCG (slow; adds `tsc_early_khz` so boot never stalls calibrating the TSC) |
+| QEMU | Linux, macOS, Windows | `-M microvm,pic=off,pit=off` on x86_64 (the guest kernel never programs the legacy 8259, so a PIT tick would arrive as vector 0; HVF keeps the PIT to calibrate the TSC), `-M virt` on ARM64; KVM, HVF or WHPX when available, else TCG (slow; adds `tsc_early_khz` so boot never stalls calibrating the TSC) |
 | vz | macOS 11+ | Apple's Virtualization.framework in a signed helper process; the default on macOS (phase 6, below) |
 
 Nothing crosses the VM boundary except virtio block devices, which the

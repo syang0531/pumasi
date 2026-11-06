@@ -1471,7 +1471,15 @@ async fn microvm_jobs_run_on_an_invited_provider() {
     }
 
     // Network (phase 9): only with `network = true`, only public
-    // addresses, never this host or private ranges.
+    // addresses, never this host or private ranges. The node's device
+    // profile (with its microVM networking) arrives after it is online, so
+    // read the node again rather than trust the view from the start.
+    let node = cluster
+        .status()
+        .nodes
+        .into_iter()
+        .find(|n| n.id == provider_id)
+        .unwrap();
     microvm_network(&client, &node).await;
 
     client.close().await;

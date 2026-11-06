@@ -170,7 +170,9 @@ pub async fn sso_callback(
             let h = r.headers_mut();
             h.append(
                 header::SET_COOKIE,
-                auth::session_cookie(&id).parse().expect("cookie"),
+                auth::session_cookie(&id, st.public_url.starts_with("https://"))
+                    .parse()
+                    .expect("cookie"),
             );
             h.append(
                 header::SET_COOKIE,
@@ -223,7 +225,7 @@ pub async fn ldap(
     }
     .await;
     match res {
-        Ok(id) => signed_in(&id),
+        Ok(id) => signed_in(&st, &id),
         Err(e) => {
             st.limiter.failed(ip);
             render(&st, l, Some(&format!("{e:#}")), StatusCode::UNAUTHORIZED).await
@@ -243,9 +245,12 @@ fn same_origin(headers: &HeaderMap) -> bool {
     }
 }
 
-fn signed_in(id: &str) -> Response {
+fn signed_in(st: &St, id: &str) -> Response {
     (
-        [(header::SET_COOKIE, auth::session_cookie(id))],
+        [(
+            header::SET_COOKIE,
+            auth::session_cookie(id, st.public_url.starts_with("https://")),
+        )],
         Redirect::to("/"),
     )
         .into_response()
@@ -279,7 +284,7 @@ pub async fn page(
             .await;
         }
         return match auth::identify(&st, st.backend.own_secret()).await {
-            Ok(ident) => signed_in(&st.sessions.create(ident)),
+            Ok(ident) => signed_in(&st, &st.sessions.create(ident)),
             Err(e) => render(&st, l, Some(&format!("{e:#}")), StatusCode::BAD_GATEWAY).await,
         };
     }
@@ -312,7 +317,7 @@ pub async fn submit(
     }
     .await;
     match res {
-        Ok(ident) => signed_in(&st.sessions.create(ident)),
+        Ok(ident) => signed_in(&st, &st.sessions.create(ident)),
         Err(e) => {
             let msg = format!("{e:#}");
             let status = crate::pages::status_for(&msg);

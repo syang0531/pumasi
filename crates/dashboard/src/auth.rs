@@ -153,8 +153,13 @@ pub fn clear_sso_cookie() -> String {
     format!("{SSO_COOKIE}=; Path=/sso; HttpOnly; SameSite=Lax; Max-Age=0")
 }
 
-pub fn session_cookie(id: &str) -> String {
-    format!("{SESSION_COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict")
+/// `secure` (served over HTTPS, or behind a proxy that is) adds `Secure`,
+/// so the browser never sends the session over plain HTTP.
+pub fn session_cookie(id: &str, secure: bool) -> String {
+    format!(
+        "{SESSION_COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict{}",
+        if secure { "; Secure" } else { "" }
+    )
 }
 
 pub fn clear_session_cookie() -> String {

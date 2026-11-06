@@ -202,7 +202,9 @@ pub async fn submit(ctx: Ctx, headers: HeaderMap, form: Multipart) -> Response {
 }
 
 /// Writes the form's job.toml and files to a temporary directory and
-/// submits from there, as `pumasi run` would.
+/// submits from there, as `pumasi run` would, except that the job file may
+/// only name files in that directory: it comes from whoever holds a
+/// ticket, and this process runs on the admin's machine.
 pub(crate) async fn submit_upload(
     st: &St,
     secret: pumasi_proto::Secret,
@@ -214,7 +216,7 @@ pub(crate) async fn submit_upload(
     } else if !job_path.exists() {
         anyhow::bail!("no job.toml: write one or attach it");
     }
-    let (mut sub, upload) = JobFile::load_split(&job_path, INLINE_INPUT_BYTES)?;
+    let (mut sub, upload) = JobFile::load_split_confined(&job_path, INLINE_INPUT_BYTES)?;
     if let Some(a) = up.field("account") {
         sub.account = Some(a.to_string());
     }

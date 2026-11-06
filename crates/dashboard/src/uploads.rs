@@ -22,7 +22,14 @@ impl TempDir {
     pub fn new(tag: &str) -> Result<Self> {
         let p =
             std::env::temp_dir().join(format!("pumasi-ui-{tag}-{:016x}", rand::random::<u64>()));
-        std::fs::create_dir_all(&p).with_context(|| format!("create {}", p.display()))?;
+        // Only for this user (uploads and output zips are other people's
+        // data, and the temporary directory is shared on Unix), and never
+        // a directory someone else made first.
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(&p)
+            .with_context(|| format!("create {}", p.display()))?;
         Ok(Self(p))
     }
 
@@ -145,5 +152,23 @@ impl Stream for TempFileStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn temporary_directories_are_private() {
+        let d = super::TempDir::new("test").unwrap();
+        assert!(d.path().is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        let p = d.path().to_path_buf();
+        drop(d);
+        assert!(!p.exists());
     }
 }

@@ -1266,9 +1266,10 @@ checked.
 ## Roadmap
 
 Phases 1 to 17 are what an organization needs to run Pumasi on its own
-machines and use it from anywhere; the 1.0 tag waits for an internal
-security review of the scope in [docs/security-review.md](docs/security-review.md)
-and a green run of the long checks (5-hour soaks on Linux and macOS, 20
+machines and use it from anywhere. The internal security review of the
+scope in [docs/security-review.md](docs/security-review.md) is done
+(findings and fixes in the [threat model](docs/threat-model.md#internal-review-for-10));
+the 1.0 tag waits for a green run of the long checks (5-hour soaks on Linux and macOS, 20
 minutes per fuzz target) on the commit being tagged. There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 18 and 19
 are only for trading with other clusters.
@@ -1291,7 +1292,7 @@ are only for trading with other clusters.
 | 14 | WebGPU executor (experimental): wasm jobs with `gpus = 1` run WGSL compute shaders on any GPU through wgpu (Vulkan, Metal, DX12, GL) and the `pumasi_webgpu` imports, signed adapter profiles with a WGSL benchmark, adapters sharing slots with listed GPUs, GPU time billed in CU, matrix multiplication and blur examples checked against the CPU on Linux, Windows and macOS in CI, glibc Linux binaries that can load GPU drivers | done |
 | 15 | Remote API clients: per-account job policies (images and digests, executors, no network, forced selector, tolerations, longest timeout, GPUs per task), who submitted each job and the image digests it ran, `queue_timeout`, the nodes that can take an account's work now (and why the others cannot), Docker re-checked by running agents, `pumasi ui --api-only` with HTTPS (`--tls-cert`) and failed sign-in limits, a Cloudflare Tunnel guide, `?wait=` long polling, curl examples run in CI, GPU driver capabilities for drawing (`gpu.graphics`, `gpu check --docker-run`) and a Blender example | done |
 | 16 | Confidentiality tiers: `trusted` (owner machines and trusted providers) and `confidential` (SEV-SNP and TDX microVMs): images and inputs sealed on the control plane, remote attestation checked against AMD's and Intel's certificates (recorded reports and forgeries tested in CI), keys released only to a fresh guest with an admin-trusted launch measurement, sealed results, `pumasi confidential` and the dashboard's measurement list | this release |
-| 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny, CodeQL and fuzzing in CI, an SSO end-to-end test against Keycloak and OpenLDAP, an internal security review, operations guide, long soak tests on Linux and macOS, then the 1.0 tag. Also: job retention (`--keep-jobs`), admin secret rotation, per-ticket request limits | this release (review and tag pending) |
+| 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny, CodeQL and fuzzing in CI, an SSO end-to-end test against Keycloak and OpenLDAP, an internal security review, operations guide, long soak tests on Linux and macOS, then the 1.0 tag. Also: job retention (`--keep-jobs`), admin secret rotation, per-ticket request limits | this release (tag pending) |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | planned |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | planned |
 

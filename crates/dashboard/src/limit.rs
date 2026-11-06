@@ -97,7 +97,11 @@ impl AuthLimiter {
             && let Some(ip) = headers
                 .get(name.as_str())
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.split(',').next())
+                // The last address: the one the proxy in front of us
+                // added. Earlier ones in `X-Forwarded-For` are whatever
+                // the client sent, so taking the first would let anyone
+                // pick the address they are counted under.
+                .and_then(|v| v.rsplit(',').next())
                 .and_then(|v| v.trim().parse::<IpAddr>().ok())
         {
             return ip;
@@ -364,5 +368,14 @@ mod tests {
         assert_eq!(l.client_ip_of(far, &h), far);
         let plain = AuthLimiter::new(None);
         assert_eq!(plain.client_ip_of(lo, &h), lo);
+        // Behind a proxy that appends to X-Forwarded-For, only the last
+        // address is the proxy's word; the client wrote the rest.
+        let xff = AuthLimiter::new(Some("X-Forwarded-For".into()));
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "10.9.9.9, 203.0.113.7".parse().unwrap());
+        assert_eq!(
+            xff.client_ip_of(lo, &h),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
     }
 }

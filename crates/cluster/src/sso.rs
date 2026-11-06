@@ -358,6 +358,23 @@ fn pct(s: &str) -> String {
     out
 }
 
+/// Largest answer read from a provider.
+const MAX_ANSWER: usize = 1 << 20;
+
+/// Reads an answer of at most [`MAX_ANSWER`] bytes, stopping as soon as it
+/// is larger (rather than buffering all of it first).
+async fn read_limited(mut resp: reqwest::Response) -> Result<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > MAX_ANSWER as u64) {
+        bail!("answer too large");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        ensure!(body.len() + chunk.len() <= MAX_ANSWER, "answer too large");
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// A redirect URI must come back to a dashboard's callback over HTTPS (or
 /// to this machine).
 fn check_redirect(uri: &str) -> Result<()> {
@@ -394,9 +411,10 @@ impl Runtime {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
-        let body = resp.bytes().await?;
         ensure!(status.is_success(), "GET {url}: HTTP {status}");
-        ensure!(body.len() <= 1 << 20, "GET {url}: answer too large");
+        let body = read_limited(resp)
+            .await
+            .with_context(|| format!("GET {url}"))?;
         serde_json::from_slice(&body).with_context(|| format!("GET {url}: not the JSON expected"))
     }
 
@@ -413,8 +431,9 @@ impl Runtime {
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status().as_u16();
-        let body = resp.bytes().await?;
-        ensure!(body.len() <= 1 << 20, "POST {url}: answer too large");
+        let body = read_limited(resp)
+            .await
+            .with_context(|| format!("POST {url}"))?;
         let v: Value = serde_json::from_slice(&body)
             .with_context(|| format!("POST {url}: HTTP {status}, not JSON"))?;
         Ok((status, v))
@@ -781,7 +800,11 @@ impl Runtime {
         if password.is_empty() || password.len() > 1024 {
             return Err(plain(anyhow!("wrong user name or password")));
         }
-        self.ldap_allowed(user).map_err(plain)?;
+        // Directories match user names without regard to case, so the
+        // failure count must too: otherwise `Alice`, `ALICE`, `aLice`...
+        // each get their own five tries.
+        let key = user.to_lowercase();
+        self.ldap_allowed(&key).map_err(plain)?;
         let _slot = self
             .ldap_slots
             .acquire()
@@ -789,13 +812,13 @@ impl Runtime {
             .map_err(|_| plain(anyhow!("shutting down")))?;
         let found = ldap_lookup(l, user).await.map_err(plain)?;
         let Some((dn, mut groups, mail)) = found else {
-            self.ldap_failed(user);
+            self.ldap_failed(&key);
             return Err(plain(anyhow!("wrong user name or password")));
         };
         match ldap_bind(l, &dn, password).await {
             Ok(true) => {}
             Ok(false) => {
-                self.ldap_failed(user);
+                self.ldap_failed(&key);
                 return Err((
                     anyhow!("wrong user name or password"),
                     Some(format!("ldap:{user}")),

@@ -26,4 +26,6 @@ install scripts check.
 
 Pumasi has not had an independent third-party security audit. The
 maintainers review the code themselves before releases
-([docs/security-review.md](docs/security-review.md) has the scope).
+([docs/security-review.md](docs/security-review.md) has the scope; the
+review for 1.0 and what it fixed are in the
+[threat model](docs/threat-model.md#internal-review-for-10)).

@@ -919,9 +919,10 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
             .await
             .contains("no rule")
     );
-    // Too many wrong passwords pause the user name.
-    for _ in 0..5 {
-        err(&anon, login("bob", "guess")).await;
+    // Too many wrong passwords pause the user name, however it is
+    // capitalized (directories ignore case, so the count does too).
+    for user in ["bob", "Bob", "bob", "BOB", "bob"] {
+        err(&anon, login(user, "guess")).await;
     }
     let paused = err(&anon, login("bob", "builder")).await;
     assert!(paused.contains("too many wrong passwords"), "{paused}");
@@ -939,7 +940,9 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
         ldap.iter()
             .all(|(t, _)| *t == "ldap:alice" || *t == "ldap:bob")
     );
-    assert_eq!(ldap.iter().filter(|(t, _)| *t == "ldap:bob").count(), 6);
+    // "no rule", then the three wrong passwords for the name the
+    // directory knows (this test directory is case-sensitive).
+    assert_eq!(ldap.iter().filter(|(t, _)| *t == "ldap:bob").count(), 4);
     admin.close().await;
     anon.close().await;
     cluster.shutdown().await?;

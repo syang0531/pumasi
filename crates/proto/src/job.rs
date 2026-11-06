@@ -878,6 +878,53 @@ impl JobFile {
         file.resolve_with(base, Some(inline_limit))
     }
 
+    /// Like [`Self::load_split`], for a job file someone else wrote (the
+    /// dashboard's uploads): every local path (`module`, `stdin`, `files`
+    /// and the tasks' own) must stay inside the job's folder. `pumasi run`
+    /// reads whatever its own user names, `../build/m.wasm` included; a
+    /// server reading a stranger's job file must not, or `stdin =
+    /// "/home/admin/.pumasi/admin.ticket"` hands that file to the job.
+    pub fn load_split_confined(
+        path: &Path,
+        inline_limit: u64,
+    ) -> Result<(JobSubmission, Vec<(String, PathBuf)>)> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let file = Self::parse(&text)?;
+        file.check_confined()?;
+        let base = path.parent().unwrap_or(Path::new("."));
+        file.resolve_with(base, Some(inline_limit))
+    }
+
+    /// Refuses local paths that are absolute or climb out with `..`.
+    pub fn check_confined(&self) -> Result<()> {
+        let local = |ps: &'_ [PathBuf]| -> Vec<PathBuf> {
+            ps.iter()
+                .filter(|p| store_ref_of(p).is_none())
+                .cloned()
+                .collect()
+        };
+        let mut paths: Vec<PathBuf> = Vec::new();
+        paths.extend(self.module.iter().cloned());
+        paths.extend(self.stdin.iter().cloned());
+        paths.extend(local(&self.files));
+        for t in &self.tasks {
+            paths.extend(t.stdin.iter().cloned());
+            paths.extend(local(&t.files));
+        }
+        for p in &paths {
+            rel_string(p)?;
+            // `C:x` and `\\server\x` are prefixes on Windows only; refuse
+            // them everywhere so the check does not depend on the host.
+            let s = p.to_string_lossy();
+            ensure!(
+                !s.contains(':') && !s.starts_with('\\'),
+                "file paths in a job must be relative and stay inside its folder: {s}"
+            );
+        }
+        Ok(())
+    }
+
     fn resolve_with(
         self,
         base: &Path,
@@ -1524,6 +1571,44 @@ mod tests {
         );
         let none = JobFile::parse("name = \"x\"").unwrap();
         assert!(none.resolve(&dir).is_err(), "needs module or image");
+    }
+
+    #[test]
+    fn confined_job_files_read_only_their_folder() {
+        let dir = tempdir();
+        write_module(&dir);
+        std::fs::write(dir.join("in.txt"), "x").unwrap();
+        let outside = tempdir().join("secret");
+        std::fs::write(&outside, "admin ticket").unwrap();
+        let job = dir.join("job.toml");
+        let load = |text: String| {
+            std::fs::write(&job, text).unwrap();
+            JobFile::load_split_confined(&job, 1 << 20)
+        };
+        load(
+            "module = \"m.wasm\"\nstdin = \"in.txt\"\nfiles = [\"in.txt\", \"store:data\"]".into(),
+        )
+        .unwrap();
+        let o = outside.display().to_string().replace('\\', "/");
+        for bad in [
+            format!("module = \"{o}\""),
+            format!("module = \"m.wasm\"\nstdin = \"{o}\""),
+            "module = \"m.wasm\"\nstdin = \"../secret\"".to_string(),
+            format!("image = \"busybox\"\nfiles = [\"{o}\"]"),
+            format!("module = \"m.wasm\"\n[[task]]\nstdin = \"{o}\""),
+            "module = \"m.wasm\"\n[[task]]\nfiles = [\"a/../../x\"]".to_string(),
+            "module = \"C:m.wasm\"".to_string(),
+        ] {
+            let err = load(bad.clone()).expect_err(&bad);
+            assert!(
+                format!("{err:#}").contains("inside its folder"),
+                "{bad}: {err:#}"
+            );
+        }
+        // `pumasi run` still reads paths its own user wrote.
+        std::fs::write(&job, format!("module = \"m.wasm\"\nstdin = \"{o}\"")).unwrap();
+        let (sub, _) = JobFile::load_split(&job, 1 << 20).unwrap();
+        assert_eq!(sub.tasks[0].stdin, b"admin ticket");
     }
 
     #[test]

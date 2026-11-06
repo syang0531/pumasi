@@ -1136,7 +1136,7 @@ pub fn format_duration_ms(ms: u64) -> String {
     if ms == 0 {
         return "0s".into();
     }
-    if ms % 1000 != 0 {
+    if !ms.is_multiple_of(1000) {
         return format!("{ms}ms");
     }
     let mut secs = ms / 1000;

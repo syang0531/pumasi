@@ -17,6 +17,9 @@
 //! HttpOnly, SameSite=Strict cookie, and requests that change something
 //! must repeat the session's CSRF token in the `X-Pumasi-CSRF` header.
 
+// Rejections are finished responses.
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::HashMap,
     sync::Mutex,

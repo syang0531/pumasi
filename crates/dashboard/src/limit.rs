@@ -11,6 +11,9 @@
 //! `CF-Connecting-IP`), the address in that header: a tunnel connects
 //! from 127.0.0.1 for everyone.
 
+// Rejections are finished responses.
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},

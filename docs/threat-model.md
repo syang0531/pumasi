@@ -2,7 +2,7 @@
 
 What Pumasi protects, from whom, where the trust boundaries are, and what
 each one does about the threats that cross it. It covers 1.0 (phase 17)
-and is the starting point of the external security review
+and is the starting point of security reviews
 ([security-review.md](security-review.md)). The security model in the
 README is the short version for users; this page is the long one for
 reviewers and operators.

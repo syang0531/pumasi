@@ -1,0 +1,93 @@
+name: Long checks
+
+# What used to need a dedicated machine, on GitHub's hosted runners (free
+# and unlimited for public repositories, at most 6 hours per job): a
+# 5h20m soak on Linux and on macOS, and every fuzz target for 20 minutes.
+# Runs every Sunday and on demand (Actions → Long checks → Run workflow).
+# The release checklist (docs/operations.md, "Before a release") asks for
+# a green run of this workflow on the commit being tagged.
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Soak length (soak.sh units: 320m at most on hosted runners)"
+        default: "320m"
+      fuzz_seconds:
+        description: "Seconds per fuzz target"
+        default: "1200"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: soak (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: soak-long
+      - run: cargo build --release -p pumasi-cli
+      # soak.sh needs bash 4 or later; macOS ships 3.2.
+      - if: runner.os == 'macOS'
+        run: brew install bash jq && echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+      - name: Soak
+        run: |
+          bash --version | head -n1
+          scripts/soak.sh --bin target/release/pumasi --duration "${{ inputs.duration || '320m' }}" \
+            --agents 3 --agent-restart-every 15m --cluster-restart-every 1h --report soak-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-report-${{ matrix.os }}
+          path: soak-report
+          if-no-files-found: ignore
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: fuzz
+          workspaces: fuzz
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo fuzz build -O --debug-assertions --target x86_64-unknown-linux-gnu
+        working-directory: fuzz
+      - name: Run each target
+        working-directory: fuzz
+        run: |
+          for t in $(cargo fuzz list); do
+            echo "::group::$t"
+            cargo fuzz run -O --debug-assertions --target x86_64-unknown-linux-gnu "$t" -- \
+              -max_total_time=${{ inputs.fuzz_seconds || '1200' }} -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

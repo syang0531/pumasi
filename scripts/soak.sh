@@ -9,8 +9,9 @@
 #                   [--agents 3] [--report DIR]
 #                   [--agent-restart-every 30m] [--cluster-restart-every 6h]
 #
-# The 1.0 release waits for a 72-hour run (the default). CI runs a short
-# one (`--duration 10m`) on every pull request. Linux and macOS; needs
+# The default is 72 hours, for a long run on a machine you own. CI runs
+# 10 minutes on every pull request, and the Long checks workflow 5h20m on
+# Linux and macOS (the run a release waits for). Linux and macOS; needs
 # bash 4 or later, curl and jq. The report directory gets samples.csv (time, process, RSS
 # in KiB, open files), jobs.csv and summary.txt.
 set -euo pipefail

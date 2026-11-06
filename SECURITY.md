@@ -19,5 +19,11 @@ latest release to get them.
 
 The [threat model](docs/threat-model.md) lists what Pumasi defends
 against and what it does not. Every pull request runs `cargo deny`,
-`cargo audit` and the fuzz targets in `fuzz/`. Release binaries come with
-`SHA256SUMS`, which the install scripts check.
+`cargo audit`, CodeQL, the fuzz targets in `fuzz/` and an SSO test
+against real Keycloak and OpenLDAP; every week, longer fuzzing and
+5-hour soak tests. Release binaries come with `SHA256SUMS`, which the
+install scripts check.
+
+Pumasi has not had an independent third-party security audit. The
+maintainers review the code themselves before releases
+([docs/security-review.md](docs/security-review.md) has the scope).

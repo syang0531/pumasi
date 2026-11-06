@@ -1,8 +1,26 @@
-# External security review: brief
+# Security review: brief
 
-What the reviewers of Pumasi 1.0 get: the scope, how to build and run
-it, where the risky code is, and what we already know. Read it together
-with the [threat model](threat-model.md).
+What reviewers of Pumasi get: the scope, how to build and run it, where
+the risky code is, and what we already know. Read it together with the
+[threat model](threat-model.md).
+
+## Status
+
+Pumasi has had **no independent third-party audit**. For 1.0 the scope
+below gets an internal review (by the maintainers, with AI assistance,
+so not independent), with every finding fixed or written into the threat
+model's residual risks. Automated checks run on every pull request:
+cargo-audit and cargo-deny, CodeQL, the fuzz targets in `fuzz/`, the
+security tests in `crates/cluster/tests/security.rs`, and an SSO
+end-to-end test against real Keycloak and OpenLDAP
+(`scripts/sso-e2e.sh`). Every Sunday the Long checks workflow fuzzes each
+target for 20 minutes.
+
+An external review is planned once the project has users or funding to
+justify one. Free programs for open source audits (OSTIF, the OpenSSF's
+Alpha-Omega, the Sovereign Tech Agency, and OSS-Fuzz for continuous
+fuzzing) choose projects by how widely they are used, so we will apply
+then. This brief is written for that review.
 
 ## The system in one paragraph
 

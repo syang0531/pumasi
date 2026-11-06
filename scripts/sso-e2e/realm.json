@@ -1,0 +1,57 @@
+{
+  "realm": "pumasi",
+  "enabled": true,
+  "sslRequired": "none",
+  "oauth2DeviceCodeLifespan": 600,
+  "oauth2DevicePollingInterval": 1,
+  "groups": [{ "name": "pumasi-admins" }, { "name": "research" }],
+  "users": [
+    {
+      "username": "alice", "email": "alice@example.com", "emailVerified": true,
+      "firstName": "Alice", "lastName": "Researcher", "enabled": true,
+      "groups": ["/research"],
+      "credentials": [{ "type": "password", "value": "alice-pass", "temporary": false }]
+    },
+    {
+      "username": "bob", "email": "bob@example.com", "emailVerified": true,
+      "firstName": "Bob", "lastName": "Admin", "enabled": true,
+      "groups": ["/pumasi-admins"],
+      "credentials": [{ "type": "password", "value": "bob-pass", "temporary": false }]
+    },
+    {
+      "username": "carol", "email": "carol@elsewhere.org", "emailVerified": true,
+      "firstName": "Carol", "lastName": "Outsider", "enabled": true,
+      "credentials": [{ "type": "password", "value": "carol-pass", "temporary": false }]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "pumasi",
+      "name": "Pumasi",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "pumasi-e2e-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://127.0.0.1:17400/sso/callback"],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

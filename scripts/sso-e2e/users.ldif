@@ -1,0 +1,28 @@
+dn: ou=people,dc=example,dc=com
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,dc=example,dc=com
+objectClass: organizationalUnit
+ou: groups
+
+dn: uid=dave,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: dave
+cn: Dave Researcher
+sn: Researcher
+mail: dave@example.com
+userPassword: dave-pass
+
+dn: uid=erin,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: erin
+cn: Erin Outsider
+sn: Outsider
+mail: erin@elsewhere.org
+userPassword: erin-pass
+
+dn: cn=research,ou=groups,dc=example,dc=com
+objectClass: groupOfNames
+cn: research
+member: uid=dave,ou=people,dc=example,dc=com

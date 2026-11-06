@@ -48,6 +48,7 @@ pub fn routes() -> Router<St> {
         .route("/datasets", get(datasets))
         .route("/storage", get(storage))
         .route("/prices", get(prices))
+        .route("/confidential", get(confidential))
         .route("/invites", post(invite))
         .route("/op", post(op))
 }
@@ -319,10 +320,14 @@ async fn node_action(
         "cordon" => cordon(true),
         "uncordon" => cordon(false),
         "benchmark" => AdminOp::Benchmark { id: node.clone() },
+        "trust" | "untrust" => AdminOp::TrustNode {
+            node: node.clone(),
+            trusted: action == "trust",
+        },
         _ => {
             return error(
                 StatusCode::NOT_FOUND,
-                "actions: drain, cordon, uncordon, benchmark",
+                "actions: drain, cordon, uncordon, benchmark, trust, untrust",
             );
         }
     };
@@ -366,6 +371,10 @@ async fn storage(axum::extract::State(st): S, a: Api) -> Response {
 
 async fn prices(axum::extract::State(st): S, a: Api) -> Response {
     simple(st, a, AdminOp::GetPolicy).await
+}
+
+async fn confidential(axum::extract::State(st): S, a: Api) -> Response {
+    simple(st, a, AdminOp::Confidential).await
 }
 
 #[derive(Deserialize)]

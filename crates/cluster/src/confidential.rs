@@ -28,12 +28,12 @@ use pumasi_proto::{
     blobs,
     confidential::{
         ConfidentialTask, ConfidentialView, Evidence, MIN_MEASUREMENT_PREFIX, MeasurementView,
-        SEALED_IMAGE_FILE, SEALED_INPUT_FILE, SEALED_OUTPUT_FILE, SealedBlob, TeeKind,
-        TeeNodeView, TeeReport,
+        SEALED_IMAGE_FILE, SEALED_INPUT_FILE, SEALED_OUTPUT_FILE, SealedBlob, TeeKind, TeeNodeView,
+        TeeReport,
     },
     job::{DockerSpec, FileEntry, JobId, MAX_OUTPUT_FILES_BYTES, TaskInput, Tier},
     monitor::EventLevel,
-    msg::{Outcome, TaskReport, TaskRef},
+    msg::{Outcome, TaskRef, TaskReport},
     store::{IMAGE_MANIFEST, ImageBlob, ImageManifest, Mount, StoredOutput, image_layer_name},
     vmdisk,
 };
@@ -303,8 +303,7 @@ pub async fn seal_input(files: &FileStore, j: SealInputJob, tag: &str) -> Result
                 let staged = pumasi_proto::job::dir_files(&staged_dir)?;
                 let out = std::fs::File::create(&input_path)?;
                 let w = SealWriter::new(out, &task_key, Kind::Input, b"")?;
-                let w =
-                    vmdisk::write_input_tar(w, &spec, &stdin, &shared, &own, &staged)?;
+                let w = vmdisk::write_input_tar(w, &spec, &stdin, &shared, &own, &staged)?;
                 Ok(w.finish()?.1)
             })
             .await??
@@ -426,7 +425,10 @@ pub async fn open_output(
         } else {
             None
         };
-        Ok(Opened { report: out, stored })
+        Ok(Opened {
+            report: out,
+            stored,
+        })
     }
     .await;
     let _ = std::fs::remove_dir_all(&work);
@@ -471,7 +473,10 @@ impl State {
         if let Some(s) = self.conf.inputs.get(&(job, index)) {
             return ConfNeed::Ready(s.clone());
         }
-        let image = self.want_images(job).into_iter().find(|(a, _)| a == "amd64");
+        let image = self
+            .want_images(job)
+            .into_iter()
+            .find(|(a, _)| a == "amd64");
         let Some((_, image)) = image else {
             return ConfNeed::Sealing("sealing the image");
         };
@@ -703,7 +708,13 @@ impl State {
         let (agent_version, vcpus, name) = self
             .nodes
             .get(node)
-            .map(|n| (n.info.agent_version.clone(), n.info.cpus, n.info.name.clone()))
+            .map(|n| {
+                (
+                    n.info.agent_version.clone(),
+                    n.info.cpus,
+                    n.info.name.clone(),
+                )
+            })
             .unwrap_or_default();
         let vcpus = self
             .jobs
@@ -864,7 +875,11 @@ impl State {
                 "{} launch measurement {} {}",
                 rec.tee,
                 short(&full),
-                if trusted { "trusted" } else { "no longer trusted" }
+                if trusted {
+                    "trusted"
+                } else {
+                    "no longer trusted"
+                }
             ),
         );
         Ok(full)
@@ -888,7 +903,11 @@ impl State {
                 None,
                 format!(
                     "{name} {} trusted jobs",
-                    if trusted { "now runs" } else { "no longer runs" }
+                    if trusted {
+                        "now runs"
+                    } else {
+                        "no longer runs"
+                    }
                 ),
             );
             self.schedule();

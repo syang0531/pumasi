@@ -369,7 +369,7 @@ impl std::fmt::Display for Refusal<'_> {
             Refusal::Gpu => f.write_str("no free GPU that matches"),
             Refusal::Full => f.write_str("every slot busy"),
             Refusal::Untrusted => f.write_str(
-                "not a trusted host for tier = \"trusted\" (a provider's machine; `pumasi node trust` lets it)",
+                "not a trusted host for tier = \"trusted\" (a provider's machine; `pumasi trust NODE` lets it)",
             ),
             Refusal::Tee(Some(why)) => write!(f, "confidential VMs unavailable: {why}"),
             Refusal::Tee(None) => f.write_str("does not start confidential VMs (SEV-SNP or TDX)"),
@@ -1307,8 +1307,12 @@ impl State {
         self.conf.leases.remove(&r);
         let (report, stored, digest) = match opened {
             Some(o) => {
-                let digest =
-                    output_digest(&o.report.outcome, &o.report.stdout, &o.report.files, o.stored.as_ref());
+                let digest = output_digest(
+                    &o.report.outcome,
+                    &o.report.stdout,
+                    &o.report.files,
+                    o.stored.as_ref(),
+                );
                 (o.report, o.stored, digest)
             }
             None => (report, stored, digest),
@@ -1632,9 +1636,8 @@ impl State {
         // A private image is pulled into the store per architecture; only
         // nodes of an architecture it is ready for can run it.
         let tier = self.jobs.get(&item.job).map(|j| j.meta.tier)?;
-        let confidential = (tier == Tier::Confidential).then(|| {
-            self.conf_need(item.job, item.index)
-        });
+        let confidential =
+            (tier == Tier::Confidential).then(|| self.conf_need(item.job, item.index));
         let images = self
             .jobs
             .get(&item.job)
@@ -3771,5 +3774,261 @@ mod tests {
         };
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert_eq!(seen[0].account.as_deref(), Some("alice"));
+    }
+
+    // -- phase 16: tiers and the key broker ----------------------------------
+
+    fn tiered(tier: Tier) -> JobSubmission {
+        JobSubmission {
+            tier,
+            max_attempts: 10,
+            ..job(Executor::Microvm, 1)
+        }
+    }
+
+    #[test]
+    fn trusted_jobs_run_on_owner_machines_and_trusted_providers() {
+        let mut st = state();
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        let (bob_id, mut bob_rx) = join(
+            &mut st,
+            "bob",
+            vec![Executor::Wasm, Executor::Microvm],
+            bob(false),
+        );
+        let id = st.submit(tiered(Tier::Trusted)).unwrap();
+        assert!(
+            assigned(&mut bob_rx).is_empty(),
+            "a provider got a trusted job"
+        );
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+        st.trust_node("bob", true).unwrap();
+        assert_eq!(assigned(&mut bob_rx).len(), 1);
+        assert!(
+            st.confidential_view()
+                .nodes
+                .iter()
+                .any(|n| n.id == bob_id && n.trusted_by_admin)
+        );
+        // Kept across a restart.
+        let snap = st.store.load().unwrap();
+        assert_eq!(snap.trusted_nodes, vec![bob_id]);
+    }
+
+    /// A confidential job whose image and first input are sealed (what
+    /// the store worker would have done).
+    fn sealed_job(st: &mut State) -> JobId {
+        let id = st.submit(tiered(Tier::Confidential)).unwrap();
+        let job = st.jobs.get_mut(&id).unwrap();
+        assert!(
+            job.meta.ext.private_image,
+            "confidential images go through the store"
+        );
+        job.meta.ext.images.insert(
+            "amd64".into(),
+            crate::datasets::ImageState::Ready(ImageBlob {
+                root: [1; 32],
+                digest: "sha256:x".into(),
+                reference: "busybox".into(),
+            }),
+        );
+        let sealed = crate::confidential::SealedInput {
+            image: pumasi_proto::confidential::SealedBlob {
+                root: [1; 32],
+                size: 10,
+            },
+            input: pumasi_proto::confidential::SealedBlob {
+                root: [2; 32],
+                size: 20,
+            },
+            output_bytes: 1 << 20,
+            extra_mib: 64,
+        };
+        st.conf.inputs.insert((id, 0), sealed);
+        id
+    }
+
+    fn test_tee(st: &mut State, allowed: bool) {
+        st.attach_verifier(Arc::new(crate::attest::Verifier::new(allowed).unwrap()));
+    }
+
+    fn tee_report(st: &mut State, node: &str, tees: Vec<pumasi_proto::confidential::TeeKind>) {
+        let generation = st.nodes[node].generation;
+        st.on_tee(
+            node,
+            generation,
+            pumasi_proto::confidential::TeeReport {
+                tees,
+                unavailable: None,
+            },
+        );
+    }
+
+    /// What a test-TEE guest would send for `nonce`: its secret key and
+    /// the evidence.
+    fn guest_evidence(
+        nonce: &[u8; 32],
+        measurement: u8,
+    ) -> ([u8; 32], pumasi_proto::confidential::Evidence) {
+        let (secret, public) = pumasi_guest::seal::key_pair();
+        let ev = pumasi_proto::confidential::Evidence {
+            tee: pumasi_proto::confidential::TeeKind::Test,
+            report: vec![measurement; 48],
+            aux: vec![],
+            key: public,
+            report_data: pumasi_guest::seal::report_data(nonce, &public).to_vec(),
+        };
+        (secret, ev)
+    }
+
+    #[test]
+    fn confidential_runs_go_only_to_tee_nodes_and_carry_nothing_in_the_clear() {
+        use pumasi_proto::confidential::TeeKind;
+        let mut st = state();
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        test_tee(&mut st, false);
+        let (node, mut rx) = join(
+            &mut st,
+            "own",
+            vec![Executor::Wasm, Executor::Microvm],
+            None,
+        );
+        let id = sealed_job(&mut st);
+        st.schedule();
+        assert!(
+            assigned(&mut rx).is_empty(),
+            "no TEE, yet it got a confidential run"
+        );
+        // The test stand-in counts only on a control plane that allows it.
+        tee_report(&mut st, &node, vec![TeeKind::Test]);
+        assert!(assigned(&mut rx).is_empty());
+        let need = st
+            .need_for(&QueueItem {
+                job: id,
+                index: 0,
+                check: false,
+                priority: 0,
+            })
+            .unwrap();
+        let n = &st.nodes[&node];
+        let why = st.refusal(&node, n, &need, &HashMap::new(), 0, &[]);
+        assert!(matches!(why, Some(Refusal::Tee(_))), "{why:?}");
+        test_tee(&mut st, true);
+        st.schedule();
+        let got = assigned(&mut rx);
+        assert_eq!(got.len(), 1);
+        let a = &got[0];
+        let c = a.confidential.as_ref().expect("a confidential assignment");
+        assert_eq!(c.tee, TeeKind::Test);
+        assert_eq!(c.input.root, [2; 32]);
+        assert_eq!(
+            a.docker.as_ref().unwrap().image,
+            "",
+            "the image name went out"
+        );
+        assert_eq!(a.input, TaskInput::default());
+        assert!(a.files.is_none() && a.mounts.is_empty() && a.image.is_none());
+        assert_eq!(a.output, OutputMode::Store);
+        assert!(st.conf.leases.contains_key(&a.task));
+    }
+
+    /// The gate: keys go only to a fresh attestation, for this run, from
+    /// the node it was placed on, once, with a measurement an admin
+    /// trusts. Everything else gets nothing.
+    #[test]
+    fn keys_only_for_fresh_genuine_trusted_attestations() {
+        use crate::attest::check_test;
+        use pumasi_proto::confidential::TeeKind;
+        let mut st = state();
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        test_tee(&mut st, true);
+        let (node, mut rx) = join(
+            &mut st,
+            "own",
+            vec![Executor::Wasm, Executor::Microvm],
+            None,
+        );
+        let (other, _other_rx) = join(&mut st, "other", vec![Executor::Wasm], None);
+        tee_report(&mut st, &node, vec![TeeKind::Test]);
+        let id = sealed_job(&mut st);
+        st.schedule();
+        let a = assigned(&mut rx).pop().expect("placed");
+        let nonce = a.confidential.as_ref().unwrap().nonce;
+        let generation = st.nodes[&node].generation;
+        let other_gen = st.nodes[&other].generation;
+        let (_, ev) = guest_evidence(&nonce, 7);
+
+        // Another node cannot ask for this run's keys.
+        assert!(st.begin_attest(&other, other_gen, a.task, &ev).is_err());
+        // Evidence from another TEE than the run was placed for.
+        let snp = pumasi_proto::confidential::Evidence {
+            tee: TeeKind::SevSnp,
+            ..ev.clone()
+        };
+        assert!(st.begin_attest(&node, generation, a.task, &snp).is_err());
+        // That used the lease up: no second try for this run.
+        assert!(st.begin_attest(&node, generation, a.task, &ev).is_err());
+
+        // The next run (the first one failed).
+        st.on_report_rejected(&node, generation, a.task, "test");
+        let a = assigned(&mut rx).pop().expect("placed again");
+        let nonce = a.confidential.as_ref().unwrap().nonce;
+        // A replayed attestation (the last run's nonce) does not check out.
+        let (expected, _) = st.begin_attest(&node, generation, a.task, &ev).unwrap();
+        let checked = check_test(&ev, &expected, true);
+        assert!(checked.is_err());
+        assert!(st.finish_attest(&node, a.task, &ev, checked).is_err());
+
+        // A fresh one checks out, but no admin trusts its measurement yet.
+        st.on_report_rejected(&node, generation, a.task, "test");
+        let a = assigned(&mut rx).pop().expect("placed again");
+        let nonce_b = a.confidential.as_ref().unwrap().nonce;
+        assert_ne!(nonce, nonce_b, "every run gets its own nonce");
+        let (_, ev) = guest_evidence(&nonce_b, 7);
+        let (expected, _) = st.begin_attest(&node, generation, a.task, &ev).unwrap();
+        let checked = check_test(&ev, &expected, true);
+        let why = st.finish_attest(&node, a.task, &ev, checked).unwrap_err();
+        assert!(why.contains("not trusted"), "{why}");
+        let view = st.confidential_view();
+        assert_eq!(view.measurements.len(), 1);
+        let m = view.measurements[0].clone();
+        assert!(!m.trusted);
+        assert_eq!(m.seen, 1);
+        // Too short a prefix, or one that matches nothing.
+        assert!(st.trust_measurement(&m.id[..4], true, "").is_err());
+        assert!(st.trust_measurement("ffffffffff", true, "").is_err());
+        st.trust_measurement(&m.id[..12], true, "test guest")
+            .unwrap();
+
+        // Trusted, fresh and for this run: the keys, sealed to the guest.
+        st.on_report_rejected(&node, generation, a.task, "test");
+        let a = assigned(&mut rx).pop().expect("placed again");
+        let nonce = a.confidential.as_ref().unwrap().nonce;
+        let (secret, ev) = guest_evidence(&nonce, 7);
+        let (expected, _) = st.begin_attest(&node, generation, a.task, &ev).unwrap();
+        let checked = check_test(&ev, &expected, true);
+        let wrapped = st.finish_attest(&node, a.task, &ev, checked).unwrap();
+        let keys = pumasi_guest::seal::unwrap_keys(&secret, &nonce, &wrapped).unwrap();
+        let job_key = st.job_key(id);
+        assert_eq!(keys.task, pumasi_guest::seal::task_key(&job_key, 0));
+        assert_eq!(keys.image, pumasi_guest::seal::image_key(&job_key));
+        // Nobody else can open them.
+        let (stranger, _) = pumasi_guest::seal::key_pair();
+        assert!(pumasi_guest::seal::unwrap_keys(&stranger, &nonce, &wrapped).is_err());
+
+        // Another measurement (a changed guest) is not trusted.
+        st.on_report_rejected(&node, generation, a.task, "test");
+        let a = assigned(&mut rx).pop().expect("placed again");
+        let nonce = a.confidential.as_ref().unwrap().nonce;
+        let (_, ev) = guest_evidence(&nonce, 8);
+        let (expected, _) = st.begin_attest(&node, generation, a.task, &ev).unwrap();
+        let checked = check_test(&ev, &expected, true);
+        assert!(st.finish_attest(&node, a.task, &ev, checked).is_err());
+
+        // Untrusting stops the keys; trust survives a restart.
+        st.trust_measurement(&m.id, false, "").unwrap();
+        let snap = st.store.load().unwrap();
+        assert_eq!(snap.measurements.len(), 2);
+        assert!(snap.measurements.iter().all(|(_, r)| !r.trusted));
     }
 }

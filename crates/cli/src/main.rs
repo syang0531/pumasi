@@ -302,6 +302,24 @@ enum Cmd {
     /// Jobs submitted on a cron schedule.
     #[command(subcommand)]
     Schedule(manage::ScheduleCmd),
+    /// The confidential tier: TEE nodes and the launch measurements their
+    /// guests attested with, which an admin trusts before any key is
+    /// released.
+    #[command(subcommand)]
+    Confidential(manage::ConfCmd),
+    /// Let a provider's node run `tier = "trusted"` jobs (your own
+    /// machines always do).
+    Trust {
+        node: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Stop a provider's node from running `tier = "trusted"` jobs.
+    Untrust {
+        node: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
     /// Make the cluster match a cluster.toml: node labels, taints and
     /// cordons, account quotas, schedules, alert rules and webhooks. Applying it twice changes
     /// nothing the second time.
@@ -1360,6 +1378,9 @@ async fn run(cli: Cli) -> Result<i32> {
         Cmd::Access(cmd) => manage::access(&home, cmd).await,
         Cmd::Whoami { admin } => manage::whoami(&home, &admin).await,
         Cmd::Schedule(cmd) => manage::schedule(&home, cmd).await,
+        Cmd::Confidential(cmd) => manage::confidential(&home, cmd).await,
+        Cmd::Trust { node, admin } => manage::trust_node(&home, &admin, &node, true).await,
+        Cmd::Untrust { node, admin } => manage::trust_node(&home, &admin, &node, false).await,
         Cmd::Apply {
             file,
             dry_run,

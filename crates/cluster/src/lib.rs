@@ -2,9 +2,9 @@
 
 mod access;
 pub mod attest;
-pub mod confidential;
 pub mod backup;
 mod check;
+pub mod confidential;
 mod datasets;
 pub mod files;
 pub mod gpu;

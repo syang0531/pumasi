@@ -122,7 +122,10 @@ pub struct KeyLink {
 
 impl KeyLink {
     /// The wrapped keys, or why the control plane refused them.
-    pub async fn ask(&self, evidence: pumasi_proto::confidential::Evidence) -> Result<Vec<u8>, String> {
+    pub async fn ask(
+        &self,
+        evidence: pumasi_proto::confidential::Evidence,
+    ) -> Result<Vec<u8>, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.waiters.lock().unwrap().insert(self.task, tx);
         let sent = self.tx.send(pumasi_proto::msg::FromAgent::Attest {

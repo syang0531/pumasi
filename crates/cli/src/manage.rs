@@ -954,3 +954,149 @@ async fn describe_inner(client: &AdminClient, kind: DescribeKind, name: &str) ->
     }
     Ok(0)
 }
+
+// ---------------------------------------------------------------------------
+// The confidential tier (phase 16)
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand)]
+pub enum ConfCmd {
+    /// TEE nodes, trusted hosts and the launch measurements seen.
+    Ls {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Trust a launch measurement (its id or a unique prefix of 8 or more
+    /// characters): guests that attest with it get their keys. Trust only
+    /// the measurement of a guest you built or checked: the firmware,
+    /// kernel and the agent version's guest init.
+    Trust {
+        id: String,
+        /// What it is, e.g. "agent 0.17.0, OVMF 2025.02, 4 vCPUs".
+        #[arg(long, default_value = "")]
+        note: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Stop trusting a launch measurement: no more keys for it.
+    Untrust {
+        id: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+}
+
+pub async fn confidential(home: &Path, cmd: ConfCmd) -> Result<i32> {
+    let (admin, op, json) = match cmd {
+        ConfCmd::Ls { json, admin } => (admin, AdminOp::Confidential, json),
+        ConfCmd::Trust { id, note, admin } => (
+            admin,
+            AdminOp::TrustMeasurement {
+                id,
+                trusted: true,
+                note,
+            },
+            false,
+        ),
+        ConfCmd::Untrust { id, admin } => (
+            admin,
+            AdminOp::TrustMeasurement {
+                id,
+                trusted: false,
+                note: String::new(),
+            },
+            false,
+        ),
+    };
+    let AdminResponse::Confidential(view) = call(home, &admin, op).await? else {
+        bail!("unexpected response");
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        print_confidential(&view);
+    }
+    Ok(0)
+}
+
+pub async fn trust_node(home: &Path, admin: &AdminArgs, node: &str, trusted: bool) -> Result<i32> {
+    let op = AdminOp::TrustNode {
+        node: node.to_string(),
+        trusted,
+    };
+    let AdminResponse::Confidential(_) = call(home, admin, op).await? else {
+        bail!("unexpected response");
+    };
+    if trusted {
+        eprintln!("{node} now runs tier = \"trusted\" jobs");
+    } else {
+        eprintln!(
+            "{node} no longer runs tier = \"trusted\" jobs (unless it is one of the owner's)"
+        );
+    }
+    Ok(0)
+}
+
+fn print_confidential(v: &pumasi_proto::confidential::ConfidentialView) {
+    if v.test_tee {
+        println!(
+            "WARNING: the control plane accepts the test TEE (--insecure-test-tee): nothing confidential is protected\n"
+        );
+    }
+    println!(
+        "{:<20} {:<7} {:<14} {:<8} NOTE",
+        "NODE", "ONLINE", "TEES", "TRUSTED"
+    );
+    for n in &v.nodes {
+        let tees = if n.tees.is_empty() {
+            "-".to_string()
+        } else {
+            n.tees
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let trusted = match (n.trusted_host, n.trusted_by_admin) {
+            (true, true) => "admin",
+            (true, false) => "owner",
+            _ => "no",
+        };
+        println!(
+            "{:<20} {:<7} {:<14} {:<8} {}",
+            truncate(&n.name, 20),
+            if n.online { "yes" } else { "no" },
+            tees,
+            trusted,
+            n.unavailable.as_deref().unwrap_or("")
+        );
+    }
+    println!();
+    if v.measurements.is_empty() {
+        println!("no launch measurements seen yet: they appear once a confidential task attests");
+        return;
+    }
+    println!(
+        "{:<18} {:<8} {:<8} {:<6} {:<20} LAST SEEN / NOTE",
+        "MEASUREMENT", "TEE", "TRUSTED", "SEEN", "NODE"
+    );
+    for m in &v.measurements {
+        println!(
+            "{:<18} {:<8} {:<8} {:<6} {:<20} {}  {}",
+            &m.id[..m.id.len().min(16)],
+            m.tee.to_string(),
+            if m.trusted { "yes" } else { "no" },
+            m.seen,
+            truncate(&m.node, 20),
+            utc(m.last_seen_unix),
+            if m.note.is_empty() {
+                format!("agent {}, {} vCPUs; {}", m.agent_version, m.vcpus, m.detail)
+            } else {
+                m.note.clone()
+            }
+        );
+    }
+}

@@ -95,7 +95,7 @@ impl FromStr for JobId {
 /// - `Open`: any node. Sandboxes protect the node from the job, not the
 ///   job from the node's owner, who can read everything.
 /// - `Trusted`: only the cluster owner's machines and providers the admin
-///   trusts (`pumasi node trust`). Their owners could still read the job;
+///   trusts (`pumasi trust`). Their owners could still read the job;
 ///   the protection is that you know and trust them.
 /// - `Confidential`: microVM jobs only, each task in a VM whose memory the
 ///   node's owner cannot read (AMD SEV-SNP or Intel TDX), with the image,

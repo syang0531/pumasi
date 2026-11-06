@@ -166,7 +166,10 @@ fn snp_products(report: &sev::firmware::guest::AttestationReport) -> Vec<&'stati
 /// Checks a SEV-SNP attestation report against its VCEK.
 pub fn check_snp(report: &[u8], vcek: &[u8], expected: &[u8; 64]) -> Result<Checked> {
     use sev::certs::snp::{Certificate, Chain, Verifiable};
-    let parsed = <sev::firmware::guest::AttestationReport as sev::parser::ByteParser<()>>::from_bytes(report)
+    let parsed =
+        <sev::firmware::guest::AttestationReport as sev::parser::ByteParser<()>>::from_bytes(
+            report,
+        )
         .context("parse the SEV-SNP report")?;
     ensure!(
         parsed.sig_algo == 1,
@@ -333,10 +336,7 @@ pub fn check_test(ev: &Evidence, expected: &[u8; 64], allowed: bool) -> Result<C
         allowed,
         "test evidence (no TEE) is refused: the control plane was not started with --insecure-test-tee"
     );
-    ensure!(
-        ev.report.len() == 48,
-        "test evidence has no measurement"
-    );
+    ensure!(ev.report.len() == 48, "test evidence has no measurement");
     ensure!(
         ev.report_data.as_slice() == expected.as_slice(),
         "the report data is not this run's"
@@ -420,7 +420,10 @@ impl Verifier {
     /// The VCEK for a report's chip and firmware versions, from AMD's key
     /// distribution service.
     async fn fetch_vcek(&self, report: &[u8]) -> Result<Vec<u8>> {
-        let parsed = <sev::firmware::guest::AttestationReport as sev::parser::ByteParser<()>>::from_bytes(report)
+        let parsed =
+            <sev::firmware::guest::AttestationReport as sev::parser::ByteParser<()>>::from_bytes(
+                report,
+            )
             .context("parse the SEV-SNP report")?;
         let t = &parsed.reported_tcb;
         let mut last = None;
@@ -488,8 +491,10 @@ impl Verifier {
                 "{INTEL_PCS}/tdx/certification/v4/tcb?fmspc={fmspc}"
             ))
             .await?;
-        let tcb_info_issuer_chain =
-            header(&resp, &["TCB-Info-Issuer-Chain", "SGX-TCB-Info-Issuer-Chain"])?;
+        let tcb_info_issuer_chain = header(
+            &resp,
+            &["TCB-Info-Issuer-Chain", "SGX-TCB-Info-Issuer-Chain"],
+        )?;
         let tcb: serde_json::Value =
             serde_json::from_slice(&resp.bytes().await?).context("TCB info")?;
         let resp = self
@@ -621,10 +626,14 @@ mod tests {
     fn the_vcek_is_found_in_an_extended_report() {
         // ARK, then VCEK, then the end.
         let mut table = Vec::new();
-        let guid_ark = [0xc0, 0xb4, 0x06, 0xa4, 0xa8, 0x03, 0x49, 0x52, 0x97, 0x43, 0x3f, 0xb6,
-            0x01, 0x4c, 0xd0, 0xae];
-        let guid_vcek = [0x63, 0xda, 0x75, 0x8d, 0xe6, 0x64, 0x45, 0x64, 0xad, 0xc5, 0xf4, 0xb9,
-            0x3b, 0xe8, 0xac, 0xcd];
+        let guid_ark = [
+            0xc0, 0xb4, 0x06, 0xa4, 0xa8, 0x03, 0x49, 0x52, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c,
+            0xd0, 0xae,
+        ];
+        let guid_vcek = [
+            0x63, 0xda, 0x75, 0x8d, 0xe6, 0x64, 0x45, 0x64, 0xad, 0xc5, 0xf4, 0xb9, 0x3b, 0xe8,
+            0xac, 0xcd,
+        ];
         let start = 3 * 24;
         for (guid, at, len) in [
             (guid_ark, start as u32, 4u32),
@@ -651,9 +660,7 @@ mod tests {
     fn valid_time(c: &dcap_qvl::QuoteCollateralV3) -> u64 {
         let window = |j: &str| {
             let v: serde_json::Value = serde_json::from_str(j).unwrap();
-            let t = |k: &str| {
-                chrono_like(v[k].as_str().unwrap())
-            };
+            let t = |k: &str| chrono_like(v[k].as_str().unwrap());
             (t("issueDate"), t("nextUpdate"))
         };
         let (a, b) = window(&c.tcb_info);
@@ -696,7 +703,11 @@ mod tests {
         let checked = check_tdx(TDX_QUOTE, &c, now, &rd).unwrap();
         assert_eq!(checked.tee, TeeKind::Tdx);
         assert_eq!(checked.measurement.len(), 96);
-        assert!(checked.detail.starts_with("TCB UpToDate"), "{}", checked.detail);
+        assert!(
+            checked.detail.starts_with("TCB UpToDate"),
+            "{}",
+            checked.detail
+        );
     }
 
     #[test]

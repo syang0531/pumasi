@@ -73,7 +73,7 @@ pub struct TeeNodeView {
     /// Why it starts none, when its owner turned confidential VMs on.
     pub unavailable: Option<String>,
     /// Runs `tier = "trusted"` jobs: one of the owner's machines, or a
-    /// provider the admin trusts (`pumasi node trust`).
+    /// provider the admin trusts (`pumasi trust`).
     pub trusted_host: bool,
     /// The admin trusts it (as opposed to it being the owner's).
     pub trusted_by_admin: bool,

@@ -1008,19 +1008,16 @@ impl MicrovmExecutor {
                         },
                     };
                     let a = attest.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        write_at(&a, REPLY_AT, &reply.frame())
-                    })
-                    .await;
+                    let _ =
+                        tokio::task::spawn_blocking(move || write_at(&a, REPLY_AT, &reply.frame()))
+                            .await;
                     return;
                 }
             })
         };
         let deadline = run_start + Duration::from_millis(limits.timeout_ms);
         debug!(task = %task, tee = %t.tee, "booting confidential microvm");
-        let end = self
-            .boot_on(vmm, &vm, &dir, Some(deadline), cancel)
-            .await;
+        let end = self.boot_on(vmm, &vm, &dir, Some(deadline), cancel).await;
         watcher.abort();
         let end = end?;
         let wall_ms = run_start.elapsed().as_millis() as u64;

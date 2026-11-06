@@ -279,7 +279,9 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
             "--insecure-test-tee: confidential tasks may run without a TEE; nothing they hold is protected"
         );
     }
-    state.attach_verifier(Arc::new(crate::attest::Verifier::new(config.insecure_test_tee)?));
+    state.attach_verifier(Arc::new(crate::attest::Verifier::new(
+        config.insecure_test_tee,
+    )?));
     let (stopped, _) = watch::channel(false);
     let prometheus = match config.metrics_addr {
         Some(addr) => {

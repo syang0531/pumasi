@@ -229,7 +229,10 @@ pub fn status_for(msg: &str) -> StatusCode {
         StatusCode::BAD_GATEWAY
     } else if crate::auth::is_bad_credentials(msg) {
         StatusCode::UNAUTHORIZED
-    } else if msg.contains("ticket cannot") || msg.contains("belongs to") {
+    } else if msg.contains("ticket cannot")
+        || msg.contains("account's policy")
+        || msg.contains("belongs to")
+    {
         StatusCode::FORBIDDEN
     } else if msg.starts_with("no such") {
         StatusCode::NOT_FOUND

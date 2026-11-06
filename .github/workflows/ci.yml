@@ -195,6 +195,10 @@ jobs:
           cache: npm
           cache-dependency-path: crates/dashboard/e2e/package-lock.json
       - run: cargo build -p pumasi-cli
+      # Phase 15: every curl example in docs/api.md, against a local
+      # cluster behind `pumasi ui --api-only`.
+      - name: docs/api.md examples
+        run: scripts/ci/api-doc.sh target/debug/pumasi
       - name: Install Playwright and Chromium
         working-directory: crates/dashboard/e2e
         run: |

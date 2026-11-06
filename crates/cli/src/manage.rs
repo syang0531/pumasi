@@ -368,6 +368,12 @@ pub async fn quota(
         s.parse::<i32>().context("expected a number or `none`")
     })?;
     let storage = limit(&storage, parse_size)?;
+    let quota_given = clear
+        || slots.is_some()
+        || gpus.is_some()
+        || cu_per_day.is_some()
+        || max_priority.is_some()
+        || storage.is_some();
     let client = connect_admin(home, admin).await?;
     let set = async {
         let cur = quotas(&client)
@@ -408,12 +414,14 @@ pub async fn quota(
         if let Some(v) = storage {
             q.storage_bytes = v;
         }
-        client
-            .call(AdminOp::SetQuota {
-                account: account.clone(),
-                quota: q.clone(),
-            })
-            .await?;
+        if quota_given {
+            client
+                .call(AdminOp::SetQuota {
+                    account: account.clone(),
+                    quota: q.clone(),
+                })
+                .await?;
+        }
         anyhow::Ok((q, p))
     };
     let r = set.await;

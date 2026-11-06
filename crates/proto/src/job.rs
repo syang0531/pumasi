@@ -111,7 +111,9 @@ pub enum Tier {
 ///   No network unless the job asks for one, and then only to the
 ///   internet. Safe to send to other people's machines, so providers that
 ///   opted in with `--allow-microvm` get these tasks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Executor {
     #[default]

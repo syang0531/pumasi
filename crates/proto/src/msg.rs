@@ -1074,8 +1074,8 @@ pub struct ClusterStatus {
 pub struct Capacity {
     pub account: String,
     /// Nodes that would take a new task of the account now (with a free
-    /// slot), by executor.
-    pub ready: Vec<(Executor, u32)>,
+    /// slot), by executor (the executors the account may use).
+    pub ready: std::collections::BTreeMap<Executor, u32>,
     /// Of those, nodes with a free GPU for image jobs.
     pub ready_gpu: u32,
     /// Of those, nodes whose Docker GPU tasks can draw.
@@ -1086,10 +1086,7 @@ pub struct Capacity {
 impl Capacity {
     /// Nodes ready for `executor`.
     pub fn ready_for(&self, executor: Executor) -> u32 {
-        self.ready
-            .iter()
-            .find(|(e, _)| *e == executor)
-            .map_or(0, |(_, n)| *n)
+        self.ready.get(&executor).copied().unwrap_or(0)
     }
 }
 

@@ -4,6 +4,7 @@
 //! specification users write, the messages agents and the control plane
 //! exchange, the admin API, and the tickets used to join a cluster.
 
+pub mod audit;
 pub mod blobs;
 pub mod confidential;
 pub mod economy;
@@ -18,6 +19,7 @@ pub mod perf;
 pub mod receipt;
 pub mod registry;
 pub mod release;
+pub mod sso;
 pub mod store;
 pub mod ticket;
 pub mod vmdisk;

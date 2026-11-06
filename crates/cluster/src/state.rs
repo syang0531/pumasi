@@ -421,6 +421,10 @@ pub struct State {
     pub(crate) monitor: Monitor,
     /// TEE nodes, leases, sealed inputs and measurements (phase 16).
     pub(crate) conf: crate::confidential::ConfState,
+    /// The audit log's next number and newest hash (phase 17).
+    pub(crate) audit_tip: crate::audit::AuditTip,
+    /// SSO settings and sign-ins under way (phase 17).
+    pub(crate) sso: crate::sso::SsoState,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -497,6 +501,8 @@ impl State {
             mgmt: Mgmt::default(),
             monitor: Monitor::default(),
             conf: Default::default(),
+            audit_tip: Default::default(),
+            sso: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -588,6 +594,8 @@ impl State {
         })?;
         state.load_monitor(Duration::from_secs(7 * 86_400))?;
         state.load_conf(snap.measurements, snap.trusted_nodes);
+        state.load_audit()?;
+        state.load_sso()?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(
@@ -718,7 +726,13 @@ impl State {
             info.name, member.role, member.account
         );
         self.members.insert(id.to_string(), member);
-        self.event(EventLevel::Info, "node.joined", Some(id), None, msg);
+        self.event(EventLevel::Info, "node.joined", Some(id), None, msg.clone());
+        let who = crate::audit::Actor {
+            name: format!("node:{}", info.name),
+            role: "node".into(),
+            peer: id.chars().take(10).collect(),
+        };
+        self.audit(&who, "node.join", id, msg, true);
         Ok(out)
     }
 

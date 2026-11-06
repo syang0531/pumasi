@@ -257,14 +257,20 @@ pub fn oci_arch() -> &'static str {
     }
 }
 
-/// An HTTPS client trusting the bundled web roots plus the system store
-/// (and `SSL_CERT_FILE`), for registries behind corporate proxies.
-pub fn http_client() -> Result<reqwest::Client> {
+/// The bundled web roots plus the system store (and `SSL_CERT_FILE`).
+pub fn root_certs() -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for cert in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(cert);
     }
+    roots
+}
+
+/// An HTTPS client trusting the bundled web roots plus the system store
+/// (and `SSL_CERT_FILE`), for registries behind corporate proxies.
+pub fn http_client() -> Result<reqwest::Client> {
+    let roots = root_certs();
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

@@ -708,6 +708,65 @@ pub enum AdminOp {
         node: String,
         trusted: bool,
     },
+    // Phase 17 from here.
+    /// Audit log entries after `after`, oldest first; with `after` 0, the
+    /// newest `limit`.
+    Audit {
+        after: u64,
+        limit: u32,
+    },
+    /// Checks the whole audit chain and answers with its head, signed by
+    /// the cluster key.
+    AuditVerify,
+    /// Replaces the cluster's admin secret: every copy of the old admin
+    /// ticket stops working. Answers with the new ticket.
+    RotateAdminSecret,
+    /// The SSO settings (without secrets).
+    SsoGet,
+    /// Changes the SSO settings.
+    SsoSet(Box<crate::sso::SsoUpdate>),
+    // The calls below need no ticket: they are how people without one
+    // sign in. The control plane checks the identity provider's answer.
+    /// Which sign-in methods there are.
+    SsoInfo,
+    /// Starts a browser sign-in: answers with the provider's URL to send
+    /// the browser to, which comes back to `redirect_uri`.
+    SsoStart {
+        redirect_uri: String,
+    },
+    /// Finishes a browser sign-in with what came back to `redirect_uri`.
+    /// Answers with an access ticket for the session.
+    SsoFinish {
+        state: String,
+        code: String,
+    },
+    /// Starts a device sign-in (`pumasi login --sso`).
+    SsoDeviceStart,
+    /// Asks whether the device sign-in is done: an access ticket when it
+    /// is, `SsoPending` while the user has not finished.
+    SsoDevicePoll {
+        handle: String,
+    },
+    /// Signs in with an LDAP user name and password.
+    LdapLogin {
+        user: String,
+        password: crate::sso::Hidden,
+    },
+}
+
+impl AdminOp {
+    /// Calls anyone may make, without a ticket (sign-in).
+    pub fn is_sign_in(&self) -> bool {
+        matches!(
+            self,
+            AdminOp::SsoInfo
+                | AdminOp::SsoStart { .. }
+                | AdminOp::SsoFinish { .. }
+                | AdminOp::SsoDeviceStart
+                | AdminOp::SsoDevicePoll { .. }
+                | AdminOp::LdapLogin { .. }
+        )
+    }
 }
 
 /// Terms of an invite for someone else's machine.
@@ -805,6 +864,26 @@ pub enum AdminResponse {
     },
     // Phase 16 from here.
     Confidential(Box<crate::confidential::ConfidentialView>),
+    // Phase 17 from here.
+    Audit(Vec<crate::audit::AuditEntry>),
+    AuditHead(Box<crate::audit::AuditHead>),
+    /// The cluster's new admin ticket after `RotateAdminSecret`.
+    AdminTicket {
+        ticket: String,
+    },
+    Sso(Box<crate::sso::SsoView>),
+    SsoInfo(crate::sso::SsoInfo),
+    /// Where to send the browser; `state` comes back with it.
+    SsoRedirect {
+        url: String,
+        state: String,
+    },
+    SsoDevice(Box<crate::sso::DeviceStart>),
+    /// The device sign-in is not finished yet; ask again after `interval`
+    /// seconds.
+    SsoPending {
+        interval_secs: u64,
+    },
 }
 
 /// A secret's name and when it was set; the value never leaves the

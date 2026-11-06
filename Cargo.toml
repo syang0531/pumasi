@@ -64,5 +64,13 @@ webpki-roots = "1"
 # WebGPU executor (phase 14): compute shaders on Vulkan, Metal, DX12 or GL.
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "dx12", "gles", "wgsl"] }
 pollster = "0.4"
+# SSO (phase 17): ID tokens from OpenID Connect providers, and LDAP.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
+# Tests: a stand-in OpenID provider and LDAP directory.
+ldap3_proto = { version = "0.9", default-features = false }
+ring = "0.17"
+futures = "0.3"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "form", "json", "multipart"] }
 # Control plane high availability (phase 13).
 openraft = { version = "=0.9.25", default-features = false, features = ["serde", "storage-v2"] }

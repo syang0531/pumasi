@@ -30,8 +30,16 @@ x509-cert.workspace = true
 dcap-qvl.workspace = true
 sha2.workspace = true
 tar.workspace = true
+jsonwebtoken.workspace = true
+ldap3.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 pumasi-agent.workspace = true
+axum.workspace = true
+ldap3_proto.workspace = true
+ring.workspace = true
+futures.workspace = true
+tokio-util = { workspace = true, features = ["codec"] }
 wat.workspace = true
 tracing-subscriber.workspace = true

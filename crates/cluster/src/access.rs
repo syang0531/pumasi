@@ -71,6 +71,16 @@ fn op_name(op: &AdminOp) -> &'static str {
         Confidential => "read the confidential tier",
         TrustMeasurement { .. } => "trust launch measurements",
         TrustNode { .. } => "trust nodes",
+        Audit { .. } | AuditVerify => "read the audit log",
+        RotateAdminSecret => "replace the admin ticket",
+        SsoGet => "read the SSO settings",
+        SsoSet(_) => "change the SSO settings",
+        SsoInfo
+        | SsoStart { .. }
+        | SsoFinish { .. }
+        | SsoDeviceStart
+        | SsoDevicePoll { .. }
+        | LdapLogin { .. } => "sign in",
     }
 }
 

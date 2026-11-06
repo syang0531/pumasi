@@ -1420,6 +1420,144 @@ through a real control plane and agent (`PUMASI_TEST_WEBGPU=require` makes
 a missing adapter a failure; CI sets it on Linux). Old Intel Macs (Metal
 on macOS 10.15, Haswell-era Intel and Kepler GPUs) are checked by hand.
 
+## Phase 15: remote API clients
+
+Programs on other machines use the cluster through `pumasi ui
+--api-only` over HTTPS (a tunnel, a proxy or `--tls-cert`) with a
+submitter ticket. Phase 15 makes that safe to hand out and useful to
+automate.
+
+### Account job policies
+
+`AccountPolicy` (`crates/proto/src/manage.rs`) sits next to an
+account's quota: image patterns (`*` and `?`, matched against the name as
+given and with Docker's defaults filled in, so `python:3.12` and
+`docker.io/library/python:3.12` are the same), `require_digest`,
+executors, `deny_network`, a selector appended to every job, the
+tolerations a job may carry (`None` = any), the longest task timeout and
+the most GPUs per task. `access::admit` calls `State::admit_policy` for
+a submitter's `Submit` and `SetSchedule`, so the refusal (`403` in the
+API, with the reason) happens before anything is stored, and a schedule
+cannot smuggle in what a submission may not. Admin tickets are not bound
+by it. Policies are set with `AdminOp::SetAccountPolicy` (`pumasi quota
+ACCOUNT --images ...`) or the account's entry in `cluster.toml`, kept in
+the table `account_policies`, and shown by `pumasi quota` and `describe
+account`.
+
+Each job also records its origin in the table `job_origin`: the name of
+the ticket that submitted it (`cluster admin`, an access ticket's name,
+or `schedule NAME`), its queue timeout and GPU capabilities, and the image
+digests its tasks ran. Agents report a digest per task
+(`FromAgent::Image`, protocol 13) after pulling or loading the image
+(`docker image inspect`'s repo digest of that repository, else the image
+id); at most 16 distinct digests are kept per job.
+
+### Queue timeouts and capacity
+
+`queue_timeout` in job.toml is `JobSubmission::queue_timeout_ms`. The
+clock starts when the job could run (its `after` jobs succeeded), and
+`tick_queue_timeouts` fails the tasks that are still pending and were
+never started once it runs out, with an error that lists every node and
+why it did not take the task (`State::why_unplaced`). Tasks that already
+started are left alone: the timeout is about waiting for a node, not
+about running long.
+
+The reasons come from `State::refusal`, which `fits` now wraps: it
+returns a `Refusal` (offline, paused, cordoned, executor missing, cannot
+pay, memory, CPUs, image architecture, taint, selector, GPUs, cannot
+draw, full...) instead of a bool, so the scheduler, the queue timeout
+and `capacity` share one set of rules. `ClusterStatus::capacity`
+(`State::capacity`, for the caller's account: a submitter's own, the
+owner for others) builds a small synthetic task per executor the account
+may use and counts the online nodes that would take it now, plus those
+with a free GPU and those whose GPUs can draw, and gives each node its
+executors, free slots and GPUs and the reason it would refuse. The quota
+is checked once for the account.
+
+### Docker that comes and goes
+
+An agent whose Docker is not usable at startup (Docker Desktop not
+started yet) no longer fails: it starts without the executor and a
+`DockerWatch` checks `docker version` every 30 seconds. When Docker
+appears or disappears it re-marks which GPUs Docker can use, signs a new
+device profile, and sends `FromAgent::Executors` (`ExecutorReport`:
+executors now, unavailable ones with a short reason such as "Docker
+Desktop is not running", and whether its Docker GPUs can draw). The
+control plane updates the node, emits `node.executor_unavailable` or
+`node.executor_available`, and schedules again. `pumasi status` and
+`NodeView::unavailable` show the reason.
+
+### The API over the internet
+
+`UiConfig::api_only` routes only `/api/v1`, `/api/openapi.json` and
+`/healthz`, takes bearer tickets only (no cookies, so no CSRF), and drops
+the Host check, which guarded browser sessions against DNS rebinding and
+would refuse a tunnel's public host name. A bearer ticket is now
+resolved with `WhoAmI` (cached for a minute per secret) so handlers know
+its name and role; the control plane still checks the secret on every
+call. `limit::AuthLimiter` counts failed sign-ins and wrong bearer
+tickets per client address (10 in a minute block it for 5 minutes, `429`
+with `Retry-After`); the address is the TCP peer, or, for a connection
+from loopback, the header named by `--real-ip-header` (a client that
+reaches the port directly cannot choose its own address). The peer comes
+from `ConnectInfo<ClientAddr>`, which the router is served with, plain
+or TLS.
+
+`--tls-cert` and `--tls-key` load PEM files into a rustls `ServerConfig`
+(ring provider, TLS 1.2 and 1.3, ALPN `http/1.1`). `tls::TlsListener`
+implements axum's `Listener`: an accept task hands each connection to its
+own handshake task (10 s limit, 256 at once) and queues finished streams,
+so a silent client blocks nobody. `pumasi ui --api-only` refuses plain
+HTTP on an address other than loopback unless `--insecure-http`.
+
+`GET /api/v1/jobs/{id}?wait=D` asks the control plane for the job, and
+while it is not finished sleeps (250 ms doubling to 2 s) and asks again,
+until it finishes or `D` (at most 90 s, under Cloudflare's 100 s) runs
+out; the answer is the same job view either way. `docs/api.md` is
+written as a walkthrough whose `sh` blocks (and hidden `<!-- ci: -->`
+lines) `scripts/ci/api-doc.sh` runs in order against a real control
+plane, agent and `pumasi ui --api-only`.
+
+### GPU drawing
+
+`gpu.capabilities` in job.toml becomes `JobSubmission::gpu_capabilities`
+(`graphics`, `video`; `compute` and `utility` are implied). The agent
+passes them as `NVIDIA_DRIVER_CAPABILITIES` (always with `compute,utility`)
+to `docker create`, which is what makes the NVIDIA Container Toolkit
+mount the EGL, GLX, Vulkan and OptiX libraries on Linux. On WSL 2 (Docker
+Desktop) the toolkit mounts the Windows driver's libraries under
+`/usr/lib/wsl/lib` and `/dev/dxg`, and drawing goes through Mesa's d3d12
+gallium driver in the image. Whether that works on a machine depends on
+the driver, the toolkit and the image, so it is measured rather than
+guessed: `pumasi gpu check --docker-run [--image IMAGE]`
+(`gpu::docker_check`) starts the image with every capability, looks for
+`nvidia-smi`, the NVIDIA EGL/GLX/Vulkan files, OptiX, `/dev/dxg` and
+`libd3d12`, Mesa's `d3d12_dri.so`, and asks `eglinfo`/`vulkaninfo` (when
+the image has them) which renderer they get, treating llvmpipe and
+lavapipe as a failure. The answer is saved as `docker-gpu.json` in the
+agent's data directory; the agent reads it (or `--gpu-graphics yes|no`)
+at each Docker check and reports it in `ExecutorReport::gpu_graphics`.
+The node gets the built-in label `gpu.graphics=true`, and jobs that ask
+for `graphics` are refused by `Refusal::GpuGraphics` elsewhere.
+`examples/blender-render` (Cycles and EEVEE, with an image built on
+Ubuntu's Mesa) is checked on an RTX 3080 under Windows by hand.
+
+### Compatibility
+
+`PROTOCOL_VERSION` is 13: `TaskAssignment` gains `gpu_capabilities` at
+the end (older agents ignore it, and graphics jobs only go to nodes that
+reported `gpu_graphics`, which only protocol 13 agents do), and
+`FromAgent::Executors` and `FromAgent::Image` are new (the control
+plane refuses agents newer than itself, so an agent that sends them talks
+to one that knows them). GPU jobs with capabilities go only to agents of
+`REMOTE_PROTOCOL` (13) or later.
+`JobSubmission` gains `queue_timeout_ms` and `gpu_capabilities` at the
+end, which changes the stored schedules that embed it: layout 7 migrates
+them (see Persistence). The admin protocol gains
+`AdminOp::SetAccountPolicy` and new fields at the end of `ClusterStatus`,
+`NodeView`, `JobView` and `QuotaView`, so the CLI and `pumasi ui` must
+match the control plane's version, as before.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -1482,7 +1620,14 @@ Phase 13 keeps layout 6 and adds the table `raft_sm` (applied log id and
 membership) to `state.redb`, and `raft.redb`, `snapshot.bin`,
 `endpoint.key` and `join.peers` beside it on replicas.
 
-`PROTOCOL_VERSION` is 12: protocol 5 (phase 4) added `UpgradeHello` and the
+Phase 15 moves to layout 7: schedules embed a `JobSubmission`, which
+gained two fields, so `migrate_v6` re-encodes each stored schedule
+(without a queue timeout or GPU capabilities). The tables
+`account_policies` (by account) and `job_origin` (by job id) are new;
+like every table they come last in the `tables!` list, so Raft batches
+from replicas of the same version agree on table numbers.
+
+`PROTOCOL_VERSION` is 13 (phase 15, above): protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
 `BenchResult` and `ToAgent::Benchmark` and `Rebenchmark`, which the control
@@ -1498,7 +1643,7 @@ itself, an agent sends them only to a control plane that knows them. The hello i
 `ToAgent::Replicas`; a protocol 10 agent talking to a follower sees an
 unknown reply and retries, so it reaches the cluster only while the replica
 it joined leads. Protocol 12 adds `FromAgent::WebGpu`; protocol 11 agents
-get no wasm jobs with GPUs. The control plane accepts hellos from
+get no wasm jobs with GPUs. Protocol 13 is described under phase 15. The control plane accepts hellos from
 `MIN_AGENT_PROTOCOL` (5) up: `AgentHello::decode` tries the current layout
 and falls back to the protocol 5 one (available), so phase 4 and 5 agents
 keep working and can take a rollout. Upgrade the control plane first; it
@@ -1506,6 +1651,12 @@ rejects agents newer than itself. Phase 3 agents cannot be upgraded
 remotely; install a current binary on them once.
 
 ## Not yet
+
+- Remote API: no iroh proxy for the CLI behind HTTP-only networks, no
+  ACME (certificates come from certbot, a proxy or a tunnel), failed
+  sign-in counts live in each `pumasi ui` process, `?wait=` polls the
+  control plane, and policies cannot limit CPU, memory or CU per job
+  (quotas cover slots, GPUs and CU per day).
 
 - File store: replicas on owner nodes (the control plane is the only full
   copy, so back up `<cluster dir>/blobs`), an S3-compatible gateway, and
@@ -1532,8 +1683,7 @@ remotely; install a current binary on them once.
   measured.
 - Dashboard: prices, alert rules, webhooks, quotas, schedules and
   rollouts are shown (or left to the CLI) but not edited in the browser;
-  sessions are in memory only; there is no TLS of its own (use a reverse
-  proxy when serving other machines); charts are server-drawn snapshots
+  sessions are in memory only; charts are server-drawn snapshots
   that refresh every 10 seconds rather than streaming.
 - WebGPU: compute shaders only (no textures, samplers or render
   passes), one bind group, no optional features such as `shader-f16` or

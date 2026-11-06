@@ -13,6 +13,7 @@ use crate::{
     St,
     auth::{self, SESSION_COOKIE},
     i18n::{self, Lang},
+    limit::ClientIp,
 };
 
 #[derive(Deserialize)]
@@ -37,13 +38,18 @@ fn signed_in(id: &str) -> Response {
 /// its own ticket.
 pub async fn page(
     State(st): State<St>,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     Query(q): Query<LoginQuery>,
 ) -> Response {
     let l = Lang::from_headers(&headers);
     if let Some(given) = q.token {
+        if let Err(r) = st.limiter.check(ip) {
+            return r;
+        }
         let ok = st.token.as_deref().is_some_and(|t| auth::same(t, &given));
         if !ok {
+            st.limiter.failed(ip);
             return form(
                 l,
                 Some(l.t(
@@ -63,10 +69,14 @@ pub async fn page(
 
 pub async fn submit(
     State(st): State<St>,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     Form(f): Form<LoginForm>,
 ) -> Response {
     let l = Lang::from_headers(&headers);
+    if let Err(r) = st.limiter.check(ip) {
+        return r;
+    }
     // Sign-in forms only from this origin.
     if let (Some(origin), Some(host)) = (
         headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
@@ -86,7 +96,19 @@ pub async fn submit(
     .await;
     match res {
         Ok(ident) => signed_in(&st.sessions.create(ident)),
-        Err(e) => form(l, Some(&format!("{e:#}")), StatusCode::UNAUTHORIZED),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let status = crate::pages::status_for(&msg);
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::BAD_REQUEST {
+                st.limiter.failed(ip);
+            }
+            let status = if status == StatusCode::BAD_GATEWAY {
+                status
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            form(l, Some(&msg), status)
+        }
     }
 }
 

@@ -67,6 +67,7 @@ fn op_name(op: &AdminOp) -> &'static str {
         HaStatus => "read the control plane replicas",
         HaInvite { .. } | HaRemove { .. } => "change the control plane replicas",
         Backup { .. } => "back up the control plane",
+        SetAccountPolicy { .. } => "set job policies",
     }
 }
 
@@ -177,6 +178,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         Submit(mut sub) => {
             pin(&mut sub.account, account)?;
             own_mounts(st, account, &sub)?;
+            st.admit_policy(account, &mut sub)?;
             Submit(sub)
         }
         op @ (Cancel { .. } | Receipts { .. } | TaskFiles { .. } | Job { .. } | Logs { .. }) => op,
@@ -243,6 +245,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         SetSchedule(mut spec) => {
             pin(&mut spec.job.account, account)?;
             own_mounts(st, account, &spec.job)?;
+            st.admit_policy(account, &mut spec.job)?;
             if let Some(other) = st.schedule_account(&spec.name) {
                 ensure!(
                     other == account,

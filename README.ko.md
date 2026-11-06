@@ -432,6 +432,36 @@ curl -H "Authorization: Bearer $(cat ~/.pumasi/admin.ticket)" http://127.0.0.1:7
 curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm http://127.0.0.1:7400/api/v1/jobs
 ```
 
+### 어디서든 클러스터 쓰기 (HTTP API)
+
+Pumasi가 없는 기기(집의 노트북, CI 작업, 다른 팀의 서비스)의 스크립트도 `curl`로 HTTPS를 통해 작업을 제출하고 결과를 받을 수 있습니다. 관리자는 클라이언트마다 submitter 티켓과 그 계정의 작업 정책을 주고, API만 띄워 Cloudflare Tunnel이나 리버스 프록시, 자체 인증서 뒤에 둡니다.
+
+```sh
+pumasi access create "lab scripts" --role submitter --account lab
+pumasi quota lab --executors docker --images 'ghcr.io/lab/*' --network deny \
+  --max-timeout 30m --max-gpus-per-task 1
+pumasi ui --api-only --listen 127.0.0.1:7400 --real-ip-header CF-Connecting-IP
+cloudflared tunnel run pumasi          # https://pumasi.example.com -> 127.0.0.1:7400
+```
+
+클라이언트에서는:
+
+```sh
+curl -H "Authorization: Bearer $PUMASI_TICKET" -F files=@job.toml -F files=@scene.py \
+  https://pumasi.example.com/api/v1/jobs
+curl -H "Authorization: Bearer $PUMASI_TICKET" "https://pumasi.example.com/api/v1/jobs/$JOB?wait=60s"
+curl -H "Authorization: Bearer $PUMASI_TICKET" -o out.zip "https://pumasi.example.com/api/v1/jobs/$JOB/outputs.zip"
+```
+
+- **계정별 작업 정책**: 허용 이미지(패턴 또는 고정 다이제스트), 실행기, 네트워크 차단, 모든 작업에 붙는 selector, 허용 toleration, 최대 제한 시간, 태스크당 최대 GPU. 그 밖의 것은 누가 제출하든 이유와 함께 `403`으로 거절합니다. 작업마다 제출한 티켓 이름과 태스크가 실제로 쓴 이미지 다이제스트가 남습니다.
+- **`--api-only`**는 `/api/v1`와 `/api/openapi.json`만 bearer 티켓으로 제공합니다(화면·쿠키 없음). 한 주소에서 1분에 틀린 티켓이 10번이면 5분간 막습니다(`429`). `--tls-cert`·`--tls-key`로 HTTPS를 직접 제공하고, 루프백이 아닌 주소에서는 `--api-only`가 평문 HTTP를 거부합니다.
+- 작업 조회에 **`?wait=60s`**를 붙이면 끝나는 즉시 답합니다(최대 90초, Cloudflare의 100초 안). job.toml의 **`queue_timeout = "10m"`**은 그 시간 안에 어느 노드도 시작하지 않은 작업을 노드별 이유와 함께 실패시킵니다. `/api/v1/status`(와 `pumasi status`)의 **`capacity`**는 지금 그 계정 작업을 받을 노드 수를 실행기·GPU별로, 못 받는 노드는 이유와 함께 알려 줍니다.
+- 에이전트가 30초마다 Docker를 다시 확인하므로, Docker Desktop이 늦게 켜지거나 꺼지는 Windows 기기도 재시작 없이 Docker 작업을 받거나 멈춥니다.
+
+[docs/api.md](docs/api.md)에 CI가 실제 클러스터에 돌려 보는 curl 예제와 Cloudflare Tunnel 설정, 그 한계(무료 요금제 요청 본문 100 MB)가 있습니다.
+
+**Blender 등 GPU 그리기.** CUDA 작업은 `gpus = 1`이면 됩니다. 그리는 작업(Blender EEVEE, OpenGL·Vulkan 렌더러)은 `[gpu]`에 `capabilities = ["graphics"]`를 더하고, Docker GPU가 그릴 수 있는 노드에만 갑니다. 노드에서 `pumasi gpu check --docker-run --image 이미지`를 돌리면 컨테이너를 띄워 CUDA, OptiX, 그리기(Linux는 NVIDIA EGL·Vulkan 드라이버, Windows Docker Desktop은 Mesa D3D12 드라이버)를 확인하고, 노드에 `gpu.graphics=true` 라벨이 붙습니다. [examples/blender-render](examples/blender-render)는 장면 하나를 Cycles와 EEVEE로 렌더링합니다.
+
 ## 명령어
 
 | 명령 | 설명 |
@@ -446,7 +476,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치. `--gpu-bundle`은 패스스루용 GPU 게스트 커널과 드라이버 추가 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
 | `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
-| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU]` / `gpu webgpu [--software]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄. `webgpu`는 wasm 작업이 쓸 수 있는 WebGPU 어댑터 목록 |
+| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image 이미지]]` / `gpu webgpu [--software]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄. `--docker-run`은 컨테이너를 띄워 Docker에서 CUDA·OptiX·그리기(EGL, OpenGL, Vulkan)가 되는지 확인해 에이전트용으로 저장(`gpu.graphics`). `webgpu`는 wasm 작업이 쓸 수 있는 WebGPU 어댑터 목록 |
 | `pumasi store put 이름 경로... [--account A]` / `get 이름[@버전] \| --job ID [-o DIR]` / `ls [이름]` / `rm 이름[@버전]` / `usage` / `quota 계정 크기\|none` | 클러스터 파일 저장소: 버전 있는 데이터셋, 작업 출력, 이어받기, 쿼터 |
 | `pumasi secret set 이름 [값]` / `ls` / `rm 이름` | 클러스터 비밀. `registry/<호스트>`는 비공개 레지스트리 로그인 |
 | `pumasi run job.toml [--account A] [--priority N] [--after 작업] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
@@ -463,7 +493,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi login <티켓>` | 다른 기기에서 관리자 티켓이나 접근 티켓으로 원격 클러스터 관리 |
 | `pumasi cordon \| uncordon \| drain <노드>` | 노드에 새 작업 중단, 재개, 또는 실행 중인 태스크까지 다른 노드로 이동 |
 | `pumasi label <노드> k=v... \| k-` / `taint <노드> key[=value]... \| key-` | selector용 노드 라벨, 허용하지 않는 작업을 막는 테인트 |
-| `pumasi quota [계정 --slots N --gpus N --cu-per-day CU --max-priority N --storage 크기] [--clear]` | 모든 계정의 한도와 사용량 보기, 또는 한 계정 변경 (`none`은 한도 해제) |
+| `pumasi quota [계정 --slots N --gpus N --cu-per-day CU --max-priority N --storage 크기 --images P,.. --require-digest yes --executors E,.. --network deny --selector S --tolerations T,.. --max-timeout D --max-gpus-per-task N] [--clear]` | 모든 계정의 한도·작업 정책·사용량 보기, 또는 한 계정 변경 (`none`이나 `any`는 한도 해제) |
 | `pumasi access create 이름 --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|이름` | 다른 사람에게 줄 역할 티켓. `pumasi whoami`는 지금 쓰는 티켓 표시 |
 | `pumasi schedule add 이름 job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm 이름` / `run 이름` | cron 일정으로 제출하는 작업 |
 | `pumasi apply -f cluster.toml [--dry-run] [--prune]` | 라벨·테인트·cordon·쿼터·스케줄·경보 규칙·웹훅을 파일과 같게 맞춤. 두 번 적용해도 결과 같음 |
@@ -477,7 +507,7 @@ curl -H "Authorization: Bearer $TICKET" -F job=@job.toml -F files=@model.wasm ht
 | `pumasi ha status [-o json]` / `ha invite [--ttl 1h]` / `ha remove ID` | 컨트롤 플레인 복제본: 리더와 각자의 로그 진행, 복제본 하나 더 붙일 티켓, 복제본 빼기 |
 | `pumasi cluster replica <티켓> [--net public\|local] [--bind ADDR]` | 이 기기를 컨트롤 플레인 복제본으로 실행 (나중에는 `pumasi cluster start`로 다시 시작) |
 | `pumasi backup FILE` / `pumasi cluster restore FILE` | 컨트롤 플레인 상태와 클러스터 키의 일관된 사본, 그리고 그 사본으로 컨트롤 플레인 만들기 |
-| `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB]` | 이 기기에서 웹 대시보드와 JSON API 제공(기본 127.0.0.1:7400) |
+| `pumasi ui [--listen ADDR] [--login-only] [--no-open] [--url-file F] [--max-upload 4GiB] [--api-only] [--tls-cert F --tls-key F] [--real-ip-header H]` | 이 기기에서 웹 대시보드와 JSON API 제공(기본 127.0.0.1:7400). `--api-only`는 다른 곳의 프로그램용(bearer 티켓만), `--tls-cert`는 HTTPS |
 | `pumasi exec module.wasm [--input DIR] [--seed S] [--gpu] [인자...]` | 에이전트와 같은 샌드박스로 로컬 실행 (`DIR`이 `/input`으로 보이고 `/output`은 `pumasi-out/exec`에 저장, `--seed`는 결정적 모드, `--gpu`는 이 기기의 가장 좋은 WebGPU 어댑터를 줌) |
 
 `--home DIR` 또는 `PUMASI_HOME`으로 상태 디렉터리를 바꾸면 한 기기에서 클러스터와 에이전트 여러 개를 띄워 시험할 수 있습니다.
@@ -508,6 +538,7 @@ deterministic = true                  # 기본값(gpus가 있으면 꺼짐): 가
 priority = 0                          # -1000~1000, 높을수록 먼저 돌고 낮은 것을 선점할 수 있음
 after = []                            # 먼저 성공해야 하는 작업 ID
 tolerations = []                      # 허용하는 노드 테인트, 예: ["gpu-only"]
+# queue_timeout = "30m"               # 그때까지 어느 노드도 시작하지 않으면 노드별 이유와 함께 실패
 
 [selector]                            # 라벨이 맞는 노드에서만 (클러스터 관리 참고)
 os = "linux"
@@ -529,6 +560,7 @@ shards = 4
 network = false                       # 기본값. true면 외부 네트워크 허용
 # gpus = 1                            # 태스크당 GPU 수 ("all"이면 노드의 GPU 전부)
 # gpu = { vendor = "nvidia", min_vram_gb = 16 }  # 어떤 GPU인지 (vendor: nvidia, amd, any)
+# gpu = { vendor = "nvidia", capabilities = ["graphics"] }  # 그리기(EGL, OpenGL, Vulkan), "video"는 NVENC
 
 [resources]
 memory_mb = 512
@@ -566,6 +598,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 - 참가 티켓은 만료 시간과 사용 횟수를 가진 비밀값입니다. 한 번 참가한 노드는 공개키로 기억되어 다시 티켓이 필요 없고, `remove-node`로 퇴출합니다.
 - `~/.pumasi/cluster/admin.ticket`은 전체 권한이므로 비밀번호처럼 다뤄야 합니다. 다른 사람에게는 접근 티켓(`pumasi access create`)을 줍니다. `submitter` 티켓은 한 계정의 작업·스케줄·데이터셋만 다루고 그것만 보며, `viewer` 티켓은 읽기만 합니다. 모든 요청은 컨트롤 플레인에서 티켓의 역할로 검사하고, 회수하거나 만료된 티켓은 바로 막힙니다.
+- 인터넷에 연 `pumasi ui --api-only`(터널, 프록시, `--tls-cert`)는 bearer 티켓만 받고 틀린 티켓을 클라이언트 주소별로 제한하며, 루프백이 아닌 주소에서 평문 HTTP를 거부하고, 클라이언트마다 티켓의 역할과 계정 작업 정책이 허락하는 것만 줍니다. 유출된 submitter 티켓도 그 계정 정책이 허락하는 것(Docker 노드라면 호스트 커널을 공유하는 컨테이너)은 돌릴 수 있으니, 정책은 좁게(고정 이미지, 네트워크 차단) 두고 티켓은 `pumasi access revoke`로 회수하세요.
 - WASM 태스크는 실행 기기로부터 격리(자기 `/input`·`/output`만 보임, 네트워크 차단, 메모리·CPU 상한)됩니다.
 - Docker 태스크는 컨테이너 수준의 격리라 호스트 커널을 공유합니다. 그래서 기기 주인이 `--allow-docker`를 줘야만 실행합니다. 내 기기나 믿을 수 있는 사람끼리의 클러스터에서 씁니다.
 - microVM 태스크는 작업으로부터 제공자의 기기를 보호합니다. 태스크마다 KVM 위에서 자기 커널을 쓰고(Firecracker는 seccomp로 자신도 가둠), 자기 디스크만 보이며, 메모리와 vCPU 상한이 걸립니다. 작업이 `network = true`를 쓰지 않으면 네트워크 장치가 없고, 쓰더라도 에이전트가 공인 주소로만 넘겨 주는 카드뿐이라 제공자의 기기나 내부망에는 닿지 않습니다. 패스스루한 GPU는 IOMMU 뒤에 있고, IOMMU 그룹 전체를 함께 넘길 수 있는 GPU만 패스스루합니다. 이미지 레이어도 호스트가 아니라 VM 안에서 풉니다. 다만 제공자는 태스크가 하는 일을 볼 수 있습니다(오픈 등급).
@@ -576,7 +609,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-개인이나 조직이 자기 장비에서 쓰는 데는 1~15단계면 충분합니다. 16단계는 조직 도입에 필요한 마무리이고, 17·18단계는 다른 클러스터와 거래할 때만 필요합니다.
+개인이나 조직이 자기 장비에서 쓰고 어디서든 접근하는 데는 1~16단계면 충분합니다. 17단계는 조직 도입에 필요한 마무리이고, 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -593,13 +626,14 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 11 | 모니터링·경보: 노드 지표(CPU, 메모리, 디스크, 네트워크, 온도, GPU)를 다운샘플링해 7일 보관, `top`, 실시간 `logs -f`, `events`, 선택형 Prometheus 엔드포인트와 Grafana 대시보드, 경보 규칙(노드 오프라인, 실패율, 디스크, 온도, 벤치마크 저하, SMART, 검증 불일치)을 Slack·Discord·JSON 웹훅으로 | 완료 |
 | 12 | 바이너리에 내장한 웹 대시보드(`pumasi ui`): 개요, 차트·cordon·drain이 있는 노드, 제출·실시간 출력·취소·출력 다운로드가 되는 작업, 업로드·다운로드가 되는 저장소, CU와 원장, 초대와 액세스 티켓, 요금, 이벤트와 경보. 액세스 티켓과 역할로 로그인, 한국어·영어, OpenAPI가 있는 JSON API, CI의 Playwright 테스트 | 완료 |
 | 13 | 컨트롤 플레인 고가용성: 상태를 Raft(openraft)로 3대 또는 5대에 복제, 자동 장애 전환과 리더를 따라가는 노드·CLI·대시보드, 모든 복제본이 담긴 티켓, 스냅숏으로 따라잡는 복제본, `pumasi backup`과 `cluster restore` | 완료 |
-| 14 | WebGPU 실행기(실험): `gpus = 1`인 wasm 작업이 wgpu(Vulkan, Metal, DX12, GL)와 `pumasi_webgpu` 임포트로 어떤 GPU에서든 WGSL 컴퓨트 셰이더 실행, WGSL 벤치마크가 담긴 서명된 어댑터 프로필, GPU 목록과 슬롯 공유, GPU 시간 CU 과금, CI에서 Linux·Windows·macOS 결과를 CPU와 비교하는 행렬곱·블러 예제, GPU 드라이버를 불러올 수 있는 glibc Linux 바이너리 | 이번 릴리스 |
-| 15 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
-| 16 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델, CI에 cargo-audit·cargo-deny·퍼징, 외부 보안 점검, 운영 문서, 72시간 장기 안정성 테스트 뒤 1.0 태그 | 예정 |
-| 17 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
-| 18 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
+| 14 | WebGPU 실행기(실험): `gpus = 1`인 wasm 작업이 wgpu(Vulkan, Metal, DX12, GL)와 `pumasi_webgpu` 임포트로 어떤 GPU에서든 WGSL 컴퓨트 셰이더 실행, WGSL 벤치마크가 담긴 서명된 어댑터 프로필, GPU 목록과 슬롯 공유, GPU 시간 CU 과금, CI에서 Linux·Windows·macOS 결과를 CPU와 비교하는 행렬곱·블러 예제, GPU 드라이버를 불러올 수 있는 glibc Linux 바이너리 | 완료 |
+| 15 | 원격 API 클라이언트: 계정별 작업 정책(이미지·다이제스트, 실행기, 네트워크 차단, 강제 selector, toleration, 최대 제한 시간, 태스크당 GPU), 작업마다 제출자와 실제 이미지 다이제스트 기록, `queue_timeout`, 지금 그 계정 작업을 받을 노드 수와 못 받는 이유, 실행 중인 에이전트의 Docker 재확인, HTTPS(`--tls-cert`)와 인증 실패 제한이 있는 `pumasi ui --api-only`, Cloudflare Tunnel 안내, `?wait=` 롱폴링, CI에서 실행하는 curl 예제, 그리기용 GPU 드라이버 능력(`gpu.graphics`, `gpu check --docker-run`)과 Blender 예제 | 이번 릴리스 |
+| 16 | SEV-SNP·TDX 서버 기반 기밀 등급과 원격 증명 | 예정 |
+| 17 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델(인터넷에 노출된 API와 터널 시나리오 포함: 티켓 유출, 정책 우회, 요청 폭주), CI에 cargo-audit·cargo-deny·퍼징, 외부 보안 점검, 운영 문서, 72시간 장기 안정성 테스트 뒤 1.0 태그 | 예정 |
+| 18 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 예정 |
+| 19 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
-알려진 한계: 파일 저장소의 데이터는 쓰기마다가 아니라 30초마다 다른 컨트롤 플레인 복제본에 복사되므로, 리더가 죽기 직전에 올린 파일은 그 리더가 돌아올 때까지 없을 수 있습니다. `pumasi upgrade rollout`으로 올린 에이전트 바이너리는 받은 복제본에만 있습니다(장애 전환 뒤에는 다시 배포). 이번 릴리스보다 오래된 에이전트는 처음 참가한 복제본만 따라갑니다. CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 WebGPU로만 씁니다. WebGPU는 실험 기능입니다. CI에서는 소프트웨어 래스터라이저로, 실제 GPU는 손으로 확인하며, 컴퓨트 셰이더만 되고(텍스처·샘플러 없음, 바인드 그룹 하나, f16 없음), 폭주하는 셰이더는 작업 제한 시간이 아니라 GPU 드라이버의 감시 타이머가 멈추고, WebGPU용 GPU 챌린지는 아직 없습니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. microVM 태스크 출력은 끝날 때에야 `pumasi logs`에 나타나고(게스트가 출력 디스크에 쓰기 때문), Intel·Apple GPU는 지표가 없고 Windows 노드는 온도를 보고하지 않으며, 최근 1시간의 10초 단위 지표는 컨트롤 플레인을 다시 시작하면 사라집니다. 대시보드는 요금과 경보 규칙을 보여 주기만 하고 바꾸지는 않으며(CLI와 `apply`로 바꿈), 로그인 세션을 메모리에만 두므로 `pumasi ui`를 다시 시작하면 모두 로그아웃됩니다.
+알려진 한계: 파일 저장소의 데이터는 쓰기마다가 아니라 30초마다 다른 컨트롤 플레인 복제본에 복사되므로, 리더가 죽기 직전에 올린 파일은 그 리더가 돌아올 때까지 없을 수 있습니다. `pumasi upgrade rollout`으로 올린 에이전트 바이너리는 받은 복제본에만 있습니다(장애 전환 뒤에는 다시 배포). 이번 릴리스보다 오래된 에이전트는 처음 참가한 복제본만 따라갑니다. CU는 실제 결제와 연결되어 있지 않습니다. 접근 티켓은 관리자가 나눠 주며 SSO는 아직 없습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 WebGPU로만 씁니다. WebGPU는 실험 기능입니다. CI에서는 소프트웨어 래스터라이저로, 실제 GPU는 손으로 확인하며, 컴퓨트 셰이더만 되고(텍스처·샘플러 없음, 바인드 그룹 하나, f16 없음), 폭주하는 셰이더는 작업 제한 시간이 아니라 GPU 드라이버의 감시 타이머가 멈추고, WebGPU용 GPU 챌린지는 아직 없습니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. microVM 태스크 출력은 끝날 때에야 `pumasi logs`에 나타나고(게스트가 출력 디스크에 쓰기 때문), Intel·Apple GPU는 지표가 없고 Windows 노드는 온도를 보고하지 않으며, 최근 1시간의 10초 단위 지표는 컨트롤 플레인을 다시 시작하면 사라집니다. 대시보드는 요금과 경보 규칙을 보여 주기만 하고 바꾸지는 않으며(CLI와 `apply`로 바꿈), 로그인 세션을 메모리에만 두므로 `pumasi ui`를 다시 시작하면 모두 로그아웃됩니다. 원격 API에는 터널이나 인증서 갱신이 내장되어 있지 않고(Cloudflare Tunnel, 리버스 프록시, certbot이 맡음, CLI용 iroh 프록시도 아직 없음), 인증 실패 횟수는 `pumasi ui` 프로세스마다 따로 세며, Cloudflare를 거친 업로드는 요금제의 본문 한도에서 멈추고, `?wait=`는 컨트롤 플레인을 폴링해 작업을 따라갑니다. Docker 안의 그리기는 실제 GPU에서 손으로 확인합니다. Linux 호스트의 EEVEE는 Xvfb 아래에서 돌아 이미지가 GPU 디스플레이를 따로 가져오지 않는 한 CPU로 그립니다(Cycles는 상관없음).
 
 ## 라이선스
 

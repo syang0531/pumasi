@@ -83,6 +83,27 @@ pub struct TaskIo {
     pub live: Option<LiveOutput>,
     /// The WebGPU adapter of a wasm task that asked for a GPU (phase 14).
     pub webgpu: Option<crate::webgpu::WebGpuTask>,
+    /// NVIDIA driver capabilities beyond compute and utility (phase 15).
+    pub gpu_capabilities: Vec<pumasi_proto::job::GpuCapability>,
+    /// Where the image's digest goes once it is known (phase 15).
+    pub image_report: Option<ImageReport>,
+}
+
+/// Sends the image a task runs, by digest, to the cluster.
+#[derive(Debug, Clone)]
+pub struct ImageReport {
+    pub task: pumasi_proto::msg::TaskRef,
+    pub tx: tokio::sync::mpsc::UnboundedSender<pumasi_proto::msg::FromAgent>,
+}
+
+impl ImageReport {
+    pub fn send(&self, image: &str, digest: String) {
+        let _ = self.tx.send(pumasi_proto::msg::FromAgent::Image {
+            task: self.task,
+            image: image.to_string(),
+            digest,
+        });
+    }
 }
 
 /// What a running task printed that the agent has not sent on yet. The

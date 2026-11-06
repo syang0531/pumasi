@@ -1,0 +1,26 @@
+# Render 24 frames with Blender EEVEE, which draws with OpenGL: the job
+# asks for the graphics driver capability, so it only goes to nodes whose
+# Docker GPUs can draw (label gpu.graphics=true, from `pumasi gpu check
+# --docker-run` on the node).
+#
+#   pumasi run examples/blender-render/job-eevee.toml --output
+#
+# Each task's log says what EEVEE drew with ("render device: EEVEE on
+# D3D12 (NVIDIA GeForce RTX 3080)" on Windows, the NVIDIA GL renderer on
+# Linux); "llvmpipe" means it fell back to the CPU.
+name = "blender-eevee"
+image = "ghcr.io/YOU/pumasi-blender:4.2"
+command = ["/opt/render.sh", "/input/scene.py", "eevee", "{shard}", "{shards}"]
+files = ["scene.py"]
+shards = 4
+queue_timeout = "30m"
+
+[gpu]
+vendor = "nvidia"
+min_vram_gb = 4
+capabilities = ["graphics"]
+
+[resources]
+memory_mb = 6144
+cpus = 2
+timeout = "30m"

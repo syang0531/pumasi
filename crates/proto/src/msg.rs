@@ -23,8 +23,8 @@ use crate::{
     gpu::{GpuChallenge, GpuInfo, GpuRequest, SignedDevices},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput},
     manage::{
-        AccessRole, AccessView, AccountQuota, ApplySpec, LabelSet, NodeConfig, NodeEdit, QuotaView,
-        ScheduleSpec, ScheduleView, Selector, Toleration,
+        AccessRole, AccessView, AccountPolicy, AccountQuota, ApplySpec, LabelSet, NodeConfig,
+        NodeEdit, QuotaView, ScheduleSpec, ScheduleView, Selector, Toleration,
     },
     monitor::{AlertPolicy, LogChunk, NodeMetrics, WebhookSpec},
     perf::{BenchChallenge, PerfProfile, SignedPerf},
@@ -272,6 +272,25 @@ pub struct TaskAssignment {
     // Protocol 9 from here; only protocol 9 agents get GPU jobs.
     /// The node's GPUs (by [`GpuInfo::index`]) this task may use.
     pub gpus: Vec<u32>,
+    // Protocol 13 from here; only protocol 13 agents get jobs with
+    // capabilities.
+    /// NVIDIA driver capabilities beyond compute and utility.
+    pub gpu_capabilities: Vec<crate::job::GpuCapability>,
+}
+
+/// Which executors a node can run right now, and why the others it was
+/// started with cannot (protocol 13). Sent after the welcome and whenever
+/// it changes: Docker Desktop stopped or started, the daemon gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorReport {
+    /// Executors it runs now. Always includes `Wasm`.
+    pub executors: Vec<Executor>,
+    /// Executors its owner allowed that cannot run now, and why
+    /// ("Docker Desktop is not running").
+    pub unavailable: Vec<(Executor, String)>,
+    /// Docker GPU tasks here can use the GPU for graphics (OpenGL, EGL,
+    /// Vulkan), as `pumasi gpu check --docker-run` found or the owner said.
+    pub gpu_graphics: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +426,16 @@ pub enum FromAgent {
     /// The node's signed WebGPU adapters, sent after the welcome (protocol
     /// 12). Empty when the node offers none.
     WebGpu(Box<SignedWebGpu>),
+    /// The executors it can run now (protocol 13).
+    Executors(Box<ExecutorReport>),
+    /// The image a task runs, by digest, sent before its report (protocol
+    /// 13): `repo@sha256:...` from the registry, or the image id when it
+    /// has no registry digest.
+    Image {
+        task: TaskRef,
+        image: String,
+        digest: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +666,12 @@ pub enum AdminOp {
     /// (made when `offset` is 0, kept for a while for the next chunks).
     Backup {
         offset: u64,
+    },
+    // Phase 15 from here.
+    /// Sets what an account's jobs may be (its submitter tickets).
+    SetAccountPolicy {
+        account: String,
+        policy: Box<AccountPolicy>,
     },
 }
 
@@ -973,6 +1008,11 @@ pub struct NodeView {
     // Phase 14 from here.
     /// WebGPU adapters wasm jobs can use (protocol 12 agents).
     pub webgpu: Vec<WebGpuView>,
+    // Phase 15 from here.
+    /// Executors its owner allowed that cannot run now, and why.
+    pub unavailable: Vec<(Executor, String)>,
+    /// Its Docker GPU tasks can draw (OpenGL, EGL, Vulkan).
+    pub gpu_graphics: bool,
 }
 
 /// A WebGPU adapter in the cluster status.
@@ -1022,6 +1062,48 @@ pub struct ClusterStatus {
     pub cluster_id: String,
     pub nodes: Vec<NodeView>,
     pub jobs: Vec<JobSummary>,
+    // Phase 15 from here.
+    /// Which nodes can take the caller's account's work right now.
+    pub capacity: Option<Capacity>,
+}
+
+/// Which nodes can take an account's work right now, and why the others
+/// cannot: what a remote client looks at before sending work (or to fall
+/// back to running it elsewhere).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    pub account: String,
+    /// Nodes that would take a new task of the account now (with a free
+    /// slot), by executor (the executors the account may use).
+    pub ready: std::collections::BTreeMap<Executor, u32>,
+    /// Of those, nodes with a free GPU for image jobs.
+    pub ready_gpu: u32,
+    /// Of those, nodes whose Docker GPU tasks can draw.
+    pub ready_gpu_graphics: u32,
+    pub nodes: Vec<NodeCapacity>,
+}
+
+impl Capacity {
+    /// Nodes ready for `executor`.
+    pub fn ready_for(&self, executor: Executor) -> u32 {
+        self.ready.get(&executor).copied().unwrap_or(0)
+    }
+}
+
+/// One node, as the account's work sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCapacity {
+    pub node: String,
+    /// Executors it would run the account's tasks with now.
+    pub executors: Vec<Executor>,
+    pub free_slots: u32,
+    pub free_gpus: u32,
+    /// Why it takes none of the account's work now (offline, paused,
+    /// cordoned, Docker unavailable, full, not allowed by the account's
+    /// policy...). `None` when it takes some.
+    pub reason: Option<String>,
+    /// Executors its owner allowed that cannot run now, and why.
+    pub unavailable: Vec<(Executor, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1076,6 +1158,14 @@ pub struct JobView {
     pub waiting: Option<String>,
     /// The schedule that submitted it.
     pub schedule: Option<String>,
+    // Phase 15 from here.
+    /// The ticket that submitted it: an access ticket's name, `cluster
+    /// admin`, or `schedule NAME`.
+    pub submitted_by: String,
+    /// The images its tasks ran, by digest (as the nodes pulled them).
+    pub image_digests: Vec<String>,
+    pub queue_timeout_ms: Option<u64>,
+    pub gpu_capabilities: Vec<crate::job::GpuCapability>,
 }
 
 #[cfg(test)]

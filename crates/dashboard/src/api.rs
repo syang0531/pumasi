@@ -20,6 +20,8 @@ use pumasi_proto::{
     msg::{AdminOp, AdminResponse, Invite},
     receipt::ReceiptRow,
 };
+use std::time::Duration;
+
 use serde::Deserialize;
 use serde_json::json;
 
@@ -152,20 +154,59 @@ async fn alerts(axum::extract::State(st): S, a: Api) -> Response {
     simple(st, a, AdminOp::Alerts).await
 }
 
-async fn job(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -> Response {
+/// The longest `?wait=` (phase 15): under the 100 seconds Cloudflare
+/// gives a response to start.
+pub const MAX_WAIT: Duration = Duration::from_secs(90);
+
+#[derive(Deserialize)]
+struct JobQuery {
+    /// Long poll: answer when the job finishes, or after this long
+    /// (`30s`, `2m`; a bare number is seconds), at most [`MAX_WAIT`].
+    wait: Option<String>,
+}
+
+async fn job(
+    axum::extract::State(st): S,
+    a: Api,
+    Path(id): Path<String>,
+    Query(q): Query<JobQuery>,
+) -> Response {
     let id = match job_id(&id) {
         Ok(i) => i,
         Err(r) => return r,
     };
-    simple(
-        st,
-        a,
-        AdminOp::Job {
-            id,
-            with_output: false,
-        },
-    )
-    .await
+    let wait = match q.wait.as_deref().map(pumasi_proto::job::parse_duration_ms) {
+        None => Duration::ZERO,
+        Some(Ok(ms)) => Duration::from_millis(ms).min(MAX_WAIT),
+        Some(Err(e)) => return error(StatusCode::BAD_REQUEST, &format!("wait: {e:#}")),
+    };
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut pause = Duration::from_millis(250);
+    loop {
+        let r = match call(
+            &st,
+            &a,
+            AdminOp::Job {
+                id,
+                with_output: false,
+            },
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(r) => return r,
+        };
+        let done = match &r {
+            AdminResponse::Job(j) => j.summary.state.is_terminal(),
+            _ => true,
+        };
+        let now = tokio::time::Instant::now();
+        if done || now >= deadline {
+            return payload(r);
+        }
+        tokio::time::sleep(pause.min(deadline - now)).await;
+        pause = (pause * 2).min(Duration::from_secs(2));
+    }
 }
 
 async fn submit(axum::extract::State(st): S, a: Api, form: Multipart) -> Response {

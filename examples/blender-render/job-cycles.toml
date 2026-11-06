@@ -1,0 +1,23 @@
+# Render 24 frames with Blender Cycles on NVIDIA GPUs, 4 tasks of 6 frames.
+#
+#   pumasi run examples/blender-render/job-cycles.toml --output
+#
+# Build and push the image first (see README.md) and put its name below.
+# Cycles uses OptiX when the driver's OptiX library is in the container
+# and CUDA otherwise; on Linux the toolkit mounts OptiX only with the
+# graphics capability, so add `capabilities = ["graphics"]` for OptiX.
+name = "blender-cycles"
+image = "ghcr.io/YOU/pumasi-blender:4.2"
+command = ["/opt/render.sh", "/input/scene.py", "cycles", "{shard}", "{shards}"]
+files = ["scene.py"]
+shards = 4
+queue_timeout = "30m"
+
+[gpu]
+vendor = "nvidia"
+min_vram_gb = 4
+
+[resources]
+memory_mb = 6144
+cpus = 2
+timeout = "30m"

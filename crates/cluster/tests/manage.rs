@@ -1,6 +1,7 @@
 //! End-to-end tests of cluster management (phase 10) over real iroh
 //! connections: selectors, drain, preemption, quotas, access tickets and
-//! `apply`.
+//! `apply`; and (phase 15) account job policies, queue timeouts and the
+//! capacity remote clients see.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -9,8 +10,8 @@ use pumasi_agent::{Agent, AgentConfig, AgentExit};
 use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
     job::{Executor, JobId, JobSubmission, Limits, TaskInput, Tier},
-    manage::{AccessRole, AccountQuota, ApplySpec, NodeEdit, NodeSpec},
-    msg::{AdminOp, AdminResponse, JobState, JobView, NodeView, TaskState},
+    manage::{AccessRole, AccountPolicy, AccountQuota, ApplySpec, NodeEdit, NodeSpec},
+    msg::{AdminOp, AdminResponse, ClusterStatus, JobState, JobView, NodeView, Outcome, TaskState},
     net::NetMode,
     ticket::{AdminTicket, JoinTicket},
 };
@@ -106,6 +107,7 @@ async fn spawn_agent(name: &str, slots: u32, ticket: JoinTicket) -> RunningAgent
         gpus: false,
         fake_gpus: None,
         webgpu: None,
+        gpu_graphics: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -164,6 +166,8 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         selector: Default::default(),
         tolerations: vec![],
         after: vec![],
+        queue_timeout_ms: None,
+        gpu_capabilities: vec![],
     }
 }
 
@@ -554,5 +558,181 @@ async fn jobs_wait_for_their_dependencies_across_a_restart() {
     assert!(v2.waiting.is_none());
     client.close().await;
     a.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+async fn status(client: &AdminClient) -> ClusterStatus {
+    let AdminResponse::Status(s) = client.call(AdminOp::Status).await.unwrap() else {
+        panic!("expected status")
+    };
+    s
+}
+
+async fn set_policy(client: &AdminClient, account: &str, policy: AccountPolicy) {
+    client
+        .call(AdminOp::SetAccountPolicy {
+            account: account.into(),
+            policy: Box::new(policy),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn policies_queue_timeouts_and_capacity() {
+    init_tracing();
+    let dir = tempdir("remote");
+    let cluster = start_cluster(dir.clone()).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let a = spawn_agent("a", 2, ticket).await;
+    wait_online(&cluster, 1).await;
+    let client = admin(&cluster).await;
+    let AdminResponse::AccessTicket { ticket, .. } = client
+        .call(AdminOp::CreateAccess {
+            name: "lab scripts".into(),
+            role: AccessRole::Submitter {
+                account: "lab".into(),
+            },
+            ttl_secs: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let lab = AdminClient::connect(&ticket.parse().unwrap(), NetMode::Local)
+        .await
+        .unwrap();
+    client
+        .call(AdminOp::Deposit {
+            account: "lab".into(),
+            amount: 1_000_000,
+            memo: "test".into(),
+        })
+        .await
+        .unwrap();
+
+    // The policy refuses what it does not allow, for submitters only.
+    set_policy(
+        &client,
+        "lab",
+        AccountPolicy {
+            executors: vec![Executor::Docker],
+            ..Default::default()
+        },
+    )
+    .await;
+    let err = lab
+        .call(AdminOp::Submit(Box::new(submission(vec![vec!["x"]]))))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("allows only docker jobs"),
+        "{err:#}"
+    );
+    set_policy(
+        &client,
+        "lab",
+        AccountPolicy {
+            max_timeout_ms: Some(30_000),
+            ..Default::default()
+        },
+    )
+    .await;
+    let err = lab
+        .call(AdminOp::Submit(Box::new(submission(vec![vec!["x"]]))))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("above the 30s"), "{err:#}");
+    let AdminResponse::Quotas(q) = client.call(AdminOp::Quotas).await.unwrap() else {
+        panic!()
+    };
+    let view = q.iter().find(|v| v.account == "lab").unwrap();
+    assert_eq!(view.policy.max_timeout_ms, Some(30_000));
+
+    // A forced selector no node matches: the account sees no capacity,
+    // with the reason, and its job fails at the queue timeout instead of
+    // waiting forever.
+    set_policy(
+        &client,
+        "lab",
+        AccountPolicy {
+            executors: vec![Executor::Wasm],
+            selector: "zone=moon".parse().unwrap(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let cap = status(&lab).await.capacity.unwrap();
+    assert_eq!(cap.account, "lab");
+    assert_eq!(cap.ready_for(Executor::Wasm), 0, "{cap:#?}");
+    assert_eq!(
+        cap.ready.len(),
+        1,
+        "only the executors it may use: {cap:#?}"
+    );
+    let reason = cap.nodes[0].reason.clone().unwrap();
+    assert!(reason.contains("zone=moon"), "{reason}");
+    let mut sub = submission(vec![vec!["late"]]);
+    sub.queue_timeout_ms = Some(1500);
+    let id = submit(&lab, sub).await;
+    let view = wait_job(&lab, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Failed);
+    assert_eq!(view.submitted_by, "lab scripts");
+    assert_eq!(view.queue_timeout_ms, Some(1500));
+    let TaskState::Failed(Outcome::Error(msg)) = &view.tasks[0].state else {
+        panic!("{:?}", view.tasks[0].state)
+    };
+    assert!(
+        msg.contains("queue timeout of 1500ms") && msg.contains("zone=moon"),
+        "{msg}"
+    );
+
+    // Without the selector the node is ready for it, and its jobs run.
+    set_policy(
+        &client,
+        "lab",
+        AccountPolicy {
+            executors: vec![Executor::Wasm],
+            ..Default::default()
+        },
+    )
+    .await;
+    let cap = status(&lab).await.capacity.unwrap();
+    assert_eq!(cap.ready_for(Executor::Wasm), 1, "{cap:#?}");
+    assert!(cap.nodes[0].reason.is_none());
+    let mut sub = submission(vec![vec!["ok"]]);
+    sub.queue_timeout_ms = Some(60_000);
+    let id = submit(&lab, sub).await;
+    let view = wait_job(&lab, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    assert_eq!(view.submitted_by, "lab scripts");
+    // The admin's status shows the owner's capacity; the admin is not
+    // bound by lab's policy.
+    let cap = status(&client).await.capacity.unwrap();
+    assert_eq!(cap.account, "owner");
+    assert_eq!(cap.ready_for(Executor::Wasm), 1);
+    let mut sub = submission(vec![vec!["admin"]]);
+    sub.account = Some("lab".into());
+    let id = submit(&client, sub).await;
+    assert_eq!(job(&client, id).await.submitted_by, "cluster admin");
+
+    // Policies survive a restart.
+    lab.close().await;
+    client.close().await;
+    a.kill().await;
+    cluster.shutdown().await.unwrap();
+    let cluster = start_cluster(dir).await.unwrap();
+    let client = admin(&cluster).await;
+    let AdminResponse::Quotas(q) = client.call(AdminOp::Quotas).await.unwrap() else {
+        panic!()
+    };
+    let view = q.iter().find(|v| v.account == "lab").unwrap();
+    assert_eq!(view.policy.executors, vec![Executor::Wasm]);
+    let view = job(&client, id).await;
+    assert_eq!(view.submitted_by, "cluster admin");
+    client.close().await;
     cluster.shutdown().await.unwrap();
 }

@@ -32,9 +32,10 @@ use tracing::info;
 
 use crate::{
     manage::{AccessRecord, JobSched, ScheduleRecord},
+    remote::JobOrigin,
     state::{DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord},
 };
-use pumasi_proto::manage::{AccountQuota, NodeConfig};
+use pumasi_proto::manage::{AccountPolicy, AccountQuota, NodeConfig};
 use pumasi_proto::monitor::{AlertPolicy, EventView, MetricPoint, WebhookSpec};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -99,6 +100,12 @@ const METRICS: TableDefinition<(&str, u8, u64), &[u8]> = TableDefinition::new("m
 const WEBHOOKS: TableDefinition<&str, &[u8]> = TableDefinition::new("webhooks");
 /// A node's latest signed WebGPU adapters (phase 14), by node id.
 const MEMBER_WEBGPU: TableDefinition<&str, &[u8]> = TableDefinition::new("member_webgpu");
+/// Remote API clients (phase 15). What each account's jobs may be, by
+/// account.
+const ACCOUNT_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("account_policies");
+/// Who submitted a job, its queue timeout, GPU capabilities and the image
+/// digests its tasks ran, by job id.
+const JOB_ORIGIN: TableDefinition<u128, &[u8]> = TableDefinition::new("job_origin");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -108,7 +115,7 @@ const CREDIT_RATE_META: &str = "credit_cpu_hour";
 const CREDIT_RECEIPTS_DONE_META: &str = "credit_receipts_converted";
 const ALERT_POLICY_META: &str = "alert_policy";
 /// Layout version written by this build.
-const SCHEMA: u32 = 6;
+const SCHEMA: u32 = 7;
 
 fn run_key(t: &TaskRef) -> RunKey {
     (t.job.0, t.index, t.attempt, t.check)
@@ -150,7 +157,9 @@ macro_rules! tables {
             EVENTS,
             METRICS,
             WEBHOOKS,
-            MEMBER_WEBGPU
+            MEMBER_WEBGPU,
+            ACCOUNT_POLICIES,
+            JOB_ORIGIN
         )
     };
 }
@@ -406,6 +415,8 @@ pub struct Snapshot {
     pub preempted: Vec<((u128, u32, bool), u32)>,
     pub access: Vec<AccessRecord>,
     pub schedules: Vec<ScheduleRecord>,
+    pub account_policies: Vec<(String, AccountPolicy)>,
+    pub job_origin: Vec<(u128, JobOrigin)>,
     pub members: Vec<Member>,
     pub tokens: Vec<TokenRecord>,
     pub jobs: Vec<(JobMeta, Vec<TaskRecord>)>,
@@ -535,6 +546,8 @@ impl Store {
         tx.open_table(METRICS)?;
         tx.open_table(WEBHOOKS)?;
         tx.open_table(MEMBER_WEBGPU)?;
+        tx.open_table(ACCOUNT_POLICIES)?;
+        tx.open_table(JOB_ORIGIN)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -582,6 +595,9 @@ impl Store {
         }
         // Phase 11 only adds tables (events, metrics, webhooks) and a meta
         // key that older binaries ignore safely, so the layout stays 6.
+        if schema < 7 {
+            store.migrate_v6()?;
+        }
         Ok(store)
     }
 
@@ -667,6 +683,30 @@ impl Store {
         }
         tx.commit()?;
         info!("migrated state database to layout 3");
+        Ok(())
+    }
+
+    /// Layout 7 (phase 15) adds a queue timeout and GPU capabilities to
+    /// the job a schedule submits; schedules get neither.
+    fn migrate_v6(&self) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        let mut n = 0;
+        {
+            let mut t = tx.open_table(SCHEDULES)?;
+            let rows: Vec<(String, Vec<u8>)> = t
+                .iter()?
+                .map(|r| r.map(|(k, v)| (k.value().to_string(), v.value().to_vec())))
+                .collect::<std::result::Result<_, _>>()?;
+            for (k, v) in rows {
+                let r: ScheduleRecord = dec::<legacy::ScheduleRecordV6>(&v)?.into();
+                t.insert(k.as_str(), enc(&r).as_slice())?;
+                n += 1;
+            }
+            let mut meta = tx.open_table(META)?;
+            meta.insert(SCHEMA_META, 7u32.to_le_bytes().as_slice())?;
+        }
+        tx.commit()?;
+        info!(schedules = n, "migrated state database to layout 7");
         Ok(())
     }
 
@@ -980,6 +1020,15 @@ impl Store {
             let (_, v) = row?;
             snap.schedules.push(dec(v.value())?);
         }
+        for row in tx.open_table(ACCOUNT_POLICIES)?.iter()? {
+            let (k, v) = row?;
+            snap.account_policies
+                .push((k.value().to_string(), dec(v.value())?));
+        }
+        for row in tx.open_table(JOB_ORIGIN)?.iter()? {
+            let (k, v) = row?;
+            snap.job_origin.push((k.value(), dec(v.value())?));
+        }
         snap.next_ledger_seq = tx
             .open_table(LEDGER)?
             .last()?
@@ -1055,6 +1104,9 @@ impl Store {
         if !meta.sched.is_empty() {
             b.put(JOB_SCHED, meta.id.0, enc(&meta.sched).as_slice());
         }
+        if !meta.origin.is_empty() {
+            b.put(JOB_ORIGIN, meta.id.0, enc(&meta.origin).as_slice());
+        }
         for (i, task) in tasks.iter().enumerate() {
             b.put(TASKS, (meta.id.0, i as u32), enc(task).as_slice());
             if !task.ext.is_empty() {
@@ -1113,6 +1165,16 @@ impl Store {
 
     pub fn put_account_quota(&self, account: &str, q: Option<&AccountQuota>) -> Result<()> {
         self.put_str_row(ACCOUNT_QUOTAS, account, q.map(enc))
+    }
+
+    pub fn put_account_policy(&self, account: &str, p: Option<&AccountPolicy>) -> Result<()> {
+        self.put_str_row(ACCOUNT_POLICIES, account, p.map(enc))
+    }
+
+    pub fn put_job_origin(&self, job: u128, o: &JobOrigin) -> Result<()> {
+        let mut b = Batch::default();
+        b.put(JOB_ORIGIN, job, enc(o).as_slice());
+        self.commit(b)
     }
 
     pub fn put_schedule(&self, name: &str, r: Option<&ScheduleRecord>) -> Result<()> {
@@ -1712,6 +1774,7 @@ pub(crate) mod legacy {
                 ext: Default::default(),
                 gpu: None,
                 sched: Default::default(),
+                origin: Default::default(),
             }
         }
     }
@@ -1744,6 +1807,92 @@ pub(crate) mod legacy {
                 check: None,
                 cost: 0,
                 ext: Default::default(),
+            }
+        }
+    }
+
+    /// Layout 6 schedules: the job submission had no queue timeout or GPU
+    /// capabilities.
+    #[derive(serde::Deserialize)]
+    pub struct ScheduleRecordV6 {
+        spec: ScheduleSpecV6,
+        next_unix: Option<u64>,
+        last_unix: Option<u64>,
+        last_job: Option<pumasi_proto::job::JobId>,
+        last_error: Option<String>,
+        runs: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ScheduleSpecV6 {
+        name: String,
+        cron: String,
+        job: JobSubmissionV6,
+        overlap: bool,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct JobSubmissionV6 {
+        name: String,
+        executor: pumasi_proto::job::Executor,
+        module: Vec<u8>,
+        docker: Option<pumasi_proto::job::DockerSpec>,
+        files: Vec<pumasi_proto::job::FileEntry>,
+        tasks: Vec<pumasi_proto::job::TaskInput>,
+        limits: pumasi_proto::job::Limits,
+        tier: pumasi_proto::job::Tier,
+        max_attempts: u32,
+        max_price_per_hour: Option<f64>,
+        account: Option<String>,
+        deterministic: bool,
+        mounts: Vec<pumasi_proto::store::MountRequest>,
+        task_mounts: Vec<Vec<pumasi_proto::store::MountRequest>>,
+        output_dataset: Option<String>,
+        gpu: Option<pumasi_proto::gpu::GpuRequest>,
+        priority: i32,
+        selector: pumasi_proto::manage::Selector,
+        tolerations: Vec<pumasi_proto::manage::Toleration>,
+        after: Vec<pumasi_proto::job::JobId>,
+    }
+
+    impl From<ScheduleRecordV6> for crate::manage::ScheduleRecord {
+        fn from(r: ScheduleRecordV6) -> Self {
+            let j = r.spec.job;
+            Self {
+                spec: pumasi_proto::manage::ScheduleSpec {
+                    name: r.spec.name,
+                    cron: r.spec.cron,
+                    job: pumasi_proto::job::JobSubmission {
+                        name: j.name,
+                        executor: j.executor,
+                        module: j.module,
+                        docker: j.docker,
+                        files: j.files,
+                        tasks: j.tasks,
+                        limits: j.limits,
+                        tier: j.tier,
+                        max_attempts: j.max_attempts,
+                        max_price_per_hour: j.max_price_per_hour,
+                        account: j.account,
+                        deterministic: j.deterministic,
+                        mounts: j.mounts,
+                        task_mounts: j.task_mounts,
+                        output_dataset: j.output_dataset,
+                        gpu: j.gpu,
+                        priority: j.priority,
+                        selector: j.selector,
+                        tolerations: j.tolerations,
+                        after: j.after,
+                        queue_timeout_ms: None,
+                        gpu_capabilities: Vec::new(),
+                    },
+                    overlap: r.spec.overlap,
+                },
+                next_unix: r.next_unix,
+                last_unix: r.last_unix,
+                last_job: r.last_job,
+                last_error: r.last_error,
+                runs: r.runs,
             }
         }
     }
@@ -1810,6 +1959,86 @@ mod tests {
         hold_secs: u64,
         verify_permille: u32,
         max_strikes: u32,
+    }
+
+    #[test]
+    fn migrates_layout6_schedules() {
+        use pumasi_proto::job::{Executor, JobSubmission, Limits, TaskInput, Tier};
+        let path =
+            std::env::temp_dir().join(format!("pumasi-store-{}.redb", rand::random::<u64>()));
+        let r = crate::manage::ScheduleRecord {
+            spec: pumasi_proto::manage::ScheduleSpec {
+                name: "nightly".into(),
+                cron: "@daily".into(),
+                job: JobSubmission {
+                    name: "report".into(),
+                    executor: Executor::Wasm,
+                    module: b"\0asm\x01\0\0\0".to_vec(),
+                    docker: None,
+                    files: vec![],
+                    tasks: vec![TaskInput::default(); 2],
+                    limits: Limits::default(),
+                    tier: Tier::Open,
+                    max_attempts: 2,
+                    max_price_per_hour: None,
+                    account: Some("lab".into()),
+                    deterministic: true,
+                    mounts: vec![],
+                    task_mounts: vec![],
+                    output_dataset: None,
+                    gpu: None,
+                    priority: 3,
+                    selector: Default::default(),
+                    tolerations: vec![],
+                    after: vec![],
+                    queue_timeout_ms: None,
+                    gpu_capabilities: vec![],
+                },
+                overlap: true,
+            },
+            next_unix: Some(1_800_000_000),
+            last_unix: None,
+            last_job: None,
+            last_error: Some("x".into()),
+            runs: 4,
+        };
+        // A layout 6 record is the same without the job's last two fields
+        // (an empty option and an empty list, a byte each).
+        let job = enc(&r.spec.job);
+        let record = |job: &[u8]| {
+            let mut b = enc(&r.spec.name);
+            b.extend(enc(&r.spec.cron));
+            b.extend_from_slice(job);
+            b.extend(enc(&r.spec.overlap));
+            b.extend(enc(&r.next_unix));
+            b.extend(enc(&r.last_unix));
+            b.extend(enc(&r.last_job));
+            b.extend(enc(&r.last_error));
+            b.extend(enc(&r.runs));
+            b
+        };
+        assert_eq!(record(&job), enc(&r));
+        let old = record(&job[..job.len() - 2]);
+        {
+            let store = Store::open(&path).unwrap();
+            let tx = store.db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(SCHEDULES).unwrap();
+                t.insert("nightly", old.as_slice()).unwrap();
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert(SCHEMA_META, 6u32.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let snap = Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(snap.schedules.len(), 1);
+        assert_eq!(enc(&snap.schedules[0]), enc(&r));
+        assert_eq!(snap.schedules[0].spec.job.priority, 3);
+        // Reopening does not migrate again.
+        let again = Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(enc(&again.schedules[0]), enc(&r));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

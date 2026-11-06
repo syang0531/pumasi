@@ -47,6 +47,9 @@ const KEY_FILE: &str = "secret.key";
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How often a running task's new output goes to the cluster.
 const LIVE_OUTPUT_EVERY: Duration = Duration::from_millis(200);
+/// How often the agent checks that Docker still answers (or answers
+/// again): Docker Desktop starts after sign-in and can be quit.
+const DOCKER_RECHECK: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -91,6 +94,52 @@ pub struct AgentConfig {
     /// Offer this machine's WebGPU adapters to wasm jobs that ask for a
     /// GPU (phase 14, experimental). `None`: none.
     pub webgpu: Option<crate::webgpu::Options>,
+    /// Whether Docker GPU tasks here can draw (OpenGL, EGL, Vulkan).
+    /// `None`: as the last `pumasi gpu check --docker-run` found (saved in
+    /// `data_dir`).
+    pub gpu_graphics: Option<bool>,
+}
+
+/// The Docker executor as it is now: Docker Desktop may start after the
+/// agent and stop while it runs.
+#[derive(Clone, Default)]
+struct DockerNow {
+    exec: Option<DockerExecutor>,
+    /// Why Docker cannot run tasks now (with `--allow-docker`).
+    reason: Option<String>,
+    /// Its GPU tasks can draw.
+    gpu_graphics: bool,
+}
+
+impl DockerNow {
+    fn same(&self, other: &DockerNow) -> bool {
+        self.exec.is_some() == other.exec.is_some()
+            && self.reason == other.reason
+            && self.gpu_graphics == other.gpu_graphics
+    }
+}
+
+/// The first line of why Docker is not usable, for the cluster's status.
+fn docker_reason(e: &anyhow::Error) -> String {
+    let top = e.to_string();
+    let short = top.split(" (`").next().unwrap_or(&top);
+    short.chars().take(200).collect()
+}
+
+/// Whether Docker GPU tasks can draw now.
+fn graphics_now(
+    forced: Option<bool>,
+    data_dir: &std::path::Path,
+    docker_up: bool,
+    devices: &Option<pumasi_proto::gpu::SignedDevices>,
+) -> bool {
+    docker_up
+        && devices
+            .as_ref()
+            .is_some_and(|d| d.profile.gpus.iter().any(|g| g.docker))
+        && forced.unwrap_or_else(|| {
+            crate::gpu::docker_check::DockerGpuCheck::load(data_dir).is_some_and(|c| c.graphics)
+        })
 }
 
 /// What the agent remembers about the cluster it joined.
@@ -116,7 +165,8 @@ pub struct Agent {
     /// Signs usage receipts. The same key as the endpoint identity.
     key: SecretKey,
     executor: WasmExecutor,
-    docker: Option<DockerExecutor>,
+    /// Docker as it is now, kept current by a background check.
+    docker: watch::Receiver<DockerNow>,
     microvm: Option<MicrovmExecutor>,
     /// Shared job files by content hash.
     files: FileCache,
@@ -134,8 +184,9 @@ pub struct Agent {
     rebench: Arc<Notify>,
     /// The file store cache, which other nodes may fetch from.
     node_store: NodeStore,
-    /// GPUs and microVM networking, signed; sent after the welcome.
-    devices: Option<pumasi_proto::gpu::SignedDevices>,
+    /// GPUs and microVM networking, signed; sent after the welcome and
+    /// again when Docker starts reaching the GPUs.
+    devices: watch::Receiver<Option<pumasi_proto::gpu::SignedDevices>>,
     /// WebGPU adapters wasm tasks may use, and their signed profile.
     webgpu: Option<Arc<crate::webgpu::WebGpu>>,
     webgpu_profile: pumasi_proto::webgpu::SignedWebGpu,
@@ -195,16 +246,31 @@ impl Agent {
             .accept(BLOBS_ALPN, node_store.protocol())
             .spawn();
         let executor = WasmExecutor::new()?;
-        let docker =
-            match &config.docker {
-                Some(bin) => {
-                    let label = endpoint.id().fmt_short().to_string();
-                    Some(DockerExecutor::detect(bin, &label).await.context(
-                        "--allow-docker was given but Docker is not usable on this machine",
-                    )?)
+        let mut info = node_info(&config);
+        let cpu_cap = config.max_cpu_percent.is_some().then_some(info.cpus);
+        let docker_label = endpoint.id().fmt_short().to_string();
+        // Docker that is not usable yet (Docker Desktop starts after
+        // sign-in) is checked again in the background.
+        let mut docker_now = match &config.docker {
+            Some(bin) => match DockerExecutor::detect(bin, &docker_label).await {
+                Ok(d) => DockerNow {
+                    exec: Some(d.with_cpu_cap(cpu_cap)),
+                    ..Default::default()
+                },
+                Err(e) => {
+                    warn!(
+                        "--allow-docker was given but Docker is not usable now; docker jobs come once it is (checked every {} s): {e:#}",
+                        DOCKER_RECHECK.as_secs()
+                    );
+                    DockerNow {
+                        reason: Some(docker_reason(&e)),
+                        ..Default::default()
+                    }
                 }
-                None => None,
-            };
+            },
+            None => DockerNow::default(),
+        };
+        let docker = docker_now.exec.clone();
         let microvm =
             match &config.microvm {
                 Some(vm) => {
@@ -225,9 +291,6 @@ impl Agent {
             },
             None => None,
         };
-        let mut info = node_info(&config);
-        let docker =
-            docker.map(|d| d.with_cpu_cap(config.max_cpu_percent.is_some().then_some(info.cpus)));
         let available = match &config.availability {
             Some(a) if a.policy.is_active() => {
                 let now = a.check().await;
@@ -349,6 +412,27 @@ impl Agent {
         if microvm.is_some() {
             info.executors.push(Executor::Microvm);
         }
+        docker_now.gpu_graphics = graphics_now(
+            config.gpu_graphics,
+            &config.data_dir,
+            docker.is_some(),
+            &devices,
+        );
+        let (docker_tx, docker_rx) = watch::channel(docker_now);
+        let (devices_tx, devices_rx) = watch::channel(devices.clone());
+        if let Some(bin) = config.docker.clone() {
+            let ctx = DockerWatch {
+                bin,
+                label: docker_label,
+                cpu_cap,
+                gpus: config.gpus && config.fake_gpus.is_none(),
+                forced: config.gpu_graphics,
+                data_dir: config.data_dir.clone(),
+                key: key.clone(),
+                network: microvm.as_ref().is_some_and(|m| m.network_capable()),
+            };
+            tokio::spawn(ctx.run(docker_tx, devices_tx));
+        }
         let sampler = {
             let dir = config.data_dir.clone();
             // Only GPUs the cluster may use are watched (NVML stays closed
@@ -363,7 +447,7 @@ impl Agent {
             endpoint,
             key,
             executor,
-            docker,
+            docker: docker_rx,
             microvm,
             files: Default::default(),
             config,
@@ -374,7 +458,7 @@ impl Agent {
             perf: Arc::new(Mutex::new(perf)),
             rebench: Arc::new(Notify::new()),
             node_store,
-            devices,
+            devices: devices_rx,
             webgpu,
             webgpu_profile,
             sampler: Arc::new(Mutex::new(sampler)),
@@ -383,8 +467,14 @@ impl Agent {
     }
 
     /// The signed device profile (GPUs, microVM networking).
-    pub fn devices(&self) -> Option<&pumasi_proto::gpu::SignedDevices> {
-        self.devices.as_ref()
+    pub fn devices(&self) -> Option<pumasi_proto::gpu::SignedDevices> {
+        self.devices.borrow().clone()
+    }
+
+    /// The executors this node runs now, and why the others it was
+    /// allowed cannot.
+    pub fn executors_now(&self) -> pumasi_proto::msg::ExecutorReport {
+        report_of(&self.docker.borrow(), self.microvm.is_some())
     }
 
     /// The signed WebGPU profile (empty when the node offers none).
@@ -601,10 +691,12 @@ impl Agent {
             Err(e) => return SessionEnd::Failed(e.into()),
         };
         let mut available = self.available.clone();
+        let mut node = self.info.clone();
+        node.executors = self.executors_now().executors;
         let hello = AgentHello {
             protocol_version: PROTOCOL_VERSION,
             join_secret: *join_secret,
-            node: self.info.clone(),
+            node,
             upgrade: self.upgrader.as_ref().map(|u| u.hello()),
             availability: available.borrow_and_update().clone(),
         };
@@ -632,7 +724,7 @@ impl Agent {
         if let Some(up) = &self.upgrader {
             up.commit();
         }
-        if role == Role::Provider && self.docker.is_some() {
+        if role == Role::Provider && self.docker.borrow().exec.is_some() {
             info!("docker jobs run here only if the cluster's invite allowed them");
         }
         if join_secret.take().is_some() {
@@ -713,11 +805,50 @@ impl Agent {
         if let Some(p) = self.perf() {
             let _ = out_tx.send(FromAgent::Perf(Box::new(p)));
         }
-        if let Some(d) = &self.devices {
-            let _ = out_tx.send(FromAgent::Devices(Box::new(d.clone())));
+        let mut devices = self.devices.clone();
+        if let Some(d) = devices.borrow_and_update().clone() {
+            let _ = out_tx.send(FromAgent::Devices(Box::new(d)));
         }
         // The control plane is never older than its agents, so it knows this.
         let _ = out_tx.send(FromAgent::WebGpu(Box::new(self.webgpu_profile.clone())));
+        let mut docker = self.docker.clone();
+        let microvm_on = self.microvm.is_some();
+        let _ = out_tx.send(FromAgent::Executors(Box::new(report_of(
+            &docker.borrow_and_update(),
+            microvm_on,
+        ))));
+        // Docker coming and going, and the GPUs it reaches.
+        let docker_changes = {
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    let msg = tokio::select! {
+                        r = docker.changed() => {
+                            if r.is_err() {
+                                break;
+                            }
+                            FromAgent::Executors(Box::new(report_of(
+                                &docker.borrow_and_update(),
+                                microvm_on,
+                            )))
+                        }
+                        r = devices.changed() => {
+                            if r.is_err() {
+                                break;
+                            }
+                            match devices.borrow_and_update().clone() {
+                                Some(d) => FromAgent::Devices(Box::new(d)),
+                                None => continue,
+                            }
+                        }
+                    };
+                    if out_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let _docker_changes = AbortOnDrop(docker_changes);
         let benchmarks = self.config.bench.clone().map(|config| {
             let out_tx = out_tx.clone();
             let running = running.clone();
@@ -906,6 +1037,7 @@ impl Agent {
                 Ok(Some(ToAgent::GpuChallenge(ch))) => {
                     let pci = self
                         .devices
+                        .borrow()
                         .as_ref()
                         .and_then(|d| d.profile.gpus.iter().find(|g| g.index == ch.device))
                         .map(|g| g.pci.clone())
@@ -978,7 +1110,7 @@ impl Agent {
         let cancel = Arc::new(AtomicBool::new(false));
         running.lock().unwrap().insert(a.task, cancel.clone());
         let executor = self.executor.clone();
-        let docker = self.docker.clone();
+        let docker = self.docker.borrow().exec.clone();
         let microvm = self.microvm.clone();
         let shared: Arc<Vec<FileEntry>> = match a.files_hash {
             Some(h) => match self.files.lock().unwrap().get(&h) {
@@ -1020,6 +1152,7 @@ impl Agent {
             Vec::new()
         } else {
             self.devices
+                .borrow()
                 .as_ref()
                 .map(|d| {
                     d.profile
@@ -1062,6 +1195,11 @@ impl Agent {
             };
             io.gpus = gpus;
             io.webgpu = webgpu;
+            io.gpu_capabilities = a.gpu_capabilities.clone();
+            io.image_report = Some(crate::executor::ImageReport {
+                task,
+                tx: out_tx.clone(),
+            });
             // What the task prints goes to the cluster as it comes (not for
             // check runs: only the task's own run is shown).
             let streamer = (!task.check).then(|| {
@@ -1329,6 +1467,116 @@ pub fn default_slots(cpus: u32, memory_bytes: u64) -> u32 {
     const GIB: u64 = 1 << 30;
     let by_memory = (memory_bytes.saturating_sub(2 * GIB) / GIB).max(1);
     cpus.min(by_memory.min(u32::MAX as u64) as u32).max(1)
+}
+
+/// What the agent tells the cluster about its executors.
+fn report_of(docker: &DockerNow, microvm: bool) -> pumasi_proto::msg::ExecutorReport {
+    let mut executors = vec![Executor::Wasm];
+    let mut unavailable = Vec::new();
+    match (&docker.exec, &docker.reason) {
+        (Some(_), _) => executors.push(Executor::Docker),
+        (None, Some(why)) => unavailable.push((Executor::Docker, why.clone())),
+        (None, None) => {}
+    }
+    if microvm {
+        executors.push(Executor::Microvm);
+    }
+    pumasi_proto::msg::ExecutorReport {
+        executors,
+        unavailable,
+        gpu_graphics: docker.gpu_graphics,
+    }
+}
+
+/// Checks Docker every [`DOCKER_RECHECK`]: notices it stopping, and
+/// starts using it when it answers again (marking the GPUs it reaches).
+struct DockerWatch {
+    bin: String,
+    label: String,
+    cpu_cap: Option<u32>,
+    /// Detect again which GPUs Docker reaches (not with test GPUs).
+    gpus: bool,
+    forced: Option<bool>,
+    data_dir: PathBuf,
+    key: SecretKey,
+    network: bool,
+}
+
+impl DockerWatch {
+    async fn run(
+        self,
+        docker: watch::Sender<DockerNow>,
+        devices: watch::Sender<Option<pumasi_proto::gpu::SignedDevices>>,
+    ) {
+        loop {
+            tokio::time::sleep(DOCKER_RECHECK).await;
+            if docker.is_closed() {
+                break;
+            }
+            let cur = docker.borrow().clone();
+            let mut next = cur.clone();
+            match &cur.exec {
+                Some(d) => {
+                    if let Err(e) = d.alive().await {
+                        warn!("Docker stopped answering; no docker jobs until it is back: {e:#}");
+                        next.exec = None;
+                        next.reason = Some(docker_reason(&e));
+                    }
+                }
+                None => match DockerExecutor::detect(&self.bin, &self.label).await {
+                    Ok(d) => {
+                        info!("Docker is usable now; docker jobs come here");
+                        if self.gpus {
+                            self.mark_gpus(d.bin(), &devices).await;
+                        }
+                        next.exec = Some(d.with_cpu_cap(self.cpu_cap));
+                        next.reason = None;
+                    }
+                    Err(e) => next.reason = Some(docker_reason(&e)),
+                },
+            }
+            next.gpu_graphics = graphics_now(
+                self.forced,
+                &self.data_dir,
+                next.exec.is_some(),
+                &devices.borrow(),
+            );
+            if !next.same(&cur) {
+                docker.send_replace(next);
+            }
+        }
+    }
+
+    /// Marks the GPUs Docker reaches now, and signs the profile again if
+    /// that changed.
+    async fn mark_gpus(
+        &self,
+        bin: &str,
+        devices: &watch::Sender<Option<pumasi_proto::gpu::SignedDevices>>,
+    ) {
+        let Some(cur) = devices.borrow().clone() else {
+            return;
+        };
+        let env = crate::gpu::GpuEnv {
+            docker_nvidia: crate::gpu::docker_nvidia(bin).await,
+            docker_amd: cfg!(target_os = "linux"),
+            ..Default::default()
+        };
+        let mut gpus = cur.profile.gpus.clone();
+        crate::gpu::mark_docker(&mut gpus, &env);
+        if gpus == cur.profile.gpus {
+            return;
+        }
+        let profile = crate::gpu::profile(
+            *self.key.public().as_bytes(),
+            gpus,
+            self.network,
+            cur.profile.notes.clone(),
+        );
+        devices.send_replace(Some(pumasi_proto::gpu::SignedDevices::sign(
+            profile, &self.key,
+        )));
+    }
 }
 
 fn node_info(config: &AgentConfig) -> NodeInfo {

@@ -18,7 +18,7 @@ use pumasi_proto::{
     economy::{Metered, MilliCu, Policy, validate_account, vcpus},
     gpu::{GpuRequest, GpuVendor},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
-    manage::{LabelSet, Selector, Toleration, tolerated},
+    manage::{LabelSet, Selector, Taint, Toleration},
     monitor::EventLevel,
     msg::{
         AccountView, Availability, ClusterStatus, Invite, JobState, JobSummary, JobView, NodeInfo,
@@ -28,7 +28,7 @@ use pumasi_proto::{
     perf::SignedPerf,
     receipt::{Billing, Receipt, check_usage, output_digest},
     secrets_eq,
-    store::{BlobHash, ImageBlob, OutputMode, StoredOutput},
+    store::{BlobHash, ImageBlob, OutputMode, StoredOutput, format_size},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -142,6 +142,10 @@ pub struct JobMeta {
     /// their own table.
     #[serde(skip)]
     pub sched: JobSched,
+    /// Who submitted it and the rest of phase 15's job details, persisted
+    /// in their own table.
+    #[serde(skip)]
+    pub origin: crate::remote::JobOrigin,
 }
 
 /// What a run produced, kept for a check run until the check settles in
@@ -252,6 +256,11 @@ pub(crate) struct NodeRuntime {
     pub perf: PerfRuntime,
     /// GPUs in use and GPU checks.
     pub gpu: GpuRuntime,
+    /// Executors its owner allowed that cannot run now, and why (protocol
+    /// 13 agents report them).
+    pub unavailable: Vec<(Executor, String)>,
+    /// Its Docker GPU tasks can draw.
+    pub gpu_graphics: bool,
 }
 
 impl NodeRuntime {
@@ -287,6 +296,70 @@ pub(crate) struct Need {
     pub exclude_accounts: Vec<String>,
     pub selector: Selector,
     pub tolerations: Vec<Toleration>,
+    /// Its GPU tasks ask for driver capabilities (protocol 13 agents).
+    pub gpu_caps: bool,
+    /// Its GPU tasks draw: only nodes whose Docker GPUs can.
+    pub gpu_graphics: bool,
+}
+
+/// Why a node cannot take a run, for `queue_timeout` failures and the
+/// status's capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal<'a> {
+    Offline,
+    Suspended,
+    Upgrading,
+    Paused(&'a str),
+    Benchmarking,
+    Cordoned,
+    /// It does not run this executor; why, when its owner allowed it.
+    Executor(Executor, Option<&'a str>),
+    RanItAlready,
+    CannotPay(&'a str),
+    Memory(u64),
+    Cpus(u32),
+    OldAgent,
+    ImageArch,
+    VmNetwork,
+    Taint(&'a Taint),
+    Selector(&'a Selector),
+    GpuGraphics,
+    GpuCheck,
+    Gpu,
+    Full,
+}
+
+impl std::fmt::Display for Refusal<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Offline => f.write_str("offline"),
+            Refusal::Suspended => f.write_str("suspended after failed checks"),
+            Refusal::Upgrading => f.write_str("upgrading"),
+            Refusal::Paused(why) => write!(f, "paused: {why}"),
+            Refusal::Benchmarking => f.write_str("being benchmarked"),
+            Refusal::Cordoned => f.write_str("cordoned"),
+            Refusal::Executor(e, Some(why)) => write!(f, "{e} unavailable: {why}"),
+            Refusal::Executor(e, None) => write!(f, "does not run {e} jobs"),
+            Refusal::RanItAlready => f.write_str("ran the task being checked"),
+            Refusal::CannotPay(a) => write!(
+                f,
+                "account {a} has no CU left (or used its daily CU) for other accounts' machines"
+            ),
+            Refusal::Memory(m) => write!(f, "less than {} of memory", format_size(*m)),
+            Refusal::Cpus(c) => write!(f, "fewer than {c} CPUs"),
+            Refusal::OldAgent => f.write_str("its agent is too old for this job (upgrade it)"),
+            Refusal::ImageArch => f.write_str("the private image is not ready for its architecture"),
+            Refusal::VmNetwork => f.write_str("its microVMs cannot have a network"),
+            Refusal::Taint(t) => write!(f, "taint {t} not tolerated"),
+            Refusal::Selector(s) => write!(f, "does not match the selector {s}"),
+            Refusal::GpuGraphics => f.write_str(
+                "its Docker GPUs cannot draw (no gpu.graphics; see `pumasi gpu check --docker-run`)",
+            ),
+            Refusal::GpuCheck => f.write_str("its GPUs are being checked"),
+            Refusal::Gpu => f.write_str("no free GPU that matches"),
+            Refusal::Full => f.write_str("every slot busy"),
+        }
+    }
 }
 
 pub struct State {
@@ -410,6 +483,8 @@ impl State {
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
         let mut job_ext: HashMap<u128, JobExt> = snap.job_ext.into_iter().collect();
         let mut task_ext: HashMap<(u128, u32), TaskExt> = snap.task_ext.into_iter().collect();
+        let mut job_origin: HashMap<u128, crate::remote::JobOrigin> =
+            snap.job_origin.into_iter().collect();
         state.rollout = state.load_rollout()?;
         state.convert_credit_receipts()?;
         state.ensure_account(OWNER_ACCOUNT)?;
@@ -419,6 +494,7 @@ impl State {
             state.next_seq = state.next_seq.max(meta.seq + 1);
             meta.ext = job_ext.remove(&meta.id.0).unwrap_or_default();
             meta.sched = job_sched.remove(&meta.id.0).unwrap_or_default();
+            meta.origin = job_origin.remove(&meta.id.0).unwrap_or_default();
             meta.gpu = job_gpu.remove(&meta.id.0).or_else(|| {
                 // Jobs from before phase 9 passed `--gpus` to docker: that
                 // was every NVIDIA GPU of the node.
@@ -489,6 +565,7 @@ impl State {
             preempted: snap.preempted,
             access: snap.access,
             schedules: snap.schedules,
+            account_policies: snap.account_policies,
         })?;
         state.load_monitor(Duration::from_secs(7 * 86_400))?;
         let now = now_unix();
@@ -733,6 +810,8 @@ impl State {
                     ..Default::default()
                 },
                 gpu: GpuRuntime::default(),
+                unavailable: Vec::new(),
+                gpu_graphics: false,
             },
         );
         let name = self.node_name(id);
@@ -903,6 +982,7 @@ impl State {
         }
         self.release_holds(now_unix());
         self.tick_schedules(now_unix());
+        self.tick_queue_timeouts();
         self.tick_files();
         self.expire_upgrades();
         self.expire_challenges();
@@ -928,9 +1008,24 @@ impl State {
     /// 0 need the account's quota to allow them) or a schedule.
     pub fn submit_from(
         &mut self,
+        sub: JobSubmission,
+        submitter: bool,
+        schedule: Option<String>,
+    ) -> Result<JobId> {
+        let by = match &schedule {
+            Some(s) => format!("schedule {s}"),
+            None => "cluster admin".to_string(),
+        };
+        self.submit_by(sub, submitter, schedule, by)
+    }
+
+    /// [`Self::submit_from`], recording the ticket that submitted the job.
+    pub fn submit_by(
+        &mut self,
         mut sub: JobSubmission,
         submitter: bool,
         schedule: Option<String>,
+        by: String,
     ) -> Result<JobId> {
         sub.validate()?;
         let account = sub.account.take().unwrap_or_else(|| OWNER_ACCOUNT.into());
@@ -969,7 +1064,14 @@ impl State {
             }
         };
         let sched = sched_of(&sub, schedule);
+        let origin = crate::remote::JobOrigin {
+            submitted_by: by,
+            queue_timeout_ms: sub.queue_timeout_ms,
+            gpu_capabilities: sub.gpu_capabilities.clone(),
+            image_digests: Vec::new(),
+        };
         let meta = JobMeta {
+            origin,
             id,
             name: sub.name,
             executor: sub.executor,
@@ -1017,10 +1119,15 @@ impl State {
         }
         info!(job = %id, name = %meta.name, tasks = tasks.len(), account = %meta.account, priority = meta.sched.priority, "job submitted");
         let msg = format!(
-            "job {id} ({}) submitted: {} tasks, account {}",
+            "job {id} ({}) submitted by {}: {} tasks, account {}{}",
             meta.name,
+            meta.origin.submitted_by,
             tasks.len(),
-            meta.account
+            meta.account,
+            meta.docker
+                .as_ref()
+                .map(|d| format!(", image {}", d.image))
+                .unwrap_or_default()
         );
         self.jobs.insert(id, Job { meta, tasks });
         self.monitor.active_jobs.insert(id);
@@ -1476,7 +1583,7 @@ impl State {
 
     /// What a queued run needs from a node, or `None` when the item is
     /// stale (the task moved on).
-    fn need_for(&mut self, item: &QueueItem) -> Option<Need> {
+    pub(crate) fn need_for(&mut self, item: &QueueItem) -> Option<Need> {
         // A private image is pulled into the store per architecture; only
         // nodes of an architecture it is ready for can run it.
         let images = self
@@ -1534,6 +1641,12 @@ impl State {
             exclude_accounts,
             selector: job.meta.sched.selector.clone(),
             tolerations: job.meta.sched.tolerations.clone(),
+            gpu_caps: !job.meta.origin.gpu_capabilities.is_empty(),
+            gpu_graphics: job
+                .meta
+                .origin
+                .gpu_capabilities
+                .contains(&pumasi_proto::job::GpuCapability::Graphics),
         })
     }
 
@@ -1549,48 +1662,113 @@ impl State {
         extra_slots: u32,
         freed: &[u32],
     ) -> bool {
+        self.refusal(id, n, need, labels, extra_slots, freed)
+            .is_none()
+    }
+
+    /// Why node `id` cannot take the run (the first reason found), or
+    /// `None` when it can. See [`Self::fits`].
+    pub(crate) fn refusal<'a>(
+        &'a self,
+        id: &str,
+        n: &'a NodeRuntime,
+        need: &'a Need,
+        labels: &HashMap<String, LabelSet>,
+        extra_slots: u32,
+        freed: &[u32],
+    ) -> Option<Refusal<'a>> {
+        use Refusal as R;
         let config = self.node_config(id);
-        n.online
-            && !n.suspended
-            && !n.draining
-            && n.paused.is_none()
-            && !n.perf.wanted
-            && n.perf.challenge.is_none()
-            && !self.upgrading.contains_key(id)
-            && !config.is_some_and(|c| c.cordoned)
-            && n.free_slots() + extra_slots > 0
-            && n.info.memory_bytes >= need.memory
-            && n.info.cpus >= need.cpus
-            && n.executors.contains(&need.executor)
-            && (n.account == need.consumer || need.can_pay)
-            && !need.exclude_nodes.iter().any(|x| x == id)
-            && !need.exclude_accounts.contains(&n.account)
-            && (!need.store_job || n.perf.protocol >= STORE_PROTOCOL)
-            && need.images.as_ref().is_none_or(|imgs| {
-                let arch = oci_arch_of(&n.info.arch);
-                imgs.iter().any(|(a, _)| *a == arch)
-            })
-            && (!need.vm_network
-                || (n.perf.protocol >= DEVICES_PROTOCOL
-                    && self
-                        .devices
-                        .get(id)
-                        .is_some_and(|d| d.signed.profile.microvm_network)))
-            && need.gpu.as_ref().is_none_or(|req| {
-                let mut busy = n.gpu.busy_set();
-                for g in freed {
-                    busy.remove(g);
-                }
-                n.perf.protocol >= DEVICES_PROTOCOL
-                    && !n.gpu.checking()
-                    && self.pick_gpus(id, req, need.executor, &busy).is_some()
-            })
-            && tolerated(
-                config.map(|c| c.taints.as_slice()).unwrap_or_default(),
-                &need.tolerations,
-            )
-            && (need.selector.is_empty()
-                || labels.get(id).is_some_and(|l| need.selector.matches(l)))
+        if !n.online {
+            return Some(R::Offline);
+        }
+        if n.suspended {
+            return Some(R::Suspended);
+        }
+        if n.draining || self.upgrading.contains_key(id) {
+            return Some(R::Upgrading);
+        }
+        if let Some(why) = &n.paused {
+            return Some(R::Paused(why));
+        }
+        if n.perf.wanted || n.perf.challenge.is_some() {
+            return Some(R::Benchmarking);
+        }
+        if config.is_some_and(|c| c.cordoned) {
+            return Some(R::Cordoned);
+        }
+        if !n.executors.contains(&need.executor) {
+            let why = n
+                .unavailable
+                .iter()
+                .find(|(e, _)| *e == need.executor)
+                .map(|(_, w)| w.as_str());
+            return Some(R::Executor(need.executor, why));
+        }
+        if need.exclude_nodes.iter().any(|x| x == id) || need.exclude_accounts.contains(&n.account)
+        {
+            return Some(R::RanItAlready);
+        }
+        if !(n.account == need.consumer || need.can_pay) {
+            return Some(R::CannotPay(&need.consumer));
+        }
+        if n.info.memory_bytes < need.memory {
+            return Some(R::Memory(need.memory));
+        }
+        if n.info.cpus < need.cpus {
+            return Some(R::Cpus(need.cpus));
+        }
+        if need.store_job && n.perf.protocol < STORE_PROTOCOL
+            || need.gpu.is_some() && n.perf.protocol < DEVICES_PROTOCOL
+            || need.gpu_caps && n.perf.protocol < pumasi_proto::REMOTE_PROTOCOL
+        {
+            return Some(R::OldAgent);
+        }
+        if need.images.as_ref().is_some_and(|imgs| {
+            let arch = oci_arch_of(&n.info.arch);
+            !imgs.iter().any(|(a, _)| *a == arch)
+        }) {
+            return Some(R::ImageArch);
+        }
+        if need.vm_network
+            && !(n.perf.protocol >= DEVICES_PROTOCOL
+                && self
+                    .devices
+                    .get(id)
+                    .is_some_and(|d| d.signed.profile.microvm_network))
+        {
+            return Some(R::VmNetwork);
+        }
+        if let Some(t) = config
+            .map(|c| c.taints.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .find(|t| !need.tolerations.iter().any(|tol| tol.tolerates(t)))
+        {
+            return Some(R::Taint(t));
+        }
+        if !need.selector.is_empty() && !labels.get(id).is_some_and(|l| need.selector.matches(l)) {
+            return Some(R::Selector(&need.selector));
+        }
+        if need.gpu_graphics && !n.gpu_graphics {
+            return Some(R::GpuGraphics);
+        }
+        if let Some(req) = &need.gpu {
+            if n.gpu.checking() {
+                return Some(R::GpuCheck);
+            }
+            let mut busy = n.gpu.busy_set();
+            for g in freed {
+                busy.remove(g);
+            }
+            if self.pick_gpus(id, req, need.executor, &busy).is_none() {
+                return Some(R::Gpu);
+            }
+        }
+        if n.free_slots() + extra_slots == 0 {
+            return Some(R::Full);
+        }
+        None
     }
 
     /// Places as many queued runs as free slots allow, highest priority
@@ -1777,6 +1955,7 @@ impl State {
             output,
             image,
             peers,
+            gpu_capabilities: job.meta.origin.gpu_capabilities.clone(),
         };
         if tx.send(ToAgent::Assign(Box::new(assignment))).is_err() {
             return None;
@@ -1847,6 +2026,11 @@ impl State {
     }
 
     pub fn status(&self) -> ClusterStatus {
+        self.status_for(None)
+    }
+
+    /// The status, with which nodes can take `account`'s work now.
+    pub fn status_for(&self, account: Option<&str>) -> ClusterStatus {
         let mut nodes: Vec<NodeView> = self
             .members
             .values()
@@ -1882,6 +2066,8 @@ impl State {
                         .is_some_and(|d| d.signed.profile.microvm_network),
                     config: self.node_config(&m.id).cloned().unwrap_or_default(),
                     labels: self.node_labels(&m.id),
+                    unavailable: online.map(|n| n.unavailable.clone()).unwrap_or_default(),
+                    gpu_graphics: online.is_some_and(|n| n.gpu_graphics),
                 }
             })
             .collect();
@@ -1897,6 +2083,7 @@ impl State {
             cluster_id: self.cluster_id.clone(),
             nodes,
             jobs: jobs.into_iter().map(|(_, s)| s).collect(),
+            capacity: account.map(|a| self.capacity(a)),
         }
     }
 
@@ -1971,6 +2158,10 @@ impl State {
             after: job.meta.sched.after.clone(),
             waiting: self.waiting_reason(id),
             schedule: job.meta.sched.schedule.clone(),
+            submitted_by: job.meta.origin.submitted_by.clone(),
+            image_digests: job.meta.origin.image_digests.clone(),
+            queue_timeout_ms: job.meta.origin.queue_timeout_ms,
+            gpu_capabilities: job.meta.origin.gpu_capabilities.clone(),
         })
     }
 
@@ -2065,6 +2256,8 @@ mod tests {
             selector: Default::default(),
             tolerations: vec![],
             after: vec![],
+            queue_timeout_ms: None,
+            gpu_capabilities: vec![],
         }
     }
 
@@ -2323,6 +2516,95 @@ mod tests {
         big.gpu.as_mut().unwrap().min_vram_mib = 80 * 1024;
         let id = st.submit(big).unwrap();
         assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+    }
+
+    #[test]
+    fn graphics_jobs_need_nodes_that_draw() {
+        let mut st = state();
+        let (draws, _, mut draws_rx) = join_gpus(&mut st, "draws", vec![gpu(0, 12_700, 0)], None);
+        let (_, _, mut plain_rx) = join_gpus(&mut st, "plain", vec![gpu(0, 12_700, 0)], None);
+        let cap = st.capacity("owner");
+        assert_eq!((cap.ready_gpu, cap.ready_gpu_graphics), (2, 0));
+        let mut eevee = gpu_job(1, 1);
+        eevee.gpu_capabilities = vec![pumasi_proto::job::GpuCapability::Graphics];
+        let id = st.submit(eevee).unwrap();
+        assert!(assigned(&mut draws_rx).is_empty());
+        assert!(assigned(&mut plain_rx).is_empty());
+        assert!(st.why_unplaced(id, 0).contains("cannot draw"));
+
+        // `pumasi gpu check --docker-run` found that it draws.
+        let generation = st.nodes[&draws].generation;
+        st.on_executors(
+            &draws,
+            generation,
+            pumasi_proto::msg::ExecutorReport {
+                executors: vec![Executor::Wasm, Executor::Docker],
+                unavailable: vec![],
+                gpu_graphics: true,
+            },
+        );
+        let got = assigned(&mut draws_rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].task.job, id);
+        assert_eq!(
+            got[0].gpu_capabilities,
+            vec![pumasi_proto::job::GpuCapability::Graphics]
+        );
+        assert!(assigned(&mut plain_rx).is_empty());
+        assert_eq!(
+            st.node_labels(&draws).get("gpu.graphics"),
+            Some(&vec!["true".to_string()])
+        );
+        // A CUDA job takes the other node.
+        st.submit(gpu_job(1, 1)).unwrap();
+        assert_eq!(assigned(&mut plain_rx).len(), 1);
+    }
+
+    #[test]
+    fn nodes_report_docker_going_away_and_coming_back() {
+        let mut st = state();
+        let (id, mut rx) = join(&mut st, "win", vec![Executor::Wasm, Executor::Docker], None);
+        let generation = st.nodes[&id].generation;
+        let report = |up: bool| pumasi_proto::msg::ExecutorReport {
+            executors: if up {
+                vec![Executor::Wasm, Executor::Docker]
+            } else {
+                vec![Executor::Wasm]
+            },
+            unavailable: if up {
+                vec![]
+            } else {
+                vec![(Executor::Docker, "Docker Desktop is not running".into())]
+            },
+            gpu_graphics: false,
+        };
+        st.on_executors(&id, generation, report(false));
+        let view = st.status();
+        let node = view.nodes.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(node.unavailable.len(), 1);
+        let jid = st.submit(job(Executor::Docker, 1)).unwrap();
+        assert_eq!(st.jobs[&jid].tasks[0].state, TaskState::Pending);
+        let cap = st.capacity("owner");
+        assert_eq!(cap.ready_for(Executor::Docker), 0);
+        assert_eq!(cap.ready_for(Executor::Wasm), 1);
+        assert!(
+            st.why_unplaced(jid, 0).contains("docker"),
+            "{}",
+            st.why_unplaced(jid, 0)
+        );
+        assert!(
+            st.events(0, 0, 100)
+                .iter()
+                .any(|e| e.kind == "node.executor_unavailable")
+        );
+        // Docker Desktop started: the waiting task goes there.
+        st.on_executors(&id, generation, report(true));
+        let got = assigned(&mut rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].task.job, jid);
+        // A report from an older connection is ignored.
+        st.on_executors(&id, generation + 1, report(false));
+        assert!(st.status().nodes[0].unavailable.is_empty());
     }
 
     #[test]

@@ -111,7 +111,9 @@ pub enum Tier {
 ///   No network unless the job asks for one, and then only to the
 ///   internet. Safe to send to other people's machines, so providers that
 ///   opted in with `--allow-microvm` get these tasks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Executor {
     #[default]
@@ -273,6 +275,73 @@ pub struct DockerSpec {
     pub gpus: Option<String>,
 }
 
+/// What a Docker GPU task may use of an NVIDIA GPU besides its memory
+/// (`gpu = { capabilities = ["compute", "graphics"] }`): the NVIDIA
+/// Container Toolkit's driver capabilities. Without any, a task gets
+/// `compute` and `utility` (CUDA and `nvidia-smi`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuCapability {
+    /// CUDA and OpenCL.
+    Compute,
+    /// `nvidia-smi` and NVML.
+    Utility,
+    /// OpenGL, EGL and Vulkan (Blender EEVEE, OptiX denoising, games).
+    /// Only nodes whose Docker GPU check found graphics (label
+    /// `gpu.graphics=true`) get these tasks.
+    Graphics,
+    /// NVENC and NVDEC video encoding and decoding.
+    Video,
+}
+
+impl GpuCapability {
+    pub const ALL: [GpuCapability; 4] = [
+        GpuCapability::Compute,
+        GpuCapability::Utility,
+        GpuCapability::Graphics,
+        GpuCapability::Video,
+    ];
+
+    /// `NVIDIA_DRIVER_CAPABILITIES` for a task that asked for `caps`:
+    /// always with `compute` and `utility`.
+    pub fn driver_env(caps: &[GpuCapability]) -> String {
+        let mut all: Vec<GpuCapability> = vec![GpuCapability::Compute, GpuCapability::Utility];
+        for c in caps {
+            if !all.contains(c) {
+                all.push(*c);
+            }
+        }
+        all.sort();
+        all.iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+impl fmt::Display for GpuCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            GpuCapability::Compute => "compute",
+            GpuCapability::Utility => "utility",
+            GpuCapability::Graphics => "graphics",
+            GpuCapability::Video => "video",
+        })
+    }
+}
+
+impl std::str::FromStr for GpuCapability {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.to_string() == s.trim().to_ascii_lowercase())
+            .with_context(|| {
+                format!("unknown GPU capability {s:?} (compute, utility, graphics or video)")
+            })
+    }
+}
+
 /// What the CLI sends to the control plane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobSubmission {
@@ -316,9 +385,22 @@ pub struct JobSubmission {
     pub tolerations: Vec<Toleration>,
     /// Jobs that must succeed before this one starts.
     pub after: Vec<JobId>,
+    // Phase 15 from here.
+    /// A task that no node has taken this long after the job could start
+    /// fails, with the reason no node took it (instead of waiting in the
+    /// queue for as long as it takes).
+    pub queue_timeout_ms: Option<u64>,
+    /// Driver capabilities its Docker GPU tasks need beyond `compute` and
+    /// `utility` (NVIDIA).
+    pub gpu_capabilities: Vec<GpuCapability>,
 }
 
 impl JobSubmission {
+    /// Whether its tasks need a node whose Docker GPUs can draw.
+    pub fn needs_gpu_graphics(&self) -> bool {
+        self.gpu_capabilities.contains(&GpuCapability::Graphics)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.tasks.is_empty(), "job has no tasks");
         ensure!(self.tasks.len() <= 100_000, "too many tasks (max 100000)");
@@ -413,6 +495,23 @@ impl JobSubmission {
             t.validate()?;
         }
         ensure!(self.after.len() <= 64, "a job waits for at most 64 jobs");
+        if let Some(t) = self.queue_timeout_ms {
+            ensure!(t >= 1000, "queue_timeout must be at least 1s");
+        }
+        if !self.gpu_capabilities.is_empty() {
+            ensure!(
+                self.executor == Executor::Docker,
+                "GPU capabilities are for docker jobs (a microVM gets the whole GPU)"
+            );
+            let g = self
+                .gpu
+                .as_ref()
+                .context("GPU capabilities need a GPU request (`gpus = 1`)")?;
+            ensure!(
+                g.vendor.is_none_or(|v| v == GpuVendor::Nvidia),
+                "GPU capabilities are for NVIDIA GPUs"
+            );
+        }
         ensure!(self.limits.timeout_ms > 0, "timeout must be positive");
         ensure!(
             self.limits.memory_bytes >= 64 * 1024,
@@ -516,6 +615,9 @@ pub struct JobFile {
     /// Ids of jobs that must succeed first.
     #[serde(default)]
     pub after: Vec<String>,
+    /// Fail a task no node took within this long (`"2m"`), with the
+    /// reason, instead of leaving it in the queue.
+    pub queue_timeout: Option<String>,
 }
 
 /// `gpus = 2` or `gpus = "all"`.
@@ -551,6 +653,10 @@ pub struct GpuFile {
     pub vendor: Option<String>,
     /// Smallest GPU memory, in GB (GiB).
     pub min_vram_gb: Option<f64>,
+    /// Driver capabilities beyond `compute` and `utility`: `graphics`
+    /// (OpenGL, EGL, Vulkan) and `video` (NVENC, NVDEC). Docker, NVIDIA.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -915,6 +1021,30 @@ impl JobFile {
                 })
             }
         };
+        let gpu_capabilities = {
+            let mut caps = self
+                .gpu
+                .as_ref()
+                .map(|g| {
+                    g.capabilities
+                        .iter()
+                        .map(|c| c.parse::<GpuCapability>())
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            // compute and utility are always there.
+            caps.retain(|c| !matches!(c, GpuCapability::Compute | GpuCapability::Utility));
+            caps.sort();
+            caps.dedup();
+            caps
+        };
+        let queue_timeout_ms = self
+            .queue_timeout
+            .as_deref()
+            .map(parse_duration_ms)
+            .transpose()
+            .context("queue_timeout")?;
         let wants_gpu = gpu.is_some();
         let output_dataset = match &self.output {
             Some(o) => {
@@ -927,6 +1057,8 @@ impl JobFile {
             None => None,
         };
         let sub = JobSubmission {
+            queue_timeout_ms,
+            gpu_capabilities,
             priority: self.priority.unwrap_or(0),
             selector: Selector::from_table(&self.selector)?,
             tolerations: self
@@ -996,6 +1128,26 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
         .parse()
         .with_context(|| format!("invalid duration {s:?}"))?;
     Ok(n * mult)
+}
+
+/// `90s`, `5m`, `1h30m`, `2d`: the shortest of [`parse_duration_ms`]'s
+/// forms that is exact (milliseconds only when needed).
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms == 0 {
+        return "0s".into();
+    }
+    if !ms.is_multiple_of(1000) {
+        return format!("{ms}ms");
+    }
+    let mut secs = ms / 1000;
+    let mut out = String::new();
+    for (unit, len) in [("d", 86_400), ("h", 3600), ("m", 60), ("s", 1)] {
+        if secs >= len {
+            out.push_str(&format!("{}{unit}", secs / len));
+            secs %= len;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1161,6 +1313,72 @@ mod tests {
             assert_eq!(sub.executor, executor, "{file}");
             assert_eq!(sub.gpu.as_ref().map(|g| g.count), Some(count), "{file}");
             sub.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn blender_examples_resolve() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/blender-render");
+        for (file, graphics) in [("job-cycles.toml", false), ("job-eevee.toml", true)] {
+            let text = std::fs::read_to_string(dir.join(file)).unwrap();
+            let sub = JobFile::parse(&text).unwrap().resolve(&dir).unwrap();
+            sub.validate().unwrap();
+            assert_eq!(sub.needs_gpu_graphics(), graphics, "{file}");
+            assert_eq!(sub.queue_timeout_ms, Some(30 * 60_000), "{file}");
+            assert_eq!(sub.tasks.len(), 4);
+        }
+    }
+
+    #[test]
+    fn gpu_capabilities_and_queue_timeout() {
+        let dir = tempdir();
+        let sub = JobFile::parse(
+            "image = \"x\"\nqueue_timeout = \"90s\"\n[gpu]\nvendor = \"nvidia\"\ncapabilities = [\"video\", \"compute\", \"graphics\", \"video\"]",
+        )
+        .unwrap()
+        .resolve(&dir)
+        .unwrap();
+        sub.validate().unwrap();
+        assert_eq!(
+            sub.gpu_capabilities,
+            vec![GpuCapability::Graphics, GpuCapability::Video]
+        );
+        assert_eq!(sub.queue_timeout_ms, Some(90_000));
+        assert_eq!(
+            GpuCapability::driver_env(&sub.gpu_capabilities),
+            "compute,utility,graphics,video"
+        );
+        assert_eq!(GpuCapability::driver_env(&[]), "compute,utility");
+        for (text, why) in [
+            (
+                "image = \"x\"\n[gpu]\ncapabilities = [\"opengl\"]",
+                "unknown GPU capability",
+            ),
+            (
+                "image = \"x\"\ngpus = 1\n[gpu]\nvendor = \"amd\"\ncapabilities = [\"graphics\"]",
+                "NVIDIA",
+            ),
+            ("image = \"x\"\nqueue_timeout = \"500ms\"", "at least 1s"),
+        ] {
+            let e = JobFile::parse(text)
+                .and_then(|f| f.resolve(&dir))
+                .and_then(|s| s.validate());
+            let e = e.unwrap_err();
+            assert!(format!("{e:#}").contains(why), "{text}: {e:#}");
+        }
+    }
+
+    #[test]
+    fn durations_format_back() {
+        for (ms, s) in [
+            (0, "0s"),
+            (1500, "1500ms"),
+            (90_000, "1m30s"),
+            (5_400_000, "1h30m"),
+            (172_800_000, "2d"),
+        ] {
+            assert_eq!(format_duration_ms(ms), s);
+            assert_eq!(parse_duration_ms(s).unwrap_or(ms), ms, "{s}");
         }
     }
 

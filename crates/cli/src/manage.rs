@@ -8,10 +8,10 @@ use clap::{Subcommand, ValueEnum};
 use pumasi_cluster::AdminClient;
 use pumasi_proto::{
     economy::{format_cu, parse_cu, validate_account},
-    job::{JobFile, JobId},
+    job::{Executor, JobFile, JobId, parse_duration_ms},
     manage::{
-        AccessRole, AccessView, AccountQuota, ClusterFile, NodeEdit, QuotaView, ScheduleSpec,
-        ScheduleView, Selector, Taint,
+        AccessRole, AccessView, AccountPolicy, AccountQuota, ClusterFile, NodeEdit, QuotaView,
+        ScheduleSpec, ScheduleView, Selector, Taint, Toleration, parse_network_rule,
     },
     msg::{AccountView, AdminOp, AdminResponse, ClusterStatus, NodeView},
     store::{format_size, parse_size},
@@ -225,6 +225,120 @@ fn limit<T>(v: &Option<String>, parse: impl Fn(&str) -> Result<T>) -> Result<Opt
     }
 }
 
+/// What jobs of an account may be, for its submitter tickets (`pumasi
+/// quota NAME --images ... --network deny`). Admin tickets are not held to
+/// it.
+#[derive(clap::Args, Default)]
+pub struct PolicyArgs {
+    /// Images its jobs may use: patterns such as `ghcr.io/me/blender:*`
+    /// (`*` any characters), or `name@sha256:...` to pin a digest.
+    /// Comma-separated; `any` lifts it.
+    #[arg(long, value_delimiter = ',')]
+    images: Option<Vec<String>>,
+    /// Only images named by digest (`name@sha256:...`): `yes` or `no`.
+    #[arg(long, value_name = "yes|no")]
+    require_digest: Option<String>,
+    /// Executors its jobs may use (wasm, docker, microvm),
+    /// comma-separated; `any` lifts it.
+    #[arg(long, value_delimiter = ',')]
+    executors: Option<Vec<String>>,
+    /// `deny` refuses jobs with `network = true`; `allow` lifts it.
+    #[arg(long, value_name = "allow|deny")]
+    network: Option<String>,
+    /// Added to every job's selector, e.g. `gpu=nvidia`; `none` removes
+    /// it.
+    #[arg(long)]
+    selector: Option<String>,
+    /// Tolerations its jobs may carry (`key`, `key=value`, `*`),
+    /// comma-separated; `none` for none, `any` lifts it.
+    #[arg(long)]
+    tolerations: Option<String>,
+    /// Longest task timeout, e.g. 30m; `none` lifts it.
+    #[arg(long)]
+    max_timeout: Option<String>,
+    /// Most GPUs per task; `none` lifts it.
+    #[arg(long)]
+    max_gpus_per_task: Option<String>,
+}
+
+impl PolicyArgs {
+    fn given(&self) -> bool {
+        self.images.is_some()
+            || self.require_digest.is_some()
+            || self.executors.is_some()
+            || self.network.is_some()
+            || self.selector.is_some()
+            || self.tolerations.is_some()
+            || self.max_timeout.is_some()
+            || self.max_gpus_per_task.is_some()
+    }
+
+    fn apply(&self, p: &mut AccountPolicy) -> Result<()> {
+        let any = |v: &[String]| v.len() == 1 && v[0].trim() == "any";
+        if let Some(v) = &self.images {
+            p.images = if any(v) {
+                Vec::new()
+            } else {
+                v.iter().map(|i| i.trim().to_string()).collect()
+            };
+        }
+        if let Some(v) = &self.require_digest {
+            p.require_digest = match v.trim() {
+                "yes" | "true" => true,
+                "no" | "false" => false,
+                other => bail!("--require-digest is `yes` or `no`, not {other:?}"),
+            };
+        }
+        if let Some(v) = &self.executors {
+            p.executors = if any(v) {
+                Vec::new()
+            } else {
+                let mut e = v
+                    .iter()
+                    .map(|e| match e.trim() {
+                        "wasm" => Ok(Executor::Wasm),
+                        "docker" => Ok(Executor::Docker),
+                        "microvm" => Ok(Executor::Microvm),
+                        other => bail!("unknown executor {other:?} (wasm, docker or microvm)"),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                e.sort_by_key(|e| e.to_string());
+                e.dedup();
+                e
+            };
+        }
+        if let Some(v) = &self.network {
+            p.deny_network = parse_network_rule(v)?;
+        }
+        if let Some(v) = &self.selector {
+            p.selector = match v.trim() {
+                "none" | "" => Selector::default(),
+                s => s.parse()?,
+            };
+        }
+        if let Some(v) = &self.tolerations {
+            p.tolerations = match v.trim() {
+                "any" => None,
+                "none" | "" => Some(Vec::new()),
+                s => Some(
+                    s.split(',')
+                        .map(|t| t.parse::<Toleration>())
+                        .collect::<Result<_>>()?,
+                ),
+            };
+        }
+        if let Some(v) = limit(&self.max_timeout, parse_duration_ms)? {
+            p.max_timeout_ms = v;
+        }
+        if let Some(v) = limit(&self.max_gpus_per_task, |s| {
+            s.parse::<u32>().context("expected a number or `none`")
+        })? {
+            p.max_gpus_per_task = v;
+        }
+        p.validate()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn quota(
     home: &Path,
@@ -236,6 +350,7 @@ pub async fn quota(
     max_priority: Option<String>,
     storage: Option<String>,
     clear: bool,
+    policy: PolicyArgs,
 ) -> Result<i32> {
     let Some(account) = account else {
         let client = connect_admin(home, admin).await?;
@@ -253,18 +368,37 @@ pub async fn quota(
         s.parse::<i32>().context("expected a number or `none`")
     })?;
     let storage = limit(&storage, parse_size)?;
+    let quota_given = clear
+        || slots.is_some()
+        || gpus.is_some()
+        || cu_per_day.is_some()
+        || max_priority.is_some()
+        || storage.is_some();
     let client = connect_admin(home, admin).await?;
     let set = async {
+        let cur = quotas(&client)
+            .await?
+            .into_iter()
+            .find(|v| v.account == account);
         let mut q = if clear {
             AccountQuota::default()
         } else {
-            quotas(&client)
-                .await?
-                .into_iter()
-                .find(|v| v.account == account)
-                .map(|v| v.quota)
-                .unwrap_or_default()
+            cur.as_ref().map(|v| v.quota.clone()).unwrap_or_default()
         };
+        let mut p = if clear {
+            AccountPolicy::default()
+        } else {
+            cur.as_ref().map(|v| v.policy.clone()).unwrap_or_default()
+        };
+        policy.apply(&mut p)?;
+        if clear || policy.given() {
+            client
+                .call(AdminOp::SetAccountPolicy {
+                    account: account.clone(),
+                    policy: Box::new(p.clone()),
+                })
+                .await?;
+        }
         if let Some(v) = slots {
             q.slots = v;
         }
@@ -280,18 +414,21 @@ pub async fn quota(
         if let Some(v) = storage {
             q.storage_bytes = v;
         }
-        client
-            .call(AdminOp::SetQuota {
-                account: account.clone(),
-                quota: q.clone(),
-            })
-            .await?;
-        anyhow::Ok(q)
+        if quota_given {
+            client
+                .call(AdminOp::SetQuota {
+                    account: account.clone(),
+                    quota: q.clone(),
+                })
+                .await?;
+        }
+        anyhow::Ok((q, p))
     };
-    let q = set.await;
+    let r = set.await;
     client.close().await;
-    let q = q?;
+    let (q, p) = r?;
     eprintln!("quota of {account}: {}", q.describe());
+    eprintln!("job policy of {account}: {}", p.describe());
     Ok(0)
 }
 
@@ -326,6 +463,9 @@ fn print_quotas(list: &[QuotaView]) {
         println!("(no accounts)");
     }
     println!("(used/limit; no limit when only one number is shown)");
+    for v in list.iter().filter(|v| !v.policy.is_empty()) {
+        println!("job policy of {}: {}", v.account, v.policy.describe());
+    }
 }
 
 pub async fn access(home: &Path, cmd: AccessCmd) -> Result<i32> {
@@ -748,6 +888,7 @@ async fn describe_inner(client: &AdminClient, kind: DescribeKind, name: &str) ->
                 );
             }
             println!("  quota: {}", q.quota.describe());
+            println!("  job policy: {}", q.policy.describe());
             println!(
                 "  now: {} running, {} GPUs, {} queued, {} CU in the last 24 h, {} stored",
                 q.running,

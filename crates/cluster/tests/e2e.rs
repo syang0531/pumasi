@@ -1183,6 +1183,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
     .await
     .unwrap();
     let docker_id = docker_agent.id().to_string();
+    let docker_label = format!("label=pumasi.agent={}", docker_agent.id().fmt_short());
     let d = spawn_join(docker_agent, ticket);
     wait_online(&cluster, 2).await;
     let client = admin(&cluster).await;
@@ -1261,9 +1262,17 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         "{view:#?}"
     );
 
-    // No leftover containers.
+    // No leftover containers from this agent (other tests run Docker in
+    // parallel, so look only at this agent's label).
     let out = std::process::Command::new("docker")
-        .args(["ps", "-aq", "--filter", "label=pumasi=1"])
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            "label=pumasi=1",
+            "--filter",
+            &docker_label,
+        ])
         .output()
         .unwrap();
     assert!(

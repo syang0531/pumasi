@@ -334,14 +334,17 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz build -O --debug-assertions
+      # The prebuilt cargo-fuzz defaults to its own (musl) target, which
+      # the sanitizer cannot use.
+      - run: cargo fuzz build -O --debug-assertions --target x86_64-unknown-linux-gnu
         working-directory: fuzz
       - name: Run each target for 60 seconds
         working-directory: fuzz
         run: |
           for t in $(cargo fuzz list); do
             echo "::group::$t"
-            cargo fuzz run -O --debug-assertions "$t" -- -max_total_time=60 -rss_limit_mb=2048
+            cargo fuzz run -O --debug-assertions --target x86_64-unknown-linux-gnu "$t" -- \
+              -max_total_time=60 -rss_limit_mb=2048
             echo "::endgroup::"
           done
       - name: Keep the crashing inputs

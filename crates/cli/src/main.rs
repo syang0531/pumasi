@@ -827,10 +827,21 @@ enum AgentCmd {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum GraphicsArg {
+pub(crate) enum GraphicsArg {
     Auto,
     Yes,
     No,
+}
+
+impl GraphicsArg {
+    /// `None` for `auto`.
+    pub(crate) fn forced(self) -> Option<bool> {
+        match self {
+            GraphicsArg::Auto => None,
+            GraphicsArg::Yes => Some(true),
+            GraphicsArg::No => Some(false),
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -876,6 +887,12 @@ struct AgentOpts {
     /// the last `pumasi gpu check --docker-run`.
     #[arg(long, value_enum, default_value = "auto")]
     gpu_graphics: GraphicsArg,
+    /// Whether Docker GPU tasks that ask for graphics get the WSL 2
+    /// driver libraries (`/usr/lib/wsl`, read-only), which Docker Desktop
+    /// leaves out of GPU containers: `auto` does on Windows. The only
+    /// host folder Pumasi puts in a container.
+    #[arg(long, value_enum, default_value = "auto")]
+    docker_wsl_libs: GraphicsArg,
     /// Also run image jobs in microVMs. Each task gets its own VM and
     /// kernel, so this is safe on machines you share with a cluster.
     /// Needs `pumasi vm setup` first.
@@ -1635,11 +1652,8 @@ async fn agent(
             bench: !opts.no_benchmark,
         }),
         store_cache_bytes: opts.store_cache.as_deref().map(parse_size).transpose()?,
-        gpu_graphics: match opts.gpu_graphics {
-            GraphicsArg::Auto => None,
-            GraphicsArg::Yes => Some(true),
-            GraphicsArg::No => Some(false),
-        },
+        gpu_graphics: opts.gpu_graphics.forced(),
+        docker_wsl_libs: opts.docker_wsl_libs.forced(),
     };
     let exe = config.upgrade.as_ref().map(|u| u.exe.clone());
     let agent = Agent::new(config).await?;

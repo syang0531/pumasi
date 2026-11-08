@@ -15,30 +15,38 @@ out=${OUT:-/output}
 mkdir -p "$out"
 
 # WSL 2 (Docker Desktop on Windows): drawing goes through Mesa's d3d12
-# driver onto the Windows GPU driver in /usr/lib/wsl/lib.
+# driver onto the Windows GPU driver in /usr/lib/wsl/lib, which the Pumasi
+# agent lends graphics tasks (Docker Desktop leaves it out). Without it
+# d3d12 cannot start, so draw on the CPU (llvmpipe) instead of crashing.
 if [ -e /dev/dxg ]; then
-  export LD_LIBRARY_PATH="/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  export GALLIUM_DRIVER=${GALLIUM_DRIVER:-d3d12}
-  export MESA_D3D12_DEFAULT_ADAPTER_NAME=${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}
+  if [ -e /usr/lib/wsl/lib/libd3d12.so ]; then
+    export LD_LIBRARY_PATH="/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export GALLIUM_DRIVER=${GALLIUM_DRIVER:-d3d12}
+    export MESA_D3D12_DEFAULT_ADAPTER_NAME=${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}
+  else
+    echo "note: WSL 2 without /usr/lib/wsl/lib/libd3d12.so: drawing on the CPU (llvmpipe)"
+    export GALLIUM_DRIVER=${GALLIUM_DRIVER:-llvmpipe}
+  fi
 fi
 
-run() {
-  blender --background --factory-startup --python "$scene" -- \
+# --python-exit-code: a Python error in the scene script fails the task
+# (Blender itself exits 0 after one).
+blender_run() {
+  "$@" blender --background --factory-startup --python-exit-code 1 --python "$scene" -- \
     --engine "$engine" --shard "$shard" --shards "$shards" --out "$out"
 }
 
 case "$engine" in
   cycles)
     command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L || true
-    run ;;
+    blender_run ;;
   eevee)
     if command -v eglinfo >/dev/null 2>&1; then
       echo "EGL: $(eglinfo -B 2>/dev/null | grep -i -m1 'renderer' | sed 's/.*: *//')"
     fi
-    if [ -n "${DISPLAY:-}" ]; then run; else
+    if [ -n "${DISPLAY:-}" ]; then blender_run; else
       # EEVEE opens a window system even in background mode.
-      xvfb-run -a -s "-screen 0 1920x1080x24" blender --background --factory-startup \
-        --python "$scene" -- --engine "$engine" --shard "$shard" --shards "$shards" --out "$out"
+      blender_run xvfb-run -a -s "-screen 0 1920x1080x24"
     fi ;;
   *) echo "engine must be cycles or eevee, not $engine"; exit 2 ;;
 esac

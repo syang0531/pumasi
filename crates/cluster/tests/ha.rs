@@ -257,6 +257,7 @@ async fn provider(name: &str, slots: u32, ticket: JoinTicket) -> RunningAgent {
         fake_gpus: None,
         webgpu: None,
         gpu_graphics: None,
+        docker_wsl_libs: None,
         max_cpu_percent: None,
         availability: None,
         bench: None,

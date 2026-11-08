@@ -460,7 +460,7 @@ curl -H "Authorization: Bearer $PUMASI_TICKET" -o out.zip "https://pumasi.exampl
 
 [docs/api.md](docs/api.md)에 CI가 실제 클러스터에 돌려 보는 curl 예제와 Cloudflare Tunnel 설정, 그 한계(무료 요금제 요청 본문 100 MB)가 있습니다.
 
-**Blender 등 GPU 그리기.** CUDA 작업은 `gpus = 1`이면 됩니다. 그리는 작업(Blender EEVEE, OpenGL·Vulkan 렌더러)은 `[gpu]`에 `capabilities = ["graphics"]`를 더하고, Docker GPU가 그릴 수 있는 노드에만 갑니다. 노드에서 `pumasi gpu check --docker-run --image 이미지`를 돌리면 컨테이너를 띄워 CUDA, OptiX, 그리기(Linux는 NVIDIA EGL·Vulkan 드라이버, Windows Docker Desktop은 Mesa D3D12 드라이버)를 확인하고, 노드에 `gpu.graphics=true` 라벨이 붙습니다. [examples/blender-render](examples/blender-render)는 장면 하나를 Cycles와 EEVEE로 렌더링합니다.
+**Blender 등 GPU 그리기.** CUDA 작업은 `gpus = 1`이면 됩니다. 그리는 작업(Blender EEVEE, OpenGL·Vulkan 렌더러)은 `[gpu]`에 `capabilities = ["graphics"]`를 더하고, Docker GPU가 그릴 수 있는 노드에만 갑니다. 노드에서 `pumasi gpu check --docker-run --image 이미지`를 돌리면 컨테이너를 띄워 CUDA, OptiX, 그리기(Linux는 NVIDIA EGL·Vulkan 드라이버, Windows Docker Desktop은 Mesa D3D12 드라이버)를 확인하고, 노드에 `gpu.graphics=true` 라벨이 붙습니다. Docker Desktop은 GPU 컨테이너에 D3D12 라이브러리를 넣지 않으므로, Windows에서는 확인용 컨테이너와 graphics 태스크가 Docker Desktop의 `/usr/lib/wsl`을 읽기 전용으로 받습니다(확인은 `--wsl-libs`, 에이전트는 `--docker-wsl-libs`, `auto`는 Windows에서만). Docker Desktop 컨테이너에서는 OptiX가 시작하지 않아 Cycles는 CUDA를 씁니다. [examples/blender-render](examples/blender-render)는 장면 하나를 Cycles와 EEVEE로 렌더링합니다.
 
 ### 조직에서 운영하기: SSO, 감사 로그, 운영 문서
 
@@ -505,7 +505,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치. `--gpu-bundle`은 패스스루용 GPU 게스트 커널과 드라이버 추가 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
 | `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
-| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image 이미지]]` / `gpu webgpu [--software]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄. `--docker-run`은 컨테이너를 띄워 Docker에서 CUDA·OptiX·그리기(EGL, OpenGL, Vulkan)가 되는지 확인해 에이전트용으로 저장(`gpu.graphics`). `webgpu`는 wasm 작업이 쓸 수 있는 WebGPU 어댑터 목록 |
+| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image 이미지] [--wsl-libs auto\|yes\|no]]` / `gpu webgpu [--software]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄. `--docker-run`은 컨테이너를 띄워 Docker에서 CUDA·OptiX·그리기(EGL, OpenGL, Vulkan)가 되는지 확인해 에이전트용으로 저장(`gpu.graphics`). `webgpu`는 wasm 작업이 쓸 수 있는 WebGPU 어댑터 목록 |
 | `pumasi store put 이름 경로... [--account A]` / `get 이름[@버전] \| --job ID [-o DIR]` / `ls [이름]` / `rm 이름[@버전]` / `usage` / `quota 계정 크기\|none` | 클러스터 파일 저장소: 버전 있는 데이터셋, 작업 출력, 이어받기, 쿼터 |
 | `pumasi secret set 이름 [값]` / `ls` / `rm 이름` | 클러스터 비밀. `registry/<호스트>`는 비공개 레지스트리 로그인 |
 | `pumasi run job.toml [--account A] [--priority N] [--after 작업] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
@@ -619,7 +619,7 @@ timeout = "2m"                        # 부팅과 실행 포함, 첫 이미지 �
 
 `shards` 대신 `[[task]]`로 태스크를 하나씩 나열할 수도 있고, 태스크마다 `files = [...]`로 그 태스크만 받는 파일을 줄 수 있습니다.
 
-컨테이너는 `network = true`가 아니면 `--network none`으로, 메모리·CPU·프로세스 수 상한과 `no-new-privileges`를 걸고, 호스트 폴더를 마운트하지 않은 채(파일은 복사로 주고받음) 실행됩니다. 이미지는 처음 쓸 때 받아 옵니다.
+컨테이너는 `network = true`가 아니면 `--network none`으로, 메모리·CPU·프로세스 수 상한과 `no-new-privileges`를 걸고, 호스트 폴더를 마운트하지 않은 채(파일은 복사로 주고받음) 실행됩니다. 예외는 하나입니다. Windows에서 `graphics`를 요구한 NVIDIA 태스크는 Docker Desktop의 `/usr/lib/wsl`(GPU 드라이버의 Linux 라이브러리)을 읽기 전용으로 받습니다. Docker Desktop이 GPU 컨테이너에 이 폴더를 넣지 않기 때문입니다(에이전트의 `--docker-wsl-libs no`로 끔). 이미지는 처음 쓸 때 받아 옵니다.
 
 microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는 작업의 `command`)을 이미지에 지정된 사용자로, `/input`을 작업 디렉터리로 해서 실행합니다. 루트 파일시스템은 모든 태스크가 읽기 전용으로 공유하는 이미지 위에 태스크마다 새 쓰기 층을 얹은 것이고, 끝나면 버립니다. KVM이 있으면 태스크 하나가 1초 안쪽으로 부팅됩니다.
 

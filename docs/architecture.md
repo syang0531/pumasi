@@ -137,7 +137,10 @@ advertises `executors = [wasm, docker]`. Per task:
 2. `docker create` with `--network none` (unless the job sets
    `network = true`), `--memory`/`--memory-swap`, `--cpus`, `--pids-limit`,
    `--security-opt no-new-privileges`, `--init`, a `pumasi.agent` label, and
-   no bind mounts.
+   no bind mounts, with one exception: NVIDIA tasks that ask for
+   `graphics` on an agent with `--docker-wsl-libs` (the default on
+   Windows) get `--volume /usr/lib/wsl:/usr/lib/wsl:ro` (see
+   [GPU drawing](#gpu-drawing)).
 3. `docker cp - <name>:/` streams a tar built in memory: `/input` with the
    job's and the task's files, and an empty `/output` (mode 0777, so any
    image user can write it).
@@ -1525,12 +1528,30 @@ plane, agent and `pumasi ui --api-only`.
 passes them as `NVIDIA_DRIVER_CAPABILITIES` (always with `compute,utility`)
 to `docker create`, which is what makes the NVIDIA Container Toolkit
 mount the EGL, GLX, Vulkan and OptiX libraries on Linux. On WSL 2 (Docker
-Desktop) the toolkit mounts the Windows driver's libraries under
-`/usr/lib/wsl/lib` and `/dev/dxg`, and drawing goes through Mesa's d3d12
-gallium driver in the image. Whether that works on a machine depends on
+Desktop) drawing goes through Mesa's d3d12 gallium driver in the image,
+which loads the Windows driver's `libd3d12.so` from `/usr/lib/wsl/lib`
+and talks to the GPU through `/dev/dxg`. Docker Desktop (seen with 4.80)
+gives `--gpus` containers `/dev/dxg` and the CUDA libraries but not
+`/usr/lib/wsl/lib`, even with `NVIDIA_DRIVER_CAPABILITIES=all`, although
+its VM has the folder. So the agent lends it: with `--docker-wsl-libs`
+(`auto`: on Windows hosts, where Docker is Docker Desktop) NVIDIA tasks
+that ask for `graphics` get `--volume /usr/lib/wsl:/usr/lib/wsl:ro`.
+This is the only host folder a container gets, and the exception is kept
+narrow on purpose: read-only, a fixed path in Docker Desktop's VM (not on
+the Windows file system), only graphics tasks, and only the GPU driver's
+user-mode files, which drive the same `/dev/dxg` every `--gpus` container
+already has. `--volume`
+rather than `--mount` means a VM without the folder gives an empty one,
+so drawing falls back to the CPU instead of the task failing. The image
+still has to point Mesa at it (`LD_LIBRARY_PATH=/usr/lib/wsl/lib`,
+`GALLIUM_DRIVER=d3d12`), as `examples/blender-render/render.sh` does only
+when `libd3d12.so` is there. OptiX does not start in Docker Desktop
+containers (Blender: error 7805) with or without the folder, so the probe
+reports it as missing on WSL 2. Whether drawing works on a machine depends on
 the driver, the toolkit and the image, so it is measured rather than
-guessed: `pumasi gpu check --docker-run [--image IMAGE]`
-(`gpu::docker_check`) starts the image with every capability, looks for
+guessed: `pumasi gpu check --docker-run [--image IMAGE] [--wsl-libs]`
+(`gpu::docker_check`) starts the image with every capability (and the
+WSL folder, as graphics tasks get it), looks for
 `nvidia-smi`, the NVIDIA EGL/GLX/Vulkan files, OptiX, `/dev/dxg` and
 `libd3d12`, Mesa's `d3d12_dri.so`, and asks `eglinfo`/`vulkaninfo` (when
 the image has them) which renderer they get, treating llvmpipe and

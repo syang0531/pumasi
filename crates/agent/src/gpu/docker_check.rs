@@ -12,6 +12,13 @@
 //! Mesa's D3D12 driver in the image. With an image that has `eglinfo` or
 //! `vulkaninfo` (the `examples/blender-render` image does), it also asks
 //! them which renderer they get.
+//!
+//! Docker Desktop gives `--gpus` containers `/dev/dxg` and the CUDA
+//! libraries but not `/usr/lib/wsl/lib`, where the Windows driver's D3D12
+//! libraries are, so nothing can draw on the GPU there. On Windows hosts
+//! the probe and graphics tasks get that folder read-only from Docker
+//! Desktop's VM ([`wsl_libs_args`]): the one host folder Pumasi puts in a
+//! container.
 
 use std::{path::Path, process::Stdio, time::Duration};
 
@@ -23,6 +30,24 @@ pub const DEFAULT_PROBE_IMAGE: &str = "ubuntu:24.04";
 /// Where `pumasi gpu check --docker-run` saves its answer, in the agent's
 /// data directory.
 pub const CHECK_FILE: &str = "docker-gpu.json";
+
+/// The folder in Docker Desktop's VM with the Windows GPU driver's Linux
+/// libraries (`libd3d12.so`, `libdxcore.so`, `libcuda.so`, ...).
+pub const WSL_LIBS: &str = "/usr/lib/wsl";
+
+/// Whether graphics tasks and the probe get [`WSL_LIBS`] when nobody says:
+/// on Windows hosts, where Docker means Docker Desktop on WSL 2.
+pub fn wsl_libs_auto() -> bool {
+    cfg!(windows)
+}
+
+/// The `docker create`/`run` options that put [`WSL_LIBS`] in a container,
+/// read-only. `--volume` (not `--mount`) so a VM without the folder gives
+/// an empty one instead of failing the task: drawing then falls back to
+/// the CPU, as it did before.
+pub fn wsl_libs_args() -> [String; 2] {
+    ["--volume".into(), format!("{WSL_LIBS}:{WSL_LIBS}:ro")]
+}
 
 /// Prints `key=value` lines about the container's GPU stack.
 const SCRIPT: &str = r#"
@@ -47,6 +72,12 @@ echo "vulkan_nvidia=$vk"
 [ -e /dev/dxg ] && echo "wsl_dxg=yes" || echo "wsl_dxg=no"
 echo "wsl_d3d12=$(has 'libd3d12.so*')"
 echo "mesa_d3d12=$(has 'dri/d3d12_dri.so')"
+# What a WSL 2 task does to draw (examples/blender-render/render.sh): Mesa's
+# d3d12 driver, loading the Windows driver's libd3d12 from /usr/lib/wsl/lib.
+if [ -e /dev/dxg ] && [ -e /usr/lib/wsl/lib/libd3d12.so ]; then
+  export LD_LIBRARY_PATH="/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export GALLIUM_DRIVER=d3d12
+fi
 if command -v eglinfo >/dev/null 2>&1; then
   echo "egl_renderer=$(eglinfo -B 2>/dev/null | grep -i 'renderer' | head -n 1 | sed 's/.*: *//')"
 fi
@@ -60,6 +91,9 @@ fi
 pub struct DockerGpuCheck {
     /// The image probed.
     pub image: String,
+    /// The probe container had [`WSL_LIBS`] from the host.
+    #[serde(default)]
+    pub wsl_libs: bool,
     pub checked_unix: u64,
     /// The GPUs `nvidia-smi -L` lists inside the container (CUDA works).
     pub cuda: Vec<String>,
@@ -83,10 +117,12 @@ pub struct DockerGpuCheck {
 }
 
 impl DockerGpuCheck {
-    /// Reads the `key=value` lines the script printed.
-    pub fn parse(image: &str, out: &str) -> Self {
+    /// Reads the `key=value` lines the script printed, in a container that
+    /// had [`WSL_LIBS`] if `wsl_libs`.
+    pub fn parse(image: &str, wsl_libs: bool, out: &str) -> Self {
         let mut c = DockerGpuCheck {
             image: image.to_string(),
+            wsl_libs,
             checked_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -127,6 +163,13 @@ impl DockerGpuCheck {
         }
         c.nvidia_graphics = egl_nvidia && (vulkan_nvidia || glx_nvidia);
         c.wsl = dxg && d3d12;
+        // Docker Desktop's OptiX library does not start in a container
+        // (Blender: "OptiX initialization failed with error code 7805"),
+        // with or without /usr/lib/wsl.
+        let wsl_optix = dxg && !c.nvidia_graphics && c.optix;
+        if wsl_optix {
+            c.optix = false;
+        }
         let software = |r: &Option<String>| {
             r.as_deref().is_some_and(|r| {
                 let r = r.to_ascii_lowercase();
@@ -182,7 +225,22 @@ impl DockerGpuCheck {
                 "no NVIDIA EGL/Vulkan driver in the container: the toolkit did not mount the graphics libraries".into(),
             );
         }
-        if !c.optix {
+        if dxg && !d3d12 {
+            c.notes.push(format!(
+                "WSL 2 without the D3D12 libraries in the container: Docker Desktop does not put {WSL_LIBS}/lib in GPU containers{}",
+                if c.wsl_libs {
+                    ", and its VM has no such folder to lend either"
+                } else {
+                    " (with --wsl-libs yes here and --docker-wsl-libs yes on the agent, graphics tasks get it read-only from Docker Desktop's VM; that is the default on Windows)"
+                }
+            ));
+        }
+        if wsl_optix {
+            c.notes.push(
+                "OptiX does not start in Docker Desktop containers: Blender Cycles uses CUDA"
+                    .into(),
+            );
+        } else if !c.optix {
             c.notes
                 .push("no OptiX library: Blender Cycles can use CUDA, not OptiX".into());
         }
@@ -202,28 +260,36 @@ impl DockerGpuCheck {
     }
 }
 
-/// Runs the probe in `image` with every NVIDIA driver capability.
-pub async fn probe(docker: &str, image: &str) -> Result<DockerGpuCheck> {
+/// The `docker run` arguments of the probe.
+fn probe_args(image: &str, wsl_libs: bool) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "run",
+        "--rm",
+        "--pull",
+        "missing",
+        "--network",
+        "none",
+        "--gpus",
+        "all",
+        "--env",
+        "NVIDIA_DRIVER_CAPABILITIES=all",
+    ]
+    .map(String::from)
+    .into();
+    if wsl_libs {
+        a.extend(wsl_libs_args());
+    }
+    a.extend(["--entrypoint", "sh", image, "-c", SCRIPT].map(String::from));
+    a
+}
+
+/// Runs the probe in `image` with every NVIDIA driver capability, and
+/// with [`WSL_LIBS`] when `wsl_libs` (as graphics tasks get it).
+pub async fn probe(docker: &str, image: &str, wsl_libs: bool) -> Result<DockerGpuCheck> {
     let out = tokio::time::timeout(
         Duration::from_secs(15 * 60),
         tokio::process::Command::new(docker)
-            .args([
-                "run",
-                "--rm",
-                "--pull",
-                "missing",
-                "--network",
-                "none",
-                "--gpus",
-                "all",
-                "--env",
-                "NVIDIA_DRIVER_CAPABILITIES=all",
-                "--entrypoint",
-                "sh",
-                image,
-                "-c",
-                SCRIPT,
-            ])
+            .args(probe_args(image, wsl_libs))
             .stdin(Stdio::null())
             .output(),
     )
@@ -237,7 +303,7 @@ pub async fn probe(docker: &str, image: &str) -> Result<DockerGpuCheck> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(DockerGpuCheck::parse(image, &stdout))
+    Ok(DockerGpuCheck::parse(image, wsl_libs, &stdout))
 }
 
 #[cfg(test)]
@@ -248,6 +314,7 @@ mod tests {
     fn linux_host_with_graphics_libraries() {
         let c = DockerGpuCheck::parse(
             "ubuntu:24.04",
+            false,
             "cuda=GPU 0: NVIDIA GeForce RTX 3080 (UUID: GPU-1);\negl_nvidia=yes\nglx_nvidia=yes\noptix=yes\nvulkan_nvidia=yes\nwsl_dxg=no\nwsl_d3d12=no\nmesa_d3d12=no\n",
         );
         assert_eq!(c.cuda, vec!["GPU 0: NVIDIA GeForce RTX 3080 (UUID: GPU-1)"]);
@@ -257,24 +324,59 @@ mod tests {
     #[test]
     fn wsl_and_renderers() {
         let wsl = "cuda=GPU 0: NVIDIA GeForce RTX 3080 (UUID: GPU-1);\negl_nvidia=no\nglx_nvidia=no\noptix=yes\nvulkan_nvidia=no\nwsl_dxg=yes\nwsl_d3d12=yes\nmesa_d3d12=no\n";
-        let c = DockerGpuCheck::parse("ubuntu:24.04", wsl);
+        let c = DockerGpuCheck::parse("ubuntu:24.04", false, wsl);
         assert!(c.wsl && c.graphics && !c.nvidia_graphics);
         // An image whose GL ends up on llvmpipe cannot draw on the GPU.
         let c = DockerGpuCheck::parse(
             "blender",
+            true,
             &format!("{wsl}egl_renderer=llvmpipe (LLVM 17.0.6, 256 bits)\n"),
         );
         assert!(!c.graphics);
         let c = DockerGpuCheck::parse(
             "blender",
+            true,
             &format!("{wsl}mesa_d3d12=yes\negl_renderer=D3D12 (NVIDIA GeForce RTX 3080)\n"),
         );
         assert!(c.graphics && c.mesa_d3d12);
+        // Docker Desktop's OptiX library is there but does not start.
+        assert!(!c.optix && c.notes.iter().any(|n| n.contains("OptiX does not start")));
+    }
+
+    #[test]
+    fn docker_desktop_without_the_wsl_libraries() {
+        // What Docker Desktop 4.80 gives a `--gpus` container: /dev/dxg and
+        // CUDA, but no /usr/lib/wsl/lib.
+        let out = "cuda=GPU 0: NVIDIA GeForce RTX 3080 (UUID: GPU-1);\negl_nvidia=no\nglx_nvidia=no\noptix=no\nvulkan_nvidia=no\nwsl_dxg=yes\nwsl_d3d12=no\nmesa_d3d12=yes\negl_renderer=llvmpipe (LLVM 20.1.2, 256 bits)\n";
+        let c = DockerGpuCheck::parse("blender", false, out);
+        assert!(!c.graphics && !c.wsl);
+        assert!(
+            c.notes.iter().any(|n| n.contains("--docker-wsl-libs yes")),
+            "{:?}",
+            c.notes
+        );
+        let c = DockerGpuCheck::parse("blender", true, out);
+        assert!(
+            c.notes.iter().any(|n| n.contains("no such folder")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    #[test]
+    fn the_probe_borrows_the_wsl_libraries_only_when_asked() {
+        let a = probe_args("blender", false).join(" ");
+        assert!(!a.contains("/usr/lib/wsl:"));
+        let a = probe_args("blender", true).join(" ");
+        assert!(
+            a.contains("--volume /usr/lib/wsl:/usr/lib/wsl:ro --entrypoint sh blender -c"),
+            "{a}"
+        );
     }
 
     #[test]
     fn no_gpu_in_the_container() {
-        let c = DockerGpuCheck::parse("ubuntu:24.04", "cuda=\negl_nvidia=no\n");
+        let c = DockerGpuCheck::parse("ubuntu:24.04", false, "cuda=\negl_nvidia=no\n");
         assert!(c.cuda.is_empty() && !c.graphics);
         assert!(c.notes[0].contains("no GPU inside the container"));
     }

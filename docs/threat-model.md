@@ -150,7 +150,10 @@ reachable by anyone, with scripts elsewhere holding submitter tickets
 
 - WASM tasks: wasmtime with fuel and memory limits, WASI with only
   `/input` and `/output`, no network.
-- Docker tasks: only with `--allow-docker`, sharing the host kernel.
+- Docker tasks: only with `--allow-docker`, sharing the host kernel. No
+  host folders, except Docker Desktop's `/usr/lib/wsl` read-only for
+  NVIDIA graphics tasks on Windows (GPU driver libraries, inside Docker
+  Desktop's VM; `--docker-wsl-libs no` turns it off).
 - MicroVM tasks: their own kernel behind KVM, WHPX or
   Virtualization.framework, own disks, no network device unless asked,
   and then only to public addresses. Guest output is parsed with caps.

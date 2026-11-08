@@ -1280,7 +1280,8 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 (findings and fixes in the [threat model](docs/threat-model.md#internal-review-for-10));
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
-([release notes](docs/releases/v1.0.0.md)). There has been no
+([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 18 and 19
 are only for trading with other clusters.
 

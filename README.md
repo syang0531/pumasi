@@ -874,7 +874,12 @@ that draw (Blender EEVEE, OpenGL or Vulkan renderers) add `capabilities
 draw: `pumasi gpu check --docker-run --image IMAGE` on a node starts a
 container and reports CUDA, OptiX and drawing (NVIDIA's EGL and Vulkan
 drivers on Linux, Mesa's D3D12 driver on Windows with Docker Desktop),
-and the node gets the label `gpu.graphics=true`.
+and the node gets the label `gpu.graphics=true`. On Windows the probe and
+graphics tasks get Docker Desktop's `/usr/lib/wsl` read-only, since Docker
+Desktop does not put the D3D12 libraries in GPU containers itself
+(`--wsl-libs` on the check, `--docker-wsl-libs` on the agent; `auto` means
+Windows only). OptiX does not start in Docker Desktop containers, so
+Cycles uses CUDA there.
 [examples/blender-render](examples/blender-render) renders a scene with
 Cycles and with EEVEE.
 
@@ -978,7 +983,7 @@ defends against, including the API exposed to the internet.
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
-| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image IMAGE]]` / `gpu webgpu [--software]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally, and with `--docker-run` starts a container to see whether CUDA, OptiX and drawing (EGL, OpenGL, Vulkan) work in Docker (saved for the agent: `gpu.graphics`); `webgpu` lists the WebGPU adapters wasm jobs can use. |
+| `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image IMAGE] [--wsl-libs auto\|yes\|no]]` / `gpu webgpu [--software]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally, and with `--docker-run` starts a container to see whether CUDA, OptiX and drawing (EGL, OpenGL, Vulkan) work in Docker (saved for the agent: `gpu.graphics`); `webgpu` lists the WebGPU adapters wasm jobs can use. |
 | `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
 | `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
 | `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
@@ -1109,7 +1114,10 @@ into `pumasi-out/<job id>/task-<N>/`. stdout and stderr are captured up to
 
 Containers run with `--network none` unless `network = true`, with memory,
 CPU and process caps, `no-new-privileges`, and no host directories mounted
-(files are copied in and out). Images are pulled on first use; images from
+(files are copied in and out). The one exception: on Windows, NVIDIA tasks
+that ask for `graphics` get Docker Desktop's `/usr/lib/wsl` read-only, the
+GPU driver's Linux libraries, which Docker Desktop leaves out of GPU
+containers (`--docker-wsl-libs no` on the agent turns it off). Images are pulled on first use; images from
 a registry with a login in `pumasi secret` come through the file store.
 
 A microVM task runs the image's entrypoint and command (or the job's

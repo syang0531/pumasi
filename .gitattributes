@@ -1,0 +1,8 @@
+# Text files are stored with LF and checked out with the platform's line
+# ends, except where a program reads them on Linux or in a container: a
+# shell script checked out with CRLF (Windows Git's core.autocrlf=true)
+# fails to start ("#!/bin/sh\r": No such file or directory).
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf

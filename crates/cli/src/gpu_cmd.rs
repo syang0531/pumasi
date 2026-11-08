@@ -40,6 +40,11 @@ pub enum GpuCmd {
         /// image, also shows which renderer drawing gets.
         #[arg(long, requires = "docker_run", default_value = pumasi_agent::gpu::docker_check::DEFAULT_PROBE_IMAGE)]
         image: String,
+        /// Whether the probe gets the WSL 2 driver libraries
+        /// (`/usr/lib/wsl`, read-only) the way graphics tasks do: `auto`
+        /// does on Windows. Match the agent's `--docker-wsl-libs`.
+        #[arg(long, requires = "docker_run", value_enum, default_value = "auto")]
+        wsl_libs: crate::GraphicsArg,
     },
     /// List the WebGPU adapters (Vulkan, Metal, DX12, OpenGL) that wasm
     /// jobs with `gpus = 1` could use here, benchmarked the way the agent
@@ -97,10 +102,14 @@ pub async fn run(home: &std::path::Path, cmd: GpuCmd) -> Result<i32> {
             docker,
             docker_run,
             image,
+            wsl_libs,
         } => {
             let code = check(only, &docker).await?;
             if docker_run {
-                return docker_probe(home, &docker, &image).await;
+                let wsl_libs = wsl_libs
+                    .forced()
+                    .unwrap_or_else(pumasi_agent::gpu::docker_check::wsl_libs_auto);
+                return docker_probe(home, &docker, &image, wsl_libs).await;
             }
             Ok(code)
         }
@@ -308,11 +317,23 @@ async fn check(only: Option<String>, docker: &str) -> Result<i32> {
 }
 
 /// `pumasi gpu check --docker-run`: what Docker GPU tasks can do here.
-async fn docker_probe(home: &std::path::Path, docker: &str, image: &str) -> Result<i32> {
+async fn docker_probe(
+    home: &std::path::Path,
+    docker: &str,
+    image: &str,
+    wsl_libs: bool,
+) -> Result<i32> {
     use pumasi_agent::gpu::docker_check;
     println!();
-    println!("docker GPU tasks ({image}):");
-    let c = match docker_check::probe(docker, image).await {
+    if wsl_libs {
+        println!(
+            "docker GPU tasks ({image}, graphics tasks with {} read-only):",
+            docker_check::WSL_LIBS
+        );
+    } else {
+        println!("docker GPU tasks ({image}):");
+    }
+    let c = match docker_check::probe(docker, image, wsl_libs).await {
         Ok(c) => c,
         Err(e) => {
             println!("  failed: {e:#}");

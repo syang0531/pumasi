@@ -61,6 +61,9 @@ pub struct DockerExecutor {
     /// The node's CPU cap: containers of jobs that set no CPU limit get
     /// this many.
     cpu_cap: Option<u32>,
+    /// Give NVIDIA graphics tasks Docker Desktop's `/usr/lib/wsl`
+    /// (read-only), which it leaves out of `--gpus` containers.
+    wsl_libs: bool,
 }
 
 impl DockerExecutor {
@@ -73,6 +76,14 @@ impl DockerExecutor {
     /// CPU cap; jobs with a limit are placed only within it).
     pub fn with_cpu_cap(mut self, cpus: Option<u32>) -> Self {
         self.cpu_cap = cpus;
+        self
+    }
+
+    /// Lends NVIDIA tasks that ask for `graphics` the WSL 2 driver
+    /// libraries ([`crate::gpu::docker_check::WSL_LIBS`], read-only): the
+    /// only host folder a container gets.
+    pub fn with_wsl_libs(mut self, on: bool) -> Self {
+        self.wsl_libs = on;
         self
     }
 
@@ -128,6 +139,7 @@ impl DockerExecutor {
             label: label.to_string(),
             pull_lock: Default::default(),
             cpu_cap: None,
+            wsl_libs: false,
         };
         exec.cleanup_stale().await;
         Ok(exec)
@@ -462,7 +474,7 @@ impl DockerExecutor {
         );
         let mut args = create_args(&name, &self.label, spec, input, limits, self.cpu_cap);
         let image_at = args.len() - 1 - spec.command.len() - input.args.len();
-        let gpu_args = gpu_args(&io.gpus, &io.gpu_capabilities);
+        let gpu_args = gpu_args(&io.gpus, &io.gpu_capabilities, self.wsl_libs);
         args.splice(image_at..image_at, gpu_args);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let created = self.cli(&arg_refs).await?;
@@ -800,10 +812,13 @@ fn pick_digest(image: &str, answer: &str) -> Option<String> {
 /// `/dev/kfd` plus their render nodes, and `PUMASI_GPUS` with the node's
 /// numbers for them either way.
 /// NVIDIA tasks also get `NVIDIA_DRIVER_CAPABILITIES` for the
-/// capabilities the job asked for (phase 15).
+/// capabilities the job asked for (phase 15), and with `wsl_libs` those
+/// that ask for `graphics` get Docker Desktop's `/usr/lib/wsl` read-only,
+/// where the D3D12 libraries Mesa draws with on WSL 2 are.
 fn gpu_args(
     gpus: &[pumasi_proto::gpu::GpuInfo],
     caps: &[pumasi_proto::job::GpuCapability],
+    wsl_libs: bool,
 ) -> Vec<String> {
     use pumasi_proto::gpu::GpuVendor;
     if gpus.is_empty() {
@@ -833,6 +848,9 @@ fn gpu_args(
                     pumasi_proto::job::GpuCapability::driver_env(caps)
                 ),
             ]);
+        }
+        if wsl_libs && caps.contains(&pumasi_proto::job::GpuCapability::Graphics) {
+            a.extend(crate::gpu::docker_check::wsl_libs_args());
         }
     }
     let amd: Vec<&str> = gpus
@@ -1260,28 +1278,47 @@ mod tests {
             vfio: false,
             render_node: render.into(),
         };
-        assert!(gpu_args(&[], &[]).is_empty());
+        assert!(gpu_args(&[], &[], true).is_empty());
         let two = [
             g(0, GpuVendor::Nvidia, "GPU-a", ""),
             g(2, GpuVendor::Nvidia, "GPU-b", ""),
         ];
-        let a = gpu_args(&two, &[]).join(" ");
+        let a = gpu_args(&two, &[], true).join(" ");
         assert_eq!(a, "--gpus \"device=GPU-a,GPU-b\" --env PUMASI_GPUS=0,2");
         // Graphics: the toolkit's capabilities, compute and utility kept.
-        let a = gpu_args(&two, &[pumasi_proto::job::GpuCapability::Graphics]).join(" ");
+        let graphics = [pumasi_proto::job::GpuCapability::Graphics];
+        let a = gpu_args(&two, &graphics, false).join(" ");
         assert_eq!(
             a,
             "--gpus \"device=GPU-a,GPU-b\" --env NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics --env PUMASI_GPUS=0,2"
         );
-        let a = gpu_args(&[g(1, GpuVendor::Amd, "", "/dev/dri/renderD129")], &[]).join(" ");
+        // Docker Desktop: graphics tasks borrow the WSL driver libraries.
+        let a = gpu_args(&two, &graphics, true).join(" ");
+        assert_eq!(
+            a,
+            "--gpus \"device=GPU-a,GPU-b\" --env NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics --volume /usr/lib/wsl:/usr/lib/wsl:ro --env PUMASI_GPUS=0,2"
+        );
+        let video = [pumasi_proto::job::GpuCapability::Video];
+        assert!(
+            !gpu_args(&two, &video, true)
+                .join(" ")
+                .contains("/usr/lib/wsl")
+        );
+        let a = gpu_args(
+            &[g(1, GpuVendor::Amd, "", "/dev/dri/renderD129")],
+            &graphics,
+            true,
+        )
+        .join(" ");
         assert!(
             a.starts_with("--device /dev/kfd --device /dev/dri/renderD129"),
             "{a}"
         );
         assert!(a.ends_with("--env PUMASI_GPUS=1"));
+        assert!(!a.contains("/usr/lib/wsl"));
         // Test GPUs (vendor Other) only get the variable.
         assert_eq!(
-            gpu_args(&[g(0, GpuVendor::Other, "", "")], &[]).join(" "),
+            gpu_args(&[g(0, GpuVendor::Other, "", "")], &[], true).join(" "),
             "--env PUMASI_GPUS=0"
         );
     }

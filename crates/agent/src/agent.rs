@@ -98,6 +98,10 @@ pub struct AgentConfig {
     /// `None`: as the last `pumasi gpu check --docker-run` found (saved in
     /// `data_dir`).
     pub gpu_graphics: Option<bool>,
+    /// Give Docker GPU tasks that ask for `graphics` the WSL 2 driver
+    /// libraries (`/usr/lib/wsl`, read-only), which Docker Desktop leaves
+    /// out of GPU containers. `None`: on Windows hosts.
+    pub docker_wsl_libs: Option<bool>,
 }
 
 /// The Docker executor as it is now: Docker Desktop may start after the
@@ -267,12 +271,15 @@ impl Agent {
         let mut info = node_info(&config);
         let cpu_cap = config.max_cpu_percent.is_some().then_some(info.cpus);
         let docker_label = endpoint.id().fmt_short().to_string();
+        let wsl_libs = config
+            .docker_wsl_libs
+            .unwrap_or_else(crate::gpu::docker_check::wsl_libs_auto);
         // Docker that is not usable yet (Docker Desktop starts after
         // sign-in) is checked again in the background.
         let mut docker_now = match &config.docker {
             Some(bin) => match DockerExecutor::detect(bin, &docker_label).await {
                 Ok(d) => DockerNow {
-                    exec: Some(d.with_cpu_cap(cpu_cap)),
+                    exec: Some(d.with_cpu_cap(cpu_cap).with_wsl_libs(wsl_libs)),
                     ..Default::default()
                 },
                 Err(e) => {
@@ -443,6 +450,7 @@ impl Agent {
                 bin,
                 label: docker_label,
                 cpu_cap,
+                wsl_libs,
                 gpus: config.gpus && config.fake_gpus.is_none(),
                 forced: config.gpu_graphics,
                 data_dir: config.data_dir.clone(),
@@ -1601,6 +1609,7 @@ struct DockerWatch {
     bin: String,
     label: String,
     cpu_cap: Option<u32>,
+    wsl_libs: bool,
     /// Detect again which GPUs Docker reaches (not with test GPUs).
     gpus: bool,
     forced: Option<bool>,
@@ -1636,7 +1645,7 @@ impl DockerWatch {
                         if self.gpus {
                             self.mark_gpus(d.bin(), &devices).await;
                         }
-                        next.exec = Some(d.with_cpu_cap(self.cpu_cap));
+                        next.exec = Some(d.with_cpu_cap(self.cpu_cap).with_wsl_libs(self.wsl_libs));
                         next.reason = None;
                     }
                     Err(e) => next.reason = Some(docker_reason(&e)),

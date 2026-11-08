@@ -116,8 +116,15 @@ def use_gpu_cycles(scene, samples):
 
 
 def use_eevee(scene, samples):
-    engines = {e.bl_idname for e in bpy.types.RenderEngine.__subclasses__()}
-    scene.render.engine = "BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in engines else "BLENDER_EEVEE"
+    # EEVEE is BLENDER_EEVEE_NEXT from Blender 4.2 in the 4.x series and
+    # BLENDER_EEVEE before it and in 5.x. Setting a name Blender does not
+    # know raises TypeError.
+    for name in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
+        try:
+            scene.render.engine = name
+            break
+        except TypeError:
+            continue
     scene.eevee.taa_render_samples = samples
     import gpu
 

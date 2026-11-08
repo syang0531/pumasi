@@ -1,14 +1,18 @@
 # Blender for Pumasi GPU jobs: Cycles on CUDA or OptiX, and EEVEE drawing
 # on the GPU through the NVIDIA EGL driver (Linux hosts) or Mesa's D3D12
-# driver (Windows hosts, Docker Desktop on WSL 2).
+# driver (Windows hosts, Docker Desktop on WSL 2). Blender 4.2 LTS by
+# default; 5.x works too (--build-arg BLENDER_SERIES=5.2 --build-arg
+# BLENDER_VERSION=5.2.3).
 #
 #   docker build -t ghcr.io/YOU/pumasi-blender:4.2 examples/blender-render
 #   docker push ghcr.io/YOU/pumasi-blender:4.2
 #
 # The NVIDIA Container Toolkit (or Docker Desktop) mounts the driver's
-# CUDA, OptiX, EGL and Vulkan libraries when a job asks for them; the
-# image brings only the vendor-neutral loaders (glvnd, the Vulkan loader)
-# and Mesa, whose d3d12 driver is what WSL 2 draws with.
+# CUDA, OptiX, EGL and Vulkan libraries when a job asks for them, and on
+# Windows the Pumasi agent lends graphics tasks Docker Desktop's
+# /usr/lib/wsl (D3D12); the image brings only the vendor-neutral loaders
+# (glvnd, the Vulkan loader) and Mesa, whose d3d12 driver is what WSL 2
+# draws with.
 FROM ubuntu:24.04
 
 ARG BLENDER_SERIES=4.2
@@ -44,6 +48,9 @@ RUN set -eux; \
     ln -s /opt/blender/blender /usr/local/bin/blender
 
 COPY render.sh /opt/render.sh
-RUN chmod +x /opt/render.sh
+# A checkout with CRLF line ends (Windows Git's core.autocrlf=true, before
+# the repository's .gitattributes) would leave "#!/bin/sh\r", which does
+# not start.
+RUN sed -i 's/\r$//' /opt/render.sh && chmod +x /opt/render.sh
 ENTRYPOINT []
 CMD ["/opt/render.sh", "--help"]

@@ -171,6 +171,7 @@ async fn start_cluster() -> (
         name: "ui-node".into(),
         slots: Some(2),
         net: NetMode::Local,
+        relays: Vec::new(),
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: None,
         microvm: None,

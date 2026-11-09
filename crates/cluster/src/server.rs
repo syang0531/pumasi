@@ -29,7 +29,7 @@ use pumasi_proto::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
         FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, TaskReport, ToAgent,
     },
-    net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key, write_private},
+    net::{NetMode, bind_endpoint_with, dialable_addr, load_or_create_key, write_private},
     perf::DiskClass,
     perf::kernel_native,
     release::SignedRelease,
@@ -71,6 +71,9 @@ pub struct ClusterConfig {
     /// Used only when the cluster is created; kept afterwards.
     pub name: String,
     pub net: NetMode,
+    /// Relay servers in public mode (empty: n0's public relays). Tickets
+    /// carry them, so nodes and clients use them too.
+    pub relays: Vec<pumasi_proto::net::RelayUrl>,
     pub bind: Option<SocketAddr>,
     pub heartbeat: Duration,
     /// A node silent for this long is considered gone.
@@ -102,6 +105,7 @@ impl ClusterConfig {
             data_dir,
             name: "my-cluster".into(),
             net: NetMode::Public,
+            relays: Vec::new(),
             bind: None,
             heartbeat: Duration::from_secs(2),
             node_timeout: Duration::from_secs(10),
@@ -408,9 +412,10 @@ impl Cluster {
     }
 
     async fn bind(config: &ClusterConfig, key: SecretKey) -> Result<Endpoint> {
-        bind_endpoint(
+        bind_endpoint_with(
             key,
             config.net,
+            &config.relays,
             vec![
                 AGENT_ALPN.to_vec(),
                 ADMIN_ALPN.to_vec(),
@@ -2079,7 +2084,10 @@ async fn send_call(conn: &Connection, req: &AdminRequest) -> Sent {
 
 impl AdminClient {
     pub async fn connect(ticket: &AdminTicket, net: NetMode) -> Result<Self> {
-        let endpoint = bind_endpoint(iroh::SecretKey::generate(), net, vec![], None).await?;
+        // A cluster with its own relays is reached through them alone.
+        let relays = pumasi_proto::net::custom_relays(&ticket.candidates());
+        let endpoint =
+            bind_endpoint_with(iroh::SecretKey::generate(), net, &relays, vec![], None).await?;
         match Self::connect_with(endpoint.clone(), ticket).await {
             Ok(client) => Ok(client),
             Err(e) => {

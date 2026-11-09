@@ -24,7 +24,10 @@ if [ -e /dev/dxg ]; then
     export GALLIUM_DRIVER=${GALLIUM_DRIVER:-d3d12}
     export MESA_D3D12_DEFAULT_ADAPTER_NAME=${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}
   else
-    echo "note: WSL 2 without /usr/lib/wsl/lib/libd3d12.so: drawing on the CPU (llvmpipe)"
+    # Only EEVEE draws; Cycles renders with CUDA and needs no GL.
+    if [ "$engine" = eevee ]; then
+      echo "note: WSL 2 without /usr/lib/wsl/lib/libd3d12.so: drawing on the CPU (llvmpipe)"
+    fi
     export GALLIUM_DRIVER=${GALLIUM_DRIVER:-llvmpipe}
   fi
 fi
@@ -42,7 +45,10 @@ case "$engine" in
     blender_run ;;
   eevee)
     if command -v eglinfo >/dev/null 2>&1; then
-      echo "EGL: $(eglinfo -B 2>/dev/null | grep -i -m1 'renderer' | sed 's/.*: *//')"
+      # scene.py falls back to it when Blender cannot say what it drew with.
+      PUMASI_EGL_RENDERER=$(eglinfo -B 2>/dev/null | grep -i -m1 'renderer' | sed 's/.*: *//')
+      export PUMASI_EGL_RENDERER
+      echo "EGL: $PUMASI_EGL_RENDERER"
     fi
     if [ -n "${DISPLAY:-}" ]; then blender_run; else
       # EEVEE opens a window system even in background mode.

@@ -98,6 +98,7 @@ async fn spawn_agent(name: &str, slots: u32, ticket: JoinTicket) -> RunningAgent
         name: name.into(),
         slots: Some(slots),
         net: NetMode::Local,
+        relays: Vec::new(),
         bind: Some("127.0.0.1:0".parse().unwrap()),
         docker: None,
         microvm: None,

@@ -126,12 +126,24 @@ def use_eevee(scene, samples):
         except TypeError:
             continue
     scene.eevee.taa_render_samples = samples
+    return eevee_device()
+
+
+def eevee_device():
+    """What EEVEE draws with, or None before Blender has a GPU context
+    (Blender 5.x in background mode makes it at the first render)."""
     import gpu
 
     try:
         return f"EEVEE on {gpu.platform.renderer_get()} ({gpu.platform.vendor_get()}, {gpu.platform.version_get()})"
-    except Exception as e:  # no GPU context yet in some versions
-        return f"EEVEE ({e})"
+    except Exception:
+        return None
+
+
+def report_device(device):
+    print(f"render device: {device}", flush=True)
+    if "llvmpipe" in device or "softpipe" in device:
+        print("warning: drawing on the CPU (llvmpipe), not the GPU", flush=True)
 
 
 def main():
@@ -141,9 +153,8 @@ def main():
     scene.render.resolution_x, scene.render.resolution_y = w, h
     scene.render.image_settings.file_format = "PNG"
     device = use_gpu_cycles(scene, a.samples) if a.engine == "cycles" else use_eevee(scene, a.samples)
-    print(f"render device: {device}", flush=True)
-    if "llvmpipe" in device or "softpipe" in device:
-        print("warning: drawing on the CPU (llvmpipe), not the GPU", flush=True)
+    if device:
+        report_device(device)
     os.makedirs(a.out, exist_ok=True)
     times = {}
     for f in range(a.shard + 1, FRAMES + 1, a.shards):
@@ -153,6 +164,11 @@ def main():
         bpy.ops.render.render(write_still=True)
         times[f] = round(time.time() - t, 3)
         print(f"frame {f}: {times[f]}s", flush=True)
+        if not device:
+            # The GPU context exists now; else say what EGL (render.sh) found.
+            egl = os.environ.get("PUMASI_EGL_RENDERER")
+            device = eevee_device() or (f"EEVEE on {egl} (from EGL)" if egl else "EEVEE (device unknown)")
+            report_device(device)
     with open(os.path.join(a.out, "render.json"), "w") as fh:
         json.dump({"engine": a.engine, "device": device, "size": a.size, "samples": a.samples, "seconds": times}, fh, indent=2)
 

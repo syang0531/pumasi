@@ -460,6 +460,31 @@ lending your machine earns them, using others' machines spends them, and
 an account may go down to minus the credit limit. The balances always add
 up to zero.
 
+### Machines on other networks, and your own relay
+
+Machines join from anywhere: home, office, a cloud VM, behind NAT, with no
+port forwarding. Agents and the CLI always dial out to the control plane;
+connections are iroh QUIC, encrypted end to end and authenticated by key.
+They try a direct path first (hole punching) and fall back to a relay,
+which only forwards encrypted packets. `pumasi status` shows per node
+whether its link is direct or relayed.
+
+By default the relays are n0's public ones (the iroh developers). To use
+your own, run an [iroh-relay](https://github.com/n0-computer/iroh/tree/main/iroh-relay)
+server of the same major version (1.x) on a machine everyone can reach,
+and start the control plane with it:
+
+```sh
+pumasi cluster start --name homelab --relay https://relay.example.com
+```
+
+Join and admin tickets then carry that relay, and agents, `pumasi login`,
+`pumasi ui` and replicas use it on their own, without the option
+(`--relay` on an agent overrides it). Give `--relay` every time the control
+plane starts (in its service definition); repeat it for more than one.
+Address lookup still publishes the signed address records to n0's DNS;
+on a LAN with no internet, `--net local` turns relays and lookup off.
+
 ### Run the agent as a service
 
 `pumasi agent join` runs in the foreground. To keep a machine in the
@@ -973,7 +998,7 @@ defends against, including the API exposed to the internet.
 
 | Command | What it does |
 | --- | --- |
-| `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR] [--metrics-addr ADDR] [--keep-jobs 30d]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. `--metrics-addr` serves Prometheus metrics; `--keep-jobs` is how long finished jobs are kept (`0`: forever). |
+| `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR] [--relay URL] [--metrics-addr ADDR] [--keep-jobs 30d]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. `--relay` uses your own iroh-relay instead of n0's; `--metrics-addr` serves Prometheus metrics; `--keep-jobs` is how long finished jobs are kept (`0`: forever). |
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-confidential] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-confidential` confidential jobs in SEV-SNP or TDX microVMs, `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |

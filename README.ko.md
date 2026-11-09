@@ -229,6 +229,18 @@ smart    APPLE SSD SM0128F, health ok, 7% of endurance used, 21530 h powered on,
 
 **품앗이(mutual) 모드.** 돈 없이 기기를 서로 빌려 쓰는 그룹용입니다. `pumasi prices set --ledger mutual --credit-limit 20`. 아무도 CU를 지급하지 않고, 내 기기를 빌려주면 CU를 벌고 남의 기기를 쓰면 씁니다. 잔액은 신용 한도만큼 마이너스까지 갈 수 있고, 모든 잔액의 합은 항상 0입니다.
 
+### 다른 네트워크의 기기와 자체 릴레이
+
+기기는 어디서든 참가합니다. 집, 사무실, 클라우드 VM, NAT 뒤 모두 되고 포트포워딩도 필요 없습니다. 에이전트와 CLI는 항상 컨트롤 플레인으로 먼저 연결하고, 연결은 키로 서로 인증하는 종단 간 암호화 iroh QUIC입니다. 먼저 직접 연결(홀펀칭)을 시도하고, 안 되면 암호화된 패킷만 전달하는 릴레이를 거칩니다. 노드마다 직접 연결인지 릴레이인지는 `pumasi status`에 나옵니다.
+
+기본 릴레이는 n0(iroh 개발사)의 공개 릴레이입니다. 자체 릴레이를 쓰려면 모두가 닿을 수 있는 기기에 같은 메이저 버전(1.x)의 [iroh-relay](https://github.com/n0-computer/iroh/tree/main/iroh-relay) 서버를 띄우고 컨트롤 플레인을 그것으로 시작합니다.
+
+```sh
+pumasi cluster start --name homelab --relay https://relay.example.com
+```
+
+그러면 참가·관리자 티켓에 그 릴레이가 들어가서, 에이전트와 `pumasi login`, `pumasi ui`, 복제본이 옵션 없이 알아서 씁니다(에이전트에 `--relay`를 주면 그것이 우선). `--relay`는 컨트롤 플레인을 시작할 때마다(서비스 정의에) 주고, 여러 개면 반복합니다. 주소 조회는 여전히 서명된 주소 기록을 n0의 DNS에 올립니다. 인터넷이 없는 LAN에서는 `--net local`이 릴레이와 조회를 끕니다.
+
 ### 에이전트를 서비스로 실행
 
 `pumasi agent join`은 터미널을 차지하고 돕니다. 재부팅해도 클러스터에 다시 붙게 하려면 서비스로 설치합니다.
@@ -491,7 +503,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 
 | 명령 | 설명 |
 | --- | --- |
-| `pumasi cluster start [--metrics-addr ADDR] [--keep-jobs 30d]` | 컨트롤 플레인 실행. 처음 실행하면 클러스터를 만들고, 상태는 `~/.pumasi/cluster`에 저장합니다. `--metrics-addr`는 Prometheus 지표 제공, `--keep-jobs`는 끝난 작업 보관 기간(`0`이면 영구) |
+| `pumasi cluster start [--relay URL] [--metrics-addr ADDR] [--keep-jobs 30d]` | 컨트롤 플레인 실행. 처음 실행하면 클러스터를 만들고, 상태는 `~/.pumasi/cluster`에 저장합니다. `--relay`는 n0 대신 자체 iroh-relay 사용, `--metrics-addr`는 Prometheus 지표 제공, `--keep-jobs`는 끝난 작업 보관 기간(`0`이면 영구) |
 | `pumasi sso status` / `sso oidc ...` / `sso ldap ...` / `sso map 규칙 역할` / `sso unmap 규칙` / `sso session 12h` / `sso device on\|off` / `sso ticket` | SSO: OIDC 제공자나 LDAP 디렉터리, 규칙(`group:`, `email:`, `domain:`, `anyone`)과 역할(`admin`, `viewer`, `submitter:계정`), 로그인 유지 시간, 터미널 로그인(`pumasi login --sso`, 디바이스 흐름, 기본 꺼짐) 허용 여부, 로그인용 티켓 |
 | `pumasi login <티켓> [--sso \| --ldap 사용자]` | 원격 클러스터에 로그인. `--sso`(디바이스 흐름)와 `--ldap`은 `pumasi sso ticket`의 로그인 티켓으로 |
 | `pumasi audit ls` / `audit verify [--against HEAD]` / `audit export [--syslog udp://\|tcp://호스트:포트]` | 감사 로그 조회, 해시 체인 전체 검증과 서명된 끝, syslog(RFC 5424) 내보내기 |

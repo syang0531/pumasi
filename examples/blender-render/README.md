@@ -39,9 +39,11 @@ It starts a container with every driver capability and reports:
 docker GPU tasks (ghcr.io/YOU/pumasi-blender:4.2, graphics tasks with /usr/lib/wsl read-only):
   CUDA: GPU 0: NVIDIA GeForce RTX 3080 (UUID: GPU-...)
   OptiX: no
-  EGL/OpenGL/Vulkan: yes (WSL 2, through Mesa's D3D12 driver)
+  EGL/OpenGL: yes (WSL 2, through Mesa's D3D12 driver)
   EGL renderer: D3D12 (NVIDIA GeForce RTX 3080)
+  Vulkan: CPU only (llvmpipe (LLVM 20.1.2, 256 bits))
   note: drawing works on the GPU (D3D12 (NVIDIA GeForce RTX 3080))
+  note: Vulkan draws on the CPU here (llvmpipe (LLVM 20.1.2, 256 bits)): jobs that draw with Vulkan (such as Blender's Vulkan backend) will not use the GPU; EGL/OpenGL does
   note: OptiX does not start in Docker Desktop containers: Blender Cycles uses CUDA
 ```
 
@@ -68,7 +70,10 @@ pumasi run examples/blender-render/job-eevee.toml --output
 
 Each task writes `cycles-NNNN.png` or `eevee-NNNN.png` and a
 `render.json` with the device and the seconds per frame, and its log
-starts with `render device: ...`. Over the HTTP API (see
+says `render device: ...`. Blender 5.x knows what EEVEE draws with only
+once it has rendered, so EEVEE tasks print that line after the first
+frame, falling back to the renderer `eglinfo` found (`render.sh` prints it
+as `EGL: ...` first). Over the HTTP API (see
 [docs/api.md](../../docs/api.md)):
 
 ```sh
@@ -83,7 +88,7 @@ curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" \
 | Host | CUDA, OptiX | EEVEE (OpenGL) |
 | --- | --- | --- |
 | Linux, NVIDIA Container Toolkit | the toolkit mounts `libcuda`; `libnvoptix` only with the `graphics` capability (add it to `job-cycles.toml` for OptiX) | the toolkit mounts NVIDIA's EGL and GLX drivers with `graphics` |
-| Windows, Docker Desktop (WSL 2) | Docker Desktop mounts `libcuda`; OptiX does not start in its containers (Blender: error 7805), so Cycles uses CUDA | the agent lends graphics tasks Docker Desktop's `/usr/lib/wsl` read-only, and Mesa's d3d12 driver draws through `/dev/dxg` on the Windows driver (`render.sh` sets `GALLIUM_DRIVER=d3d12` when `/usr/lib/wsl/lib/libd3d12.so` is there, `llvmpipe` when not) |
+| Windows, Docker Desktop (WSL 2) | Docker Desktop mounts `libcuda`; OptiX does not start in its containers (Blender: error 7805), so Cycles uses CUDA | the agent lends graphics tasks Docker Desktop's `/usr/lib/wsl` read-only, and Mesa's d3d12 driver draws through `/dev/dxg` on the Windows driver (`render.sh` sets `GALLIUM_DRIVER=d3d12` when `/usr/lib/wsl/lib/libd3d12.so` is there, `llvmpipe` when not). Vulkan stays on the CPU (lavapipe/llvmpipe): keep Blender on its OpenGL backend |
 
 EEVEE opens a window system even in background mode, so `render.sh` runs
 it under Xvfb. On WSL 2 that still draws on the GPU (Mesa renders with

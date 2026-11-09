@@ -956,6 +956,23 @@ struct NetArgs {
     /// Local UDP address to bind, e.g. 0.0.0.0:7480.
     #[arg(long)]
     bind: Option<SocketAddr>,
+    /// Your own relay server (an iroh-relay URL such as
+    /// https://relay.example.com) instead of n0's public ones; repeat for
+    /// more. On the control plane, tickets carry it, so agents and clients
+    /// use it without the option.
+    #[arg(long = "relay", value_name = "URL")]
+    relays: Vec<pumasi_proto::net::RelayUrl>,
+}
+
+impl NetArgs {
+    /// `--relay`, else the cluster's own relays named in its addresses.
+    fn relays_for(&self, cluster: &[iroh::EndpointAddr]) -> Vec<pumasi_proto::net::RelayUrl> {
+        if self.relays.is_empty() {
+            pumasi_proto::net::custom_relays(cluster)
+        } else {
+            self.relays.clone()
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -1492,6 +1509,13 @@ async fn cluster_start(
         (Some(t), None) => net_for_all(&t.candidates(), None),
         (None, None) => NetMode::default(),
     };
+    config.relays = match &replica {
+        Some(t) => net.relays_for(&t.candidates()),
+        None => net.relays.clone(),
+    };
+    if config.net == NetMode::Local && !config.relays.is_empty() {
+        bail!("--relay needs public network mode; drop --net local");
+    }
     // A fixed port lets agents reconnect after a restart in local mode.
     config.bind = Some(net.bind.unwrap_or_else(|| "0.0.0.0:7480".parse().unwrap()));
     let cluster = match &replica {
@@ -1573,21 +1597,21 @@ async fn agent(
             (None, opts)
         }
     };
-    let net = match &ticket {
-        Some(t) => net_for_all(&t.candidates(), opts.net.net),
-        None => {
-            let saved = std::fs::read_to_string(data_dir.join("membership.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<pumasi_agent::Membership>(&s).ok());
-            match saved {
-                Some(m) => net_for_all(
-                    &pumasi_proto::ticket::candidates(&m.cluster, &m.replicas),
-                    opts.net.net,
-                ),
-                None => opts.net.net.unwrap_or_default(),
-            }
-        }
+    // The cluster's addresses: from the ticket, or from the last join.
+    let cluster_addrs = match &ticket {
+        Some(t) => t.candidates(),
+        None => std::fs::read_to_string(data_dir.join("membership.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<pumasi_agent::Membership>(&s).ok())
+            .map(|m| pumasi_proto::ticket::candidates(&m.cluster, &m.replicas))
+            .unwrap_or_default(),
     };
+    let net = if cluster_addrs.is_empty() {
+        opts.net.net.unwrap_or_default()
+    } else {
+        net_for_all(&cluster_addrs, opts.net.net)
+    };
+    let relays = opts.net.relays_for(&cluster_addrs);
     // The drive measured is the one under the agent's data directory.
     let bench = if opts.no_benchmark {
         None
@@ -1612,6 +1636,7 @@ async fn agent(
                 .then(|| pumasi_agent::AvailabilityConfig::new(policy))
         },
         net,
+        relays,
         bind: opts.net.bind,
         docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
         microvm: opts.allow_microvm.then(|| {

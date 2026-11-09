@@ -49,7 +49,9 @@ impl Backend {
         {
             return Ok(c.clone());
         }
-        let client = match guard.take() {
+        // A failed reconnect keeps the old client, and with it the endpoint,
+        // for the next try: dropping the last handle would log an error.
+        let client = match guard.as_ref() {
             Some(old) => old.reconnect().await,
             None => AdminClient::connect(&self.ticket, self.net).await,
         }

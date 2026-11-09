@@ -1058,21 +1058,11 @@ fn home_dir(cli_home: &Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(base).join(".pumasi"))
 }
 
-/// Picks local mode for tickets that carry only IP addresses.
-/// [`net_for`] over every address of a cluster: public if any has a relay.
+/// Picks local mode for tickets that carry only IP addresses: public if any
+/// address of the cluster has a relay.
 fn net_for_all(addrs: &[iroh::EndpointAddr], explicit: Option<NetMode>) -> NetMode {
     explicit.unwrap_or_else(|| {
         if addrs.iter().any(|a| a.relay_urls().next().is_some()) {
-            NetMode::Public
-        } else {
-            NetMode::Local
-        }
-    })
-}
-
-fn net_for(addr: &iroh::EndpointAddr, explicit: Option<NetMode>) -> NetMode {
-    explicit.unwrap_or_else(|| {
-        if addr.relay_urls().next().is_some() {
             NetMode::Public
         } else {
             NetMode::Local
@@ -1796,16 +1786,41 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
 }
 
 async fn connect_admin(home: &Path, args: &AdminArgs) -> Result<AdminClient> {
-    let ticket = load_ticket(home, args)?;
+    let (ticket, source) = load_ticket_with_source(home, args)?;
     let net = net_for_all(&ticket.candidates(), None);
-    AdminClient::connect(&ticket, net).await
+    AdminClient::connect(&ticket, net)
+        .await
+        .map_err(|e| e.context(ticket_hint(home, &ticket, &source)))
+}
+
+/// Where the ticket in use came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TicketSource {
+    /// `--admin` or `PUMASI_ADMIN`.
+    Given,
+    /// A file: the one `pumasi login` saved, or a local cluster's.
+    File(PathBuf),
+}
+
+impl std::fmt::Display for TicketSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Given => f.write_str("--admin / PUMASI_ADMIN"),
+            Self::File(p) => write!(f, "{}", p.display()),
+        }
+    }
 }
 
 /// The admin or access ticket: `--admin`, else the one `pumasi login` or a
 /// local cluster saved.
 fn load_ticket(home: &Path, args: &AdminArgs) -> Result<AdminTicket> {
-    let text = match &args.admin {
-        Some(t) => t.clone(),
+    Ok(load_ticket_with_source(home, args)?.0)
+}
+
+/// [`load_ticket`], and where it came from.
+fn load_ticket_with_source(home: &Path, args: &AdminArgs) -> Result<(AdminTicket, TicketSource)> {
+    let (text, source) = match &args.admin {
+        Some(t) => (t.clone(), TicketSource::Given),
         None => {
             let candidates = [
                 home.join(ADMIN_TICKET_FILE),
@@ -1814,10 +1829,39 @@ fn load_ticket(home: &Path, args: &AdminArgs) -> Result<AdminTicket> {
             let found = candidates.iter().find(|p| p.exists()).with_context(|| {
                 "no admin ticket found: start a cluster here, run `pumasi login <TICKET>`, or pass --admin"
             })?;
-            std::fs::read_to_string(found)?
+            (
+                std::fs::read_to_string(found)?,
+                TicketSource::File(found.clone()),
+            )
         }
     };
-    text.parse()
+    let ticket = text
+        .parse()
+        .with_context(|| format!("the ticket from {source} is not valid"))?;
+    Ok((ticket, source))
+}
+
+/// Says which ticket a failed connection used, and points at the local
+/// cluster's own ticket when that names another cluster (a `pumasi login`
+/// left over from an earlier or another cluster wins over it).
+fn ticket_hint(home: &Path, ticket: &AdminTicket, source: &TicketSource) -> String {
+    let mut hint = format!(
+        "using the ticket from {source} (cluster {})",
+        ticket.cluster.id.fmt_short()
+    );
+    let local = home.join("cluster").join(ADMIN_TICKET_FILE);
+    if *source != TicketSource::File(local.clone())
+        && let Ok(text) = std::fs::read_to_string(&local)
+        && let Ok(own) = text.parse::<AdminTicket>()
+        && own.cluster.id != ticket.cluster.id
+    {
+        hint.push_str(&format!(
+            "; the cluster started on this machine is {} and its ticket is {}: `pumasi login` with it to use that one",
+            own.cluster.id.fmt_short(),
+            local.display()
+        ));
+    }
+    hint
 }
 
 async fn wait_for_job(client: &AdminClient, id: JobId) -> Result<JobView> {

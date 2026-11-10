@@ -139,6 +139,7 @@ pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
 - Docker 작업에는 WSL 2 백엔드, Linux 컨테이너 모드로 실행 중인 Docker Desktop이 필요합니다. Docker Desktop은 로그인한 사용자와 함께 시작하므로, 아무도 로그인하지 않은 기기는 WASM과 microVM 작업만 받습니다(Docker Desktop 로그인 시 시작과 자동 로그인을 켜면 해결).
 - `pumasi service install`은 사설·도메인 네트워크에서 에이전트가 UDP를 받도록 방화벽 규칙을 추가해, 릴레이 대신 직접 연결되게 합니다. `service uninstall`이 규칙을 지웁니다. Windows가 공용(Public)으로 분류한 네트워크에서는 릴레이로 연결되며, 넓히려면 `netsh advfirewall firewall set rule name="Pumasi agent (UDP in)" new profile=any`.
 - 에이전트가 띄운 VM과 Docker CLI는 Windows Job Object에 묶여, 에이전트가 비정상 종료해도 함께 끝납니다.
+- 1.2.1까지의 `install.ps1`은 `pumasi.exe`를 SYSTEM, Administrators, 설치한 계정만 쓸 수 있게 남겨서, 다른 계정에서 실행하면 "액세스가 거부되었습니다"가 났습니다(서비스는 정상). `install.ps1`을 다시 실행하거나 관리자 PowerShell에서 `icacls "C:\Program Files\Pumasi\pumasi.exe" /reset`을 실행하세요.
 
 #### Windows 스마트 앱 컨트롤 (Smart App Control)
 

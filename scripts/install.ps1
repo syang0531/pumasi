@@ -124,7 +124,16 @@ try {
         Remove-Item -Force $old -ErrorAction SilentlyContinue
         Move-Item -Force $exe $old
     }
-    Move-Item -Force $exeTmp $exe
+    # Copy, not move: a moved file keeps the ACL of the temp folder it was
+    # downloaded to (SYSTEM, Administrators and the installing user only),
+    # so other accounts could not run it from Program Files. A copy gets
+    # the install folder's inherited permissions.
+    try {
+        Copy-Item -Force $exeTmp $exe
+    } catch {
+        if (Test-Path "$exe.old") { Move-Item -Force "$exe.old" $exe }
+        throw
+    }
     Write-Host "installed $exe ($(& $exe --version))"
 
     if (-not $NoPath) {

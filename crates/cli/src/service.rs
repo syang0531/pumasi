@@ -1132,7 +1132,8 @@ mod tests {
         let plist = launchd_plist(&s, true);
         assert!(plist.contains("<string>pumasi.ui</string>"));
         assert!(plist.contains("<key>UserName</key>\n    <string>stan</string>"));
-        assert!(plist.contains("/var/lib/pumasi/logs/ui.log"));
+        assert!(plist.contains(&*s.log_file().to_string_lossy()));
+        assert!(s.log_file().ends_with("logs/ui.log"));
         assert!(!launchd_plist(&s, false).contains("UserName"));
     }
 

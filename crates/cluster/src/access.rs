@@ -81,6 +81,8 @@ fn op_name(op: &AdminOp) -> &'static str {
         | SsoDeviceStart
         | SsoDevicePoll { .. }
         | LdapLogin { .. } => "sign in",
+        ListJoinTokens => "list join tickets",
+        RevokeJoinToken { .. } => "revoke join tickets",
     }
 }
 

@@ -19,9 +19,19 @@ curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.
 sudo useradd --system --create-home --home-dir /var/lib/pumasi pumasi
 ```
 
-Run it as a service. Pumasi does not install one for the control plane
-yet, so write the unit yourself (systemd shown; launchd and Windows
-services work the same way):
+Run it as a service. `pumasi service install cluster` writes and starts
+one (systemd, launchd or a Windows service) that runs as the owner of
+the home it is given:
+
+```sh
+sudo chown pumasi /var/lib/pumasi
+sudo pumasi --home /var/lib/pumasi service install cluster -- --name acme --bind 0.0.0.0:7480 --storage-class ssd --keep-jobs 90d
+sudo pumasi --home /var/lib/pumasi service status cluster
+```
+
+It adds `--no-token` (no join ticket in the log at every start; make them
+with `pumasi token`). For a hardened unit like the one below, write it
+yourself:
 
 ```ini
 # /etc/systemd/system/pumasi-cluster.service

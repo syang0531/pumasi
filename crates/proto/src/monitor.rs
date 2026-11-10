@@ -273,6 +273,14 @@ impl AlertPolicy {
 
     /// One line per rule, for `pumasi alert ls`.
     pub fn describe(&self) -> Vec<(&'static str, String)> {
+        self.describe_in(false)
+    }
+
+    /// One line per rule, in Korean with `ko`.
+    pub fn describe_in(&self, ko: bool) -> Vec<(&'static str, String)> {
+        if ko {
+            return self.describe_ko();
+        }
         let off = || "off".to_string();
         vec![
             (
@@ -324,6 +332,67 @@ impl AlertPolicy {
                 "check_mismatch",
                 if self.check_mismatch {
                     "a check run disagreeing with a result".into()
+                } else {
+                    off()
+                },
+            ),
+        ]
+    }
+}
+
+impl AlertPolicy {
+    fn describe_ko(&self) -> Vec<(&'static str, String)> {
+        let off = || "꺼짐".to_string();
+        vec![
+            (
+                "node_offline",
+                self.node_offline_secs
+                    .map(|s| format!("노드가 {} 동안 오프라인", human_duration(s)))
+                    .unwrap_or_else(off),
+            ),
+            (
+                "failure_rate",
+                self.failure_rate
+                    .map(|f| {
+                        format!(
+                            "{} 동안 실행의 {}% 실패 (최소 {}회)",
+                            human_duration(f.window_secs),
+                            f.percent,
+                            f.min_runs
+                        )
+                    })
+                    .unwrap_or_else(off),
+            ),
+            (
+                "disk",
+                self.disk_percent
+                    .map(|p| format!("디스크 사용량 {p}% 초과"))
+                    .unwrap_or_else(off),
+            ),
+            (
+                "temperature",
+                self.temp_c
+                    .map(|t| format!("센서 온도 {t} °C 초과"))
+                    .unwrap_or_else(off),
+            ),
+            (
+                "perf_drop",
+                self.perf_drop_percent
+                    .map(|p| format!("벤치마크가 지난번보다 {p}% 느림"))
+                    .unwrap_or_else(off),
+            ),
+            (
+                "smart",
+                if self.smart {
+                    "드라이브 SMART 실패, 수명 다함, 미디어 오류".into()
+                } else {
+                    off()
+                },
+            ),
+            (
+                "check_mismatch",
+                if self.check_mismatch {
+                    "검증 실행이 결과와 다름".into()
                 } else {
                     off()
                 },

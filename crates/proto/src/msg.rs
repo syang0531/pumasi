@@ -752,6 +752,14 @@ pub enum AdminOp {
         user: String,
         password: crate::sso::Hidden,
     },
+    // 1.2 from here.
+    /// The join tickets and invites that can still be used.
+    ListJoinTokens,
+    /// Revokes a join ticket or invite by id (or unique prefix), or by
+    /// the ticket itself.
+    RevokeJoinToken {
+        id: String,
+    },
 }
 
 impl AdminOp {
@@ -884,6 +892,29 @@ pub enum AdminResponse {
     SsoPending {
         interval_secs: u64,
     },
+    // 1.2 from here.
+    JoinTokens(Vec<JoinTokenView>),
+}
+
+/// A join ticket or invite that can still be used; its secret is not
+/// shown again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinTokenView {
+    /// Short id derived from the secret, to revoke it by.
+    pub id: String,
+    pub expires_unix: u64,
+    /// Machines that can still join with it; `None` for any number.
+    pub uses_left: Option<u32>,
+    /// Set for invites of other people's machines.
+    pub invite: Option<Invite>,
+}
+
+/// The id of a join secret: the first bytes of its hash, in hex.
+pub fn join_token_id(secret: &crate::Secret) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"pumasi/join-id/v1\0");
+    h.update(secret);
+    crate::short_hex(h.finalize().as_bytes())
 }
 
 /// A secret's name and when it was set; the value never leaves the
@@ -1129,6 +1160,51 @@ pub struct NodeView {
     pub unavailable: Vec<(Executor, String)>,
     /// Its Docker GPU tasks can draw (OpenGL, EGL, Vulkan).
     pub gpu_graphics: bool,
+}
+
+impl NodeView {
+    /// How a GPU no job can use here would become usable, in English and
+    /// Korean: empty when every GPU is usable by some executor.
+    pub fn gpu_hints(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.gpus.iter().any(|g| !g.info.docker && !g.info.vfio) {
+            return Vec::new();
+        }
+        let mut v = Vec::new();
+        let docker = self.executors.contains(&Executor::Docker)
+            || self.unavailable.iter().any(|(e, _)| *e == Executor::Docker);
+        match self.info.os.as_str() {
+            "macos" => v.push((
+                "macOS lends GPUs to no container or microVM; wasm jobs can use it through WebGPU (agent option --allow-webgpu, experimental).",
+                "macOS는 컨테이너나 microVM에 GPU를 넘겨주지 못합니다. wasm 작업은 WebGPU로 쓸 수 있습니다(에이전트 옵션 --allow-webgpu, 실험).",
+            )),
+            os => {
+                if docker {
+                    v.push((
+                        "Docker cannot reach it: on Linux install the NVIDIA Container Toolkit, on Windows use Docker Desktop's WSL 2 backend; `pumasi gpu check --docker-run` tests it.",
+                        "Docker가 GPU를 못 씁니다. Linux는 NVIDIA Container Toolkit을, Windows는 Docker Desktop의 WSL 2 백엔드를 쓰세요. `pumasi gpu check --docker-run`으로 확인합니다.",
+                    ));
+                } else {
+                    v.push((
+                        "Docker GPU jobs (gpus = 1) need Docker on this machine: start its agent with --allow-docker (Docker Desktop on Windows).",
+                        "Docker GPU 작업(gpus = 1)은 이 기기에 Docker가 있어야 합니다. 에이전트를 --allow-docker로 시작하세요(Windows는 Docker Desktop).",
+                    ));
+                }
+                if os != "linux" {
+                    v.push((
+                        "MicroVM GPU passthrough is Linux only.",
+                        "microVM GPU 패스스루는 Linux에서만 됩니다.",
+                    ));
+                }
+            }
+        }
+        if self.webgpu.is_empty() && self.info.os != "macos" {
+            v.push((
+                "Wasm jobs can use it through WebGPU without Docker: agent option --allow-webgpu (experimental).",
+                "Docker 없이도 wasm 작업이 WebGPU로 쓸 수 있습니다: 에이전트 옵션 --allow-webgpu(실험).",
+            ));
+        }
+        v
+    }
 }
 
 /// A WebGPU adapter in the cluster status.

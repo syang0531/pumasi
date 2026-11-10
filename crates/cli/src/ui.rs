@@ -14,7 +14,10 @@ use pumasi_proto::store::parse_size;
 use crate::{AdminArgs, load_ticket_with_source, net_for_all, ticket_hint};
 
 /// Port tried first when `--listen` is not given.
-const DEFAULT_PORT: u16 = 7400;
+pub const DEFAULT_PORT: u16 = 7400;
+
+/// Where a dashboard service writes its sign-in link, in the home.
+pub const URL_FILE: &str = "ui.url";
 
 #[derive(Args)]
 pub struct UiArgs {
@@ -72,6 +75,15 @@ pub struct UiArgs {
 }
 
 pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
+    run_until(home, args, crate::ctrl_c()).await
+}
+
+/// Serves until `shutdown` resolves.
+pub async fn run_until(
+    home: &Path,
+    args: UiArgs,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<i32> {
     let (ticket, source) = load_ticket_with_source(home, &args.admin)?;
     let net = net_for_all(&ticket.candidates(), None);
     let probe = (ticket.clone(), ticket_hint(home, &ticket, &source));
@@ -143,7 +155,7 @@ pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
     }
     tokio::select! {
         r = ui.wait() => r?,
-        _ = crate::ctrl_c() => {}
+        _ = shutdown => {}
     }
     Ok(0)
 }

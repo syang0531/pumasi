@@ -45,6 +45,7 @@ use pumasi_proto::{
     store::{DatasetView, StoragePolicy, StoreRef, StoreTarget, format_size, parse_size},
     ticket::{AdminTicket, JoinTicket},
 };
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 #[derive(Parser)]
 #[command(
@@ -68,8 +69,12 @@ enum Cmd {
     /// Run a node agent that contributes this machine to a cluster.
     #[command(subcommand)]
     Agent(AgentCmd),
-    /// Create a ticket that lets another machine join the cluster.
+    /// Create a ticket that lets another machine join the cluster; `token
+    /// ls` lists the ones still usable, `token revoke` cancels one.
+    #[command(args_conflicts_with_subcommands = true)]
     Token {
+        #[command(subcommand)]
+        cmd: Option<manage::TokenCmd>,
         /// How long the ticket stays valid, e.g. 30m, 24h.
         #[arg(long, default_value = "24h")]
         ttl: String,
@@ -1020,7 +1025,7 @@ fn main() {
     // Under the Windows service manager there is no console: log to a file
     // and hand the main thread to the service dispatcher.
     #[cfg(windows)]
-    if let Cmd::Service(service::ServiceCmd::Run { agent_args }) = &cli.cmd {
+    if let Cmd::Service(service::ServiceCmd::Run { role, args }) = &cli.cmd {
         let home = match home_dir(&cli.home) {
             Ok(h) => h,
             Err(e) => {
@@ -1028,41 +1033,73 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let logs = home.join("logs");
-        let _ = std::fs::create_dir_all(&logs);
+        let log = role.log_file(&home);
+        let _ = std::fs::create_dir_all(home.join("logs"));
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(logs.join("agent.log"))
+            .open(&log)
         {
             Ok(file) => tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_target(false)
                 .with_ansi(false)
                 .with_writer(std::sync::Mutex::new(file))
+                .finish()
+                .with(quiet_shutdown())
                 .init(),
-            Err(_) => tracing_subscriber::fmt().with_env_filter(filter).init(),
+            Err(_) => tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .finish()
+                .with(quiet_shutdown())
+                .init(),
         }
-        std::process::exit(service::windows::run(home, agent_args.clone()));
+        std::process::exit(service::windows::run(*role, home, args.clone()));
     }
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(use_color())
         .with_writer(std::io::stderr)
+        .finish()
+        .with(quiet_shutdown())
         .init();
 
     // The command future is large: keep it on the heap, not the stack
     // (the main thread has only 1 MiB on Windows; see build.rs).
+    let home = home_dir(&cli.home).ok();
     let runtime = tokio::runtime::Runtime::new().expect("start the async runtime");
     let code = runtime.block_on(Box::pin(run(cli)));
     match code {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("error: {e:#}");
+            if let Some(hint) = home.and_then(|h| permission_hint(&e, &h)) {
+                eprintln!("note: {hint}");
+            }
             std::process::exit(1);
         }
     }
+}
+
+/// Colored logs only on a terminal, and not with `NO_COLOR` set: a log
+/// redirected to a file gets no escape codes.
+fn use_color() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+}
+
+/// Drops iroh's `relay_recv_channel closed` error, which it logs while an
+/// endpoint with a relay closes normally (the relay actor stops before
+/// the socket does), so a command that worked prints no ERROR line. It is
+/// the only error event of that module, and it means nothing else.
+fn quiet_shutdown() -> tracing_subscriber::filter::FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool>
+{
+    tracing_subscriber::filter::filter_fn(|m| {
+        !(*m.level() == tracing::Level::ERROR && m.target() == "iroh::socket::transports::relay")
+    })
 }
 
 fn home_dir(cli_home: &Option<PathBuf>) -> Result<PathBuf> {
@@ -1072,7 +1109,71 @@ fn home_dir(cli_home: &Option<PathBuf>) -> Result<PathBuf> {
     let base = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .context("cannot find home directory; set PUMASI_HOME")?;
-    Ok(PathBuf::from(base).join(".pumasi"))
+    let home = PathBuf::from(base).join(".pumasi");
+    Ok(sudo_home(home))
+}
+
+/// Under `sudo`, macOS (and some Linux setups) keep the user's `HOME`, so
+/// root would make `~/.pumasi` and own it, and the user's own commands
+/// (`pumasi vm setup`, `pumasi login`) then fail on it. Use root's home
+/// there instead, as Linux's sudo does, unless root already owns the
+/// user's `~/.pumasi` (an agent service installed that way before keeps
+/// its state).
+#[cfg(unix)]
+fn sudo_home(home: PathBuf) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 || std::env::var_os("SUDO_USER").is_none() {
+        return home;
+    }
+    // SAFETY: getpwuid returns static storage or null, read at once.
+    let root = unsafe {
+        let pw = libc::getpwuid(0);
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return home;
+        }
+        PathBuf::from(
+            std::ffi::CStr::from_ptr((*pw).pw_dir)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    let root_home = root.join(".pumasi");
+    if home == root_home || std::fs::metadata(&home).is_ok_and(|m| m.uid() == 0) {
+        return home;
+    }
+    root_home
+}
+
+#[cfg(not(unix))]
+fn sudo_home(home: PathBuf) -> PathBuf {
+    home
+}
+
+/// A hint for an error that comes from a home this user cannot write,
+/// such as one an agent service installed with `sudo` made.
+fn permission_hint(e: &anyhow::Error, home: &Path) -> Option<String> {
+    let denied = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    });
+    if !denied {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if me != 0 && std::fs::metadata(home).is_ok_and(|m| m.uid() != me) {
+            return Some(format!(
+                "{} belongs to another user (root, when an agent service was installed with sudo): run this command with sudo to work on that agent, or give your own --home",
+                home.display()
+            ));
+        }
+    }
+    let _ = home;
+    None
 }
 
 /// Picks local mode for tickets that carry only IP addresses: public if any
@@ -1096,7 +1197,19 @@ async fn run(cli: Cli) -> Result<i32> {
             no_token,
             storage_class,
             metrics,
-        }) => cluster_start(&home, name, net, no_token, storage_class, metrics, None).await,
+        }) => {
+            cluster_start(
+                &home,
+                name,
+                net,
+                no_token,
+                storage_class,
+                metrics,
+                None,
+                shutdown_signal(),
+            )
+            .await
+        }
         Cmd::Cluster(ClusterCmd::Replica {
             ticket,
             net,
@@ -1112,6 +1225,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 storage_class,
                 metrics,
                 Some(ticket),
+                shutdown_signal(),
             )
             .await
         }
@@ -1150,7 +1264,13 @@ async fn run(cli: Cli) -> Result<i32> {
         Cmd::Agent(cmd) => agent(&home, cmd, ctrl_c(), false).await,
         Cmd::Service(cmd) => service_cmd(&home, cmd),
         Cmd::Upgrade(cmd) => upgrade::run(&home, cmd).await,
-        Cmd::Token { ttl, uses, admin } => {
+        Cmd::Token { cmd: Some(cmd), .. } => manage::token(&home, cmd).await,
+        Cmd::Token {
+            cmd: None,
+            ttl,
+            uses,
+            admin,
+        } => {
             let ttl_secs = parse_duration_ms(&ttl)? / 1000;
             let client = connect_admin(&home, &admin).await?;
             let resp = client
@@ -1482,6 +1602,7 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cluster_start(
     home: &Path,
     name: String,
@@ -1490,6 +1611,7 @@ async fn cluster_start(
     storage_class: Option<StorageClassArg>,
     metrics: MetricsArgs,
     replica: Option<pumasi_proto::ticket::ReplicaTicket>,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<i32> {
     let mut config = ClusterConfig::new(home.join("cluster"));
     config.name = name;
@@ -1530,7 +1652,7 @@ async fn cluster_start(
         );
         eprintln!("`pumasi ha status` shows the replicas; this one takes over if the leader fails");
         eprintln!();
-        tokio::signal::ctrl_c().await?;
+        shutdown.await;
         eprintln!("shutting down");
         cluster.shutdown().await?;
         return Ok(0);
@@ -1551,17 +1673,38 @@ async fn cluster_start(
     if !no_token {
         let ticket = cluster.create_join_ticket(Duration::from_secs(24 * 3600), None)?;
         eprintln!();
-        eprintln!("add a machine (ticket valid 24h):");
+        eprintln!(
+            "add a machine (ticket {}, valid 24h for any number of machines; `pumasi token revoke {}` cancels it):",
+            pumasi_proto::msg::join_token_id(&ticket.secret),
+            pumasi_proto::msg::join_token_id(&ticket.secret),
+        );
         eprintln!("  pumasi agent join {ticket}");
     }
     eprintln!();
-    tokio::signal::ctrl_c().await?;
+    shutdown.await;
     eprintln!("shutting down");
     cluster.shutdown().await?;
     Ok(0)
 }
 
 async fn ctrl_c() {
+    shutdown_signal().await
+}
+
+/// Ctrl-C, or on Unix also SIGTERM (what `systemctl stop` and launchd
+/// send), so a service stops cleanly.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
     let _ = tokio::signal::ctrl_c().await;
 }
 
@@ -1733,41 +1876,181 @@ fn restart_self(exe: &Path) -> Result<i32> {
     }
 }
 
-/// What the Windows service runs: `agent start` with the given options.
+/// What the Windows service runs: `agent start`, `cluster start` or `ui`
+/// with the given options, until `shutdown` resolves.
 #[cfg_attr(not(windows), allow(dead_code))]
-async fn run_service_agent(
+async fn run_service(
+    role: service::Role,
     home: PathBuf,
-    agent_args: Vec<String>,
+    args: Vec<String>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<i32> {
-    let cmd = parse_agent_args(&agent_args)?;
-    agent(&home, cmd, shutdown, true).await
+    match parse_service_args(role, &args)? {
+        Cmd::Agent(cmd) => agent(&home, cmd, shutdown, true).await,
+        Cmd::Cluster(ClusterCmd::Start {
+            name,
+            net,
+            no_token,
+            storage_class,
+            metrics,
+        }) => {
+            cluster_start(
+                &home,
+                name,
+                net,
+                no_token,
+                storage_class,
+                metrics,
+                None,
+                shutdown,
+            )
+            .await
+        }
+        Cmd::Ui(args) => ui::run_until(&home, args, shutdown).await,
+        _ => bail!("not {} options", role.as_str()),
+    }
+}
+
+/// Parses options meant for the command a service runs (`pumasi agent
+/// start`, `pumasi cluster start` or `pumasi ui`).
+fn parse_service_args(role: service::Role, args: &[String]) -> Result<Cmd> {
+    let cmd: &[&str] = match role {
+        service::Role::Agent => &["agent", "start"],
+        service::Role::Cluster => &["cluster", "start"],
+        service::Role::Ui => &["ui"],
+    };
+    let argv = std::iter::once("pumasi")
+        .chain(cmd.iter().copied())
+        .map(String::from)
+        .chain(args.iter().cloned());
+    if has_flag(args, "--home") {
+        bail!("give --home before `service install`, not after `--`");
+    }
+    match Cli::try_parse_from(argv) {
+        Ok(Cli { cmd, .. }) => Ok(cmd),
+        Err(e) => bail!("invalid {} options {args:?}: {e}", role.as_str()),
+    }
 }
 
 /// Parses options meant for `pumasi agent start`.
 fn parse_agent_args(agent_args: &[String]) -> Result<AgentCmd> {
-    let argv = ["pumasi", "agent", "start"]
-        .into_iter()
-        .map(String::from)
-        .chain(agent_args.iter().cloned());
-    match Cli::try_parse_from(argv) {
-        Ok(Cli {
-            cmd: Cmd::Agent(cmd),
-            ..
-        }) => Ok(cmd),
-        Ok(_) => bail!("not agent options"),
-        Err(e) => bail!("invalid agent options {agent_args:?}: {e}"),
+    match parse_service_args(service::Role::Agent, agent_args)? {
+        Cmd::Agent(cmd) => Ok(cmd),
+        _ => bail!("not agent options"),
     }
 }
 
+/// Whether `args` holds the option `--flag` (alone or as `--flag=...`).
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+}
+
+/// The options a control plane or dashboard service needs on top of the
+/// user's: no join ticket printed at every start into the log, no
+/// browser, a fixed address, and the sign-in link in a file.
+fn service_defaults(role: service::Role, home: &Path, mut args: Vec<String>) -> Vec<String> {
+    match role {
+        service::Role::Agent => {}
+        service::Role::Cluster => {
+            if !has_flag(&args, "--no-token") {
+                args.push("--no-token".into());
+            }
+        }
+        service::Role::Ui => {
+            if !has_flag(&args, "--no-open") {
+                args.push("--no-open".into());
+            }
+            if !has_flag(&args, "--listen") {
+                args.push("--listen".into());
+                args.push(format!("127.0.0.1:{}", ui::DEFAULT_PORT));
+            }
+            if !has_flag(&args, "--api-only") && !has_flag(&args, "--url-file") {
+                args.push("--url-file".into());
+                args.push(home.join(ui::URL_FILE).to_string_lossy().into_owned());
+            }
+        }
+    }
+    args
+}
+
 fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
-    use service::ServiceCmd;
+    use service::{Role, ServiceCmd};
     match cmd {
         ServiceCmd::Install {
+            role: role @ (Role::Cluster | Role::Ui),
             ticket,
             scope,
             dry_run,
-            agent_args,
+            args,
+        } => {
+            if ticket.is_some() {
+                bail!("--ticket is for the agent; the control plane and the dashboard take none");
+            }
+            let home = service::absolute(home)?;
+            let args = service_defaults(role, &home, args);
+            parse_service_args(role, &args)?;
+            let user = if service::is_system(scope) {
+                service::home_owner(&home)
+            } else {
+                None
+            };
+            if !dry_run {
+                eprintln!(
+                    "home: {}{}",
+                    home.display(),
+                    match &user {
+                        Some(u) => format!(" (the service runs as {u}, its owner)"),
+                        None => String::new(),
+                    }
+                );
+                if std::env::var_os("SUDO_USER").is_some() && user.is_none() && !cfg!(windows) {
+                    eprintln!(
+                        "note: root owns this home; for your own cluster use `sudo pumasi --home ~/.pumasi service install {}`",
+                        role.as_str()
+                    );
+                }
+                if role == Role::Ui
+                    && !has_flag(&args, "--admin")
+                    && let Err(e) = load_ticket_with_source(&home, &AdminArgs { admin: None })
+                {
+                    eprintln!(
+                        "note: no admin ticket in this home yet ({e:#}); the dashboard starts once the control plane here has made one, or after `pumasi login`"
+                    );
+                }
+                if role == Role::Cluster {
+                    eprintln!(
+                        "note: stop a `pumasi cluster start` running in a terminal first: both use the same data and port"
+                    );
+                }
+            }
+            let exe = own_exe().context("cannot find this binary's path")?;
+            let code = service::install(
+                &service::Spec {
+                    role,
+                    exe,
+                    home: home.clone(),
+                    args: args.clone(),
+                    user,
+                },
+                scope,
+                dry_run,
+            )?;
+            if !dry_run && role == Role::Ui && !has_flag(&args, "--api-only") {
+                println!(
+                    "the dashboard's sign-in link is written to {} when it starts",
+                    home.join(ui::URL_FILE).display()
+                );
+            }
+            Ok(code)
+        }
+        ServiceCmd::Install {
+            role: Role::Agent,
+            ticket,
+            scope,
+            dry_run,
+            args: agent_args,
         } => {
             parse_agent_args(&agent_args)?;
             let home = service::absolute(home)?;
@@ -1791,20 +2074,26 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
             let exe = own_exe().context("cannot find this binary's path")?;
             service::install(
                 &service::Spec {
+                    role: Role::Agent,
                     exe,
                     home,
-                    agent_args,
+                    args: agent_args,
+                    user: None,
                 },
                 scope,
                 dry_run,
             )
         }
-        ServiceCmd::Uninstall { scope } => service::uninstall(scope),
-        ServiceCmd::Status { scope } => service::status(scope),
-        ServiceCmd::Run { agent_args } => {
-            let _ = agent_args;
+        ServiceCmd::Uninstall { role, scope } => service::uninstall(role, scope),
+        ServiceCmd::Status { role, scope } => service::status(role, scope),
+        ServiceCmd::Run { role, .. } => {
             bail!(
-                "`service run` is what the Windows service manager runs; use `pumasi agent start`"
+                "`service run` is what the Windows service manager runs; use `pumasi {}`",
+                match role {
+                    Role::Agent => "agent start",
+                    Role::Cluster => "cluster start",
+                    Role::Ui => "ui",
+                }
             )
         }
     }
@@ -2080,6 +2369,10 @@ fn print_capacity(c: &pumasi_proto::msg::Capacity) {
     }
 }
 
+/// Jobs with more tasks list only the ones that did not succeed, unless
+/// asked for their output.
+const MAX_TASK_LINES: usize = 100;
+
 fn print_job(v: &JobView, output: bool) {
     let s = &v.summary;
     println!("job {} \"{}\": {}", s.id, s.name, s.state);
@@ -2182,7 +2475,8 @@ fn print_job(v: &JobView, output: bool) {
         } else {
             cost
         };
-        let show_line = output || !matches!(t.state, TaskState::Succeeded) || v.tasks.len() <= 20;
+        let show_line =
+            output || !matches!(t.state, TaskState::Succeeded) || v.tasks.len() <= MAX_TASK_LINES;
         if show_line {
             let _ = writeln!(
                 stdout,
@@ -2195,6 +2489,25 @@ fn print_job(v: &JobView, output: bool) {
                 cost,
                 check
             );
+        }
+        // A failed task shows why without another command: the end of
+        // its stderr.
+        if !output
+            && matches!(t.state, TaskState::Failed(_))
+            && let Some(err) = &t.stderr
+        {
+            let text = String::from_utf8_lossy(err);
+            let (tail, cut) = tail_lines(&text, 5);
+            if cut {
+                let _ = writeln!(
+                    stdout,
+                    "      ... (`pumasi logs {} --task {}` has all of it)",
+                    s.id, t.index
+                );
+            }
+            for line in tail {
+                let _ = writeln!(stdout, "      {line}");
+            }
         }
         if output {
             if let Some(out) = &t.stdout
@@ -2212,6 +2525,31 @@ fn print_job(v: &JobView, output: bool) {
             }
         }
     }
+    if !output && v.tasks.len() > MAX_TASK_LINES {
+        let hidden = v
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.state, TaskState::Succeeded))
+            .count();
+        if hidden > 0 {
+            let _ = writeln!(
+                stdout,
+                "  ({hidden} succeeded tasks not listed; `pumasi job {} --output` lists every task)",
+                s.id
+            );
+        }
+    }
+}
+
+/// The last `n` non-empty lines of `text`, and whether there were more.
+fn tail_lines(text: &str, n: usize) -> (Vec<&str>, bool) {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let cut = lines.len() > n;
+    (lines[lines.len().saturating_sub(n)..].to_vec(), cut)
 }
 
 /// `GPU 0 NVIDIA GeForce RTX 3060 (12 GiB, 12.7 TFLOPS) docker [busy 3f2a…/0]`.
@@ -2247,7 +2585,7 @@ fn gpu_line(g: &pumasi_proto::msg::GpuView) -> String {
         i.index,
         i.describe(),
         if uses.is_empty() {
-            "(not usable here)".to_string()
+            "(no job can use it yet; `pumasi node` on this node says how)".to_string()
         } else {
             uses.join(",")
         }
@@ -3422,6 +3760,9 @@ fn print_node(n: &NodeView) {
     }
     if n.gpus.is_empty() {
         println!("  no GPUs");
+    }
+    for (en, _) in n.gpu_hints() {
+        println!("  GPU: {en}");
     }
     for g in &n.gpus {
         println!("  {}", gpu_line(g));

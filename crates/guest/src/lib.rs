@@ -48,6 +48,15 @@ pub const ROLE_INPUT: &str = "input";
 pub const OUTPUT_MARK: &[u8] = b"PUMASI-OUTPUT-EMPTY";
 /// Kernel command line parameter that selects the mode.
 pub const MODE_PARAM: &str = "pumasi.mode";
+/// Kernel command line parameter that picks how the guest ends the VM:
+/// [`EXIT_POWER_OFF`], or else a reboot (which `reboot=k` and QEMU's
+/// `-no-reboot` turn into the VMM exiting). Virtualization.framework
+/// boots a rebooting guest again, so the vz backend asks for a power off.
+pub const EXIT_PARAM: &str = "pumasi.exit";
+pub const EXIT_POWER_OFF: &str = "poweroff";
+/// The console line the guest prints right before it ends the VM (`log`
+/// in init.rs adds the `pumasi-guest: ` prefix to "done").
+pub const DONE_LINE: &str = "pumasi-guest: done";
 
 /// Entries of the input tar besides [`DISK_ROLE_ENTRY`].
 pub const SPEC_ENTRY: &str = "spec.json";

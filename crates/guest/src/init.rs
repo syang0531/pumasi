@@ -1,5 +1,6 @@
 //! The init process. Runs once per VM boot, writes a result to the output
-//! disk, and reboots, which ends the VMM process on the host.
+//! disk, and reboots or powers off (`pumasi.exit`), which ends the VMM
+//! process on the host.
 //!
 //! The init is single-threaded on purpose: it forks the task (or the layer
 //! unpacker) and the child may then allocate freely before `execve`.
@@ -66,11 +67,21 @@ pub fn main() -> ! {
 }
 
 fn power_off() -> ! {
+    let off =
+        cmdline_param(pumasi_guest::EXIT_PARAM).as_deref() == Some(pumasi_guest::EXIT_POWER_OFF);
+    unsafe { libc::sync() };
+    // `pumasi_guest::DONE_LINE`: the host watches the console for it, in
+    // case the VM keeps running.
+    log("done");
     unsafe {
-        libc::sync();
         // With `reboot=k` (Firecracker) or `-no-reboot` (QEMU) a reboot
-        // ends the VMM process.
-        libc::reboot(libc::RB_AUTOBOOT);
+        // ends the VMM process; Virtualization.framework reboots the VM
+        // instead, so the vz backend asks for a power off.
+        libc::reboot(if off {
+            libc::RB_POWER_OFF
+        } else {
+            libc::RB_AUTOBOOT
+        });
     }
     loop {
         std::thread::park();

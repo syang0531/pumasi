@@ -485,7 +485,7 @@ plane starts (in its service definition); repeat it for more than one.
 Address lookup still publishes the signed address records to n0's DNS;
 on a LAN with no internet, `--net local` turns relays and lookup off.
 
-### Run the agent as a service
+### Run the agent, the control plane and the dashboard as services
 
 `pumasi agent join` runs in the foreground. To keep a machine in the
 cluster across reboots, install the agent as a service instead:
@@ -506,6 +506,37 @@ joined before. Options after `--` are passed to `pumasi agent start`.
 Logs go to the journal on Linux and to `~/.pumasi/logs/agent.log` on macOS
 and Windows. `pumasi service uninstall` removes the service; the machine
 stays a member (`pumasi remove-node` revokes it).
+
+The control plane and the dashboard (or the remote API) install the same
+way, so the cluster comes back after a reboot of its first machine:
+
+```sh
+sudo pumasi --home ~/.pumasi service install cluster -- --name homelab
+sudo pumasi --home ~/.pumasi service install ui -- --api-only
+pumasi service status          # every Pumasi service on this machine
+```
+
+- `cluster` runs `pumasi cluster start` (service `pumasi-cluster`, label
+  `pumasi.cluster`) and adds `--no-token`, so no join ticket lands in the
+  log at every start; make them with `pumasi token`. Stop a `cluster
+  start` running in a terminal first.
+- `ui` runs `pumasi ui` (service `pumasi-ui`) on 127.0.0.1:7400 unless
+  `--listen` says otherwise, without opening a browser. The dashboard's
+  sign-in link is written to `~/.pumasi/ui.url` when it starts.
+- A system service of these two runs as the owner of the home (`User=`
+  in systemd, `UserName` in launchd), so the admin ticket it writes stays
+  yours. Give `--home` before `service install`: under `sudo`, Pumasi uses
+  root's home unless told otherwise. On Windows they run as LocalSystem;
+  `pumasi-cluster` gets a firewall rule like the agent's.
+- `pumasi service uninstall cluster` (or `ui`) removes one; the cluster's
+  data stays.
+
+On macOS, `curl ... | sudo sh -s -- --ticket ...` installs the agent as a
+LaunchDaemon that runs as root with its state in root's home; the script
+runs `pumasi vm setup` first when the options include `--allow-microvm`.
+Use `sudo` for later commands about that agent (`sudo pumasi vm setup`,
+`sudo pumasi service status`). An agent installed this way by 1.1.0 or
+earlier keeps its state in `~/.pumasi`, owned by root.
 
 ### Upgrading every agent at once
 
@@ -1004,10 +1035,11 @@ defends against, including the API exposed to the internet.
 | --- | --- |
 | `pumasi cluster start [--name N] [--net public\|local] [--bind ADDR] [--relay URL] [--metrics-addr ADDR] [--keep-jobs 30d]` | Run the control plane. Creates the cluster on first run, keeps state in `~/.pumasi/cluster`. `--relay` uses your own iroh-relay instead of n0's; `--metrics-addr` serves Prometheus metrics; `--keep-jobs` is how long finished jobs are kept (`0`: forever). |
 | `pumasi token [--ttl 24h] [--uses N]` | Create a join ticket for another machine of yours. |
+| `pumasi token ls` / `pumasi token revoke ID\|TICKET` | List the join tickets and invites that can still be used (with the one `cluster start` printed), or cancel one. |
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-confidential] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-confidential` confidential jobs in SEV-SNP or TDX microVMs, `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
-| `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- AGENT OPTIONS]` | Run the agent as a service that starts at boot (systemd, launchd, Windows service). `status` and `uninstall` too. |
+| `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- OPTIONS]` | Run the agent (default), the control plane or the dashboard/API as a service that starts at boot (systemd, launchd, Windows service). `status [ROLE]` and `uninstall [ROLE]` too. |
 | `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
@@ -1310,7 +1342,7 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 18 and 19
 are only for trading with other clusters.
 

@@ -241,7 +241,7 @@ pumasi cluster start --name homelab --relay https://relay.example.com
 
 그러면 참가·관리자 티켓에 그 릴레이가 들어가서, 에이전트와 `pumasi login`, `pumasi ui`, 복제본이 옵션 없이 알아서 씁니다(에이전트에 `--relay`를 주면 그것이 우선). `--relay`는 컨트롤 플레인을 시작할 때마다(서비스 정의에) 주고, 여러 개면 반복합니다. 주소 조회는 여전히 서명된 주소 기록을 n0의 DNS에 올립니다. 인터넷이 없는 LAN에서는 `--net local`이 릴레이와 조회를 끕니다.
 
-### 에이전트를 서비스로 실행
+### 에이전트·컨트롤 플레인·대시보드를 서비스로 실행
 
 `pumasi agent join`은 터미널을 차지하고 돕니다. 재부팅해도 클러스터에 다시 붙게 하려면 서비스로 설치합니다.
 
@@ -257,6 +257,21 @@ pumasi service status
 | Windows | Windows 서비스 `pumasi-agent` (자동 시작, 실패 시 재시작) | 관리자 PowerShell 필요 |
 
 `--ticket`은 첫 시작 때 클러스터에 참가하고, 없으면 이미 참가한 기기여야 합니다. `--` 뒤의 옵션은 `pumasi agent start`로 넘어갑니다. 로그는 Linux는 journal, macOS와 Windows는 `~/.pumasi/logs/agent.log`입니다. `pumasi service uninstall`은 서비스만 지우고 멤버십은 남깁니다(퇴출은 `pumasi remove-node`).
+
+컨트롤 플레인과 대시보드(또는 원격 API)도 같은 방법으로 설치합니다. 그러면 1번 기기를 재부팅해도 클러스터가 다시 뜹니다.
+
+```sh
+sudo pumasi --home ~/.pumasi service install cluster -- --name homelab
+sudo pumasi --home ~/.pumasi service install ui -- --api-only
+pumasi service status          # 이 기기의 Pumasi 서비스 모두
+```
+
+- `cluster`는 `pumasi cluster start`를 돌리고(서비스 `pumasi-cluster`, launchd 레이블 `pumasi.cluster`), 시작할 때마다 참가 티켓이 로그에 남지 않도록 `--no-token`을 붙입니다. 참가 티켓은 `pumasi token`으로 만드세요. 터미널에서 돌던 `cluster start`는 먼저 멈춥니다.
+- `ui`는 `pumasi ui`를 돌립니다(서비스 `pumasi-ui`). `--listen`이 없으면 127.0.0.1:7400이고 브라우저는 열지 않습니다. 대시보드 로그인 링크는 시작할 때 `~/.pumasi/ui.url`에 씁니다.
+- 이 둘을 시스템 서비스로 설치하면 홈 디렉터리 소유자 계정으로 돕니다(systemd `User=`, launchd `UserName`). 그래서 관리자 티켓 파일이 계속 내 것입니다. `--home`은 `service install` 앞에 주세요. `sudo` 아래에서는 따로 말하지 않으면 root의 홈을 씁니다. Windows에서는 LocalSystem으로 돌고, `pumasi-cluster`에도 에이전트처럼 방화벽 규칙을 넣습니다.
+- `pumasi service uninstall cluster`(또는 `ui`)로 지웁니다. 클러스터 데이터는 남습니다.
+
+macOS에서 `curl ... | sudo sh -s -- --ticket ...`으로 설치하면 에이전트가 root로 도는 LaunchDaemon이 되고 상태는 root의 홈에 둡니다. 옵션에 `--allow-microvm`이 있으면 스크립트가 `pumasi vm setup`을 먼저 합니다. 그 에이전트에 대한 명령은 `sudo`로 하세요(`sudo pumasi vm setup`, `sudo pumasi service status`). 1.1.0 이하에서 이렇게 설치한 에이전트는 root 소유의 `~/.pumasi`를 계속 씁니다.
 
 ### 모든 에이전트를 한 번에 업그레이드
 
@@ -509,10 +524,11 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi audit ls` / `audit verify [--against HEAD]` / `audit export [--syslog udp://\|tcp://호스트:포트]` | 감사 로그 조회, 해시 체인 전체 검증과 서명된 끝, syslog(RFC 5424) 내보내기 |
 | `pumasi admin rotate` | 관리자 시크릿 교체: 기존 관리자 티켓은 모두 무효 |
 | `pumasi token [--ttl 24h] [--uses N]` | 내 다른 기기용 참가 티켓 발급 |
+| `pumasi token ls` / `pumasi token revoke ID\|티켓` | 아직 쓸 수 있는 참가 티켓과 초대 목록(`cluster start`가 출력한 것 포함), 또는 취소 |
 | `pumasi invite <계정> [--ttl 7d] [--uses 1] [--allow-docker]` | 다른 사람의 기기를 `계정` 몫으로 버는 제공자로 초대 |
 | `pumasi agent join <티켓> [--allow-docker] [--allow-microvm] [--allow-webgpu] [--no-gpus]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업, `--allow-webgpu`면 GPU를 쓰는 wasm 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`, 테스트용 `--webgpu-software`). `--no-gpus`가 아니면 GPU도 제공 |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | 이전에 참가한 클러스터에 티켓 없이 재접속 |
-| `pumasi service install [--ticket T] [--user\|--system] [--dry-run] [-- 에이전트 옵션]` | 부팅 시 시작하는 서비스로 에이전트 설치 (systemd, launchd, Windows 서비스). `status`, `uninstall`도 있음 |
+| `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- 옵션]` | 부팅 시 시작하는 서비스로 에이전트(기본), 컨트롤 플레인, 대시보드/API 설치 (systemd, launchd, Windows 서비스). `status [역할]`, `uninstall [역할]`도 있음 |
 | `pumasi upgrade rollout 파일... [--wait] [--force]` | 클러스터 키로 서명한 새 에이전트 바이너리를 노드에 배포. `upgrade status`로 노드별 상태, `upgrade cancel`로 중단 |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치. `--gpu-bundle`은 패스스루용 GPU 게스트 커널과 드라이버 추가 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
@@ -652,7 +668,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |

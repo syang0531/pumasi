@@ -1908,6 +1908,10 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
                 view: r.view(),
             })
         }
+        AdminOp::ListJoinTokens => Ok(AdminResponse::JoinTokens(inner.state().list_tokens())),
+        AdminOp::RevokeJoinToken { id } => Ok(AdminResponse::JoinTokens(vec![
+            inner.state().revoke_token(&id)?,
+        ])),
         AdminOp::ListAccess => Ok(AdminResponse::AccessList(inner.state().list_access())),
         AdminOp::RevokeAccess { id } => {
             Ok(AdminResponse::AccessList(inner.state().revoke_access(&id)?))

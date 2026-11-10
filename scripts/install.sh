@@ -155,6 +155,18 @@ case ":$PATH:" in
 esac
 
 if [ -n "$TICKET" ]; then
+  # microVM jobs need the guest kernel (and the VMM) in the same home the
+  # service uses: set it up first, as the same user.
+  for a in "$@"; do
+    if [ "$a" = --allow-microvm ]; then
+      say "setting up microVMs (pumasi vm setup)"
+      "$DIR/pumasi" vm setup || say "note: pumasi vm setup failed; microVM jobs wait until it is done (run it again as $(id -un))"
+      break
+    fi
+  done
   say "installing the agent service"
   "$DIR/pumasi" service install --ticket "$TICKET" -- "$@"
+  if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    say "note: the agent service runs as root; for commands about it (pumasi vm setup, service status) use sudo"
+  fi
 fi

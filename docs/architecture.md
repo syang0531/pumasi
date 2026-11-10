@@ -2007,8 +2007,8 @@ remotely; install a current binary on them once.
 - Phase 17 leftovers: no per-peer limit on unauthenticated sign-in calls
   at the control plane, the audit log is never pruned (pruning behind a
   signed checkpoint), no SCIM provisioning (people appear when they first
-  sign in and their sessions simply expire), no SAML, the control plane
-  has no service installer of its own. 1.0 was tagged after a green
+  sign in and their sessions simply expire), no SAML (1.2 added the
+  control plane's service installer, `pumasi service install cluster`). 1.0 was tagged after a green
   long-checks run on the tagged commit. The internal security review is done (threat
   model, "Internal review for 1.0"); no third-party audit yet.
 - Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker

@@ -98,6 +98,11 @@ if [ "$MODE" = service ]; then
   as_root "$AGENT_BIN" --home "$(nat "$AHOME")" service install --ticket "$TICKET" \
     -- --net local --name "$NODE" --slots 1
   as_root "$AGENT_BIN" --home "$(nat "$AHOME")" service status
+  if [ "$OS" = windows ]; then
+    # The firewall rule for direct connections, with a plain program path
+    # (netsh refuses \\?\ paths).
+    powershell -NoProfile -Command "\$p = (Get-NetFirewallRule -DisplayName 'Pumasi agent (UDP in)' -ErrorAction Stop | Get-NetFirewallApplicationFilter).Program; \$p; if (-not \$p -or \$p.StartsWith('\\\\?')) { exit 1 }"
+  fi
 else
   "$AGENT_BIN" --home "$(nat "$AHOME")" agent join "$TICKET" --net local --name "$NODE" --slots 1 \
     >"$WORK/agent.log" 2>&1 &

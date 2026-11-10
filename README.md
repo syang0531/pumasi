@@ -300,6 +300,33 @@ pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
 - The VMs and Docker CLIs an agent starts are kept in Windows Job Objects,
   so they end with the agent even if it crashes.
 
+#### Windows Smart App Control
+
+Pumasi's Windows binaries are not code-signed yet. Smart App Control in
+Windows 11 blocks unsigned programs that Microsoft's cloud service does not
+already know, so on a machine where it is on (not in evaluation mode):
+
+- running a newly downloaded `pumasi.exe` shows "Smart App Control blocked
+  an app that may be unsafe", and a service whose binary is blocked does not
+  start;
+- an agent offered a new binary by `pumasi upgrade rollout` tries it
+  (`--version`) before swapping it in, so it keeps running the old one, and
+  `pumasi upgrade status` says "Windows blocked the new binary: Smart App
+  Control or an App Control policy does not allow it". That node stays on
+  its version; nothing else breaks.
+
+To check, open Windows Security > App & browser control > Smart App Control
+settings, or look for event 3077 naming `pumasi.exe` in Event Viewer under
+Applications and Services Logs > Microsoft > Windows > CodeIntegrity >
+Operational. Until releases are signed, turn Smart App Control off on that
+machine and run `install.ps1` there again from an administrator PowerShell:
+it restarts the Pumasi services on the new binary. (A rollout does not offer
+a node a binary that already failed there.) `install.ps1` itself runs the
+download once before it replaces anything, so a blocked binary never
+replaces a working one. Windows 11 25H2 can turn Smart App Control back on
+later; older versions need a reset of Windows for that. Machines managed with App Control for Business or AppLocker need their
+administrator to allow `pumasi.exe` instead.
+
 ### Macs, old Intel ones too
 
 Any Mac from macOS 10.15 runs the agent, including the 2013-2014 Intel
@@ -1342,7 +1369,7 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 18 and 19
 are only for trading with other clusters.
 
@@ -1475,6 +1502,29 @@ cd crates/dashboard/e2e && npm ci && npx playwright install chromium && npx play
 and `pumasi ui --api-only` from the debug build (CI runs it in the
 dashboard job; it needs `curl`, `jq` and `unzip`). `crates/dashboard/tests/ui.rs`
 covers `--api-only` over TLS, the failed sign-in limit and `?wait=`.
+
+## Code signing policy
+
+Windows release binaries are being set up for signing (see
+[docs/signing.md](docs/signing.md)): free code signing provided by
+[SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org). Signed binaries are built only
+by this repository's release workflow on GitHub-hosted runners, from the
+tagged source, and each signing request is approved by hand.
+
+- Committers and reviewers: [syang0531](https://github.com/syang0531)
+- Approvers: [syang0531](https://github.com/syang0531)
+
+Privacy: Pumasi has no telemetry. This program will not transfer any
+information to other networked systems unless specifically requested by the
+user or the person installing or operating it. What the operator sets up
+does talk to other systems: the cluster's own machines; relay servers that
+connect machines on other networks (by default n0's public iroh relays,
+which see only encrypted traffic; `--relay` picks your own); container
+registries for the images jobs name; GitHub, the Firecracker project and
+the QEMU for Windows builds when `pumasi vm setup` or the install scripts
+download; AMD and Intel attestation services for confidential jobs; and
+webhooks and identity providers the cluster's configuration names.
 
 ## License
 

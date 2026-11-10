@@ -105,6 +105,17 @@ try {
     if ($got -ne $want) { throw "checksum mismatch for ${asset}: got $got, expected $want" }
     Write-Host "checksum ok ($got)"
 
+    # Try it before it replaces anything: Smart App Control and other
+    # application control policies block unsigned binaries at this point.
+    $newVersion = $null
+    try { $newVersion = & $exeTmp --version 2>&1 } catch { $newVersion = $_.Exception.Message }
+    if ($LASTEXITCODE -ne 0 -or -not ("$newVersion" -match '^pumasi ')) {
+        throw ("Windows did not run the downloaded pumasi.exe: $newVersion`n" +
+            'If Smart App Control is on (Windows Security > App & browser control), it blocks ' +
+            'unsigned programs, and Pumasi''s binaries are not code-signed yet. See ' +
+            '"Windows Smart App Control" in https://github.com/syang0531/pumasi#readme')
+    }
+
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
     $exe = Join-Path $Dir 'pumasi.exe'
     if (Test-Path $exe) {
@@ -123,6 +134,17 @@ try {
             [Environment]::SetEnvironmentVariable('Path', ($path.TrimEnd(';') + ";$Dir"), $scope)
             $env:Path = "$env:Path;$Dir"
             Write-Host "added $Dir to the $scope PATH (open a new terminal to use it)"
+        }
+    }
+
+    # Services keep running the old binary (renamed aside) until restarted.
+    if ($admin) {
+        foreach ($name in 'pumasi-cluster', 'pumasi-agent', 'pumasi-ui') {
+            $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') {
+                Write-Host "restarting the $name service"
+                Restart-Service -Name $name
+            }
         }
     }
 

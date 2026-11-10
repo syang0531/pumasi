@@ -1854,7 +1854,24 @@ async fn agent(
 /// The running binary, if the agent can replace it.
 fn own_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    Some(exe.canonicalize().unwrap_or(exe))
+    let exe = exe.canonicalize().unwrap_or(exe);
+    Some(if cfg!(windows) { plain_path(exe) } else { exe })
+}
+
+/// `C:\x` for Windows' verbatim `\\?\C:\x` (and `\\server\share` for
+/// `\\?\UNC\server\share`), which `canonicalize` returns there and which
+/// netsh firewall rules, among others, do not accept.
+fn plain_path(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        PathBuf::from(rest)
+    } else {
+        p
+    }
 }
 
 /// Runs the binary at `exe` again with this process's arguments.
@@ -3957,6 +3974,25 @@ fn utc(unix: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_windows_paths() {
+        let plain = |s: &str| plain_path(PathBuf::from(s)).to_string_lossy().into_owned();
+        assert_eq!(
+            plain(r"\\?\C:\Program Files\Pumasi\pumasi.exe"),
+            r"C:\Program Files\Pumasi\pumasi.exe"
+        );
+        assert_eq!(
+            plain(r"\\?\UNC\host\share\pumasi.exe"),
+            r"\\host\share\pumasi.exe"
+        );
+        assert_eq!(plain(r"C:\pumasi.exe"), r"C:\pumasi.exe");
+        assert_eq!(
+            plain(r"\\?\Volume{x}\pumasi.exe"),
+            r"\\?\Volume{x}\pumasi.exe"
+        );
+        assert_eq!(plain("/usr/local/bin/pumasi"), "/usr/local/bin/pumasi");
+    }
 
     #[test]
     fn utc_dates() {

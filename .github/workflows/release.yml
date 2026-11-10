@@ -1,8 +1,9 @@
 name: Release
 
-# A tag like v0.4.0 builds the pumasi binary for six platforms and publishes
-# them with SHA256SUMS, build provenance attestations and the install
-# scripts as a GitHub release. Pull requests that touch the release setup
+# A tag like v0.4.0 builds the pumasi binary for six platforms, signs the
+# Windows ones once SignPath is set up, and publishes them with SHA256SUMS,
+# build provenance attestations and the install scripts as a GitHub
+# release. Pull requests that touch the release setup
 # run the builds without publishing.
 
 on:
@@ -174,6 +175,11 @@ jobs:
               [ "$(printf '%s\n' "GLIBC_${{ matrix.glibc }}" "$newest" | sort -V | tail -n1)" = "GLIBC_${{ matrix.glibc }}" ]
               ;;
             macos-*) vtool -show-build "$bin" | tee /dev/stderr | grep -Eq "(minos|version) ${{ matrix.minos }}( |$)" ;;
+            windows-*)
+              # Product name and version in the file's properties, which
+              # code signing checks.
+              powershell -NoProfile -Command "\$v = (Get-Item '$bin').VersionInfo; \$v | Format-List ProductName, ProductVersion, FileVersion; if (\$v.ProductName -ne 'Pumasi' -or -not \$v.ProductVersion) { exit 1 }"
+              ;;
           esac
       - name: The Linux binary loads GPU drivers (WebGPU on lavapipe)
         if: matrix.native && runner.os == 'Linux'
@@ -188,8 +194,59 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
-  publish:
+  # Authenticode signatures for the Windows binaries, from SignPath's free
+  # code signing for open source (docs/signing.md), so Smart App Control
+  # and SmartScreen let them run. Runs for tags once the repository
+  # variable SIGNPATH_ORGANIZATION_ID and the secret SIGNPATH_API_TOKEN are
+  # set; until then releases ship unsigned. Each request waits for an
+  # approver to approve it in SignPath.
+  sign:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_ORGANIZATION_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: unsigned
+          pattern: pumasi-windows-*
+          merge-multiple: true
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-unsigned
+          path: unsigned/
+          if-no-files-found: error
+      - uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'pumasi' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 17400
+          output-artifact-directory: signed
+      - name: Check the signatures
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends osslsigncode
+          for f in unsigned/pumasi-windows-*.exe; do
+            s="signed/$(basename "$f")"
+            osslsigncode verify -in "$s" | tee /dev/stderr | grep -q "SignPath Foundation"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-signed
+          path: signed/
+          if-no-files-found: error
+
+  publish:
+    needs: [build, sign]
+    # After an unsigned build too: `sign` is skipped until SignPath is set up.
+    if: always() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -203,6 +260,16 @@ jobs:
           # The binaries, not the guest init artifacts they embed.
           pattern: pumasi-*
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        if: needs.sign.result == 'success'
+        with:
+          name: windows-signed
+          path: signed
+      - name: Use the signed Windows binaries
+        if: needs.sign.result == 'success'
+        run: |
+          cp signed/pumasi-windows-*.exe dist/
+          ls -l dist
       - name: Check build markers
         run: |
           # A tag build carries the tag's version; any other build the crate

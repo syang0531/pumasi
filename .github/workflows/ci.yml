@@ -611,6 +611,18 @@ jobs:
           ./scripts/install.ps1 -BaseUrl $rel -Dir $inst -NoPath
           $v = & (Join-Path $inst 'pumasi.exe') --version
           if ($v -notmatch 'ci-new') { throw "unexpected version $v" }
+          # The installed binary takes the install folder's permissions, not
+          # those of the temp folder it was downloaded to (same volume, as
+          # with Program Files on C:). Everyone is in the folder's ACL only.
+          $acl = Join-Path ([IO.Path]::GetTempPath()) ('pumasi-acl-' + [Guid]::NewGuid())
+          New-Item -ItemType Directory $acl | Out-Null
+          icacls $acl /grant '*S-1-1-0:(OI)(CI)RX' | Out-Null
+          ./scripts/install.ps1 -BaseUrl $rel -Dir $acl -NoPath
+          $everyone = (Get-Acl (Join-Path $acl 'pumasi.exe')).Access | Where-Object {
+            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-1-0'
+          }
+          if (-not $everyone) { icacls (Join-Path $acl 'pumasi.exe'); throw 'pumasi.exe did not inherit the install folder permissions' }
+          Remove-Item -Recurse -Force $acl
           Add-Content (Join-Path $rel 'pumasi-windows-x86_64.exe') 'tampered'
           $failed = $false
           try { ./scripts/install.ps1 -BaseUrl $rel -Dir (Join-Path $env:RUNNER_TEMP 'inst2') -NoPath } catch { $failed = $true }

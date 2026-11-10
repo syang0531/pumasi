@@ -396,7 +396,12 @@ async fn smoke_test(new: &Path, version: &str) -> Result<()> {
     )
     .await
     .context("new binary did not answer --version in time")?
-    .with_context(|| format!("could not run the new binary {}", new.display()))?;
+    .map_err(|e| match e.raw_os_error().and_then(windows_block) {
+        Some(why) => anyhow::anyhow!("{why} ({e})"),
+        None => {
+            anyhow::Error::new(e).context(format!("could not run the new binary {}", new.display()))
+        }
+    })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     ensure!(
         out.status.success(),
@@ -410,6 +415,30 @@ async fn smoke_test(new: &Path, version: &str) -> Result<()> {
         stdout.trim()
     );
     Ok(())
+}
+
+/// Why Windows refused to start a binary, for the OS errors its
+/// application control gives: Smart App Control and App Control for
+/// Business (`ERROR_SYSTEM_INTEGRITY_*`), AppLocker or software restriction
+/// policies (`ERROR_ACCESS_DISABLED_BY_POLICY`), and Defender
+/// (`ERROR_VIRUS_INFECTED`). `None` elsewhere and for other errors.
+fn windows_block(code: i32) -> Option<&'static str> {
+    if !cfg!(windows) {
+        return None;
+    }
+    match code {
+        4550..=4580 => Some(
+            "Windows blocked the new binary: Smart App Control or an App Control policy \
+             does not allow it (Pumasi's Windows binaries are not code-signed yet). \
+             See \"Windows Smart App Control\" in the README",
+        ),
+        1260 => Some(
+            "Windows blocked the new binary: an AppLocker or software restriction policy \
+             does not allow it. Ask the machine's administrator to allow pumasi.exe",
+        ),
+        225 => Some("Windows Defender quarantined the new binary as a threat"),
+        _ => None,
+    }
 }
 
 fn previous_name() -> &'static str {
@@ -591,6 +620,17 @@ mod tests {
                 .failed_before(&sha256(b"crashy binary"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn names_windows_application_control() {
+        let sac = windows_block(4551);
+        assert_eq!(sac.is_some(), cfg!(windows));
+        if let Some(why) = sac {
+            assert!(why.contains("Smart App Control"));
+        }
+        assert_eq!(windows_block(1260).is_some(), cfg!(windows));
+        assert!(windows_block(2).is_none());
     }
 
     #[cfg(unix)]

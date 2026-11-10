@@ -140,6 +140,15 @@ pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
 - `pumasi service install`은 사설·도메인 네트워크에서 에이전트가 UDP를 받도록 방화벽 규칙을 추가해, 릴레이 대신 직접 연결되게 합니다. `service uninstall`이 규칙을 지웁니다. Windows가 공용(Public)으로 분류한 네트워크에서는 릴레이로 연결되며, 넓히려면 `netsh advfirewall firewall set rule name="Pumasi agent (UDP in)" new profile=any`.
 - 에이전트가 띄운 VM과 Docker CLI는 Windows Job Object에 묶여, 에이전트가 비정상 종료해도 함께 끝납니다.
 
+#### Windows 스마트 앱 컨트롤 (Smart App Control)
+
+Pumasi의 Windows 바이너리는 아직 코드 서명이 없습니다. Windows 11의 스마트 앱 컨트롤은 Microsoft 클라우드가 모르는 서명 없는 프로그램을 막기 때문에, 이 기능이 켜진(평가 모드가 아닌) 기기에서는:
+
+- 새로 받은 `pumasi.exe`를 실행하면 "스마트 앱 컨트롤이 안전하지 않을 수 있는 앱을 차단했습니다"가 뜨고, 바이너리가 막힌 서비스는 시작하지 않습니다.
+- `pumasi upgrade rollout`으로 새 바이너리를 받은 에이전트는 바꾸기 전에 실행해 보므로(`--version`) 이전 바이너리로 계속 돌고, `pumasi upgrade status`에 "Windows blocked the new binary: Smart App Control or an App Control policy does not allow it"가 나옵니다. 그 노드만 이전 버전에 머물고 다른 문제는 없습니다.
+
+확인은 Windows 보안 > 앱 및 브라우저 컨트롤 > 스마트 앱 컨트롤 설정, 또는 이벤트 뷰어의 응용 프로그램 및 서비스 로그 > Microsoft > Windows > CodeIntegrity > Operational에서 `pumasi.exe`가 적힌 이벤트 3077로 합니다. 릴리스에 서명이 들어가기 전까지는 그 기기에서 스마트 앱 컨트롤을 끄고 관리자 PowerShell에서 `install.ps1`을 다시 실행하세요. 실행 중인 Pumasi 서비스를 새 바이너리로 재시작합니다(그 노드에서 한 번 실패한 바이너리는 배포가 다시 시도하지 않습니다). `install.ps1`은 받은 바이너리를 바꾸기 전에 한 번 실행해 보므로, 막힌 바이너리가 돌던 바이너리를 덮어쓰지 않습니다. Windows 11 25H2는 나중에 다시 켤 수 있고, 그 전 버전은 Windows를 초기화해야 다시 켤 수 있습니다. App Control for Business나 AppLocker로 관리되는 기기는 관리자가 `pumasi.exe`를 허용해야 합니다.
+
 ### Mac, 구형 Intel Mac까지
 
 macOS 10.15 이상이면 어떤 Mac이든 에이전트를 돌릴 수 있습니다. 마지막 macOS가 10.15·11·12인 2013~2014년 Intel 기종도 포함됩니다.
@@ -668,7 +677,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -693,6 +702,15 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 19 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 예정 |
 
 알려진 한계: 파일 저장소의 데이터는 쓰기마다가 아니라 30초마다 다른 컨트롤 플레인 복제본에 복사되므로, 리더가 죽기 직전에 올린 파일은 그 리더가 돌아올 때까지 없을 수 있습니다. `pumasi upgrade rollout`으로 올린 에이전트 바이너리는 받은 복제본에만 있습니다(장애 전환 뒤에는 다시 배포). 이번 릴리스보다 오래된 에이전트는 처음 참가한 복제본만 따라갑니다. CU는 실제 결제와 연결되어 있지 않습니다. SSO로 로그인할 수 있지만 SCIM·SAML은 없고, 세션이 끝나거나 회수되기 전에는 사람이 자동으로 빠지지 않습니다. 감사 로그는 지우지 않고 계속 쌓이며, 컨트롤 플레인은 인증 없는 로그인 호출을 피어별로 제한하지 않습니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 WebGPU로만 씁니다. WebGPU는 실험 기능입니다. CI에서는 소프트웨어 래스터라이저로, 실제 GPU는 손으로 확인하며, 컴퓨트 셰이더만 되고(텍스처·샘플러 없음, 바인드 그룹 하나, f16 없음), 폭주하는 셰이더는 작업 제한 시간이 아니라 GPU 드라이버의 감시 타이머가 멈추고, WebGPU용 GPU 챌린지는 아직 없습니다. microVM 네트워크는 QEMU가 있어야 하고(Firecracker만으로는 안 되고 Virtualization.framework도 아직) TCP와 DNS만 넘깁니다. 파일 저장소는 컨트롤 플레인에만 있습니다(소유자 노드 복제본과 S3 호환 게이트웨이는 아직 없음). 노드 간 지연·대역폭은 아직 재지 않습니다(노드와 컨트롤 플레인 사이 왕복 시간만). microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows x86_64) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, ARM Windows는 아직 microVM이 없습니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. microVM 태스크 출력은 끝날 때에야 `pumasi logs`에 나타나고(게스트가 출력 디스크에 쓰기 때문), Intel·Apple GPU는 지표가 없고 Windows 노드는 온도를 보고하지 않으며, 최근 1시간의 10초 단위 지표는 컨트롤 플레인을 다시 시작하면 사라집니다. 대시보드는 요금과 경보 규칙을 보여 주기만 하고 바꾸지는 않으며(CLI와 `apply`로 바꿈), 로그인 세션을 메모리에만 두므로 `pumasi ui`를 다시 시작하면 모두 로그아웃됩니다. 원격 API에는 터널이나 인증서 갱신이 내장되어 있지 않고(Cloudflare Tunnel, 리버스 프록시, certbot이 맡음, CLI용 iroh 프록시도 아직 없음), 인증 실패 횟수는 `pumasi ui` 프로세스마다 따로 세며, Cloudflare를 거친 업로드는 요금제의 본문 한도에서 멈추고, `?wait=`는 컨트롤 플레인을 폴링해 작업을 따라갑니다. Docker 안의 그리기는 실제 GPU에서 손으로 확인합니다. Linux 호스트의 EEVEE는 Xvfb 아래에서 돌아 이미지가 GPU 디스플레이를 따로 가져오지 않는 한 CPU로 그립니다(Cycles는 상관없음).
+
+## 코드 서명 정책 (Code signing policy)
+
+Windows 릴리스 바이너리에 서명을 붙이는 중입니다([docs/signing.md](docs/signing.md)). Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org). 서명되는 바이너리는 이 저장소의 릴리스 워크플로가 GitHub 호스팅 러너에서 태그된 소스로만 빌드하고, 서명 요청마다 사람이 승인합니다.
+
+- 커미터·리뷰어: [syang0531](https://github.com/syang0531)
+- 승인자: [syang0531](https://github.com/syang0531)
+
+개인정보: Pumasi에는 원격 측정(telemetry)이 없습니다. 이 프로그램은 사용자나 설치·운영하는 사람이 요청하지 않는 한 다른 네트워크 시스템에 어떤 정보도 보내지 않습니다. 운영자가 설정한 것은 다른 시스템과 통신합니다: 클러스터의 기기들, 다른 네트워크의 기기를 잇는 릴레이 서버(기본은 n0의 공개 iroh 릴레이이며 암호화된 트래픽만 봄, `--relay`로 직접 운영하는 릴레이 지정), 작업이 지정한 이미지의 컨테이너 레지스트리, `pumasi vm setup`과 설치 스크립트가 받는 GitHub·Firecracker·Windows용 QEMU 배포처, 기밀 작업의 AMD·Intel 증명 서비스, 클러스터 설정에 적은 웹훅과 ID 공급자.
 
 ## 라이선스
 

@@ -615,6 +615,16 @@ jobs:
           $failed = $false
           try { ./scripts/install.ps1 -BaseUrl $rel -Dir (Join-Path $env:RUNNER_TEMP 'inst2') -NoPath } catch { $failed = $true }
           if (-not $failed) { throw 'a tampered binary was installed' }
+          # A binary Windows will not run (as when Smart App Control blocks
+          # it) is refused before it replaces the installed one.
+          Set-Content (Join-Path $rel 'pumasi-windows-x86_64.exe') 'not a program'
+          $h = (Get-FileHash -Algorithm SHA256 (Join-Path $rel 'pumasi-windows-x86_64.exe')).Hash.ToLower()
+          Set-Content (Join-Path $rel 'SHA256SUMS') "$h  pumasi-windows-x86_64.exe"
+          $failed = $false
+          try { ./scripts/install.ps1 -BaseUrl $rel -Dir $inst -NoPath } catch { $failed = $true; "refused: $_" }
+          if (-not $failed) { throw 'a binary that does not run was installed' }
+          $v = & (Join-Path $inst 'pumasi.exe') --version
+          if ($v -notmatch 'ci-new') { throw "the installed binary was replaced: $v" }
       - name: Install as a service, restart, roll out the new binary, uninstall
         shell: bash
         run: |

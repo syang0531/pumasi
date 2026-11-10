@@ -892,6 +892,10 @@ curl -H "Authorization: Bearer $PUMASI_TICKET" -o out.zip "https://pumasi.exampl
 [docs/api.md](docs/api.md) walks through it with curl examples that CI
 runs against a real cluster, including the Cloudflare Tunnel setup and
 its limits (100 MB request bodies on the free plan).
+[`examples/remote-client/pumasi-remote`](examples/remote-client) does
+submit, wait and download in one command, and the same page shows how a
+Claude Code cloud session (HTTPS proxy only, the ticket added by a
+network secret) uses a home cluster this way.
 
 **Blender and other GPU drawing.** CUDA jobs need only `gpus = 1`. Jobs
 that draw (Blender EEVEE, OpenGL or Vulkan renderers) add `capabilities

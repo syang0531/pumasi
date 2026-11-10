@@ -301,7 +301,7 @@ pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
   so they end with the agent even if it crashes.
 - `install.ps1` up to 1.2.1 left `pumasi.exe` usable only by SYSTEM,
   Administrators and the account that installed it, so another account
-  got "Access is denied" running it (the service was fine). Run
+  got "Access is denied" running it (the service was fine). Run a newer
   `install.ps1` again, or in an administrator PowerShell:
   `icacls "C:\Program Files\Pumasi\pumasi.exe" /reset`.
 

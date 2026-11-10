@@ -1,13 +1,13 @@
-//! `pumasi service`: run the agent as an OS service that starts at boot
-//! and restarts when it stops (systemd on Linux, launchd on macOS, the
-//! service manager on Windows).
+//! `pumasi service`: run the agent, the control plane or the dashboard/API
+//! as an OS service that starts at boot and restarts when it stops
+//! (systemd on Linux, launchd on macOS, the service manager on Windows).
 //!
-//! The service runs `pumasi --home <home> agent start <agent args>` (on
-//! Windows `... service run -- <agent args>`, which speaks the service
-//! control protocol). When the agent installs an upgrade it restarts in
-//! place: `exec` on Unix, and on Windows the service exits with
-//! [`RESTART_EXIT_CODE`], which the failure actions set at install turn
-//! into a restart.
+//! The service runs `pumasi --home <home> agent start <args>` (or
+//! `cluster start`, or `ui`; on Windows `... service run --role <role> --
+//! <args>`, which speaks the service control protocol). When the agent
+//! installs an upgrade it restarts in place: `exec` on Unix, and on
+//! Windows the service exits with [`RESTART_EXIT_CODE`], which the failure
+//! actions set at install turn into a restart.
 
 use std::path::{Path, PathBuf};
 
@@ -18,18 +18,95 @@ use clap::{Args, Subcommand};
 /// rollback). `EX_TEMPFAIL` from sysexits.h.
 pub const RESTART_EXIT_CODE: i32 = 75;
 
-// launchd uses its own label (`pumasi.agent`).
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-const NAME: &str = "pumasi-agent";
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const LAUNCHD_LABEL: &str = "pumasi.agent";
+/// What a service runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Role {
+    /// The node agent (`pumasi agent start`).
+    Agent,
+    /// The control plane (`pumasi cluster start`).
+    Cluster,
+    /// The dashboard or, with `-- --api-only`, the remote API (`pumasi ui`).
+    Ui,
+}
+
+impl Role {
+    pub const ALL: [Role; 3] = [Role::Agent, Role::Cluster, Role::Ui];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Agent => "agent",
+            Role::Cluster => "cluster",
+            Role::Ui => "ui",
+        }
+    }
+
+    /// The service's name: systemd unit and Windows service.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Agent => "pumasi-agent",
+            Role::Cluster => "pumasi-cluster",
+            Role::Ui => "pumasi-ui",
+        }
+    }
+
+    /// The launchd label.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn label(self) -> &'static str {
+        match self {
+            Role::Agent => "pumasi.agent",
+            Role::Cluster => "pumasi.cluster",
+            Role::Ui => "pumasi.ui",
+        }
+    }
+
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    fn title(self) -> &'static str {
+        match self {
+            Role::Agent => "Pumasi agent",
+            Role::Cluster => "Pumasi control plane",
+            Role::Ui => "Pumasi dashboard",
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn description(self) -> &'static str {
+        match self {
+            Role::Agent => "Contributes this machine to a Pumasi cluster.",
+            Role::Cluster => "Runs the control plane of a Pumasi cluster.",
+            Role::Ui => "Serves the Pumasi dashboard or remote API.",
+        }
+    }
+
+    /// The log file, where the service manager does not keep logs itself
+    /// (launchd, Windows).
+    pub fn log_file(self, home: &Path) -> PathBuf {
+        home.join("logs").join(format!("{}.log", self.as_str()))
+    }
+
+    /// The subcommand the service runs.
+    fn command(self) -> &'static [&'static str] {
+        match self {
+            Role::Agent => &["agent", "start"],
+            Role::Cluster => &["cluster", "start"],
+            Role::Ui => &["ui"],
+        }
+    }
+}
 
 #[derive(Subcommand)]
 pub enum ServiceCmd {
-    /// Install and start the agent as a service that starts at boot. The
-    /// machine must have joined a cluster before, or pass --ticket.
+    /// Install and start a service that starts at boot: the agent
+    /// (default), the control plane (`cluster`) or the dashboard or
+    /// remote API (`ui`). For the agent, the machine must have joined a
+    /// cluster before, or pass --ticket.
     Install {
-        /// Join the cluster with this ticket when the service first starts.
+        /// What the service runs: `agent`, `cluster` (`pumasi cluster
+        /// start`) or `ui` (`pumasi ui`).
+        #[arg(value_enum, default_value_t = Role::Agent)]
+        role: Role,
+        /// Agent only: join the cluster with this ticket when the service
+        /// first starts.
         #[arg(long)]
         ticket: Option<String>,
         #[command(flatten)]
@@ -37,26 +114,36 @@ pub enum ServiceCmd {
         /// Print the service definition instead of installing it.
         #[arg(long)]
         dry_run: bool,
-        /// Options for the agent, as for `pumasi agent start`, after `--`
-        /// (for example `-- --allow-microvm --auto-upgrade`).
+        /// Options for the command the service runs, after `--`: as for
+        /// `pumasi agent start` (`-- --allow-microvm --auto-upgrade`),
+        /// `pumasi cluster start` (`-- --name home`) or `pumasi ui`
+        /// (`-- --api-only`).
         #[arg(last = true)]
-        agent_args: Vec<String>,
+        args: Vec<String>,
     },
-    /// Stop and remove the service. The machine stays a cluster member.
+    /// Stop and remove a service. An agent's machine stays a cluster
+    /// member; a control plane keeps its data.
     Uninstall {
+        #[arg(value_enum, default_value_t = Role::Agent)]
+        role: Role,
         #[command(flatten)]
         scope: ScopeArgs,
     },
-    /// Show whether the service is installed and running.
+    /// Show whether a service is installed and running (without a role,
+    /// every Pumasi service installed here).
     Status {
+        #[arg(value_enum)]
+        role: Option<Role>,
         #[command(flatten)]
         scope: ScopeArgs,
     },
     /// Entry point the Windows service manager runs.
     #[command(hide = true)]
     Run {
+        #[arg(long, value_enum, default_value_t = Role::Agent)]
+        role: Role,
         #[arg(last = true)]
-        agent_args: Vec<String>,
+        args: Vec<String>,
     },
 }
 
@@ -115,9 +202,13 @@ fn is_root() -> bool {
 
 /// What the service runs.
 pub struct Spec {
+    pub role: Role,
     pub exe: PathBuf,
     pub home: PathBuf,
-    pub agent_args: Vec<String>,
+    pub args: Vec<String>,
+    /// The account a system service runs as (Linux, macOS); `None` for
+    /// root.
+    pub user: Option<String>,
 }
 
 impl Spec {
@@ -128,17 +219,56 @@ impl Spec {
             self.home.to_string_lossy().into_owned(),
         ];
         if cfg!(windows) {
-            a.extend(["service".into(), "run".into(), "--".into()]);
+            a.extend([
+                "service".into(),
+                "run".into(),
+                "--role".into(),
+                self.role.as_str().into(),
+                "--".into(),
+            ]);
         } else {
-            a.extend(["agent".into(), "start".into()]);
+            a.extend(self.role.command().iter().map(|s| s.to_string()));
         }
-        a.extend(self.agent_args.iter().cloned());
+        a.extend(self.args.iter().cloned());
         a
     }
 
     fn log_file(&self) -> PathBuf {
-        self.home.join("logs").join("agent.log")
+        self.role.log_file(&self.home)
     }
+}
+
+/// The account that owns `home` (or its nearest existing parent), which a
+/// system control plane or dashboard runs as so the files it writes (the
+/// admin ticket) stay readable by that user. `None` when root owns it.
+#[cfg(unix)]
+pub fn home_owner(home: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = home
+        .ancestors()
+        .find_map(|p| std::fs::metadata(p).ok())?
+        .uid();
+    if uid == 0 {
+        return None;
+    }
+    // SAFETY: getpwuid returns a pointer to static storage or null; it is
+    // read at once, before any other call that could reuse it.
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return Some(uid.to_string());
+        }
+        Some(
+            std::ffi::CStr::from_ptr((*pw).pw_name)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+#[cfg(not(unix))]
+pub fn home_owner(_home: &Path) -> Option<String> {
+    None
 }
 
 /// Makes a path absolute without resolving symlinks it may not have yet.
@@ -150,16 +280,43 @@ pub fn absolute(p: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Whether a system service (rather than a user one) would be installed.
+pub fn is_system(scope: ScopeArgs) -> bool {
+    cfg!(windows) || scope.resolve() == Scope::System
+}
+
 pub fn install(spec: &Spec, scope: ScopeArgs, dry_run: bool) -> Result<i32> {
     imp::install(spec, scope, dry_run)
 }
 
-pub fn uninstall(scope: ScopeArgs) -> Result<i32> {
-    imp::uninstall(scope)
+pub fn uninstall(role: Role, scope: ScopeArgs) -> Result<i32> {
+    imp::uninstall(role, scope)
 }
 
-pub fn status(scope: ScopeArgs) -> Result<i32> {
-    imp::status(scope)
+/// Exit code 0 when the service runs, 3 when it is not installed or
+/// stopped; without a role, 0 when every installed one runs.
+pub fn status(role: Option<Role>, scope: ScopeArgs) -> Result<i32> {
+    if let Some(role) = role {
+        return imp::status(role, scope, true);
+    }
+    let mut any = false;
+    let mut all_running = true;
+    for role in Role::ALL {
+        if !imp::installed(role, scope)? {
+            continue;
+        }
+        if any {
+            println!();
+        }
+        any = true;
+        println!("{}:", role.as_str());
+        all_running &= imp::status(role, scope, false)? == 0;
+    }
+    if !any {
+        println!("no Pumasi service is installed");
+        return Ok(3);
+    }
+    Ok(if all_running { 0 } else { 3 })
 }
 
 fn run_cmd(program: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -211,24 +368,37 @@ fn systemd_unit(spec: &Spec, user: bool) -> String {
         exec.push(' ');
         exec.push_str(&systemd_quote(&a));
     }
+    let after = match spec.role {
+        // A dashboard on the control plane's machine starts after it.
+        Role::Ui => " pumasi-cluster.service",
+        _ => "",
+    };
+    let run_as = match (&spec.user, user) {
+        (Some(u), false) => format!("User={u}\n"),
+        _ => String::new(),
+    };
+    let kill = match spec.role {
+        Role::Agent => "# Stopping the service also stops its tasks (containers, microVMs).\n",
+        _ => "",
+    };
     format!(
         "[Unit]
-Description=Pumasi node agent
+Description={}
 Wants=network-online.target
-After=network-online.target
+After=network-online.target{after}
 
 [Service]
 ExecStart={exec}
-Environment=PUMASI_LOG=pumasi=info,openraft=error,warn
+{run_as}Environment=PUMASI_LOG=pumasi=info,openraft=error,warn
 Restart=always
 RestartSec=5
-# Stopping the service also stops its tasks (containers, microVMs).
-KillMode=control-group
+{kill}KillMode=control-group
 TimeoutStopSec=30
 
 [Install]
 WantedBy={}
 ",
+        spec.role.title(),
         if user {
             "default.target"
         } else {
@@ -241,15 +411,16 @@ WantedBy={}
 mod imp {
     use super::*;
 
-    fn unit_path(scope: Scope) -> Result<PathBuf> {
+    fn unit_path(role: Role, scope: Scope) -> Result<PathBuf> {
+        let name = role.name();
         Ok(match scope {
-            Scope::System => PathBuf::from(format!("/etc/systemd/system/{NAME}.service")),
+            Scope::System => PathBuf::from(format!("/etc/systemd/system/{name}.service")),
             Scope::User => {
                 let config = std::env::var_os("XDG_CONFIG_HOME")
                     .map(PathBuf::from)
                     .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
                     .context("cannot find the user's config directory")?;
-                config.join("systemd/user").join(format!("{NAME}.service"))
+                config.join("systemd/user").join(format!("{name}.service"))
             }
         })
     }
@@ -264,22 +435,27 @@ mod imp {
     }
 
     /// The scope given, or the one whose unit file exists.
-    fn installed_scope(scope: ScopeArgs) -> Result<Scope> {
+    fn installed_scope(role: Role, scope: ScopeArgs) -> Result<Scope> {
         if let Some(s) = scope.explicit() {
             return Ok(s);
         }
         for s in [Scope::System, Scope::User] {
-            if unit_path(s)?.exists() {
+            if unit_path(role, s)?.exists() {
                 return Ok(s);
             }
         }
         Ok(scope.resolve())
     }
 
+    pub fn installed(role: Role, scope: ScopeArgs) -> Result<bool> {
+        Ok(unit_path(role, installed_scope(role, scope)?)?.exists())
+    }
+
     pub fn install(spec: &Spec, scope: ScopeArgs, dry_run: bool) -> Result<i32> {
         let scope = scope.resolve();
         let unit = systemd_unit(spec, scope == Scope::User);
-        let path = unit_path(scope)?;
+        let path = unit_path(spec.role, scope)?;
+        let name = spec.role.name();
         if dry_run {
             println!("# {}", path.display());
             print!("{unit}");
@@ -295,8 +471,8 @@ mod imp {
             )
         })?;
         systemctl(scope, &["daemon-reload"])?;
-        systemctl(scope, &["enable", &format!("{NAME}.service")])?;
-        systemctl(scope, &["restart", &format!("{NAME}.service")])?;
+        systemctl(scope, &["enable", &format!("{name}.service")])?;
+        systemctl(scope, &["restart", &format!("{name}.service")])?;
         println!("installed {} and started it", path.display());
         if scope == Scope::User {
             // Without lingering a user service starts only at login.
@@ -311,35 +487,38 @@ mod imp {
             }
         }
         println!(
-            "logs: journalctl {}-u {NAME} -f",
+            "logs: journalctl {}-u {name} -f",
             if scope == Scope::User { "--user " } else { "" }
         );
         Ok(0)
     }
 
-    pub fn uninstall(scope: ScopeArgs) -> Result<i32> {
-        let scope = installed_scope(scope)?;
-        let path = unit_path(scope)?;
+    pub fn uninstall(role: Role, scope: ScopeArgs) -> Result<i32> {
+        let scope = installed_scope(role, scope)?;
+        let path = unit_path(role, scope)?;
         if !path.exists() {
             println!("not installed ({} does not exist)", path.display());
             return Ok(0);
         }
-        let _ = systemctl(scope, &["disable", "--now", &format!("{NAME}.service")]);
+        let _ = systemctl(
+            scope,
+            &["disable", "--now", &format!("{}.service", role.name())],
+        );
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         systemctl(scope, &["daemon-reload"])?;
         println!("removed {}", path.display());
         Ok(0)
     }
 
-    pub fn status(scope: ScopeArgs) -> Result<i32> {
-        let scope = installed_scope(scope)?;
-        let path = unit_path(scope)?;
+    pub fn status(role: Role, scope: ScopeArgs, _named: bool) -> Result<i32> {
+        let scope = installed_scope(role, scope)?;
+        let path = unit_path(role, scope)?;
         if !path.exists() {
             println!("not installed");
             return Ok(3);
         }
         let mut args = vec!["show", "-p", "ActiveState,SubState,MainPID,UnitFileState"];
-        let unit = format!("{NAME}.service");
+        let unit = format!("{}.service", role.name());
         args.push(&unit);
         let show = systemctl(scope, &args)?;
         let get = |k: &str| {
@@ -378,7 +557,7 @@ fn xml_escape(s: &str) -> String {
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn launchd_plist(spec: &Spec) -> String {
+fn launchd_plist(spec: &Spec, system: bool) -> String {
     let mut args = format!(
         "        <string>{}</string>\n",
         xml_escape(&spec.exe.to_string_lossy())
@@ -387,14 +566,22 @@ fn launchd_plist(spec: &Spec) -> String {
         args.push_str(&format!("        <string>{}</string>\n", xml_escape(&a)));
     }
     let log = xml_escape(&spec.log_file().to_string_lossy());
+    let label = spec.role.label();
+    let run_as = match (&spec.user, system) {
+        (Some(u), true) => format!(
+            "    <key>UserName</key>\n    <string>{}</string>\n",
+            xml_escape(u)
+        ),
+        _ => String::new(),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{LAUNCHD_LABEL}</string>
-    <key>ProgramArguments</key>
+    <string>{label}</string>
+{run_as}    <key>ProgramArguments</key>
     <array>
 {args}    </array>
     <key>EnvironmentVariables</key>
@@ -422,14 +609,15 @@ fn launchd_plist(spec: &Spec) -> String {
 mod imp {
     use super::*;
 
-    fn plist_path(scope: Scope) -> Result<PathBuf> {
+    fn plist_path(role: Role, scope: Scope) -> Result<PathBuf> {
+        let label = role.label();
         Ok(match scope {
-            Scope::System => PathBuf::from(format!("/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist")),
+            Scope::System => PathBuf::from(format!("/Library/LaunchDaemons/{label}.plist")),
             Scope::User => {
                 let home = std::env::var_os("HOME").context("HOME is not set")?;
                 PathBuf::from(home)
                     .join("Library/LaunchAgents")
-                    .join(format!("{LAUNCHD_LABEL}.plist"))
+                    .join(format!("{label}.plist"))
             }
         })
     }
@@ -442,20 +630,24 @@ mod imp {
         }
     }
 
-    fn installed_scope(scope: ScopeArgs) -> Result<Scope> {
+    fn installed_scope(role: Role, scope: ScopeArgs) -> Result<Scope> {
         if let Some(s) = scope.explicit() {
             return Ok(s);
         }
         for s in [Scope::System, Scope::User] {
-            if plist_path(s)?.exists() {
+            if plist_path(role, s)?.exists() {
                 return Ok(s);
             }
         }
         Ok(scope.resolve())
     }
 
-    fn unload(scope: Scope, path: &Path) {
-        let target = format!("{}/{LAUNCHD_LABEL}", domain(scope));
+    pub fn installed(role: Role, scope: ScopeArgs) -> Result<bool> {
+        Ok(plist_path(role, installed_scope(role, scope)?)?.exists())
+    }
+
+    fn unload(role: Role, scope: Scope, path: &Path) {
+        let target = format!("{}/{}", domain(scope), role.label());
         let ok = run_cmd("launchctl", &["bootout", &target]).is_ok_and(|o| o.status.success());
         if !ok {
             let _ = run_cmd("launchctl", &["unload", "-w", &path.to_string_lossy()]);
@@ -464,21 +656,29 @@ mod imp {
 
     pub fn install(spec: &Spec, scope: ScopeArgs, dry_run: bool) -> Result<i32> {
         let scope = scope.resolve();
-        let plist = launchd_plist(spec);
-        let path = plist_path(scope)?;
+        let plist = launchd_plist(spec, scope == Scope::System);
+        let path = plist_path(spec.role, scope)?;
         if dry_run {
             println!("<!-- {} -->", path.display());
             print!("{plist}");
             return Ok(0);
         }
         if let Some(dir) = spec.log_file().parent() {
+            let fresh = !dir.exists();
             std::fs::create_dir_all(dir)?;
+            // A service that runs as the home's owner writes its log there.
+            if fresh
+                && scope == Scope::System
+                && let Some(u) = &spec.user
+            {
+                let _ = run_cmd("chown", &[u.as_str(), dir.to_string_lossy().as_ref()]);
+            }
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         if path.exists() {
-            unload(scope, &path);
+            unload(spec.role, scope, &path);
         }
         std::fs::write(&path, plist).with_context(|| {
             format!(
@@ -507,28 +707,28 @@ mod imp {
         Ok(0)
     }
 
-    pub fn uninstall(scope: ScopeArgs) -> Result<i32> {
-        let scope = installed_scope(scope)?;
-        let path = plist_path(scope)?;
+    pub fn uninstall(role: Role, scope: ScopeArgs) -> Result<i32> {
+        let scope = installed_scope(role, scope)?;
+        let path = plist_path(role, scope)?;
         if !path.exists() {
             println!("not installed ({} does not exist)", path.display());
             return Ok(0);
         }
-        unload(scope, &path);
+        unload(role, scope, &path);
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         println!("removed {}", path.display());
         Ok(0)
     }
 
-    pub fn status(scope: ScopeArgs) -> Result<i32> {
-        let scope = installed_scope(scope)?;
-        let path = plist_path(scope)?;
+    pub fn status(role: Role, scope: ScopeArgs, _named: bool) -> Result<i32> {
+        let scope = installed_scope(role, scope)?;
+        let path = plist_path(role, scope)?;
         if !path.exists() {
             println!("not installed");
             return Ok(3);
         }
         println!("service:  {}", path.display());
-        let target = format!("{}/{LAUNCHD_LABEL}", domain(scope));
+        let target = format!("{}/{}", domain(scope), role.label());
         let out = run_cmd("launchctl", &["print", &target])?;
         if out.status.success() {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -544,7 +744,7 @@ mod imp {
             return Ok(if state == "running" { 0 } else { 3 });
         }
         // Older launchctl: `list <label>` prints a plist-like dict.
-        let out = run_cmd("launchctl", &["list", LAUNCHD_LABEL])?;
+        let out = run_cmd("launchctl", &["list", role.label()])?;
         if !out.status.success() {
             println!("state:    not loaded");
             return Ok(3);
@@ -592,20 +792,30 @@ mod imp {
             .context("cannot open the service manager (run from an administrator PowerShell)")
     }
 
+    pub fn installed(role: Role, _scope: ScopeArgs) -> Result<bool> {
+        let mgr = manager(ServiceManagerAccess::CONNECT)?;
+        Ok(mgr
+            .open_service(role.name(), ServiceAccess::QUERY_STATUS)
+            .is_ok())
+    }
+
     pub fn install(spec: &Spec, _scope: ScopeArgs, dry_run: bool) -> Result<i32> {
+        let name = spec.role.name();
         let args: Vec<OsString> = spec.args().into_iter().map(OsString::from).collect();
         if dry_run {
-            println!("service {NAME}");
+            println!("service {name}");
             println!("  binary: {}", spec.exe.display());
             println!("  arguments: {:?}", spec.args());
             println!("  start: automatic, restart on failure");
-            println!("  firewall: allow inbound UDP on private and domain networks");
+            if firewall_rule(spec.role).is_some() {
+                println!("  firewall: allow inbound UDP on private and domain networks");
+            }
             return Ok(0);
         }
         let mgr = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
         // Replace an existing installation.
         if let Ok(old) = mgr.open_service(
-            NAME,
+            name,
             ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
         ) {
             stop_and_wait(&old);
@@ -614,8 +824,8 @@ mod imp {
             std::thread::sleep(Duration::from_secs(1));
         }
         let info = ServiceInfo {
-            name: OsString::from(NAME),
-            display_name: OsString::from("Pumasi agent"),
+            name: OsString::from(name),
+            display_name: OsString::from(spec.role.title()),
             service_type: ServiceType::OWN_PROCESS,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
@@ -631,7 +841,7 @@ mod imp {
                 ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
             )
             .context("create the service")?;
-        service.set_description("Contributes this machine to a Pumasi cluster.")?;
+        service.set_description(spec.role.description())?;
         // Restart whenever the agent exits with an error, including the
         // restart code it uses after an upgrade.
         let restart = ServiceAction {
@@ -646,31 +856,41 @@ mod imp {
         })?;
         service.set_failure_actions_on_non_crash_failures(true)?;
         service.start::<&str>(&[]).context("start the service")?;
-        println!("installed and started the {NAME} service");
-        allow_through_firewall(&spec.exe);
+        println!("installed and started the {name} service");
+        if let Some(rule) = firewall_rule(spec.role) {
+            allow_through_firewall(rule, &spec.exe);
+        }
         println!("logs: {}", spec.log_file().display());
         Ok(0)
     }
 
-    const FIREWALL_RULE: &str = "Pumasi agent (UDP in)";
+    /// The agent and the control plane take QUIC connections; the
+    /// dashboard listens on TCP, on this machine by default.
+    fn firewall_rule(role: Role) -> Option<&'static str> {
+        match role {
+            Role::Agent => Some("Pumasi agent (UDP in)"),
+            Role::Cluster => Some("Pumasi control plane (UDP in)"),
+            Role::Ui => None,
+        }
+    }
 
-    /// Lets the agent receive UDP on private and domain networks, which
+    /// Lets the service receive UDP on private and domain networks, which
     /// direct (hole-punched) QUIC connections need. A service gets no
     /// firewall prompt, so without a rule its traffic goes through the
     /// relay. Public networks stay closed; see the README to open them.
-    fn allow_through_firewall(exe: &Path) {
+    fn allow_through_firewall(rule: &str, exe: &Path) {
         use std::os::windows::process::CommandExt;
-        remove_firewall_rule();
+        remove_firewall_rule(rule);
         let out = std::process::Command::new("netsh")
             .args(["advfirewall", "firewall", "add", "rule"])
-            .raw_arg(format!("name=\"{FIREWALL_RULE}\""))
+            .raw_arg(format!("name=\"{rule}\""))
             .args(["dir=in", "action=allow", "protocol=UDP", "enable=yes"])
             .arg("profile=private,domain")
             .raw_arg(format!("program=\"{}\"", exe.display()))
             .output();
         match out {
             Ok(o) if o.status.success() => println!(
-                "firewall: allowed inbound UDP for {} on private and domain networks (rule {FIREWALL_RULE:?})",
+                "firewall: allowed inbound UDP for {} on private and domain networks (rule {rule:?})",
                 exe.display()
             ),
             Ok(o) => println!(
@@ -684,11 +904,11 @@ mod imp {
     }
 
     /// True if a rule was there.
-    fn remove_firewall_rule() -> bool {
+    fn remove_firewall_rule(rule: &str) -> bool {
         use std::os::windows::process::CommandExt;
         std::process::Command::new("netsh")
             .args(["advfirewall", "firewall", "delete", "rule"])
-            .raw_arg(format!("name=\"{FIREWALL_RULE}\""))
+            .raw_arg(format!("name=\"{rule}\""))
             .output()
             .is_ok_and(|o| o.status.success())
     }
@@ -710,10 +930,11 @@ mod imp {
         }
     }
 
-    pub fn uninstall(_scope: ScopeArgs) -> Result<i32> {
+    pub fn uninstall(role: Role, _scope: ScopeArgs) -> Result<i32> {
+        let name = role.name();
         let mgr = manager(ServiceManagerAccess::CONNECT)?;
         let Ok(service) = mgr.open_service(
-            NAME,
+            name,
             ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
         ) else {
             println!("not installed");
@@ -721,21 +942,24 @@ mod imp {
         };
         stop_and_wait(&service);
         service.delete().context("remove the service")?;
-        println!("removed the {NAME} service");
-        if remove_firewall_rule() {
-            println!("removed the firewall rule {FIREWALL_RULE:?}");
+        println!("removed the {name} service");
+        if let Some(rule) = firewall_rule(role)
+            && remove_firewall_rule(rule)
+        {
+            println!("removed the firewall rule {rule:?}");
         }
         Ok(0)
     }
 
-    pub fn status(_scope: ScopeArgs) -> Result<i32> {
+    pub fn status(role: Role, _scope: ScopeArgs, _named: bool) -> Result<i32> {
+        let name = role.name();
         let mgr = manager(ServiceManagerAccess::CONNECT)?;
-        let Ok(service) = mgr.open_service(NAME, ServiceAccess::QUERY_STATUS) else {
+        let Ok(service) = mgr.open_service(name, ServiceAccess::QUERY_STATUS) else {
             println!("not installed");
             return Ok(3);
         };
         let s = service.query_status()?;
-        println!("service:  {NAME}");
+        println!("service:  {name}");
         println!("state:    {:?}", s.current_state);
         println!(
             "pid:      {}",
@@ -770,18 +994,19 @@ pub mod windows {
 
     use super::*;
 
-    static ARGS: OnceLock<(PathBuf, Vec<String>)> = OnceLock::new();
+    static ARGS: OnceLock<(Role, PathBuf, Vec<String>)> = OnceLock::new();
     static EXIT: Mutex<i32> = Mutex::new(0);
 
     define_windows_service!(ffi_service_main, service_main);
 
     /// Hands the process to the service manager; returns when the service
     /// stops.
-    pub fn run(home: PathBuf, agent_args: Vec<String>) -> i32 {
-        let _ = ARGS.set((home, agent_args));
-        if let Err(e) = service_dispatcher::start(NAME, ffi_service_main) {
+    pub fn run(role: Role, home: PathBuf, args: Vec<String>) -> i32 {
+        let _ = ARGS.set((role, home, args));
+        if let Err(e) = service_dispatcher::start(role.name(), ffi_service_main) {
             eprintln!(
-                "error: `service run` is for the Windows service manager; use `pumasi agent start` ({e})"
+                "error: `service run` is for the Windows service manager; use `pumasi {}` ({e})",
+                role.command().join(" ")
             );
             return 1;
         }
@@ -812,7 +1037,11 @@ pub mod windows {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         };
-        let status = service_control_handler::register(NAME, handler)?;
+        let (role, home, args) =
+            ARGS.get()
+                .cloned()
+                .unwrap_or((Role::Agent, PathBuf::new(), Vec::new()));
+        let status = service_control_handler::register(role.name(), handler)?;
         let report = |state, code: i32| {
             let _ = status.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
@@ -833,15 +1062,14 @@ pub mod windows {
             });
         };
         report(ServiceState::Running, 0);
-        let (home, args) = ARGS.get().cloned().unwrap_or_default();
         let rt = tokio::runtime::Runtime::new()?;
-        let code = rt.block_on(crate::run_service_agent(home, args, async {
+        let code = rt.block_on(Box::pin(crate::run_service(role, home, args, async {
             let _ = stop_rx.await;
-        }));
+        })));
         let code = match code {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("agent failed: {e:#}");
+                tracing::error!("{} failed: {e:#}", role.as_str());
                 1
             }
         };
@@ -857,9 +1085,11 @@ mod tests {
 
     fn spec() -> Spec {
         Spec {
+            role: Role::Agent,
             exe: PathBuf::from("/opt/pumasi dir/pumasi"),
             home: PathBuf::from("/var/lib/pumasi"),
-            agent_args: vec!["--name".into(), "100% \"node\" $1".into()],
+            args: vec!["--name".into(), "100% \"node\" $1".into()],
+            user: None,
         }
     }
 
@@ -879,13 +1109,38 @@ mod tests {
             r#""/opt/pumasi dir/pumasi" "--home" "/var/lib/pumasi" "agent" "start" "--name" "100%% \"node\" $$1""#
         );
         assert!(systemd_unit(&spec(), true).contains("WantedBy=default.target"));
+        assert!(!unit.contains("User="));
+    }
+
+    #[test]
+    fn control_plane_units_run_as_the_homes_owner() {
+        let mut s = spec();
+        s.role = Role::Cluster;
+        s.args = vec!["--no-token".into()];
+        s.user = Some("stan".into());
+        let unit = systemd_unit(&s, false);
+        assert!(unit.contains("Description=Pumasi control plane"));
+        assert!(unit.contains("\nUser=stan\n"));
+        if !cfg!(windows) {
+            assert!(unit.contains(r#""cluster" "start" "--no-token""#));
+        }
+        // A user unit runs as its user anyway.
+        assert!(!systemd_unit(&s, true).contains("User="));
+        s.role = Role::Ui;
+        let unit = systemd_unit(&s, false);
+        assert!(unit.contains("After=network-online.target pumasi-cluster.service"));
+        let plist = launchd_plist(&s, true);
+        assert!(plist.contains("<string>pumasi.ui</string>"));
+        assert!(plist.contains("<key>UserName</key>\n    <string>stan</string>"));
+        assert!(plist.contains("/var/lib/pumasi/logs/ui.log"));
+        assert!(!launchd_plist(&s, false).contains("UserName"));
     }
 
     #[test]
     fn launchd_plists_escape_arguments() {
         let mut s = spec();
-        s.agent_args = vec!["--name".into(), "a<b&c".into()];
-        let plist = launchd_plist(&s);
+        s.args = vec!["--name".into(), "a<b&c".into()];
+        let plist = launchd_plist(&s, true);
         assert!(plist.contains("<string>a&lt;b&amp;c</string>"));
         assert!(plist.contains("<string>/opt/pumasi dir/pumasi</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));

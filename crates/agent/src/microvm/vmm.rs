@@ -134,8 +134,20 @@ impl Vmm {
         let config = super::vz::VzConfig {
             kernel: spec.kernel.clone(),
             initrd: spec.initrd.clone(),
-            // The console is virtio (hvc0); a guest reboot stops the VM.
-            cmdline: cmdline(&["console=hvc0", "panic=1"], spec.mode),
+            // The console is virtio (hvc0). Virtualization.framework boots a
+            // rebooting guest again: the guest powers off instead.
+            cmdline: cmdline(
+                &[
+                    "console=hvc0",
+                    "panic=1",
+                    &format!(
+                        "{}={}",
+                        pumasi_guest::EXIT_PARAM,
+                        pumasi_guest::EXIT_POWER_OFF
+                    ),
+                ],
+                spec.mode,
+            ),
             disks: spec
                 .disks
                 .iter()
@@ -597,6 +609,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
         assert!(config.cmdline.contains("console=hvc0"));
         assert!(config.cmdline.contains("pumasi.mode=run"));
+        assert!(config.cmdline.contains("pumasi.exit=poweroff"));
         assert_eq!(config.disks, vec![("/a.img".into(), true)]);
         assert_eq!("vz".parse::<Backend>().unwrap(), Backend::Vz);
     }

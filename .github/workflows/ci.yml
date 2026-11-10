@@ -620,3 +620,6 @@ jobs:
         run: |
           scripts/ci/service-upgrade.sh "$RUNNER_TEMP/b/pumasi-old$EXT" \
             "$RUNNER_TEMP/b/pumasi-new$EXT" "$RUNNER_TEMP/svc"
+      - name: Control plane and remote API as services, restart, uninstall
+        shell: bash
+        run: scripts/ci/service-cluster.sh "$RUNNER_TEMP/b/pumasi-new$EXT" "$RUNNER_TEMP/svc-cluster"

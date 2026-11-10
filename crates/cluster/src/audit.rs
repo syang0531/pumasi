@@ -313,6 +313,15 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
             ),
         ),
         RevokeAccess { id } => ("access.revoke", id.clone(), none()),
+        // A whole ticket holds its secret: log its id only.
+        RevokeJoinToken { id } => (
+            "token.revoke",
+            match id.trim().parse::<pumasi_proto::ticket::JoinTicket>() {
+                Ok(t) => pumasi_proto::msg::join_token_id(&t.secret),
+                Err(_) => id.trim().to_string(),
+            },
+            none(),
+        ),
         SetSchedule(spec) => (
             "schedule.set",
             spec.name.clone(),
@@ -401,6 +410,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | GetStoragePolicy
         | Quotas
         | ListAccess
+        | ListJoinTokens
         | WhoAmI
         | Schedules
         | Metrics { .. }

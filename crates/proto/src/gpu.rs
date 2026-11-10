@@ -137,7 +137,13 @@ impl GpuInfo {
 
     /// `NVIDIA GeForce RTX 3060 (12 GiB, 12.7 TFLOPS)`.
     pub fn describe(&self) -> String {
-        let mut s = format!("{} ({}", self.name, format_mib(self.vram_mib));
+        // Integrated GPUs (Apple silicon) share the system memory.
+        let mem = if self.vram_mib == 0 {
+            "shared memory".to_string()
+        } else {
+            format_mib(self.vram_mib)
+        };
+        let mut s = format!("{} ({mem}", self.name);
         if self.fp32_gflops > 0 {
             s.push_str(&format!(
                 ", {} TFLOPS{}",

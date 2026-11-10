@@ -364,6 +364,7 @@ enum VmEnd {
 /// Lines the guest kernel prints (at emergency level, so even with
 /// `quiet`) when it is done.
 const GUEST_DONE: &[&str] = &[
+    pumasi_guest::DONE_LINE,
     "reboot: Restarting system",
     "reboot: Power down",
     "Kernel panic",
@@ -371,18 +372,24 @@ const GUEST_DONE: &[&str] = &[
 /// How long a VMM may keep running after the guest said it was done.
 const AFTER_GUEST_DONE: Duration = Duration::from_secs(3);
 
-/// Whether the end of the serial log says the guest is done.
-fn guest_said_done(serial: &Path) -> bool {
+/// Whether the serial log says the guest is done, looking at what was
+/// written since `*seen` (bytes already read). Everything new is read, so
+/// a guest that boots again right away (and buries the line) is caught.
+fn guest_said_done(serial: &Path, seen: &mut u64) -> bool {
     use std::io::{Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(serial) else {
         return false;
     };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let _ = f.seek(SeekFrom::Start(len.saturating_sub(4096)));
-    let mut tail = Vec::new();
-    let _ = f.read_to_end(&mut tail);
-    let tail = String::from_utf8_lossy(&tail);
-    GUEST_DONE.iter().any(|l| tail.contains(l))
+    // A little overlap, for a line split across two reads.
+    let from = seen.saturating_sub(64);
+    if f.seek(SeekFrom::Start(from)).is_err() {
+        return false;
+    }
+    let mut new = Vec::new();
+    let _ = f.read_to_end(&mut new);
+    *seen = from + new.len() as u64;
+    let new = String::from_utf8_lossy(&new);
+    GUEST_DONE.iter().any(|l| new.contains(l))
 }
 
 impl MicrovmExecutor {
@@ -1116,6 +1123,7 @@ impl MicrovmExecutor {
         };
         let mut done_since: Option<Instant> = None;
         let mut ticks = 0u32;
+        let mut serial_seen = 0u64;
         loop {
             tokio::select! {
                 status = child.wait() => {
@@ -1127,7 +1135,7 @@ impl MicrovmExecutor {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
                     ticks += 1;
-                    if watch_serial && done_since.is_none() && ticks.is_multiple_of(10) && guest_said_done(&serial) {
+                    if watch_serial && done_since.is_none() && ticks.is_multiple_of(10) && guest_said_done(&serial, &mut serial_seen) {
                         done_since = Some(Instant::now());
                     }
                     let end = if cancel.load(Ordering::Relaxed) {

@@ -111,6 +111,17 @@ pub struct TokenRecord {
     pub invite: Option<Invite>,
 }
 
+impl TokenRecord {
+    pub fn view(&self) -> pumasi_proto::msg::JoinTokenView {
+        pumasi_proto::msg::JoinTokenView {
+            id: pumasi_proto::msg::join_token_id(&self.secret),
+            expires_unix: self.expires_unix,
+            uses_left: self.uses_left,
+            invite: self.invite.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobMeta {
     pub id: JobId,
@@ -647,6 +658,50 @@ impl State {
         self.store.put_token(&token)?;
         self.tokens.push(token.clone());
         Ok(token)
+    }
+
+    /// The join tickets and invites that can still be used, soonest to
+    /// expire first.
+    pub fn list_tokens(&self) -> Vec<pumasi_proto::msg::JoinTokenView> {
+        let now = now_unix();
+        let mut v: Vec<_> = self
+            .tokens
+            .iter()
+            .filter(|t| t.expires_unix > now)
+            .map(TokenRecord::view)
+            .collect();
+        v.sort_by(|a, b| a.expires_unix.cmp(&b.expires_unix).then(a.id.cmp(&b.id)));
+        v
+    }
+
+    /// Revokes the join ticket whose id starts with `id`, or the ticket
+    /// `id` itself. Returns it.
+    pub fn revoke_token(&mut self, id: &str) -> Result<pumasi_proto::msg::JoinTokenView> {
+        let id = id.trim();
+        anyhow::ensure!(!id.is_empty(), "which ticket?");
+        let hits: Vec<usize> = match id.parse::<pumasi_proto::ticket::JoinTicket>() {
+            Ok(t) => (0..self.tokens.len())
+                .filter(|&i| secrets_eq(&self.tokens[i].secret, &t.secret))
+                .collect(),
+            Err(_) => (0..self.tokens.len())
+                .filter(|&i| {
+                    pumasi_proto::msg::join_token_id(&self.tokens[i].secret).starts_with(id)
+                })
+                .collect(),
+        };
+        anyhow::ensure!(
+            hits.len() < 2,
+            "ticket id {id:?} is ambiguous; give more characters"
+        );
+        let Some(&i) = hits.first() else {
+            bail!(
+                "no join ticket {id:?} (`pumasi token ls` lists them; used-up and expired ones are gone)"
+            );
+        };
+        let t = self.tokens.remove(i);
+        self.store.remove_token(&t.secret)?;
+        info!(id = %pumasi_proto::msg::join_token_id(&t.secret), "join ticket revoked");
+        Ok(t.view())
     }
 
     /// Decides whether a connecting node may join, and as what. Known

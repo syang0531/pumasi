@@ -11,7 +11,7 @@ use maud::{Markup, html};
 use pumasi_proto::{
     job::parse_duration_ms,
     manage::{AccessRole, AccessView},
-    msg::{AdminOp, AdminResponse, Invite},
+    msg::{AdminOp, AdminResponse, Invite, JoinTokenView},
 };
 use serde::Deserialize;
 
@@ -29,6 +29,31 @@ pub async fn page(ctx: Ctx) -> Response {
         Ok(_) => Vec::new(),
         Err(e) => return ctx.fail(e, false),
     };
+    let tokens: Vec<JoinTokenView> = match ctx.call(AdminOp::ListJoinTokens).await {
+        Ok(AdminResponse::JoinTokens(t)) => t,
+        Ok(_) => Vec::new(),
+        // A control plane older than 1.2 has no list: show none.
+        Err(_) => Vec::new(),
+    };
+    let token_rows = tokens
+        .iter()
+        .map(|t| {
+            html! {
+                tr {
+                    td { code { (t.id) } }
+                    td { @match &t.invite {
+                        Some(i) => { (l.t("Invite: ", "초대: ")) (i.account) @if i.allow_docker { " (Docker)" } }
+                        None => { (l.t("Your machines", "내 기기")) }
+                    } }
+                    td { @match t.uses_left { Some(n) => { (n) }, None => { (l.t("any", "제한 없음")) } } }
+                    td { (fmt::time(t.expires_unix)) }
+                    td { button class="link danger" hx-post="/access/revoke-token" hx-vals=(serde_json::json!({"id": t.id}).to_string())
+                        hx-target="#flash" hx-confirm=(l.t("Revoke this join ticket? Machines that already joined stay.", "이 참가 티켓을 취소할까요? 이미 참가한 기기는 그대로 남습니다."))
+                        { (l.t("Revoke", "취소")) } }
+                }
+            }
+        })
+        .collect();
     let rows = list
         .iter()
         .map(|a| {
@@ -77,7 +102,7 @@ pub async fn page(ctx: Ctx) -> Response {
     };
     let bottom = html! {
         section {
-            h2 { (l.t("Access tickets", "액세스 티켓")) }
+            h2 { (l.t("New access ticket", "새 액세스 티켓")) }
             p class="dim" { (l.t("For people: sign in to this dashboard or `pumasi login` with one. Admin: everything. Submitter: one account's jobs and datasets. Viewer: read only.",
                                  "사람에게 주는 티켓입니다. 이 대시보드나 `pumasi login`에 씁니다. 관리자: 전부. 제출자: 한 계정의 작업과 데이터셋. 열람자: 읽기만.")) }
             form class="inline" hx-post="/access/create" hx-target="#access-result" {
@@ -94,18 +119,37 @@ pub async fn page(ctx: Ctx) -> Response {
             div #access-result {}
         }
     };
-    let live = table(
-        &[
-            "ID",
-            l.t("Name", "이름"),
-            l.t("Role", "역할"),
-            l.t("Created", "생성"),
-            l.t("Expires", "만료"),
-            "",
-        ],
-        rows,
-        l.t("No access tickets.", "액세스 티켓이 없습니다."),
-    );
+    let live = html! {
+        section {
+            h2 { (l.t("Usable join tickets and invites", "쓸 수 있는 참가 티켓과 초대")) }
+            (table(
+                &[
+                    "ID",
+                    l.t("For", "대상"),
+                    l.t("Machines left", "남은 기기 수"),
+                    l.t("Expires", "만료"),
+                    "",
+                ],
+                token_rows,
+                l.t("No usable join tickets.", "쓸 수 있는 참가 티켓이 없습니다."),
+            ))
+        }
+        section {
+            h2 { (l.t("Access tickets", "액세스 티켓")) }
+            (table(
+                &[
+                    "ID",
+                    l.t("Name", "이름"),
+                    l.t("Role", "역할"),
+                    l.t("Created", "생성"),
+                    l.t("Expires", "만료"),
+                    "",
+                ],
+                rows,
+                l.t("No access tickets.", "액세스 티켓이 없습니다."),
+            ))
+        }
+    };
     ctx.page(
         l.t("Invites", "초대"),
         Nav::Access,
@@ -187,16 +231,19 @@ pub async fn action(
                     AdminResponse::JoinToken {
                         ticket,
                         expires_unix,
-                    } => Ok(Html(
-                        ticket_box(
-                            l,
-                            &ticket,
-                            html! { p { (l.t("Valid until", "유효 기한")) " " (fmt::time(expires_unix)) } },
-                            true,
-                        )
-                        .into_string(),
+                    } => Ok((
+                        [("hx-trigger", "refresh")],
+                        Html(
+                            ticket_box(
+                                l,
+                                &ticket,
+                                html! { p { (l.t("Valid until", "유효 기한")) " " (fmt::time(expires_unix)) } },
+                                true,
+                            )
+                            .into_string(),
+                        ),
                     )
-                    .into_response()),
+                        .into_response()),
                     _ => anyhow::bail!("unexpected response"),
                 }
             }
@@ -237,6 +284,11 @@ pub async fn action(
                         .into_response()),
                     _ => anyhow::bail!("unexpected response"),
                 }
+            }
+            "revoke-token" => {
+                let id = opt(&f.id).ok_or_else(|| anyhow::anyhow!("which ticket?"))?;
+                ctx.call(AdminOp::RevokeJoinToken { id: id.to_string() }).await?;
+                Ok(ctx.done(l.t("Revoked.", "취소했습니다.")))
             }
             "revoke" => {
                 let id = opt(&f.id).ok_or_else(|| anyhow::anyhow!("which ticket?"))?;

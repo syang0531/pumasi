@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use super::{Ctx, Nav, table};
 use crate::fmt;
+use crate::i18n::Lang;
 
 #[derive(Deserialize)]
 pub struct EventsQuery {
@@ -80,7 +81,7 @@ pub async fn page(ctx: Ctx, Query(q): Query<EventsQuery>) -> Response {
             section {
                 h2 { (l.t("Alert rules", "경보 규칙")) }
                 dl class="facts" {
-                    @for (rule, text) in alerts.policy.describe() { dt { code { (rule) } } dd { (text) } }
+                    @for (rule, text) in alerts.policy.describe_in(l == Lang::Ko) { dt { code { (rule) } } dd { (text) } }
                 }
                 p class="dim" { (l.t("Change them with `pumasi alert set` or `[alerts]` in cluster.toml.", "`pumasi alert set`이나 cluster.toml의 `[alerts]`로 바꿉니다.")) }
             }

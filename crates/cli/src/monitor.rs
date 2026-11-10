@@ -246,8 +246,10 @@ fn node_row(n: &NodeMetricsView) -> String {
         format_size(l.memory_used),
         format_size(l.memory_total)
     );
+    // The hottest sensor, GPUs included, as the dashboard shows it (a
+    // Windows machine often reports only its GPU's temperature).
     let temp = l
-        .temp_c
+        .hottest()
         .map(|t| format!("{t:.0}°C"))
         .unwrap_or_else(|| "-".into());
     let gpu = if l.gpus.is_empty() {

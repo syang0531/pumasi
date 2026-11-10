@@ -16,6 +16,15 @@
         t.textContent = d.toLocaleString(document.documentElement.lang || undefined, opts);
       }
     });
+    // Chart axes: hours and minutes only.
+    root.querySelectorAll("[data-hm]").forEach(function (t) {
+      if (t.dataset.local) return;
+      t.dataset.local = "1";
+      var d = new Date(t.getAttribute("data-hm"));
+      if (!isNaN(d)) {
+        t.textContent = d.toLocaleTimeString(document.documentElement.lang || undefined, { hour: "2-digit", minute: "2-digit" });
+      }
+    });
   }
 
   function copyButtons(root) {

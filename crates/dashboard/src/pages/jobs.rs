@@ -125,7 +125,13 @@ async fn render_list(ctx: &Ctx, filter: &str) -> anyhow::Result<Response> {
 
 const EXAMPLE: &str = r#"# Same format as `pumasi run job.toml`. Files the job lists
 # (module, stdin, files) come from the files you attach below.
-name = "hello"
+"#;
+
+const EXAMPLE_KO: &str = r#"# `pumasi run job.toml`과 같은 형식입니다. 작업이 가리키는 파일
+# (module, stdin, files)은 아래에 첨부한 파일에서 가져옵니다.
+"#;
+
+const EXAMPLE_BODY: &str = r#"name = "hello"
 image = "busybox:1.36"
 command = ["sh", "-c", "echo hello from task {shard} > /output/hello.txt; cat /output/hello.txt"]
 shards = 2
@@ -144,10 +150,10 @@ pub async fn new(ctx: Ctx) -> Response {
             hx-indicator="#submit-busy" hx-disabled-elt="find button[type=submit]" {
             label for="job" { "job.toml" }
             p class="dim" { (l.t(
-                "Leave it empty to use a job.toml among the attached files.",
-                "비워 두면 첨부한 파일 중 job.toml을 씁니다."
+                "Leave it empty to use the job.toml (or the only .toml) among the attached files.",
+                "비워 두면 첨부한 파일 중 job.toml(또는 하나뿐인 .toml)을 씁니다."
             )) }
-            textarea #job name="job" rows="14" spellcheck="false" { (EXAMPLE) }
+            textarea #job name="job" rows="14" spellcheck="false" { (l.t(EXAMPLE, EXAMPLE_KO)) (EXAMPLE_BODY) }
             div class="row" {
                 div {
                     label for="files" { (l.t("Files", "파일")) }
@@ -210,11 +216,28 @@ pub(crate) async fn submit_upload(
     secret: pumasi_proto::Secret,
     up: uploads::Upload,
 ) -> anyhow::Result<JobId> {
-    let job_path = up.dir.path().join("job.toml");
+    let mut job_path = up.dir.path().join("job.toml");
     if let Some(text) = up.field("job") {
         tokio::fs::write(&job_path, text).await?;
     } else if !job_path.exists() {
-        anyhow::bail!("no job.toml: write one or attach it");
+        // One attached .toml under another name is the job file.
+        let mut tomls: Vec<String> = std::fs::read_dir(up.dir.path())?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.to_ascii_lowercase().ends_with(".toml"))
+            .collect();
+        tomls.sort();
+        match tomls.as_slice() {
+            [one] => job_path = up.dir.path().join(one),
+            [] => {
+                anyhow::bail!("no job file: send it in the `job` field, or attach it as job.toml")
+            }
+            many => anyhow::bail!(
+                "no job.toml, and several .toml files attached ({}): name the job file job.toml",
+                many.join(", ")
+            ),
+        }
     }
     let (mut sub, upload) = JobFile::load_split_confined(&job_path, INLINE_INPUT_BYTES)?;
     if let Some(a) = up.field("account") {
@@ -364,7 +387,10 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
         })
         .collect();
     let done = s.succeeded + s.failed;
+    // The heading refreshes with the rest, so the cancel button goes away
+    // once the job ends.
     let live = html! {
+        (top)
         section class="tiles" {
             div class="tile" { div class="tile-label" { (l.t("State", "상태")) } div class="tile-value" #job-state { (fmt::job_state(l, s.state)) } }
             (super::tile(l.t("Tasks done", "완료한 태스크"), format!("{done} / {}", s.tasks), Some(format!("{} {}", s.running, l.t("running", "실행 중")))))
@@ -406,7 +432,7 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
         }
     };
     let every = if terminal { "30s" } else { "2s" };
-    Ok(ctx.page(&s.name, Nav::Jobs, top, Some((every, live)), bottom))
+    Ok(ctx.page(&s.name, Nav::Jobs, html! {}, Some((every, live)), bottom))
 }
 
 pub async fn cancel(ctx: Ctx, headers: HeaderMap, Path(id): Path<String>) -> Response {

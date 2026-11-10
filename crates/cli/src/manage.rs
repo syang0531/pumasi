@@ -54,6 +54,77 @@ pub enum AccessCmd {
     },
 }
 
+#[derive(Subcommand)]
+pub enum TokenCmd {
+    /// List the join tickets and invites that can still be used (never
+    /// their secrets), including the one `cluster start` printed.
+    Ls {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Cancel a join ticket or invite by id (or a unique prefix), or give
+    /// the ticket itself. Machines that already joined stay members.
+    Revoke {
+        id: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+}
+
+pub async fn token(home: &Path, cmd: TokenCmd) -> Result<i32> {
+    match cmd {
+        TokenCmd::Ls { admin } => {
+            let AdminResponse::JoinTokens(list) =
+                call(home, &admin, AdminOp::ListJoinTokens).await?
+            else {
+                bail!("unexpected response");
+            };
+            print_tokens(&list);
+            Ok(0)
+        }
+        TokenCmd::Revoke { id, admin } => {
+            let AdminResponse::JoinTokens(gone) =
+                call(home, &admin, AdminOp::RevokeJoinToken { id }).await?
+            else {
+                bail!("unexpected response");
+            };
+            for v in gone {
+                match &v.invite {
+                    Some(i) => eprintln!("revoked the invite for {} ({})", i.account, v.id),
+                    None => eprintln!("revoked join ticket {}", v.id),
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn print_tokens(list: &[pumasi_proto::msg::JoinTokenView]) {
+    println!(
+        "{:<14} {:<10} {:<20} {:<26}",
+        "ID", "MACHINES", "EXPIRES (UTC)", "FOR"
+    );
+    for v in list {
+        println!(
+            "{:<14} {:<10} {:<20} {:<26}",
+            v.id,
+            v.uses_left.map_or("any".into(), |n| n.to_string()),
+            utc(v.expires_unix),
+            match &v.invite {
+                Some(i) => format!(
+                    "invite: {}{}",
+                    truncate(&i.account, 16),
+                    if i.allow_docker { " (docker)" } else { "" }
+                ),
+                None => "your machines".into(),
+            }
+        );
+    }
+    if list.is_empty() {
+        println!("(no usable join tickets: `pumasi token` makes one)");
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 pub enum RoleArg {
     Admin,

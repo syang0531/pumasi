@@ -41,7 +41,11 @@ pub async fn page(ctx: Ctx) -> Response {
                     dt { (l.t("Storage, per GiB-month (SSD)", "저장, GiB-월당(SSD)")) } dd { (cu(r.storage_gib_month)) }
                     @if let Some((s, class)) = &storage {
                         dt { (l.t("Storage on HDD / NVMe", "HDD / NVMe 저장")) } dd { (cu(s.hdd_gib_month)) " / " (cu(s.nvme_gib_month)) }
-                        dt { (l.t("Control plane disk", "컨트롤 플레인 디스크")) } dd { (format!("{class:?}").to_lowercase()) }
+                        dt { (l.t("Control plane disk", "컨트롤 플레인 디스크")) } dd { @match class {
+                            pumasi_proto::perf::DiskClass::Unknown => (l.t("not given (billed as SSD; `pumasi cluster start --storage-class` sets it)",
+                                                                          "지정 안 됨 (SSD 요금; `pumasi cluster start --storage-class`로 지정)")),
+                            c => (format!("{c:?}").to_lowercase()),
+                        } }
                         dt { (l.t("Default storage quota", "기본 저장 쿼터")) } dd {
                             @if let Some(q) = s.default_quota { (fmt::format_size(q)) } @else { (l.t("none", "없음")) }
                         }

@@ -96,8 +96,9 @@ pub fn line_chart(
                     line class="grid" x1=(LEFT) x2=(W - RIGHT) y1=(format!("{yy:.1}")) y2=(format!("{yy:.1}")) {}
                     text class="axis" x=(LEFT - 6.0) y=(format!("{:.1}", yy + 4.0)) text-anchor="end" { (fmt(max * frac)) }
                 }
-                text class="axis" x=(LEFT) y=(H - 6.0) { (crate::fmt::iso_utc(from)[11..16]) }
-                text class="axis" x=(W - RIGHT) y=(H - 6.0) text-anchor="end" { (crate::fmt::iso_utc(to)[11..16]) " UTC" }
+                // UTC here; the browser turns them into local time (app.js).
+                text class="axis" x=(LEFT) y=(H - 6.0) data-hm=(crate::fmt::iso_utc(from)) { (crate::fmt::iso_utc(from)[11..16]) " UTC" }
+                text class="axis" x=(W - RIGHT) y=(H - 6.0) text-anchor="end" data-hm=(crate::fmt::iso_utc(to)) { (crate::fmt::iso_utc(to)[11..16]) " UTC" }
                 (PreEscaped(paths))
                 @if empty {
                     text class="axis" x=(W / 2.0) y=(H / 2.0) text-anchor="middle" { "—" }

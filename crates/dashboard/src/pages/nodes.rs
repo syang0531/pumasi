@@ -384,6 +384,7 @@ fn perf(l: Lang, n: &NodeView) -> Markup {
             }
             @if !n.gpus.is_empty() {
                 h3 { "GPU" }
+                @for (en, ko) in n.gpu_hints() { p class="dim" { (l.t(en, ko)) } }
                 ul class="plain" {
                     @for g in &n.gpus {
                         li {

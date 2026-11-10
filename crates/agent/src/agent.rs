@@ -1002,6 +1002,18 @@ impl Agent {
                             "upgrades are off on this node (start the agent with --auto-upgrade to accept them)"
                                 .to_string(),
                         ),
+                        Some(_)
+                            if pumasi_proto::release::is_older(
+                                &release.file().version,
+                                pumasi_proto::version(),
+                            ) =>
+                        {
+                            Some(format!(
+                                "release {} is older than this agent ({}); refusing to downgrade",
+                                release.file().version,
+                                pumasi_proto::version()
+                            ))
+                        }
                         Some(up) => up
                             .failed_before(&sha)
                             .map(|r| format!("failed before on this node: {r}")),

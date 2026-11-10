@@ -291,7 +291,7 @@ pumasi upgrade rollout pumasi-linux-x86_64 pumasi-macos-aarch64 pumasi-windows-x
 pumasi upgrade status
 ```
 
-플랫폼과 버전은 파일에서 읽습니다. 컨트롤 플레인이 바이너리마다 클러스터 키로 서명하고, 에이전트는 자기가 참가한 클러스터가 서명했고, 자기 플랫폼용이며, 서명된 크기와 SHA-256이 맞고, 새 바이너리가 실제로 뜨는(`--version`) 경우에만 설치합니다. 내 기기는 기본으로 받고(`--no-auto-upgrade`로 거부), 남의 기기는 주인이 에이전트를 `--auto-upgrade`로 띄운 경우에만 받습니다. 쉬는 노드는 바로, 바쁜 노드는 한 대씩 새 작업을 멈추고 비운 뒤 교체합니다. 에이전트는 제자리에서 재시작하고, 새 바이너리를 클러스터가 거부하거나, 5분 동안 클러스터에 못 붙거나, 계속 죽으면 이전 바이너리로 되돌리고 실패를 `pumasi upgrade status`에 보고합니다. 컨트롤 플레인을 먼저 업그레이드하세요(멈추고 바이너리 교체 후 시작). 프로토콜 버전이 다른 바이너리는 `--force`가 필요하고, 그 에이전트들은 롤백됩니다.
+플랫폼과 버전은 파일에서 읽습니다. 컨트롤 플레인이 바이너리마다 클러스터 키로 서명하고, 에이전트는 자기가 참가한 클러스터가 서명했고, 자기 플랫폼용이며, 서명된 크기와 SHA-256이 맞고, 새 바이너리가 실제로 뜨는(`--version`) 경우에만 설치합니다. 내 기기는 기본으로 받고(`--no-auto-upgrade`로 거부), 남의 기기는 주인이 에이전트를 `--auto-upgrade`로 띄운 경우에만 받습니다. 쉬는 노드는 바로, 바쁜 노드는 한 대씩 새 작업을 멈추고 비운 뒤 교체합니다. 에이전트는 제자리에서 재시작하고, 새 바이너리를 클러스터가 거부하거나, 5분 동안 클러스터에 못 붙거나, 계속 죽으면 이전 바이너리로 되돌리고 실패를 `pumasi upgrade status`에 보고합니다. 컨트롤 플레인을 먼저 업그레이드하세요(멈추고 바이너리 교체 후 시작). 프로토콜 버전이 다른 바이너리는 `--force`가 필요하고, 그 에이전트들은 롤백됩니다. 배포는 `pumasi upgrade cancel` 전까지 유지되지만 버전을 내리지는 않습니다(이미 더 새 버전을 도는 노드는 그대로).
 
 ### 클러스터 파일 저장소
 
@@ -677,7 +677,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |

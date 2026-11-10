@@ -119,9 +119,12 @@ try {
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
     $exe = Join-Path $Dir 'pumasi.exe'
     if (Test-Path $exe) {
-        # A running pumasi.exe cannot be overwritten, but can be renamed.
+        # A running pumasi.exe cannot be overwritten, but can be renamed. An
+        # older one still running (another service) keeps its .old name.
+        Remove-Item -Force "$exe.old-*" -ErrorAction SilentlyContinue
         $old = "$exe.old"
         Remove-Item -Force $old -ErrorAction SilentlyContinue
+        if (Test-Path $old) { $old = "$exe.old-$([DateTime]::UtcNow.Ticks)" }
         Move-Item -Force $exe $old
     }
     Move-Item -Force $exeTmp $exe

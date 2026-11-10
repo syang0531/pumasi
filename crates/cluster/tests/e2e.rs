@@ -2063,6 +2063,36 @@ async fn rollout_upgrades_opted_in_agents_and_refuses_forged_binaries() {
     assert_eq!(std::fs::read(&owner_exe).unwrap(), new);
     assert!(!owner_run.is_finished());
 
+    // A rollout older than what a node runs (one upgraded by hand while
+    // the rollout was still on) is not offered to it, and the agent refuses
+    // it even if it is.
+    let older = b"pumasi binary, older build".to_vec();
+    upload(&client, &older).await;
+    let resp = client
+        .call(AdminOp::Rollout {
+            files: vec![release_file(&older, "0.0.1")],
+            force: false,
+        })
+        .await
+        .unwrap();
+    let AdminResponse::Rollout(view) = resp else {
+        panic!("unexpected {resp:?}");
+    };
+    wait_upgrade_state(&client, &owner_id, |n| n.state == UpgradeState::Current).await;
+    cluster
+        .send_release_for_tests(&owner_id, view.releases[0].clone())
+        .unwrap();
+    let n = wait_upgrade_state(&client, &owner_id, |n| {
+        matches!(n.state, UpgradeState::Failed(_))
+    })
+    .await;
+    let UpgradeState::Failed(reason) = n.state else {
+        unreachable!()
+    };
+    assert!(reason.contains("older"), "{reason}");
+    assert_eq!(std::fs::read(&owner_exe).unwrap(), new);
+    assert!(!owner_run.is_finished());
+
     // A binary for another protocol needs --force.
     let mut other = release_file(&newer, "11.0.0");
     other.protocol += 1;

@@ -132,9 +132,16 @@ try {
         $path = [Environment]::GetEnvironmentVariable('Path', $scope)
         if (-not (($path -split ';') -contains $Dir)) {
             [Environment]::SetEnvironmentVariable('Path', ($path.TrimEnd(';') + ";$Dir"), $scope)
-            $env:Path = "$env:Path;$Dir"
-            Write-Host "added $Dir to the $scope PATH (open a new terminal to use it)"
+            Write-Host "added $Dir to the $scope PATH"
         }
+        # This window too: it may predate the PATH entry (an earlier
+        # install, or another scope's).
+        if (-not (($env:Path -split ';') -contains $Dir)) { $env:Path = "$Dir;$env:Path" }
+    }
+    if (-not $admin) {
+        Write-Host ('note: not an administrator PowerShell, so this went to your user folder; ' +
+            'services (pumasi service install) need an administrator PowerShell, which installs to ' +
+            (Join-Path $env:ProgramFiles 'Pumasi'))
     }
 
     # Services keep running the old binary (renamed aside) until restarted.

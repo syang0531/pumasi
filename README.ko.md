@@ -458,7 +458,7 @@ curl -H "Authorization: Bearer $PUMASI_TICKET" -o out.zip "https://pumasi.exampl
 - 작업 조회에 **`?wait=60s`**를 붙이면 끝나는 즉시 답합니다(최대 90초, Cloudflare의 100초 안). job.toml의 **`queue_timeout = "10m"`**은 그 시간 안에 어느 노드도 시작하지 않은 작업을 노드별 이유와 함께 실패시킵니다. `/api/v1/status`(와 `pumasi status`)의 **`capacity`**는 지금 그 계정 작업을 받을 노드 수를 실행기·GPU별로, 못 받는 노드는 이유와 함께 알려 줍니다.
 - 에이전트가 30초마다 Docker를 다시 확인하므로, Docker Desktop이 늦게 켜지거나 꺼지는 Windows 기기도 재시작 없이 Docker 작업을 받거나 멈춥니다.
 
-[docs/api.md](docs/api.md)에 CI가 실제 클러스터에 돌려 보는 curl 예제와 Cloudflare Tunnel 설정, 그 한계(무료 요금제 요청 본문 100 MB)가 있습니다.
+[docs/api.md](docs/api.md)에 CI가 실제 클러스터에 돌려 보는 curl 예제와 Cloudflare Tunnel 설정, 그 한계(무료 요금제 요청 본문 100 MB)가 있습니다. [`examples/remote-client/pumasi-remote`](examples/remote-client)는 제출·대기·결과 받기를 명령 하나로 하고, 같은 문서에 Claude Code 클라우드 세션(HTTPS 프록시만 있고 티켓은 네트워크 시크릿이 붙여 줌)에서 집 클러스터를 이렇게 쓰는 방법이 있습니다.
 
 **Blender 등 GPU 그리기.** CUDA 작업은 `gpus = 1`이면 됩니다. 그리는 작업(Blender EEVEE, OpenGL·Vulkan 렌더러)은 `[gpu]`에 `capabilities = ["graphics"]`를 더하고, Docker GPU가 그릴 수 있는 노드에만 갑니다. 노드에서 `pumasi gpu check --docker-run --image 이미지`를 돌리면 컨테이너를 띄워 CUDA, OptiX, 그리기(Linux는 NVIDIA EGL·Vulkan 드라이버, Windows Docker Desktop은 Mesa D3D12 드라이버)를 확인하고, 노드에 `gpu.graphics=true` 라벨이 붙습니다. Docker Desktop은 GPU 컨테이너에 D3D12 라이브러리를 넣지 않으므로, Windows에서는 확인용 컨테이너와 graphics 태스크가 Docker Desktop의 `/usr/lib/wsl`을 읽기 전용으로 받습니다(확인은 `--wsl-libs`, 에이전트는 `--docker-wsl-libs`, `auto`는 Windows에서만). Docker Desktop 컨테이너에서는 OptiX가 시작하지 않아 Cycles는 CUDA를 씁니다. [examples/blender-render](examples/blender-render)는 장면 하나를 Cycles와 EEVEE로 렌더링합니다.
 

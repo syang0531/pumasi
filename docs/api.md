@@ -259,6 +259,128 @@ curl -fsS -X POST -H "Authorization: Bearer $PUMASI_TICKET" \
 Every route, with its parameters, is in `$PUMASI_URL/api/openapi.json`
 (OpenAPI 3.1), which code generators and tools such as Postman read.
 
+## Clients behind an HTTPS proxy
+
+Some clients reach the internet only through an HTTPS proxy: a Claude
+Code cloud session, many company networks. That is all this API needs
+(one HTTPS host and a bearer header). The CLI needs more: it speaks iroh,
+QUIC over UDP directly or through relays over WebSocket, and such
+proxies usually pass neither (see the end of this section).
+
+### pumasi-remote
+
+`examples/remote-client/pumasi-remote` does the calls above in one
+script (bash, curl and jq). Put it on the client's `PATH`:
+
+```bash
+curl -fsSL -o ~/.local/bin/pumasi-remote \
+  https://raw.githubusercontent.com/syang0531/pumasi/main/examples/remote-client/pumasi-remote
+chmod +x ~/.local/bin/pumasi-remote
+```
+
+Then a folder with a `job.toml` and the files it names runs with one
+command, which submits it, follows it, prints the logs of failed tasks and
+unpacks the outputs:
+
+```sh
+mkdir -p hello && cp job.toml ticker.wasm hello/
+pumasi-remote whoami
+pumasi-remote run hello hello-out
+ls hello-out
+```
+<!-- ci: grep -q "pumasi dashboard ok" hello-out/task-0/result.txt -->
+
+- It sends only the files `job.toml` names (`module`, `stdin`, `files`,
+  the same in `[[tasks]]`; needs python3 3.11 or later), so a `.env` or
+  `.git` next to it stays on the client.
+- `PUMASI_TICKET` is optional: leave it unset when the network adds the
+  `Authorization` header itself, as Claude Code network secrets do.
+- It retries what cannot have changed anything (reads after network
+  errors, `429` after `Retry-After`) and never resends a submission that
+  may have arrived.
+- When something in front of the API answers instead of Pumasi (a
+  Cloudflare challenge page, a company proxy), it says so instead of
+  failing on HTML.
+- `submit`, `wait`, `logs`, `outputs`, `cancel`, `status` and `jobs` do
+  one step each; `pumasi-remote --help` lists them. `wait` and `run` exit
+  0 only if the job succeeded, and 2 if `--timeout` ran out first (the
+  job keeps running).
+
+### Claude Code on the web
+
+A Claude Code cloud session can use a home cluster as its build and test
+farm. Its sandbox reaches the internet only through an HTTPS proxy that
+re-signs TLS, sends no UDP, and keeps keys out of the session: a
+**network secret** of the environment adds the header to requests for
+the hosts it names, after they leave the session.
+
+1. **On the admin's machine**, a ticket for its own account, with a
+   narrow policy (Docker nodes share their kernel with containers):
+
+   ```bash
+   pumasi access create "claude cloud" --role submitter --account claude --ttl 90d
+   pumasi quota claude --slots 4 --executors wasm,docker \
+     --images 'python:3.12-slim,rust:1-slim,node:22-slim' --max-timeout 1h
+   pumasi cu add claude 100
+   ```
+
+   Serve the API and put it behind Cloudflare Tunnel as above
+   (`https://pumasi.example.com`).
+2. **In the Claude Code environment settings** (the project's cloud
+   environment):
+   - Network secret: type Bearer, header `Authorization`, prefix
+     `Bearer`, value the ticket, allowed website `pumasi.example.com`.
+     The ticket never enters the session. A secret's host is reachable
+     without adding it to the allowed domains.
+   - Environment variable: `PUMASI_URL=https://pumasi.example.com`. Do
+     not set `PUMASI_TICKET`.
+   - Setup script: the `curl` lines above (pin a commit or tag instead
+     of `main` if you prefer).
+3. **Tell Claude** in the repository's `CLAUDE.md`, for example:
+
+   ```text
+   A Pumasi cluster is available through `pumasi-remote` (PUMASI_URL is
+   set, the proxy adds the ticket). For heavy builds, tests or data jobs,
+   write a job folder (job.toml plus the files it names; images allowed:
+   python:3.12-slim, rust:1-slim, node:22-slim; no network) and run
+   `pumasi-remote run DIR`. For jobs over a minute, `pumasi-remote submit
+   DIR`, then `pumasi-remote wait ID` in the background. Check
+   `pumasi-remote status` first; if no node is ready, run locally.
+   ```
+
+   Foreground commands in a cloud session stop after 2 minutes by
+   default, which is why long jobs are submitted and then waited for in
+   the background.
+
+Things to know:
+
+- **Cloudflare's bot protection.** Requests come from cloud addresses
+  with a script's user agent. If `pumasi-remote` reports a web page
+  instead of JSON, Security → Events in the Cloudflare dashboard names
+  the rule. Bot Fight Mode cannot be skipped per host on the Free plan;
+  turn it off for the zone, or put the API on a zone without it.
+- **Cloudflare Access** needs two headers (`CF-Access-Client-Id` and
+  `CF-Access-Client-Secret`), so two network secrets for the same host
+  beside the Pumasi ticket. Whether the proxy sends all of them is not
+  documented; not tried yet.
+- **Bodies over 100 MB** fail at Cloudflare (Free and Pro). Keep job
+  folders small; put big inputs in the store from a machine with the CLI
+  (`pumasi store put`) or let the job download them (`network = true`,
+  if the policy allows it).
+- **Long polls.** `pumasi-remote` waits 50 seconds per request
+  (`PUMASI_WAIT`, at most 90). How long the session proxy keeps a quiet
+  request open is not documented; lower it if waits end with errors.
+
+### Why the CLI does not go through the proxy
+
+iroh 1.x can take an HTTP proxy (`HTTPS_PROXY`, CONNECT) and extra CA
+roots for its relay connections, so the CLI could in principle reach a
+relay from behind a company proxy. It would not help in a Claude Code
+cloud session: relays speak WebSocket after the TLS handshake and that
+proxy does not pass WebSocket upgrades, the relay host would have to be
+allowed, and the CLI keeps its ticket in a file in the session, which
+network secrets exist to avoid. The HTTP API is the way in from there.
+
 ## GPU drawing (EEVEE, OpenGL, Vulkan)
 
 CUDA jobs need only `gpus = 1`. Jobs that draw (Blender EEVEE, Workbench,

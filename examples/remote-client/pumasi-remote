@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# pumasi-remote: run jobs on a Pumasi cluster through its HTTP API, from a
+# machine without Pumasi (a laptop, a CI job, a Claude Code cloud session).
+# Needs bash, curl and jq; python3 (3.11+) to send only the files a job
+# names, and unzip or python3 to unpack outputs.
+#
+#   export PUMASI_URL=https://pumasi.example.com
+#   export PUMASI_TICKET=pumasi...   # leave unset when a proxy adds the header
+#   pumasi-remote run examples/python-wordcount
+#
+# See docs/api.md ("Clients behind an HTTPS proxy") and
+# examples/remote-client/README.md.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: pumasi-remote <command> [args]
+
+  whoami                      the ticket's name, role and account
+  status                      nodes that can take this account's work now
+  jobs                        this account's jobs
+  submit DIR|JOB.toml [opts]  send a job, print its id
+        --account A  --priority N  --after ID[,ID]
+  wait JOB [--timeout 30m]    until it ends; exit 0 only if it succeeded
+  logs JOB [TASK]             stdout and stderr of one task (default 0)
+  outputs JOB [DEST]          download and unpack (default pumasi-out/JOB)
+  cancel JOB
+  run DIR|JOB.toml [DEST] [submit opts] [--timeout 30m]
+                              submit, wait, print failed tasks' logs,
+                              download the outputs
+
+environment:
+  PUMASI_URL     the API (https://...), required
+  PUMASI_TICKET  bearer ticket; unset when a proxy adds Authorization
+                 (a Claude Code network secret, for example)
+  PUMASI_WAIT    one long poll (default 50s, at most 90s)
+EOF
+}
+
+die() { echo "pumasi-remote: $*" >&2; exit 1; }
+say() { echo "pumasi-remote: $*" >&2; }
+
+for tool in curl jq; do
+  command -v "$tool" >/dev/null || die "needs $tool"
+done
+
+base=${PUMASI_URL:-}
+base=${base%/}
+auth=()
+if [ -n "${PUMASI_TICKET:-}" ]; then
+  auth=(-H "Authorization: Bearer $PUMASI_TICKET")
+fi
+poll=${PUMASI_WAIT:-50s}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# Why a failed answer failed, from its status and body.
+explain() {
+  local code=$1 body=$2 msg
+  if msg=$(jq -er '.error' "$body" 2>/dev/null); then
+    echo "HTTP $code: $msg"
+  elif grep -qi '<html\|<!doctype' "$body" 2>/dev/null; then
+    echo "HTTP $code with a web page instead of Pumasi's JSON: something in front of" \
+      "the API answered (Cloudflare Bot Fight Mode, Access or a WAF rule, or the" \
+      "network's proxy). $(grep -oi '<title>[^<]*' "$body" | head -n1 | sed 's/<title>//I')"
+  else
+    echo "HTTP $code: $(head -c 300 "$body")"
+  fi
+  if [ "$code" = 401 ] && [ ${#auth[@]} = 0 ]; then
+    echo "  PUMASI_TICKET is not set and nothing added an Authorization header" \
+      "(in a Claude Code cloud environment, check the network secret's host)."
+  fi
+}
+
+# api METHOD PATH OUT [curl args...]: the body goes to OUT. Retries what
+# cannot have changed anything: GETs on network errors, 429, 502-504;
+# other methods only when the connection never opened or on 429.
+api() {
+  local method=$1 path=$2 out=$3
+  shift 3
+  local headers=$tmp/headers code rc delay=2 attempt=1 max=6 after
+  while :; do
+    rc=0
+    code=$(curl -sS -X "$method" ${auth[@]+"${auth[@]}"} -D "$headers" -o "$out" \
+      -w '%{http_code}' "$@" "$base$path") || rc=$?
+    if [ "$rc" = 0 ] && [ "${code:0:1}" = 2 ]; then
+      return 0
+    fi
+    local retry=no
+    if [ "$rc" != 0 ]; then
+      case $rc in
+        6|7) retry=yes ;;
+        28|35|52|55|56) [ "$method" = GET ] && retry=yes ;;
+      esac
+    else
+      case $code in
+        429) retry=yes ;;
+        502|503|504) [ "$method" = GET ] && retry=yes ;;
+      esac
+    fi
+    if [ "$retry" = no ] || [ "$attempt" -ge "$max" ]; then
+      if [ "$rc" != 0 ]; then
+        say "$method $path: curl failed (exit $rc)"
+      else
+        say "$method $path: $(explain "$code" "$out")"
+      fi
+      return 1
+    fi
+    after=$(tr -d '\r' <"$headers" 2>/dev/null | awk -F': *' 'tolower($1)=="retry-after"{print $2}' | tail -n1)
+    case $after in ''|*[!0-9]*) after=$delay ;; esac
+    if [ "$rc" != 0 ]; then
+      say "$method $path: curl exit $rc, retrying in ${after}s"
+    else
+      say "$method $path: HTTP $code, retrying in ${after}s"
+    fi
+    sleep "$after"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2 > 30 ? 30 : delay * 2))
+  done
+}
+
+need_url() {
+  [ -n "$base" ] || die "set PUMASI_URL (https://...)"
+}
+
+get_json() { # PATH: prints the body
+  api GET "$1" "$tmp/body" && cat "$tmp/body"
+}
+
+# Files a job sends: those its job.toml names (module, stdin, files and
+# the same in [[tasks]]), so nothing else in the folder (.env, .git) leaves
+# this machine. Without python3 3.11, everything except .git and pumasi-out.
+job_files() { # DIR JOBFILE
+  local dir=$1 job=$2
+  if command -v python3 >/dev/null && python3 -c 'import tomllib' 2>/dev/null; then
+    python3 - "$dir" "$job" <<'PY'
+import os, sys, tomllib
+root, job = sys.argv[1], sys.argv[2]
+with open(job, "rb") as f:
+    doc = tomllib.load(f)
+names = []
+def add(entry):
+    if isinstance(entry, str):
+        names.append(entry)
+    elif isinstance(entry, list):
+        names.extend(e for e in entry if isinstance(e, str))
+for table in [doc] + [t for t in doc.get("tasks", []) if isinstance(t, dict)]:
+    for key in ("module", "stdin", "files"):
+        add(table.get(key))
+seen = set()
+for name in names:
+    if name.startswith("store:"):
+        continue
+    path = os.path.join(root, name)
+    if os.path.isdir(path):
+        for d, subdirs, files in os.walk(path):
+            subdirs.sort()
+            for f in sorted(files):
+                full = os.path.join(d, f)
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                if rel not in seen:
+                    seen.add(rel); print(rel)
+    elif os.path.isfile(path):
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        if rel not in seen:
+            seen.add(rel); print(rel)
+    else:
+        sys.exit(f"pumasi-remote: {name} (named in the job) is not in {root}")
+PY
+  else
+    say "no python3 3.11+: sending every file in $dir except .git and pumasi-out"
+    (cd "$dir" && find . -type f ! -path './.git/*' ! -path './pumasi-out/*' | sed 's|^\./||' | sort)
+  fi
+}
+
+# A value for curl -F, quoted so commas, semicolons and quotes in file
+# names survive.
+quote() {
+  local s=${1//\\/\\\\}
+  printf '"%s"' "${s//\"/\\\"}"
+}
+
+submit() {
+  need_url
+  [ $# -ge 1 ] || die "submit needs a folder or a job file"
+  local target=$1 dir job
+  shift
+  local form=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --account) form+=(-F "account=$2"); shift 2 ;;
+      --priority) form+=(-F "priority=$2"); shift 2 ;;
+      --after) form+=(-F "after=$2"); shift 2 ;;
+      *) die "submit: unknown option $1" ;;
+    esac
+  done
+  if [ -d "$target" ]; then
+    dir=$target
+    job=$target/job.toml
+  else
+    dir=$(dirname "$target")
+    job=$target
+  fi
+  [ -f "$job" ] || die "no $job"
+  local files rel total=0 size
+  files=$(job_files "$dir" "$job") || exit 1
+  # The job file goes as the `job` field, so any name works.
+  form+=(-F "job=<$job")
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    size=$(wc -c <"$dir/$rel")
+    total=$((total + size))
+    form+=(-F "files=@$(quote "$dir/$rel");filename=$(quote "$rel")")
+  done <<<"$files"
+  if [ "$total" -gt $((95 * 1024 * 1024)) ]; then
+    say "sending $((total / 1024 / 1024)) MiB: Cloudflare's Free and Pro plans refuse" \
+      "bodies over 100 MB (put big inputs in the store and mount store:NAME)"
+  fi
+  api POST /api/v1/jobs "$tmp/submit" ${form[@]+"${form[@]}"} || exit 1
+  jq -r .id "$tmp/submit"
+}
+
+# Seconds in 90s, 30m, 2h, 1d (a bare number is seconds).
+seconds() {
+  local v=$1 n
+  n=${v%[smhd]}
+  case $n in ''|*[!0-9]*) die "not a duration: $v" ;; esac
+  case $v in
+    *m) echo $((n * 60)) ;;
+    *h) echo $((n * 3600)) ;;
+    *d) echo $((n * 86400)) ;;
+    *) echo "$n" ;;
+  esac
+}
+
+wait_job() {
+  need_url
+  [ $# -ge 1 ] || die "wait needs a job id"
+  local id=$1 timeout=""
+  shift
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --timeout) timeout=$(seconds "$2"); shift 2 ;;
+      *) die "wait: unknown option $1" ;;
+    esac
+  done
+  local start=$SECONDS line last="" state
+  while :; do
+    api GET "/api/v1/jobs/$id?wait=$poll" "$tmp/job" || exit 1
+    state=$(jq -r .summary.state "$tmp/job")
+    line=$(jq -r '.summary | "\(.state): \(.succeeded)/\(.tasks) done, \(.running) running, \(.failed) failed"' "$tmp/job")
+    if [ "$line" != "$last" ]; then
+      say "$id $line"
+      last=$line
+    fi
+    case $state in
+      Succeeded) return 0 ;;
+      Failed|Cancelled) return 1 ;;
+    esac
+    if [ -n "$timeout" ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
+      say "$id still $state after $timeout s (it keeps running; wait again or cancel)"
+      return 2
+    fi
+    if [ "$state" = Queued ]; then
+      local why
+      why=$(jq -r '[.waiting, .preparing] | map(select(. != null)) | join("; ")' "$tmp/job")
+      [ -n "$why" ] && [ "$why" != "${lastwhy:-}" ] && say "$id $why"
+      lastwhy=$why
+    fi
+  done
+}
+
+logs() {
+  need_url
+  [ $# -ge 1 ] || die "logs needs a job id"
+  api GET "/api/v1/jobs/$1/tasks/${2:-0}/logs" "$tmp/logs" || exit 1
+  jq -j .stdout "$tmp/logs"
+  jq -j '.stderr // empty' "$tmp/logs" >&2
+}
+
+outputs() {
+  need_url
+  [ $# -ge 1 ] || die "outputs needs a job id"
+  local id=$1 dest=${2:-pumasi-out/$1}
+  api GET "/api/v1/jobs/$id/outputs.zip" "$tmp/outputs.zip" || exit 1
+  mkdir -p "$dest"
+  if command -v unzip >/dev/null; then
+    unzip -qo "$tmp/outputs.zip" -d "$dest"
+  elif command -v python3 >/dev/null; then
+    python3 -m zipfile -e "$tmp/outputs.zip" "$dest"
+  else
+    cp "$tmp/outputs.zip" "$dest/outputs.zip"
+    say "no unzip or python3: left $dest/outputs.zip"
+  fi
+  echo "$dest"
+}
+
+run() {
+  [ $# -ge 1 ] || die "run needs a folder or a job file"
+  local target=$1 dest="" sub=() waitopts=()
+  shift
+  if [ $# -gt 0 ] && [ "${1:0:2}" != -- ]; then
+    dest=$1
+    shift
+  fi
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --timeout) waitopts=(--timeout "$2"); shift 2 ;;
+      --account|--priority|--after) sub+=("$1" "$2"); shift 2 ;;
+      *) die "run: unknown option $1" ;;
+    esac
+  done
+  local id status=0
+  id=$(submit "$target" ${sub[@]+"${sub[@]}"}) || exit 1
+  say "submitted $id"
+  wait_job "$id" ${waitopts[@]+"${waitopts[@]}"} || status=$?
+  if [ "$status" = 2 ]; then
+    echo "$id"
+    return 2
+  fi
+  get_json "/api/v1/jobs/$id" >"$tmp/final" || echo '{}' >"$tmp/final"
+  if [ "$status" != 0 ]; then
+    local failed
+    failed=$(jq -r '.tasks[]? | select(.state | type == "object" and has("Failed")) | .index' "$tmp/final" | head -n 3)
+    for t in $failed; do
+      say "task $t failed: $(jq -c --argjson t "$t" '.tasks[] | select(.index == $t) | .state.Failed' "$tmp/final")"
+      logs "$id" "$t" || true
+    done
+  fi
+  if [ "$(jq '[.tasks[]?.output_files | length] | add // 0' "$tmp/final")" -gt 0 ]; then
+    outputs "$id" "${dest:-pumasi-out/$id}" >/dev/null || true
+    say "outputs in ${dest:-pumasi-out/$id}"
+  else
+    say "no output files"
+  fi
+  echo "$id"
+  return "$status"
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+  whoami) need_url; get_json /api/v1/whoami | jq . ;;
+  status)
+    need_url
+    get_json /api/v1/status \
+      | jq '{cluster: .cluster_name, capacity: (.capacity | if . then {ready, ready_gpu, nodes: [.nodes[] | {node, free_slots, reason}]} else null end)}' ;;
+  jobs)
+    need_url
+    get_json /api/v1/status | jq -r '.jobs[] | "\(.id)  \(.state)  \(.succeeded)/\(.tasks)  \(.name)"' ;;
+  submit) submit "$@" ;;
+  wait) wait_job "$@" ;;
+  logs) logs "$@" ;;
+  outputs) outputs "$@" ;;
+  cancel) need_url; api POST "/api/v1/jobs/${1:?job id}/cancel" "$tmp/body" && say "cancelled $1" ;;
+  run) need_url; run "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

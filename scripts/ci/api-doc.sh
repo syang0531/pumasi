@@ -60,6 +60,6 @@ print("\n".join(out))
 PY
 mkdir -p "$work/client"
 cp "$root/crates/dashboard/e2e/fixtures/ticker.wasm" "$work/client/"
-export PATH="$(dirname "$bin"):$PATH"
+export PATH="$(dirname "$bin"):$root/examples/remote-client:$PATH"
 (cd "$work/client" && timeout 600 bash "$work/examples.sh")
 echo "docs/api.md: every example ran"

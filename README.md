@@ -596,7 +596,8 @@ the cluster for 5 minutes, or it keeps crashing, the agent puts the
 previous binary back and reports the failure in `pumasi upgrade status`.
 Upgrade the control plane first (stop it, replace the binary, start it):
 a binary with a newer protocol needs `--force` and its agents would roll
-back.
+back. A rollout stays on until `pumasi upgrade cancel` but never
+downgrades: a node already running a newer version keeps it.
 
 ### The cluster file store
 
@@ -1369,7 +1370,7 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 18 and 19
 are only for trading with other clusters.
 

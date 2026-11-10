@@ -20,6 +20,38 @@ const RELEASE_DOMAIN: &[u8] = b"pumasi/release/v1\0";
 /// Largest binary a rollout accepts.
 pub const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// True if release `version` is older than `than`, comparing the numeric
+/// `major.minor.patch` (a pre-release such as `1.2.0-rc1` comes before
+/// `1.2.0`; build metadata after `+` and a leading `v` are ignored). A
+/// version either side cannot parse is never older, so odd test and CI
+/// version strings still roll out.
+pub fn is_older(version: &str, than: &str) -> bool {
+    fn parse(v: &str) -> Option<([u64; 3], bool)> {
+        let v = v.trim().trim_start_matches('v');
+        let v = v.split('+').next()?;
+        let (core, pre) = match v.split_once('-') {
+            Some((c, _)) => (c, true),
+            None => (v, false),
+        };
+        let mut n = [0u64; 3];
+        let mut parts = core.split('.');
+        for slot in &mut n {
+            match parts.next() {
+                Some(p) => *slot = p.parse().ok()?,
+                None => break,
+            }
+        }
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((n, pre))
+    }
+    match (parse(version), parse(than)) {
+        (Some((a, a_pre)), Some((b, b_pre))) => a < b || (a == b && a_pre && !b_pre),
+        _ => false,
+    }
+}
+
 /// An operating system and CPU architecture, named like Rust's
 /// `std::env::consts::{OS, ARCH}` (`linux`, `macos`, `windows`; `x86_64`,
 /// `aarch64`).
@@ -262,6 +294,22 @@ pub fn detect_target(bytes: &[u8]) -> Result<Target> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_versions() {
+        assert!(is_older("1.2.0", "1.2.1"));
+        assert!(is_older("1.1.9", "1.2.0"));
+        assert!(is_older("v0.9.0", "1.0.0"));
+        assert!(is_older("1.2.0-rc1", "1.2.0"));
+        assert!(is_older("1.2.0", "1.2.1+ci.abc1234"));
+        assert!(!is_older("1.2.1", "1.2.1"));
+        assert!(!is_older("1.2.1+ci.new", "1.2.1+ci.old"));
+        assert!(!is_older("1.3.0", "1.2.9"));
+        assert!(!is_older("1.2.0", "1.2.0-rc1"));
+        assert!(!is_older("9.9.9-test", "1.2.1"));
+        assert!(!is_older("ci-new", "1.2.1"));
+        assert!(!is_older("1.2.0", "unknown"));
+    }
 
     fn release(cluster: &SecretKey) -> Release {
         Release {

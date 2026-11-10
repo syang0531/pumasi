@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail, ensure};
 use pumasi_proto::{
     PROTOCOL_VERSION,
     msg::{NodeUpgradeView, Role, RolloutView, ToAgent, UpgradeState},
-    release::{MAX_BINARY_BYTES, Release, ReleaseFile, SignedRelease, Target, hex},
+    release::{MAX_BINARY_BYTES, Release, ReleaseFile, SignedRelease, Target, hex, is_older},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -232,6 +232,11 @@ impl State {
             && *failed == sha
         {
             return UpgradeState::Failed(reason.clone());
+        }
+        // Never a downgrade: a node already past the rollout's version (say,
+        // upgraded by hand while the rollout was still on) keeps its binary.
+        if is_older(&release.file().version, &n.info.agent_version) {
+            return UpgradeState::Current;
         }
         if self.upgrading.get(id).is_some_and(|(s, _)| *s == sha) {
             return UpgradeState::Upgrading;

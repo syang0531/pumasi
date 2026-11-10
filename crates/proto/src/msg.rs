@@ -945,7 +945,8 @@ pub struct NodeUpgradeView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpgradeState {
-    /// No rollout, or the node runs the release binary.
+    /// No rollout, the node runs the release binary, or it runs a newer
+    /// version than the release (a rollout never downgrades).
     Current,
     /// Waits for its running tasks to finish (gets no new tasks).
     Draining,

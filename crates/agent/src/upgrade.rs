@@ -111,8 +111,8 @@ impl Upgrader {
             .with_context(|| format!("hash the agent binary {}", config.exe.display()))?;
         let dir = data_dir.join("upgrade");
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        // Left behind by a Windows swap; deletable once that binary exited.
-        let _ = std::fs::remove_file(old_path(&config.exe));
+        // Left behind by Windows swaps; deletable once those binaries exited.
+        remove_old_binaries(&config.exe);
         Ok(Self {
             config,
             dir,
@@ -466,13 +466,49 @@ fn old_path(exe: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Where the running binary goes aside: `<exe>.old`, or `<exe>.old-<n>`
+/// when `<exe>.old` cannot be deleted because it is still running. That
+/// happens when several processes run from one binary (the agent, the
+/// control plane and the dashboard as services) or `install.ps1` moved a
+/// running one there, and renaming onto it is refused.
+fn aside_path(exe: &Path) -> PathBuf {
+    let old = old_path(exe);
+    let _ = std::fs::remove_file(&old);
+    if !old.exists() {
+        return old;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut s = old.into_os_string();
+    s.push(format!("-{}-{nanos}", std::process::id()));
+    PathBuf::from(s)
+}
+
+/// Deletes `<exe>.old` and `<exe>.old-*` where possible.
+fn remove_old_binaries(exe: &Path) {
+    let old = old_path(exe);
+    let _ = std::fs::remove_file(&old);
+    let (Some(dir), Some(name)) = (old.parent(), old.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}-", name.to_string_lossy());
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 /// Moves `new` over `exe`. Atomic on Unix. Windows cannot replace a
-/// running executable but can rename it, so the running one moves to
-/// `<exe>.old` first (deleted at the next start).
+/// running executable but can rename it, so the running one moves aside
+/// first ([`aside_path`], deleted at the next start).
 fn swap_in(new: &Path, exe: &Path) -> Result<()> {
     if cfg!(windows) {
-        let old = old_path(exe);
-        let _ = std::fs::remove_file(&old);
+        let old = aside_path(exe);
         std::fs::rename(exe, &old).with_context(|| format!("move {} aside", exe.display()))?;
         if let Err(e) = std::fs::rename(new, exe) {
             let _ = std::fs::rename(&old, exe);
@@ -620,6 +656,22 @@ mod tests {
                 .failed_before(&sha256(b"crashy binary"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn old_binaries_are_cleaned_up() {
+        let (data, exe) = setup("old");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"current").unwrap();
+        assert_eq!(aside_path(&exe), old_path(&exe));
+        let old = old_path(&exe);
+        let other = PathBuf::from(format!("{}-123-456", old.display()));
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&other, b"y").unwrap();
+        remove_old_binaries(&exe);
+        assert!(!old.exists() && !other.exists());
+        assert!(exe.exists());
+        let _ = data;
     }
 
     #[test]

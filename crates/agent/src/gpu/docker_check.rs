@@ -116,7 +116,36 @@ pub struct DockerGpuCheck {
     pub notes: Vec<String>,
 }
 
+/// A renderer or device name of a software rasterizer (the CPU).
+fn is_software(r: &str) -> bool {
+    let r = r.to_ascii_lowercase();
+    r.contains("llvmpipe") || r.contains("softpipe") || r.contains("lavapipe")
+}
+
+/// A renderer or device name of a GPU.
+fn is_hardware(r: &str) -> bool {
+    let r = r.to_ascii_lowercase();
+    !r.is_empty()
+        && (r.contains("nvidia")
+            || r.contains("d3d12")
+            || r.contains("geforce")
+            || r.contains("rtx"))
+}
+
 impl DockerGpuCheck {
+    /// Where Vulkan draws in the container: `Some(true)` on the GPU,
+    /// `Some(false)` on the CPU (lavapipe/llvmpipe), `None` when unknown.
+    /// It can differ from EGL/OpenGL: on WSL 2, Mesa draws GL through D3D12
+    /// but Vulkan on the CPU.
+    pub fn vulkan_on_gpu(&self) -> Option<bool> {
+        match self.vulkan_device.as_deref() {
+            Some(d) if is_software(d) => Some(false),
+            Some(d) if is_hardware(d) => Some(true),
+            Some(_) => None,
+            None => self.nvidia_graphics.then_some(true),
+        }
+    }
+
     /// Reads the `key=value` lines the script printed, in a container that
     /// had [`WSL_LIBS`] if `wsl_libs`.
     pub fn parse(image: &str, wsl_libs: bool, out: &str) -> Self {
@@ -170,22 +199,8 @@ impl DockerGpuCheck {
         if wsl_optix {
             c.optix = false;
         }
-        let software = |r: &Option<String>| {
-            r.as_deref().is_some_and(|r| {
-                let r = r.to_ascii_lowercase();
-                r.contains("llvmpipe") || r.contains("softpipe") || r.contains("lavapipe")
-            })
-        };
-        let hardware = |r: &Option<String>| {
-            r.as_deref().is_some_and(|r| {
-                let r = r.to_ascii_lowercase();
-                !r.is_empty()
-                    && (r.contains("nvidia")
-                        || r.contains("d3d12")
-                        || r.contains("geforce")
-                        || r.contains("rtx"))
-            })
-        };
+        let software = |r: &Option<String>| r.as_deref().is_some_and(is_software);
+        let hardware = |r: &Option<String>| r.as_deref().is_some_and(is_hardware);
         if c.cuda.is_empty() {
             c.notes.push(
                 "no GPU inside the container: Docker cannot pass NVIDIA GPUs (install the NVIDIA Container Toolkit; on Windows, Docker Desktop with the WSL 2 backend and a current NVIDIA driver)".into(),
@@ -224,6 +239,12 @@ impl DockerGpuCheck {
             c.notes.push(
                 "no NVIDIA EGL/Vulkan driver in the container: the toolkit did not mount the graphics libraries".into(),
             );
+        }
+        if c.graphics && c.vulkan_on_gpu() == Some(false) {
+            c.notes.push(format!(
+                "Vulkan draws on the CPU here ({}): jobs that draw with Vulkan (such as Blender's Vulkan backend) will not use the GPU; EGL/OpenGL does",
+                c.vulkan_device.clone().unwrap_or_default()
+            ));
         }
         if dxg && !d3d12 {
             c.notes.push(format!(
@@ -371,6 +392,31 @@ mod tests {
         assert!(
             a.contains("--volume /usr/lib/wsl:/usr/lib/wsl:ro --entrypoint sh blender -c"),
             "{a}"
+        );
+    }
+
+    #[test]
+    fn wsl_vulkan_on_the_cpu_is_told_apart_from_gl() {
+        // Docker Desktop with /usr/lib/wsl lent: GL through D3D12, Vulkan on
+        // lavapipe/llvmpipe (Mesa has no Vulkan driver onto D3D12 here).
+        let out = "cuda=GPU 0: NVIDIA GeForce RTX 3080 (UUID: GPU-1);\negl_nvidia=no\nglx_nvidia=no\noptix=no\nvulkan_nvidia=no\nwsl_dxg=yes\nwsl_d3d12=yes\nmesa_d3d12=yes\negl_renderer=D3D12 (NVIDIA GeForce RTX 3080)\nvulkan_device=llvmpipe (LLVM 20.1.2, 256 bits)\n";
+        let c = DockerGpuCheck::parse("blender", true, out);
+        assert!(c.graphics);
+        assert_eq!(c.vulkan_on_gpu(), Some(false));
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.contains("Vulkan draws on the CPU")),
+            "{:?}",
+            c.notes
+        );
+        let nvidia = "cuda=GPU 0: NVIDIA L4 (UUID: GPU-1);\negl_nvidia=yes\nvulkan_nvidia=yes\n";
+        let c = DockerGpuCheck::parse("blender", false, nvidia);
+        assert_eq!(c.vulkan_on_gpu(), Some(true));
+        assert!(
+            !c.notes
+                .iter()
+                .any(|n| n.contains("Vulkan draws on the CPU"))
         );
     }
 

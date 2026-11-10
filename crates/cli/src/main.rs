@@ -956,6 +956,23 @@ struct NetArgs {
     /// Local UDP address to bind, e.g. 0.0.0.0:7480.
     #[arg(long)]
     bind: Option<SocketAddr>,
+    /// Your own relay server (an iroh-relay URL such as
+    /// https://relay.example.com) instead of n0's public ones; repeat for
+    /// more. On the control plane, tickets carry it, so agents and clients
+    /// use it without the option.
+    #[arg(long = "relay", value_name = "URL")]
+    relays: Vec<pumasi_proto::net::RelayUrl>,
+}
+
+impl NetArgs {
+    /// `--relay`, else the cluster's own relays named in its addresses.
+    fn relays_for(&self, cluster: &[iroh::EndpointAddr]) -> Vec<pumasi_proto::net::RelayUrl> {
+        if self.relays.is_empty() {
+            pumasi_proto::net::custom_relays(cluster)
+        } else {
+            self.relays.clone()
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -1058,21 +1075,11 @@ fn home_dir(cli_home: &Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(base).join(".pumasi"))
 }
 
-/// Picks local mode for tickets that carry only IP addresses.
-/// [`net_for`] over every address of a cluster: public if any has a relay.
+/// Picks local mode for tickets that carry only IP addresses: public if any
+/// address of the cluster has a relay.
 fn net_for_all(addrs: &[iroh::EndpointAddr], explicit: Option<NetMode>) -> NetMode {
     explicit.unwrap_or_else(|| {
         if addrs.iter().any(|a| a.relay_urls().next().is_some()) {
-            NetMode::Public
-        } else {
-            NetMode::Local
-        }
-    })
-}
-
-fn net_for(addr: &iroh::EndpointAddr, explicit: Option<NetMode>) -> NetMode {
-    explicit.unwrap_or_else(|| {
-        if addr.relay_urls().next().is_some() {
             NetMode::Public
         } else {
             NetMode::Local
@@ -1502,6 +1509,13 @@ async fn cluster_start(
         (Some(t), None) => net_for_all(&t.candidates(), None),
         (None, None) => NetMode::default(),
     };
+    config.relays = match &replica {
+        Some(t) => net.relays_for(&t.candidates()),
+        None => net.relays.clone(),
+    };
+    if config.net == NetMode::Local && !config.relays.is_empty() {
+        bail!("--relay needs public network mode; drop --net local");
+    }
     // A fixed port lets agents reconnect after a restart in local mode.
     config.bind = Some(net.bind.unwrap_or_else(|| "0.0.0.0:7480".parse().unwrap()));
     let cluster = match &replica {
@@ -1583,21 +1597,21 @@ async fn agent(
             (None, opts)
         }
     };
-    let net = match &ticket {
-        Some(t) => net_for_all(&t.candidates(), opts.net.net),
-        None => {
-            let saved = std::fs::read_to_string(data_dir.join("membership.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<pumasi_agent::Membership>(&s).ok());
-            match saved {
-                Some(m) => net_for_all(
-                    &pumasi_proto::ticket::candidates(&m.cluster, &m.replicas),
-                    opts.net.net,
-                ),
-                None => opts.net.net.unwrap_or_default(),
-            }
-        }
+    // The cluster's addresses: from the ticket, or from the last join.
+    let cluster_addrs = match &ticket {
+        Some(t) => t.candidates(),
+        None => std::fs::read_to_string(data_dir.join("membership.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<pumasi_agent::Membership>(&s).ok())
+            .map(|m| pumasi_proto::ticket::candidates(&m.cluster, &m.replicas))
+            .unwrap_or_default(),
     };
+    let net = if cluster_addrs.is_empty() {
+        opts.net.net.unwrap_or_default()
+    } else {
+        net_for_all(&cluster_addrs, opts.net.net)
+    };
+    let relays = opts.net.relays_for(&cluster_addrs);
     // The drive measured is the one under the agent's data directory.
     let bench = if opts.no_benchmark {
         None
@@ -1622,6 +1636,7 @@ async fn agent(
                 .then(|| pumasi_agent::AvailabilityConfig::new(policy))
         },
         net,
+        relays,
         bind: opts.net.bind,
         docker: opts.allow_docker.then(|| opts.docker_bin.clone()),
         microvm: opts.allow_microvm.then(|| {
@@ -1796,16 +1811,41 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
 }
 
 async fn connect_admin(home: &Path, args: &AdminArgs) -> Result<AdminClient> {
-    let ticket = load_ticket(home, args)?;
+    let (ticket, source) = load_ticket_with_source(home, args)?;
     let net = net_for_all(&ticket.candidates(), None);
-    AdminClient::connect(&ticket, net).await
+    AdminClient::connect(&ticket, net)
+        .await
+        .map_err(|e| e.context(ticket_hint(home, &ticket, &source)))
+}
+
+/// Where the ticket in use came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TicketSource {
+    /// `--admin` or `PUMASI_ADMIN`.
+    Given,
+    /// A file: the one `pumasi login` saved, or a local cluster's.
+    File(PathBuf),
+}
+
+impl std::fmt::Display for TicketSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Given => f.write_str("--admin / PUMASI_ADMIN"),
+            Self::File(p) => write!(f, "{}", p.display()),
+        }
+    }
 }
 
 /// The admin or access ticket: `--admin`, else the one `pumasi login` or a
 /// local cluster saved.
 fn load_ticket(home: &Path, args: &AdminArgs) -> Result<AdminTicket> {
-    let text = match &args.admin {
-        Some(t) => t.clone(),
+    Ok(load_ticket_with_source(home, args)?.0)
+}
+
+/// [`load_ticket`], and where it came from.
+fn load_ticket_with_source(home: &Path, args: &AdminArgs) -> Result<(AdminTicket, TicketSource)> {
+    let (text, source) = match &args.admin {
+        Some(t) => (t.clone(), TicketSource::Given),
         None => {
             let candidates = [
                 home.join(ADMIN_TICKET_FILE),
@@ -1814,10 +1854,39 @@ fn load_ticket(home: &Path, args: &AdminArgs) -> Result<AdminTicket> {
             let found = candidates.iter().find(|p| p.exists()).with_context(|| {
                 "no admin ticket found: start a cluster here, run `pumasi login <TICKET>`, or pass --admin"
             })?;
-            std::fs::read_to_string(found)?
+            (
+                std::fs::read_to_string(found)?,
+                TicketSource::File(found.clone()),
+            )
         }
     };
-    text.parse()
+    let ticket = text
+        .parse()
+        .with_context(|| format!("the ticket from {source} is not valid"))?;
+    Ok((ticket, source))
+}
+
+/// Says which ticket a failed connection used, and points at the local
+/// cluster's own ticket when that names another cluster (a `pumasi login`
+/// left over from an earlier or another cluster wins over it).
+fn ticket_hint(home: &Path, ticket: &AdminTicket, source: &TicketSource) -> String {
+    let mut hint = format!(
+        "using the ticket from {source} (cluster {})",
+        ticket.cluster.id.fmt_short()
+    );
+    let local = home.join("cluster").join(ADMIN_TICKET_FILE);
+    if *source != TicketSource::File(local.clone())
+        && let Ok(text) = std::fs::read_to_string(&local)
+        && let Ok(own) = text.parse::<AdminTicket>()
+        && own.cluster.id != ticket.cluster.id
+    {
+        hint.push_str(&format!(
+            "; the cluster started on this machine is {} and its ticket is {}: `pumasi login` with it to use that one",
+            own.cluster.id.fmt_short(),
+            local.display()
+        ));
+    }
+    hint
 }
 
 async fn wait_for_job(client: &AdminClient, id: JobId) -> Result<JobView> {

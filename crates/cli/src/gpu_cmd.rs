@@ -348,18 +348,24 @@ async fn docker_probe(
     }
     println!("  OptiX: {}", yes_no(c.optix));
     let how = if c.nvidia_graphics {
-        "NVIDIA EGL/Vulkan drivers"
+        "NVIDIA EGL driver"
     } else if c.wsl {
         "WSL 2, through Mesa's D3D12 driver"
     } else {
         "no driver for drawing"
     };
-    println!("  EGL/OpenGL/Vulkan: {} ({how})", yes_no(c.graphics));
+    println!("  EGL/OpenGL: {} ({how})", yes_no(c.graphics));
     if let Some(r) = &c.egl_renderer {
         println!("  EGL renderer: {r}");
     }
-    if let Some(d) = &c.vulkan_device {
-        println!("  Vulkan device: {d}");
+    // Vulkan apart: on WSL 2 it draws on the CPU while GL uses the GPU.
+    let device = c.vulkan_device.as_deref();
+    match (c.vulkan_on_gpu(), device) {
+        (Some(true), Some(d)) => println!("  Vulkan: yes ({d})"),
+        (Some(true), None) => println!("  Vulkan: yes (NVIDIA Vulkan driver)"),
+        (Some(false), Some(d)) => println!("  Vulkan: CPU only ({d})"),
+        (_, Some(d)) => println!("  Vulkan: {d}"),
+        (_, None) => println!("  Vulkan: not checked (no vulkaninfo in the image)"),
     }
     for n in &c.notes {
         println!("  note: {n}");

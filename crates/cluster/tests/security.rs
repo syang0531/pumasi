@@ -968,3 +968,28 @@ async fn ldap_sign_in_checks_passwords_and_groups() -> Result<()> {
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// A ticket whose address now answers with another key (a cluster created
+/// again on the same port, a stale `pumasi login`) fails with a message that
+/// says so, not a TLS error.
+#[tokio::test]
+async fn ticket_for_another_cluster_says_so() -> Result<()> {
+    init_tracing();
+    let cluster = start_cluster(tempdir("wrongkey")).await?;
+    let mut stale = cluster.admin_ticket();
+    stale.cluster.id = iroh::SecretKey::generate().public();
+    let e = match AdminClient::connect(&stale, NetMode::Local).await {
+        Ok(_) => panic!("connected with another cluster's key"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        e.contains("ticket belongs to another cluster"),
+        "unexpected error: {e}"
+    );
+    assert!(!e.contains("UnknownIssuer"), "raw TLS error leaked: {e}");
+    // The real ticket still works.
+    let client = AdminClient::connect(&cluster.admin_ticket(), NetMode::Local).await?;
+    client.close().await;
+    cluster.shutdown().await?;
+    Ok(())
+}

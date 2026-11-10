@@ -19,7 +19,7 @@ use pumasi_proto::{
         AgentHello, Availability, FromAgent, HelloReply, NodeInfo, Role, TaskAssignment, TaskRef,
         TaskReport, ToAgent,
     },
-    net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key},
+    net::{NetMode, bind_endpoint_with, dialable_addr, load_or_create_key},
     perf::SignedPerf,
     receipt::{SignedUsage, Usage, output_digest},
     store::{OutputMode, StoredOutput},
@@ -65,6 +65,9 @@ pub struct AgentConfig {
     /// When the node takes new tasks (power, idle, hours). `None`: always.
     pub availability: Option<AvailabilityConfig>,
     pub net: NetMode,
+    /// Relay servers in public mode (empty: n0's public relays). The CLI
+    /// fills in the cluster's own relays from its ticket.
+    pub relays: Vec<pumasi_proto::net::RelayUrl>,
     pub bind: Option<SocketAddr>,
     /// Docker CLI to use for docker jobs (`docker` or `podman`). `None`
     /// means this node runs WASM tasks only.
@@ -251,9 +254,10 @@ fn merge_replicas(candidates: &Arc<Mutex<Vec<EndpointAddr>>>, replicas: &[Endpoi
 impl Agent {
     pub async fn new(config: AgentConfig) -> Result<Self> {
         let key = load_or_create_key(&config.data_dir.join(KEY_FILE))?;
-        let endpoint = bind_endpoint(
+        let endpoint = bind_endpoint_with(
             key.clone(),
             config.net,
+            &config.relays,
             vec![BLOBS_ALPN.to_vec()],
             config.bind,
         )

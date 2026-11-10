@@ -3,7 +3,9 @@
 use std::{net::SocketAddr, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
-use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, SecretKey, endpoint::presets};
+
+pub use iroh::RelayUrl;
 use serde::{Deserialize, Serialize};
 
 /// How an endpoint finds and reaches peers.
@@ -34,16 +36,48 @@ pub async fn bind_endpoint(
     alpns: Vec<Vec<u8>>,
     bind_addr: Option<SocketAddr>,
 ) -> Result<Endpoint> {
+    bind_endpoint_with(secret_key, mode, &[], alpns, bind_addr).await
+}
+
+/// [`bind_endpoint`] with its own relay servers in public mode (empty: n0's
+/// public relays). Peers reach it through whichever relay its address
+/// names, so only it needs to know them.
+pub async fn bind_endpoint_with(
+    secret_key: SecretKey,
+    mode: NetMode,
+    relays: &[RelayUrl],
+    alpns: Vec<Vec<u8>>,
+    bind_addr: Option<SocketAddr>,
+) -> Result<Endpoint> {
     let mut builder = match mode {
         NetMode::Public => Endpoint::builder(presets::N0),
         NetMode::Local => Endpoint::builder(presets::Minimal),
     };
+    if mode == NetMode::Public && !relays.is_empty() {
+        builder = builder.relay_mode(RelayMode::Custom(RelayMap::from_iter(
+            relays.iter().cloned(),
+        )));
+    }
     builder = builder.secret_key(secret_key).alpns(alpns);
     if let Some(addr) = bind_addr {
         builder = builder.bind_addr(addr).context("invalid bind address")?;
     }
     let endpoint = builder.bind().await.context("bind endpoint")?;
     Ok(endpoint)
+}
+
+/// The relays in `addrs` that are not n0's public ones: those of a cluster
+/// started with `--relay`, which its nodes and clients then use too.
+pub fn custom_relays(addrs: &[EndpointAddr]) -> Vec<RelayUrl> {
+    let n0 = iroh::defaults::prod::default_relay_map();
+    let staging = iroh::defaults::staging::default_relay_map();
+    let mut out: Vec<RelayUrl> = Vec::new();
+    for url in addrs.iter().flat_map(|a| a.relay_urls()) {
+        if !n0.contains(url) && !staging.contains(url) && !out.contains(url) {
+            out.push(url.clone());
+        }
+    }
+    out
 }
 
 /// Returns an address others can dial. In public mode waits (bounded) until a
@@ -109,4 +143,24 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    #[test]
+    fn custom_relays_skip_n0_and_duplicates() {
+        let id = SecretKey::generate().public();
+        let n0 = iroh::defaults::prod::default_na_east_relay().url.clone();
+        let own: RelayUrl = "https://relay.example.com".parse().unwrap();
+        let addrs = [
+            EndpointAddr::new(id).with_relay_url(n0),
+            EndpointAddr::new(id).with_relay_url(own.clone()),
+            EndpointAddr::new(id).with_relay_url(own.clone()),
+            EndpointAddr::new(id).with_ip_addr("127.0.0.1:7480".parse().unwrap()),
+        ];
+        assert_eq!(custom_relays(&addrs), vec![own]);
+        assert!(custom_relays(&addrs[..1]).is_empty());
+    }
 }

@@ -29,7 +29,7 @@ use pumasi_proto::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
         FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, TaskReport, ToAgent,
     },
-    net::{NetMode, bind_endpoint, dialable_addr, load_or_create_key, write_private},
+    net::{NetMode, bind_endpoint_with, dialable_addr, load_or_create_key, write_private},
     perf::DiskClass,
     perf::kernel_native,
     release::SignedRelease,
@@ -71,6 +71,9 @@ pub struct ClusterConfig {
     /// Used only when the cluster is created; kept afterwards.
     pub name: String,
     pub net: NetMode,
+    /// Relay servers in public mode (empty: n0's public relays). Tickets
+    /// carry them, so nodes and clients use them too.
+    pub relays: Vec<pumasi_proto::net::RelayUrl>,
     pub bind: Option<SocketAddr>,
     pub heartbeat: Duration,
     /// A node silent for this long is considered gone.
@@ -102,6 +105,7 @@ impl ClusterConfig {
             data_dir,
             name: "my-cluster".into(),
             net: NetMode::Public,
+            relays: Vec::new(),
             bind: None,
             heartbeat: Duration::from_secs(2),
             node_timeout: Duration::from_secs(10),
@@ -408,9 +412,10 @@ impl Cluster {
     }
 
     async fn bind(config: &ClusterConfig, key: SecretKey) -> Result<Endpoint> {
-        bind_endpoint(
+        bind_endpoint_with(
             key,
             config.net,
+            &config.relays,
             vec![
                 AGENT_ALPN.to_vec(),
                 ADMIN_ALPN.to_vec(),
@@ -2024,11 +2029,25 @@ async fn connect_any(endpoint: &Endpoint, candidates: &[EndpointAddr]) -> Result
     for addr in candidates {
         match tokio::time::timeout(per, endpoint.connect(addr.clone(), ADMIN_ALPN)).await {
             Ok(Ok(c)) => return Ok(c),
+            Ok(Err(e)) if is_wrong_peer_key(&e) => {
+                last = anyhow::anyhow!(
+                    "the control plane at this ticket's address is not cluster {}: it answered with another key, so the ticket belongs to another cluster or to one that was created again. Use the admin ticket of the cluster that runs now (`pumasi login <TICKET>`)",
+                    addr.id.fmt_short()
+                )
+            }
             Ok(Err(e)) => last = anyhow::Error::from(e).context("could not connect to the cluster"),
             Err(_) => last = anyhow::anyhow!("timed out connecting to the cluster"),
         }
     }
     Err(last)
+}
+
+/// The peer answered the handshake with another key than the address names
+/// (iroh reports it as a certificate from an unknown issuer): something else,
+/// usually another cluster on the same port, now listens there.
+fn is_wrong_peer_key(e: &iroh::endpoint::ConnectError) -> bool {
+    let text = format!("{e:#}");
+    text.contains("invalid peer certificate") && text.contains("UnknownIssuer")
 }
 
 /// A backup made, when, and its digest.
@@ -2065,8 +2084,18 @@ async fn send_call(conn: &Connection, req: &AdminRequest) -> Sent {
 
 impl AdminClient {
     pub async fn connect(ticket: &AdminTicket, net: NetMode) -> Result<Self> {
-        let endpoint = bind_endpoint(iroh::SecretKey::generate(), net, vec![], None).await?;
-        Self::connect_with(endpoint, ticket).await
+        // A cluster with its own relays is reached through them alone.
+        let relays = pumasi_proto::net::custom_relays(&ticket.candidates());
+        let endpoint =
+            bind_endpoint_with(iroh::SecretKey::generate(), net, &relays, vec![], None).await?;
+        match Self::connect_with(endpoint.clone(), ticket).await {
+            Ok(client) => Ok(client),
+            Err(e) => {
+                // Close it ourselves: a dropped endpoint logs an error of its own.
+                endpoint.close().await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn connect_with(endpoint: Endpoint, ticket: &AdminTicket) -> Result<Self> {

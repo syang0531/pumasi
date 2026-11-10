@@ -7,10 +7,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Args;
+use pumasi_cluster::AdminClient;
 use pumasi_dashboard::UiConfig;
 use pumasi_proto::store::parse_size;
 
-use crate::{AdminArgs, load_ticket, net_for};
+use crate::{AdminArgs, load_ticket_with_source, net_for_all, ticket_hint};
 
 /// Port tried first when `--listen` is not given.
 const DEFAULT_PORT: u16 = 7400;
@@ -71,8 +72,9 @@ pub struct UiArgs {
 }
 
 pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
-    let ticket = load_ticket(home, &args.admin)?;
-    let net = net_for(&ticket.cluster, None);
+    let (ticket, source) = load_ticket_with_source(home, &args.admin)?;
+    let net = net_for_all(&ticket.candidates(), None);
+    let probe = (ticket.clone(), ticket_hint(home, &ticket, &source));
     let upload_limit = parse_size(&args.max_upload)?;
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => Some(pumasi_dashboard::tls_config(cert, key)?),
@@ -127,6 +129,15 @@ pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
         eprintln!("dashboard: {url}");
     }
     eprintln!("(Ctrl-C stops it)");
+    // Check the control plane once now, so a wrong or stale ticket shows up
+    // here and not only as an error page in the browser.
+    tokio::spawn(async move {
+        let (ticket, hint) = probe;
+        match AdminClient::connect(&ticket, net).await {
+            Ok(client) => client.close().await,
+            Err(e) => eprintln!("warning: cannot reach the control plane: {e:#}; {hint}"),
+        }
+    });
     if !args.no_open && !args.api_only {
         open_browser(&url);
     }

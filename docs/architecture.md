@@ -36,6 +36,14 @@ encrypted and mutually authenticated by key, with hole punching and relay
 fallback in `public` mode. `local` mode disables relays and address lookup
 for LANs and tests.
 
+The relays are n0's public ones unless the control plane runs with
+`--relay URL` (an iroh-relay server). Its address, and so every ticket,
+then names that relay; `custom_relays` in `pumasi-proto` picks the non-n0
+relays out of a ticket, and agents, admin clients (the CLI, `pumasi ui`)
+and replicas bind with them as their own relay map. Dialing works through
+any relay a peer's address names, so only the control plane needs the
+option.
+
 Three ALPNs:
 
 - `pumasi/agent/0`: the agent dials the control plane and opens one

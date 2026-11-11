@@ -163,8 +163,8 @@ fn markup(ctx: &Ctx, v: &LatestReleaseView, r: &RolloutView) -> Markup {
             }
             @if cp_behind {
                 p class="dim" { (l.t(
-                    "The control plane and dashboard restart into the new version by themselves once the agent on their machine has upgraded and the rollout has settled.",
-                    "컨트롤 플레인과 대시보드는 같은 PC의 에이전트가 업그레이드되고 롤아웃이 끝나면 새 버전으로 스스로 재시작합니다.")) }
+                    "The control plane and dashboard restart into the new version by themselves once the rollout has settled (the agent on their machine installs it, or the control plane does when its machine has none).",
+                    "컨트롤 플레인과 대시보드는 롤아웃이 끝나면 새 버전으로 스스로 재시작합니다(같은 PC의 에이전트가 설치하고, 에이전트가 없으면 컨트롤 플레인이 직접 설치).")) }
             }
         }
     }

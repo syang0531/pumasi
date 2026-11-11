@@ -395,6 +395,15 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
     Ok(inner)
 }
 
+/// A release binary for the control plane's own platform, from
+/// [`Cluster::own_upgrade`].
+#[derive(Debug, Clone)]
+pub struct OwnUpgrade {
+    pub file: pumasi_proto::release::ReleaseFile,
+    /// The verified binary in the release store.
+    pub path: PathBuf,
+}
+
 /// A running control plane (or control plane replica).
 pub struct Cluster {
     shared: Arc<Shared>,
@@ -628,6 +637,37 @@ impl Cluster {
                     | pumasi_proto::msg::UpgradeState::Draining
                     | pumasi_proto::msg::UpgradeState::Upgrading
             )
+        })
+    }
+
+    /// The binary this control plane should install over its own, when
+    /// no agent on its machine will: the current rollout's release for
+    /// this platform, newer than the running version, kept in the release
+    /// store. `local_node` is the node id of an agent on this machine, if
+    /// it has one; while that agent is a member of the cluster it upgrades
+    /// the shared binary itself (and rolls back if it fails), so this
+    /// returns `None`. Only the leading replica answers.
+    pub fn own_upgrade(&self, local_node: Option<&str>) -> Option<OwnUpgrade> {
+        let inner = self.shared.active()?;
+        let st = inner.state();
+        if local_node.is_some_and(|id| st.members.contains_key(id)) {
+            return None;
+        }
+        let file = st
+            .rollout
+            .as_ref()?
+            .release_for(&pumasi_proto::release::Target::host())?
+            .file()
+            .clone();
+        drop(st);
+        if !pumasi_proto::release::is_older(pumasi_proto::version(), &file.version)
+            || !self.shared.releases.has(&file.sha256, file.size)
+        {
+            return None;
+        }
+        Some(OwnUpgrade {
+            path: self.shared.releases.path_of(&file.sha256),
+            file,
         })
     }
 
@@ -1710,6 +1750,11 @@ async fn upgrade_to_latest(shared: Arc<Shared>, tag: Option<String>, force: bool
                 } else {
                     targets.insert(Target::new(&m.info.os, &m.info.arch));
                 }
+            }
+            // The control plane's own binary too: on a machine without a
+            // member agent it installs that itself (`Cluster::own_upgrade`).
+            if is_older(pumasi_proto::version(), &tag) {
+                targets.insert(Target::host());
             }
             (targets, current)
         };

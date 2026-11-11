@@ -204,7 +204,10 @@ themselves; the browser sign-in and `--ldap` do not have this problem.
    and a dashboard that share their binary with an agent restart into the
    new version by themselves once the rollout has settled, so on such a
    machine steps 3 and 5 happen on their own (a protocol change still
-   needs the control plane first).
+   needs the control plane first). From 1.3.1 on the same holds on a
+   machine that runs only the control plane: with no member agent there,
+   the leading control plane installs the rollout's binary for its own
+   platform itself.
 
 ## 4. Back up and restore
 
@@ -223,6 +226,23 @@ by its address, so in the default public network mode they find the
 restored one on any machine (its relay is published under that key);
 with `--net local` it needs the old IP address and `--bind` port.
 Practice a restore once before you need it.
+
+### Run only the control plane on a machine
+
+To keep a machine as the control plane (and dashboard) but stop it from
+running tasks, take its agent out; the cluster directory, the admin
+ticket and the control plane's own service and firewall rule are not
+touched (administrator PowerShell; `sudo` on Linux and macOS):
+
+1. `pumasi drain NODE`: no new tasks, running ones move to other nodes.
+2. `pumasi service uninstall agent`: removes the agent's service and its
+   firewall rule. `<home>/agent` (the agent's key and cache) stays and
+   may be deleted.
+3. `pumasi remove-node NODE` (a 1.2 control plane takes the node id from
+   `pumasi status`, not the name).
+
+Upgrades from 1.3.1 on still reach that machine (the control plane
+installs its own binary, see section 3).
 
 ### Move the control plane to another machine
 

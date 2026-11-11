@@ -360,6 +360,51 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
         .context("blocking task failed")?
 }
 
+/// Installs the verified binary at `src` (SHA-256 `sha256`, version
+/// `version`) over `exe`, without the agent's trial and rollback: copies
+/// it next to `exe`, checks the copy, runs `<copy> --version` (with
+/// `smoke`) and renames it over `exe`. A control plane with no agent on
+/// its machine upgrades its binary this way; it and the dashboard then
+/// restart into it because they follow their binary.
+pub async fn replace_binary(
+    src: &Path,
+    sha256: [u8; 32],
+    version: &str,
+    exe: &Path,
+    smoke: bool,
+) -> Result<()> {
+    let new = sibling_tmp(exe, "new");
+    let res = async {
+        let (from, to) = (src.to_path_buf(), new.clone());
+        let copied = blocking(move || {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copy the new binary to {}", to.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755))?;
+            }
+            sha256_file(&to)
+        })
+        .await?;
+        ensure!(
+            copied == sha256,
+            "the binary has SHA-256 {}, the release says {}",
+            hex(&copied),
+            hex(&sha256)
+        );
+        if smoke {
+            smoke_test(&new, version).await?;
+        }
+        swap_in(&new, exe)
+    }
+    .await;
+    if res.is_err() {
+        let _ = std::fs::remove_file(&new);
+    }
+    res
+}
+
 async fn fetch_chunk(
     conn: &Connection,
     sha256: [u8; 32],
@@ -487,7 +532,7 @@ fn aside_path(exe: &Path) -> PathBuf {
 }
 
 /// Deletes `<exe>.old` and `<exe>.old-*` where possible.
-fn remove_old_binaries(exe: &Path) {
+pub fn remove_old_binaries(exe: &Path) {
     let old = old_path(exe);
     let _ = std::fs::remove_file(&old);
     let (Some(dir), Some(name)) = (old.parent(), old.file_name()) else {
@@ -656,6 +701,32 @@ mod tests {
                 .failed_before(&sha256(b"crashy binary"))
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn replaces_a_binary_only_with_the_verified_one() {
+        let (data, exe) = setup("replace");
+        std::fs::create_dir_all(&data).unwrap();
+        let src = data.join("release");
+        std::fs::write(&src, b"new binary").unwrap();
+        // A hash that does not match leaves the binary alone, and nothing
+        // next to it.
+        assert!(
+            replace_binary(&src, sha256(b"other"), "9.9.9", &exe, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old binary");
+        replace_binary(&src, sha256(b"new binary"), "9.9.9", &exe, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new binary");
+        remove_old_binaries(&exe);
+        let names: Vec<_> = std::fs::read_dir(exe.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
     }
 
     #[test]

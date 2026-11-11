@@ -26,4 +26,4 @@ pub mod state;
 pub mod store;
 pub mod transfer;
 
-pub use server::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig};
+pub use server::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig, OwnUpgrade};

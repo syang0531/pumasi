@@ -2643,6 +2643,15 @@ async fn upgrades_to_the_newest_published_release() {
     view.releases[0]
         .verify(cluster.addr().id.as_bytes())
         .unwrap();
+    // The control plane leaves its own binary to a member agent on its
+    // machine, and installs it itself without one.
+    let node_id = cluster.status().nodes[0].id.clone();
+    assert!(cluster.own_upgrade(Some(&node_id)).is_none());
+    let own = cluster
+        .own_upgrade(None)
+        .expect("no binary for the control plane");
+    assert_eq!(own.file.version, version);
+    assert_eq!(std::fs::read(&own.path).unwrap(), good);
 
     let exit = tokio::time::timeout(Duration::from_secs(60), run.handle)
         .await
@@ -2652,5 +2661,105 @@ async fn upgrades_to_the_newest_published_release() {
     assert_eq!(exit, AgentExit::Upgraded { version });
     assert_eq!(std::fs::read(&exe).unwrap(), good);
     run.endpoint.close().await;
+    client.close().await;
+}
+
+/// A control plane whose nodes are all current, or that has none, still
+/// fetches the release for its own platform when it is behind, to install
+/// it over its own binary.
+#[tokio::test]
+async fn a_control_plane_without_agents_upgrades_itself() {
+    use axum::{
+        Router,
+        extract::Path,
+        http::{StatusCode, header},
+        response::IntoResponse,
+        routing::get,
+    };
+    init_tracing();
+
+    let version = newer_version();
+    let tag = format!("v{version}");
+    let good = binary_claiming(&version);
+    let asset = pumasi_proto::release::asset_name(&Target::host());
+    let sums = format!("{}  {asset}\n", hex(&sha256(&good)));
+    let latest_tag = tag.clone();
+    let (dl_tag, dl_asset, dl_good) = (tag.clone(), asset.clone(), good.clone());
+    let app = Router::new()
+        .route(
+            "/releases/latest",
+            get(move || {
+                let tag = latest_tag.clone();
+                async move {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, format!("/releases/tag/{tag}"))],
+                    )
+                }
+            }),
+        )
+        .route(
+            "/releases/download/{tag}/{file}",
+            get(move |Path((t, file)): Path<(String, String)>| {
+                let ok = t == dl_tag;
+                let body = if ok && file == "SHA256SUMS" {
+                    Some(sums.clone().into_bytes())
+                } else if ok && file == dl_asset {
+                    Some(dl_good.clone())
+                } else {
+                    None
+                };
+                async move {
+                    match body {
+                        Some(b) => b.into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let site = format!("http://{}/releases", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let mut config = ClusterConfig::new(tempdir("own-upgrade"));
+    config.net = NetMode::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.release_source = site;
+    let cluster = Cluster::start(config).await.unwrap();
+    let client = admin(&cluster).await;
+    assert!(cluster.own_upgrade(None).is_none());
+
+    client
+        .call(AdminOp::UpgradeToLatest {
+            version: None,
+            force: false,
+        })
+        .await
+        .unwrap();
+    let mut fetch = FetchState::Idle;
+    for _ in 0..300 {
+        fetch = match client
+            .call(AdminOp::LatestRelease { check: false })
+            .await
+            .unwrap()
+        {
+            AdminResponse::LatestRelease(v) => v.fetch,
+            other => panic!("unexpected {other:?}"),
+        };
+        if !matches!(fetch, FetchState::Running { .. } | FetchState::Idle) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let FetchState::Done { summary, .. } = fetch else {
+        panic!("the upgrade did not start: {fetch:?}");
+    };
+    assert!(summary.contains(&Target::host().to_string()), "{summary}");
+    assert!(cluster.rollout_settled());
+    let own = cluster
+        .own_upgrade(None)
+        .expect("no binary for the control plane");
+    assert_eq!(own.file.version, version);
+    assert_eq!(std::fs::read(&own.path).unwrap(), good);
     client.close().await;
 }

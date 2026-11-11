@@ -1746,7 +1746,7 @@ async fn cluster_start(
         );
         eprintln!("`pumasi ha status` shows the replicas; this one takes over if the leader fails");
         eprintln!();
-        return stop_cluster(cluster, shutdown, follow, in_service).await;
+        return stop_cluster(home, cluster, shutdown, follow, in_service).await;
     }
     let status = cluster.status();
     eprintln!(
@@ -1772,18 +1772,34 @@ async fn cluster_start(
         eprintln!("  pumasi agent join {ticket}");
     }
     eprintln!();
-    stop_cluster(cluster, shutdown, follow, in_service).await
+    stop_cluster(home, cluster, shutdown, follow, in_service).await
 }
 
 /// Runs the control plane until `shutdown`, or until a newer binary was
 /// installed over this one and the rollout settled: then restarts into it.
+/// With no member agent on this machine to install that binary, the
+/// control plane installs the rollout's binary for its platform itself.
 async fn stop_cluster(
+    home: &Path,
     cluster: Cluster,
     shutdown: impl std::future::Future<Output = ()>,
     follow: Option<follow::Follow>,
     in_service: bool,
 ) -> Result<i32> {
-    let stop = follow::until_stop(shutdown, follow, || cluster.rollout_settled()).await;
+    let own_exe = follow.as_ref().map(|f| f.exe().to_path_buf());
+    if let Some(exe) = &own_exe {
+        pumasi_agent::upgrade::remove_old_binaries(exe);
+    }
+    let upgrade_own = async {
+        match own_exe {
+            Some(exe) => upgrade_own_binary(&cluster, home, exe).await,
+            None => std::future::pending().await,
+        }
+    };
+    let stop = tokio::select! {
+        stop = follow::until_stop(shutdown, follow, || cluster.rollout_settled()) => stop,
+        never = upgrade_own => match never {},
+    };
     match stop {
         follow::Stop::Shutdown => {
             eprintln!("shutting down");
@@ -1796,6 +1812,68 @@ async fn stop_cluster(
             follow::restart(in_service, &exe)
         }
     }
+}
+
+/// Installs the current rollout's binary for this platform over the
+/// control plane's own when no agent on this machine is a member of the
+/// cluster to do it ([`Cluster::own_upgrade`]). Following the binary then
+/// restarts the control plane (once the rollout settles) and the
+/// dashboard into it. Each binary is tried once per start.
+async fn upgrade_own_binary(
+    cluster: &Cluster,
+    home: &Path,
+    exe: PathBuf,
+) -> std::convert::Infallible {
+    let mut tried = std::collections::HashSet::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let local_node = local_agent_id(home);
+        let Some(up) = cluster.own_upgrade(local_node.as_deref()) else {
+            continue;
+        };
+        if !tried.insert(up.file.sha256) {
+            continue;
+        }
+        // Installed already (by hand, or by an agent that has since left)?
+        let path = exe.clone();
+        let on_disk = tokio::task::spawn_blocking(move || {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|b| pumasi_proto::release::read_build_info(&b))
+        })
+        .await
+        .ok()
+        .flatten();
+        if on_disk.is_some_and(|b| !pumasi_proto::release::is_older(&b.version, &up.file.version)) {
+            continue;
+        }
+        let version = &up.file.version;
+        eprintln!(
+            "no agent on this machine installs pumasi {version}; installing it over {}",
+            exe.display()
+        );
+        match pumasi_agent::upgrade::replace_binary(&up.path, up.file.sha256, version, &exe, true)
+            .await
+        {
+            Ok(()) => eprintln!("installed pumasi {version}"),
+            Err(e) => eprintln!(
+                "could not install pumasi {version} over {}: {e:#} (run the install script on this machine instead)",
+                exe.display()
+            ),
+        }
+    }
+}
+
+/// The node id of the agent that keeps its state in this home, if one
+/// ever started here.
+fn local_agent_id(home: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(home.join("agent").join("secret.key")).ok()?;
+    let bytes: [u8; 32] = data_encoding::HEXLOWER
+        .decode(text.trim().as_bytes())
+        .ok()?
+        .try_into()
+        .ok()?;
+    Some(iroh::SecretKey::from_bytes(&bytes).public().to_string())
 }
 
 async fn ctrl_c() {

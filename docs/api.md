@@ -102,6 +102,32 @@ EOF
 cloudflared tunnel run pumasi      # or: sudo cloudflared service install
 ```
 
+Or create the tunnel in the Cloudflare dashboard (Zero Trust → Networks
+→ Tunnels → Create a tunnel, type Cloudflared): it shows a
+`cloudflared service install <token>` command for the machine (on
+Windows, from an administrator prompt) and takes the public host name
+(`pumasi.example.com` → `HTTP` `127.0.0.1:7400`) there, with no config
+file.
+
+**The web dashboard through the same name.** `pumasi ui` without
+`--api-only` serves the pages and the same `/api/v1` (bearer tickets work
+there too), so one host name can serve browsers and scripts:
+
+```bash
+pumasi ui --listen 127.0.0.1:7400 --login-only \
+  --public-url https://pumasi.example.com --real-ip-header CF-Connecting-IP
+```
+
+`--public-url` is the name browsers use: the dashboard accepts it as the
+Host (on loopback it refuses other names, against DNS rebinding; before
+1.2.3 that included the tunnel's name, so pages answered `421`), marks the
+session cookie `Secure`, and sends SSO back to it. `--login-only` turns
+off the sign-in link `pumasi ui` prints, so everyone signs in with their
+own access ticket (`pumasi access create stan --role admin --ttl 30d`)
+or SSO. Cloudflare Access can put an email check in front of the pages;
+keep a Bypass rule for `/api/` so scripts with only a ticket still get
+through.
+
 For a quick try without a domain, `cloudflared tunnel --url
 http://127.0.0.1:7400` prints a temporary `https://*.trycloudflare.com`
 address. Things to know:

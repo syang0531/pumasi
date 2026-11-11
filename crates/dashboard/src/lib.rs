@@ -156,11 +156,17 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
     let token = (!config.login_only && !config.api_only && loopback).then(auth::random_token);
     let hosts = (loopback && !config.api_only).then(|| {
         let p = addr.port();
-        vec![
+        let mut hosts = vec![
             format!("127.0.0.1:{p}"),
             format!("localhost:{p}"),
             format!("[::1]:{p}"),
-        ]
+        ];
+        // Behind a tunnel or proxy on this machine, browsers send the
+        // public name: the one `--public-url` gives is accepted too.
+        if let Some(u) = &config.public_url {
+            hosts.extend(public_hosts(u));
+        }
+        hosts
     });
     let scheme = if config.tls.is_some() {
         "https"
@@ -204,6 +210,32 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
         https,
         task,
     })
+}
+
+/// The Host headers browsers send for `public_url` (`https://name[:port]/...`):
+/// its authority, and without the port when that is the scheme's default.
+fn public_hosts(public_url: &str) -> Vec<String> {
+    let (scheme, rest) = public_url
+        .split_once("://")
+        .unwrap_or(("https", public_url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if authority.is_empty() {
+        return Vec::new();
+    }
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "http" => ":80",
+        _ => ":443",
+    };
+    let mut out = vec![authority.clone()];
+    if let Some(bare) = authority.strip_suffix(default) {
+        out.push(bare.to_string());
+    }
+    out
 }
 
 /// Largest request body except uploads and `/api/v1/op` (phase 17):
@@ -311,5 +343,25 @@ mod tests {
             std::fs::write(dir.join("ticker.wasm"), &wasm).unwrap();
         }
         assert_eq!(std::fs::read(dir.join("ticker.wasm")).unwrap(), wasm);
+    }
+
+    #[test]
+    fn public_url_hosts() {
+        use super::public_hosts;
+        assert_eq!(
+            public_hosts("https://Cluster.Example.org/"),
+            ["cluster.example.org"]
+        );
+        assert_eq!(
+            public_hosts("https://cluster.example.org:443"),
+            ["cluster.example.org:443", "cluster.example.org"]
+        );
+        assert_eq!(
+            public_hosts("https://cluster.example.org:8443/x?y"),
+            ["cluster.example.org:8443"]
+        );
+        assert_eq!(public_hosts("http://box.lan:80"), ["box.lan:80", "box.lan"]);
+        assert_eq!(public_hosts("https://[2001:db8::1]"), ["[2001:db8::1]"]);
+        assert!(public_hosts("https://").is_empty());
     }
 }

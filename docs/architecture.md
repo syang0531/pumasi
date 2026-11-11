@@ -940,8 +940,9 @@ check results, which for GPU work are not deterministic (see "Not yet").
 ### MicroVM network
 
 A microVM task with `network = true` boots on QEMU with a virtio-net card
-attached to `-netdev socket,connect=127.0.0.1:<port>`. The agent listens
-on that port (`microvm::net::Gateway`, one per task, closed with the VM)
+attached to `-netdev socket,connect=127.0.0.1:<port>`, or on vz with a
+virtio-net card over `VZFileHandleNetworkDeviceAttachment` (below). The
+agent listens on that port (`microvm::net::Gateway`, one per task, closed with the VM)
 and runs a user-space TCP/IP stack (smoltcp) as the guest's gateway
 `10.0.2.2`; the guest is `10.0.2.15/24` (the guest init configures `eth0`,
 the default route and `resolv.conf` from `RunSpec::network`). smoltcp runs
@@ -958,6 +959,24 @@ filtered the same way). Other UDP, ICMP and IPv6 are dropped. Firecracker
 cards need TAP devices and root, so Firecracker nodes run network tasks on
 QEMU when it is installed, and report `microvm_network` accordingly; the
 scheduler sends network tasks only to nodes that report it.
+
+On macOS 11+ (the vz backend, which includes the 2013-2014 Intel Macs that
+run Big Sur) the helper gets the gateway's address in `vz.json` (`net`).
+It makes an `AF_UNIX` `SOCK_DGRAM` socket pair (1 MiB send and 4 MiB
+receive buffers, as Apple advises), hands one end to
+`VZFileHandleNetworkDeviceAttachment` on a `VZVirtioNetworkDeviceConfiguration`
+(MAC `52:54:00:12:34:56`, the same as QEMU's), and joins the other end to
+the gateway with two threads (`net::bridge_datagrams`): one datagram is one
+Ethernet frame, re-framed with QEMU's 4-byte length. So vz and QEMU guests
+meet the same gateway, the same policy and the same tests (the gateway
+test runs over both framings). A frame the VM's socket has no room for
+(macOS answers `ENOBUFS` instead of blocking) is retried for a few
+milliseconds, then dropped as a busy link would; TCP sends it again. The
+framework's own `VZNATNetworkDeviceAttachment` is not used: it would put
+the guest behind the host's NAT, where it could reach the LAN and the
+host, around the policy. The guest kernels (Firecracker's 1.15 CI
+configuration, and the Intel bzImage built from it) have `virtio_net`
+built in, so nothing changes in the guest.
 
 ### GPU passthrough (experimental)
 
@@ -2011,8 +2030,9 @@ remotely; install a current binary on them once.
   most on providers); passthrough is NVIDIA-only and untested in CI; MIG
   and vGPU slices are not scheduled separately.
 - MicroVM network: TCP and DNS only (no other UDP, ICMP or IPv6), no
-  per-job allow lists or bandwidth caps, egress is not billed, and the vz
-  backend and Firecracker without QEMU have no network.
+  per-job allow lists or bandwidth caps, egress is not billed, and
+  Firecracker without QEMU has no network (its cards need TAP devices;
+  install QEMU next to it).
 - Cluster management: no affinity or anti-affinity between jobs, no
   gang scheduling (all tasks of a job at once), no per-node or per-label
   quotas, quotas count tasks rather than CPU or memory, preemption stops a

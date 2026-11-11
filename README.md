@@ -156,8 +156,10 @@ destination, and never connects to private ranges (10/8, 172.16/12,
 192.168/16, 100.64/10), loopback, link-local (cloud metadata), multicast,
 reserved ranges, any address of the host itself, or port 25. DNS goes to the
 host's resolver; other UDP, ICMP and IPv6 are not forwarded. Network jobs
-need QEMU on the node (Firecracker nodes use it when it is installed;
-`pumasi vm status` says whether they can), and only go to nodes that can.
+need QEMU or macOS 11+ (Virtualization.framework, including the 2013-2014
+Intel Macs on Big Sur) on the node (Firecracker nodes use QEMU when it is
+installed; `pumasi vm status` says whether they can), and only go to nodes
+that can.
 
 ### GPU jobs
 
@@ -1446,8 +1448,8 @@ only on the control plane (no replicas on owner nodes yet, no S3-compatible
 gateway). GPUs are checked on real hardware by hand, not in CI (hosted
 runners have none); VFIO passthrough is experimental and NVIDIA-only
 (Turing and newer, with the open kernel modules); Intel and Apple GPUs are
-used only through WebGPU. MicroVM networks need QEMU (not Firecracker alone or
-Virtualization.framework) and forward TCP and DNS only. MicroVMs need KVM (Linux), Virtualization.framework
+used only through WebGPU. MicroVM networks need QEMU or Virtualization.framework (not Firecracker
+alone) and forward TCP and DNS only. MicroVMs need KVM (Linux), Virtualization.framework
 (macOS 11+) or WHPX (Windows x86_64) for speed (QEMU without them works but
 is slow, and Windows on ARM has no microVMs yet). WHPX and
 Virtualization.framework guests are checked on real machines only: CI

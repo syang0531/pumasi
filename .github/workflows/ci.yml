@@ -467,6 +467,33 @@ jobs:
           # virtualization here, or the fake kernel). Anything else is a crash.
           [ "$code" -le 1 ]
           [ "$code" = 0 ] || grep -q "^pumasi-vz: " out.txt
+      - name: The helper attaches a network card to the gateway
+        run: |
+          # A stand-in gateway: the helper must connect to it and get the
+          # same answer from the framework as without a card.
+          python3 -c '
+          import socket, sys
+          s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1)
+          print(s.getsockname()[1], flush=True)
+          c, _ = s.accept(); print("connected", flush=True); c.recv(1)
+          ' > gw.txt &
+          for _ in $(seq 50); do [ -s gw.txt ] && break; sleep 0.1; done
+          port=$(head -n1 gw.txt)
+          cat > vz-net.json <<JSON
+          {"kernel":"$PWD/kernel","initrd":"$PWD/initrd","cmdline":"console=hvc0","disks":[["$PWD/disk.img",true]],"cpus":1,"mem_mib":256,"net":"127.0.0.1:$port"}
+          JSON
+          set +e
+          "$VM_DIR/pumasi-vz" __vz-run vz-net.json > out-net.txt 2>&1
+          code=$?
+          set -e
+          cat out-net.txt; echo "exit $code"; cat gw.txt
+          [ "$code" -le 1 ]
+          [ "$code" = 0 ] || grep -q "^pumasi-vz: " out-net.txt
+          grep -q connected gw.txt
+          # The card must not be what makes the configuration invalid.
+          if grep -q "invalid VM configuration" out-net.txt && ! grep -q "invalid VM configuration" out.txt; then
+            echo "the network card made the VM configuration invalid"; exit 1
+          fi
 
   # QEMU on Windows: WHPX where the runner offers it, and TCG.
   microvm-windows:

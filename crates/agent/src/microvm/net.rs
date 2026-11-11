@@ -3,7 +3,11 @@
 //! The guest gets a virtio-net card whose other end is not a host network
 //! device but this gateway: QEMU sends the card's Ethernet frames over a
 //! local TCP connection (`-netdev socket`), and a user-space TCP/IP stack
-//! (smoltcp) terminates the guest's connections. For each TCP connection
+//! (smoltcp) terminates the guest's connections. The vz backend
+//! (Virtualization.framework) hands its card's frames to a datagram socket
+//! instead (`VZFileHandleNetworkDeviceAttachment`), which the vz helper
+//! joins to the same kind of TCP connection ([`bridge_datagrams`]), so
+//! both backends meet the same gateway and the same policy. For each TCP connection
 //! the guest opens, the gateway opens one from the host to the same
 //! address, if that address is allowed, and copies bytes both ways. DNS
 //! queries to the gateway are answered with the host's resolver.
@@ -67,7 +71,8 @@ const MAX_CONNECTIONS: usize = 512;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// A connection the guest started but never completed.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long QEMU has to connect after the gateway starts.
+/// How long QEMU (or the vz helper) has to connect after the gateway
+/// starts.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(120);
 const DNS_PORT: u16 = 53;
 const MAX_DNS_IN_FLIGHT: usize = 64;
@@ -121,7 +126,8 @@ pub fn default_policy() -> Policy {
 
 /// A running gateway for one VM. Dropping it ends every connection.
 pub struct Gateway {
-    /// Where QEMU connects (`-netdev socket,connect=...`).
+    /// Where QEMU connects (`-netdev socket,connect=...`), or the vz
+    /// helper's [`bridge_datagrams`].
     pub addr: SocketAddr,
     task: JoinHandle<()>,
 }
@@ -546,6 +552,136 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
     }
 }
 
+/// Send and receive buffers of the datagram socket a vz VM's network card
+/// uses. Apple asks for a receive buffer at least twice the send buffer.
+#[cfg(unix)]
+const DGRAM_SNDBUF: libc::c_int = 1 << 20;
+#[cfg(unix)]
+const DGRAM_RCVBUF: libc::c_int = 4 << 20;
+
+/// Makes the pair of datagram sockets a vz network card needs: one end
+/// for `VZFileHandleNetworkDeviceAttachment`, one for [`bridge_datagrams`].
+#[cfg(unix)]
+pub fn datagram_pair() -> Result<(
+    std::os::unix::net::UnixDatagram,
+    std::os::unix::net::UnixDatagram,
+)> {
+    use std::os::fd::AsRawFd;
+    let (a, b) = std::os::unix::net::UnixDatagram::pair().context("make a datagram socket pair")?;
+    for s in [&a, &b] {
+        for (opt, size) in [
+            (libc::SO_SNDBUF, DGRAM_SNDBUF),
+            (libc::SO_RCVBUF, DGRAM_RCVBUF),
+        ] {
+            // SAFETY: an open socket and an int-sized option value.
+            let r = unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if r != 0 {
+                // Smaller buffers only drop more frames under load.
+                debug!(
+                    "setsockopt on the VM's datagram socket: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+    Ok((a, b))
+}
+
+/// Joins a datagram socket that carries one Ethernet frame per datagram
+/// (the other end of a vz VM's `VZFileHandleNetworkDeviceAttachment`) to
+/// a [`Gateway`], which speaks QEMU's stream framing (4-byte big-endian
+/// length, then the frame). Runs on two plain threads, so it works in the
+/// vz helper, which has no async runtime, and returns once both run. The
+/// threads end when either side closes. The gateway filters everything,
+/// exactly as for QEMU: this only changes how frames travel.
+#[cfg(unix)]
+pub fn bridge_datagrams(
+    dgram: std::os::unix::net::UnixDatagram,
+    gateway: SocketAddr,
+) -> Result<[std::thread::JoinHandle<()>; 2]> {
+    use std::io::{Read, Write};
+    let stream = std::net::TcpStream::connect_timeout(&gateway, Duration::from_secs(10))
+        .with_context(|| format!("connect to the VM network gateway at {gateway}"))?;
+    let _ = stream.set_nodelay(true);
+    let mut from_gw = stream.try_clone()?;
+    let mut to_gw = stream;
+    let to_vm = dgram.try_clone()?;
+    let from_vm = dgram;
+
+    let up = std::thread::Builder::new()
+        .name("vz-net-up".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; MAX_FRAME];
+            let mut out = Vec::with_capacity(4 + MAX_FRAME);
+            loop {
+                let n = match from_vm.recv(&mut buf) {
+                    // No frame is empty: the socket was shut down.
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                out.clear();
+                out.extend_from_slice(&(n as u32).to_be_bytes());
+                out.extend_from_slice(&buf[..n]);
+                if to_gw.write_all(&out).is_err() {
+                    break;
+                }
+            }
+            let _ = to_gw.shutdown(std::net::Shutdown::Both);
+        })?;
+    let down = std::thread::Builder::new()
+        .name("vz-net-down".into())
+        .spawn(move || {
+            let mut frame = vec![0u8; MAX_FRAME];
+            loop {
+                let mut len = [0u8; 4];
+                if from_gw.read_exact(&mut len).is_err() {
+                    break;
+                }
+                let len = u32::from_be_bytes(len) as usize;
+                if len > MAX_FRAME || from_gw.read_exact(&mut frame[..len]).is_err() {
+                    break;
+                }
+                send_frame(&to_vm, &frame[..len]);
+            }
+            let _ = to_vm.shutdown(std::net::Shutdown::Both);
+        })?;
+    Ok([up, down])
+}
+
+/// Hands one frame to the VM. A full socket buffer (macOS answers ENOBUFS
+/// rather than blocking) is retried briefly, then the frame is dropped,
+/// as a busy link would; TCP sends it again.
+#[cfg(unix)]
+fn send_frame(s: &std::os::unix::net::UnixDatagram, f: &[u8]) {
+    for attempt in 0..50u32 {
+        match s.send(f) {
+            Ok(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if e.raw_os_error() == Some(libc::ENOBUFS)
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                std::thread::sleep(Duration::from_micros(100 << attempt.min(4)));
+            }
+            Err(e) => {
+                trace!("frame to the VM dropped: {e}");
+                return;
+            }
+        }
+    }
+    trace!("frame to the VM dropped: its socket stayed full");
+}
+
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -797,7 +933,7 @@ mod tests {
     /// A guest made of a second smoltcp stack, talking to the gateway the
     /// way QEMU does.
     struct FakeGuest {
-        stream: TcpStream,
+        link: Link,
         dev: Queues,
         iface: Interface,
         sockets: SocketSet<'static>,
@@ -805,9 +941,36 @@ mod tests {
         inbuf: Vec<u8>,
     }
 
+    /// How the fake guest's frames reach the gateway.
+    enum Link {
+        /// QEMU's `-netdev socket`.
+        Stream(TcpStream),
+        /// A vz card's datagram socket, through [`bridge_datagrams`].
+        #[cfg(unix)]
+        Datagram(tokio::net::UnixDatagram),
+    }
+
     impl FakeGuest {
         async fn attach(gw: &Gateway) -> Self {
             let stream = TcpStream::connect(gw.addr).await.unwrap();
+            Self::with_link(Link::Stream(stream))
+        }
+
+        /// Attached the way the vz helper attaches a VM.
+        #[cfg(unix)]
+        async fn attach_datagram(gw: &Gateway) -> Self {
+            let (vm, ours) = datagram_pair().unwrap();
+            let addr = gw.addr;
+            tokio::task::spawn_blocking(move || bridge_datagrams(ours, addr).unwrap())
+                .await
+                .unwrap();
+            vm.set_nonblocking(true).unwrap();
+            Self::with_link(Link::Datagram(
+                tokio::net::UnixDatagram::from_std(vm).unwrap(),
+            ))
+        }
+
+        fn with_link(link: Link) -> Self {
             let mut dev = Queues::default();
             let start = std::time::Instant::now();
             let mac = EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
@@ -821,7 +984,7 @@ mod tests {
             });
             iface.routes_mut().add_default_ipv4_route(GATEWAY).unwrap();
             Self {
-                stream,
+                link,
                 dev,
                 iface,
                 sockets: SocketSet::new(Vec::new()),
@@ -840,14 +1003,30 @@ mod tests {
             while std::time::Instant::now() < until {
                 let now = self.now();
                 self.iface.poll(now, &mut self.dev, &mut self.sockets);
+                let stream = match &mut self.link {
+                    Link::Stream(s) => s,
+                    #[cfg(unix)]
+                    Link::Datagram(d) => {
+                        while let Some(f) = self.dev.tx.pop_front() {
+                            d.send(&f).await.unwrap();
+                        }
+                        let mut tmp = vec![0u8; 65536];
+                        while let Ok(Ok(n)) =
+                            tokio::time::timeout(Duration::from_millis(2), d.recv(&mut tmp)).await
+                        {
+                            self.dev.rx.push_back(tmp[..n].to_vec());
+                        }
+                        continue;
+                    }
+                };
                 while let Some(f) = self.dev.tx.pop_front() {
                     let mut b = (f.len() as u32).to_be_bytes().to_vec();
                     b.extend_from_slice(&f);
-                    self.stream.write_all(&b).await.unwrap();
+                    stream.write_all(&b).await.unwrap();
                 }
                 let mut tmp = [0u8; 65536];
                 if let Ok(Ok(n)) =
-                    tokio::time::timeout(Duration::from_millis(2), self.stream.read(&mut tmp)).await
+                    tokio::time::timeout(Duration::from_millis(2), stream.read(&mut tmp)).await
                 {
                     self.inbuf.extend_from_slice(&tmp[..n]);
                 }
@@ -880,6 +1059,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn guest_tcp_and_dns_through_the_gateway() {
+        guest_through_the_gateway(false).await;
+    }
+
+    /// The same over a vz card's datagram socket: the policy and the
+    /// stack are the gateway's either way.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vz_datagram_guest_through_the_gateway() {
+        guest_through_the_gateway(true).await;
+    }
+
+    async fn guest_through_the_gateway(datagram: bool) {
         // An echo server on the host that the test policy allows (the
         // default one would refuse loopback).
         let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -901,7 +1092,16 @@ mod tests {
         });
         let policy: Policy = Arc::new(move |ip, p| ip == Ipv4Addr::LOCALHOST && p == port);
         let gw = Gateway::start_with(policy).await.unwrap();
-        let mut g = FakeGuest::attach(&gw).await;
+        let mut g = if datagram {
+            #[cfg(unix)]
+            {
+                FakeGuest::attach_datagram(&gw).await
+            }
+            #[cfg(not(unix))]
+            unreachable!()
+        } else {
+            FakeGuest::attach(&gw).await
+        };
 
         // Allowed: an echo round trip, with more data than one window.
         let h = g.tcp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 40000);

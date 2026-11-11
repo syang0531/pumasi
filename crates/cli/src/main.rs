@@ -635,7 +635,7 @@ enum VmCmd {
         #[arg(long, default_value = "pumasi-out/vm")]
         out: PathBuf,
         /// Give the VM a network card that reaches public addresses only
-        /// (needs QEMU).
+        /// (QEMU or vz; Firecracker needs QEMU next to it).
         #[arg(long)]
         network: bool,
         #[command(flatten)]
@@ -3246,12 +3246,14 @@ fn vm_status(config: &MicrovmConfig) -> Result<i32> {
             );
             println!(
                 "network: {}",
-                if vmm.backend == Backend::Qemu
+                if vmm.backend == Backend::Vz {
+                    "jobs with network = true get a filtered network card (vz)"
+                } else if vmm.backend == Backend::Qemu
                     || (vmm.backend == Backend::Firecracker && a.qemu.is_some())
                 {
                     "jobs with network = true get a filtered network card (QEMU)"
                 } else {
-                    "not available (jobs with network = true need QEMU)"
+                    "not available (Firecracker needs QEMU next to it for jobs with network = true)"
                 }
             );
             Ok(0)

@@ -21,10 +21,10 @@
 //! 3. read the output disk back (as data: nothing from it is unpacked).
 //!
 //! The VM has no network device unless the job asks for one
-//! (`network = true`): then QEMU gives it a virtio-net card whose other end
-//! is the agent's filtering gateway ([`net`]), which lets it reach public
-//! addresses only. Timeouts and cancellation kill the VMM process. See
-//! `pumasi_guest` for the disk protocol.
+//! (`network = true`): then QEMU or vz gives it a virtio-net card whose
+//! other end is the agent's filtering gateway ([`net`]), which lets it
+//! reach public addresses only. Timeouts and cancellation kill the VMM
+//! process. See `pumasi_guest` for the disk protocol.
 
 pub mod ext4;
 pub mod net;
@@ -333,8 +333,8 @@ struct ImageEntry {
 #[derive(Clone)]
 pub struct MicrovmExecutor {
     vmm: Vmm,
-    /// The VMM for VMs with a network card (QEMU: the main one, or the
-    /// one next to Firecracker), if any.
+    /// The VMM for VMs with a network card (QEMU or vz: the main one; or
+    /// the QEMU next to Firecracker), if any.
     net_vmm: Option<Vmm>,
     /// What GPU passthrough needs, when it is all there.
     gpu: Option<GpuAssets>,
@@ -450,8 +450,9 @@ impl MicrovmExecutor {
             let _ = std::fs::remove_dir_all(&run_dir);
         }
         std::fs::create_dir_all(&run_dir)?;
-        // Firecracker's network cards need TAP devices (root); QEMU's can
-        // talk to the gateway, so network tasks use QEMU when it is there.
+        // Firecracker's network cards need TAP devices (root); QEMU's and
+        // vz's talk to the gateway, so network tasks on Firecracker nodes
+        // use QEMU when it is there.
         let net_vmm = match vmm.backend {
             Backend::Firecracker => assets.qemu.clone().map(|bin| Vmm {
                 backend: Backend::Qemu,
@@ -459,7 +460,9 @@ impl MicrovmExecutor {
                 accelerated: assets.kvm,
                 tsc_khz: None,
             }),
-            _ => None,
+            // QEMU's is set below, after the WHPX probe may change it.
+            Backend::Qemu => None,
+            Backend::Vz => Some(vmm.clone()),
         };
         let gpu = GpuAssets::find(&config.dir, &assets);
         let tee = tee::TeeAssets::detect(
@@ -733,14 +736,13 @@ impl MicrovmExecutor {
             }
             Some((assets, pci))
         };
-        let net_vmm =
-            if spec.network {
-                Some(self.net_vmm.as_ref().context(
-                    "microVMs on this machine cannot have a network card (that needs QEMU)",
+        let net_vmm = if spec.network {
+            Some(self.net_vmm.as_ref().context(
+                    "microVMs on this machine cannot have a network card (Firecracker needs QEMU next to it for that)",
                 )?)
-            } else {
-                None
-            };
+        } else {
+            None
+        };
         let image = match &io.image {
             Some(img) => self.ensure_local_image(img, cancel).await?,
             None => self.ensure_image(&spec.image, cancel).await?,

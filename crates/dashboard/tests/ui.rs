@@ -758,6 +758,86 @@ mod idp {
 }
 
 /// The `name=value` of a Set-Cookie header named `name`.
+/// One raw HTTP/1.1 exchange, for requests with a Host of our choosing.
+async fn raw(addr: SocketAddr, request: &str) -> String {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The full dashboard on loopback behind a tunnel: browsers send the
+/// public name as Host and Origin, which `--public-url` makes acceptable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_behind_a_tunnel() {
+    let (cluster, agent_task) = start_cluster().await;
+    let admin = cluster.admin_ticket();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ui = pumasi_dashboard::start_on(
+        listener,
+        UiConfig {
+            ticket: admin.clone(),
+            net: NetMode::Local,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            login_only: true,
+            upload_limit: 64 << 20,
+            api_only: false,
+            tls: None,
+            real_ip_header: Some("CF-Connecting-IP".into()),
+            public_url: Some("https://Pumasi.Example.com/".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let addr = ui.addr();
+
+    let page = raw(
+        addr,
+        "GET /login HTTP/1.1\r\nHost: pumasi.example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    // Other names are still refused (DNS rebinding).
+    let other = raw(
+        addr,
+        "GET /login HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(other.starts_with("HTTP/1.1 421"), "{other}");
+
+    // Signing in from the public page: same origin, and a Secure cookie.
+    let body = format!("ticket={admin}");
+    let signed = raw(
+        addr,
+        &format!(
+            "POST /login HTTP/1.1\r\nHost: pumasi.example.com\r\nOrigin: https://pumasi.example.com\r\nCF-Connecting-IP: 203.0.113.7\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert!(signed.starts_with("HTTP/1.1 303"), "{signed}");
+    let cookie_line = signed
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .unwrap();
+    assert!(cookie_line.contains("Secure"), "{cookie_line}");
+
+    // The JSON API answers bearer tickets on the same name.
+    let api = raw(
+        addr,
+        &format!(
+            "GET /api/v1/whoami HTTP/1.1\r\nHost: pumasi.example.com\r\nAuthorization: Bearer {admin}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(api.starts_with("HTTP/1.1 200"), "{api}");
+
+    ui.stop();
+    agent_task.abort();
+    drop(cluster);
+}
+
 fn set_cookie(r: &Resp, name: &str) -> Option<String> {
     r.headers
         .iter()

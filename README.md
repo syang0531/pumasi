@@ -554,7 +554,11 @@ pumasi service status          # every Pumasi service on this machine
   start` running in a terminal first.
 - `ui` runs `pumasi ui` (service `pumasi-ui`) on 127.0.0.1:7400 unless
   `--listen` says otherwise, without opening a browser. The dashboard's
-  sign-in link is written to `~/.pumasi/ui.url` when it starts.
+  sign-in link is written to `~/.pumasi/ui.url` when it starts. For the
+  dashboard and the API behind a Cloudflare Tunnel on one name, use
+  `service install ui -- --login-only --public-url https://pumasi.example.com
+  --real-ip-header CF-Connecting-IP` ([docs/api.md](docs/api.md), "Put it
+  on the internet").
 - A system service of these two runs as the owner of the home (`User=`
   in systemd, `UserName` in launchd), so the admin ticket it writes stays
   yours. Give `--home` before `service install`: under `sudo`, Pumasi uses
@@ -1375,7 +1379,7 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 18 and 19
 are only for trading with other clusters.
 

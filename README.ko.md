@@ -277,7 +277,7 @@ pumasi service status          # 이 기기의 Pumasi 서비스 모두
 ```
 
 - `cluster`는 `pumasi cluster start`를 돌리고(서비스 `pumasi-cluster`, launchd 레이블 `pumasi.cluster`), 시작할 때마다 참가 티켓이 로그에 남지 않도록 `--no-token`을 붙입니다. 참가 티켓은 `pumasi token`으로 만드세요. 터미널에서 돌던 `cluster start`는 먼저 멈춥니다.
-- `ui`는 `pumasi ui`를 돌립니다(서비스 `pumasi-ui`). `--listen`이 없으면 127.0.0.1:7400이고 브라우저는 열지 않습니다. 대시보드 로그인 링크는 시작할 때 `~/.pumasi/ui.url`에 씁니다.
+- `ui`는 `pumasi ui`를 돌립니다(서비스 `pumasi-ui`). `--listen`이 없으면 127.0.0.1:7400이고 브라우저는 열지 않습니다. 대시보드 로그인 링크는 시작할 때 `~/.pumasi/ui.url`에 씁니다. 대시보드와 API를 Cloudflare Tunnel 뒤 한 주소로 열려면 `service install ui -- --login-only --public-url https://pumasi.example.com --real-ip-header CF-Connecting-IP`로 설치합니다([docs/api.md](docs/api.md)의 "Put it on the internet").
 - 이 둘을 시스템 서비스로 설치하면 홈 디렉터리 소유자 계정으로 돕니다(systemd `User=`, launchd `UserName`). 그래서 관리자 티켓 파일이 계속 내 것입니다. `--home`은 `service install` 앞에 주세요. `sudo` 아래에서는 따로 말하지 않으면 root의 홈을 씁니다. Windows에서는 LocalSystem으로 돌고, `pumasi-cluster`에도 에이전트처럼 방화벽 규칙을 넣습니다.
 - `pumasi service uninstall cluster`(또는 `ui`)로 지웁니다. 클러스터 데이터는 남습니다.
 
@@ -678,7 +678,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 18·19단계는 다른 클러스터와 거래할 때만 필요합니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |

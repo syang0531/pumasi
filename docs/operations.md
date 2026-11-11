@@ -92,7 +92,7 @@ with `pumasi invite ACCOUNT` instead.
 machine), as its own service:
 
 ```ini
-ExecStart=/usr/local/bin/pumasi ui --listen 127.0.0.1:7400 --no-open --public-url https://pumasi.example.com
+ExecStart=/usr/local/bin/pumasi ui --listen 127.0.0.1:7400 --no-open --login-only --public-url https://pumasi.example.com --real-ip-header CF-Connecting-IP
 ```
 
 Put it on the internet only through Cloudflare Tunnel, a reverse proxy

@@ -45,8 +45,9 @@ const KERNEL_VERSION: &str = "6.1.102";
 
 /// macOS kernels: Virtualization.framework has only virtio-pci devices,
 /// which Firecracker's CI kernels have since its 1.15 configuration. Apple
-/// Silicon boots its arm64 Image as is; Intel Macs need a bzImage, built
-/// from the same configuration by `.github/workflows/guest-kernel.yml`
+/// Silicon boots its arm64 Image as is; Intel Macs need a bzImage with the
+/// EFI stub (the framework boots Intel kernels through it), built from the
+/// same configuration by `.github/workflows/guest-kernel.yml`
 /// (`scripts/kernel/build.sh`) and published as a prerelease.
 const VZ_KERNEL_VERSION: &str = "6.1.155";
 const VZ_KERNEL_AARCH64_URL: &str =
@@ -54,9 +55,9 @@ const VZ_KERNEL_AARCH64_URL: &str =
 const VZ_KERNEL_AARCH64_SHA256: &str =
     "e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591";
 const VZ_KERNEL_X86_64_URL: &str =
-    "https://github.com/syang0531/pumasi/releases/download/guest-kernel-6.1.155-1/bzImage-x86_64";
+    "https://github.com/syang0531/pumasi/releases/download/guest-kernel-6.1.155-2/bzImage-x86_64";
 const VZ_KERNEL_X86_64_SHA256: &str =
-    "a18b8737ab2f12b9cce9304c3f5295ef0a37492affa38ee57d46a57b9ae6a014";
+    "e288d5232f0142de7c7605d1718be14d12b5626abf7cdd0a5334d2ec0825fff3";
 
 /// Where the guest kernel for `os` and `arch` comes from, its SHA-256 and
 /// a label.
@@ -187,7 +188,7 @@ pub async fn setup(dir: &Path, guest: Option<&Path>, force: bool) -> Result<Setu
     }
 
     let kernel = dir.join(KERNEL_FILE);
-    if kernel.exists() && !force {
+    if kernel.exists() && !force && !stale_vz_kernel(&kernel, kernel_sha256) {
         report.kept.push(kernel.display().to_string());
     } else {
         let bytes = fetch(&http, &kernel_url, kernel_sha256).await?;
@@ -378,6 +379,33 @@ async fn download_to(
         return Ok(());
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no download URL")))
+}
+
+/// Whether `kernel` is a macOS guest kernel other than the pinned one.
+/// Those come only from this file's pins, so a different one is an older
+/// pin (1.3.0 and before pinned an Intel bzImage that Virtualization.framework
+/// cannot boot) and is replaced. Linux and Windows kernels are left alone:
+/// people point those at their own builds.
+fn stale_vz_kernel(kernel: &Path, sha256: &str) -> bool {
+    cfg!(target_os = "macos")
+        && std::fs::read(kernel).is_ok_and(|b| registry::hex(&Sha256::digest(&b)) != sha256)
+}
+
+/// Replaces an older macOS guest kernel in `dir` with the pinned one, so
+/// an upgraded agent boots the kernel its release pins without another
+/// `pumasi vm setup`. Returns what it installed, if anything.
+pub async fn refresh_vz_kernel(dir: &Path) -> Result<Option<String>> {
+    let Some((url, sha256, label)) = kernel_source(std::env::consts::OS, std::env::consts::ARCH)
+    else {
+        return Ok(None);
+    };
+    let kernel = dir.join(KERNEL_FILE);
+    if !stale_vz_kernel(&kernel, sha256) {
+        return Ok(None);
+    }
+    let bytes = fetch(&registry::http_client()?, &url, sha256).await?;
+    write_atomic(&kernel, &bytes, 0o644)?;
+    Ok(Some(format!("{} ({label})", kernel.display())))
 }
 
 async fn fetch(http: &reqwest::Client, url: &str, sha256: &str) -> Result<Vec<u8>> {

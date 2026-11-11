@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 env:
-  KERNEL_TAG: guest-kernel-6.1.155-1
+  KERNEL_TAG: guest-kernel-6.1.155-2
 
 jobs:
   bzimage:

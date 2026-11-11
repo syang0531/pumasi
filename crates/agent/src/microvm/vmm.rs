@@ -62,7 +62,7 @@ pub struct VmSpec {
     pub disks: Vec<Disk>,
     pub vcpus: u32,
     pub mem_mib: u64,
-    /// A network card whose frames go to this gateway (QEMU only; see
+    /// A network card whose frames go to this gateway (QEMU and vz; see
     /// [`super::net`]).
     pub net: Option<std::net::SocketAddr>,
     /// PCI devices bound to `vfio-pci` to pass through (QEMU on Linux
@@ -114,13 +114,13 @@ pub const SERIAL_LOG: &str = "serial.log";
 impl Vmm {
     /// The VMM command for `spec`. Writes any config file into `dir`.
     pub fn command(&self, spec: &VmSpec, dir: &Path) -> Result<tokio::process::Command> {
-        if self.backend != Backend::Qemu
-            && (spec.net.is_some() || !spec.pci.is_empty() || spec.tee.is_some())
-        {
-            bail!(
-                "{} cannot give a VM a network card or GPUs; QEMU can",
-                self.backend
-            );
+        if self.backend != Backend::Qemu && (!spec.pci.is_empty() || spec.tee.is_some()) {
+            bail!("{} cannot give a VM GPUs or a TEE; QEMU can", self.backend);
+        }
+        // Firecracker's cards need TAP devices; QEMU's and vz's reach the
+        // gateway without them.
+        if self.backend == Backend::Firecracker && spec.net.is_some() {
+            bail!("Firecracker cannot give a VM a network card here; QEMU can");
         }
         match self.backend {
             Backend::Firecracker => self.firecracker(spec, dir),
@@ -155,6 +155,7 @@ impl Vmm {
                 .collect(),
             cpus: spec.vcpus,
             mem_mib: spec.mem_mib,
+            net: spec.net,
         };
         let path = dir.join("vz.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
@@ -611,6 +612,25 @@ mod tests {
         assert!(config.cmdline.contains("pumasi.mode=run"));
         assert!(config.cmdline.contains("pumasi.exit=poweroff"));
         assert_eq!(config.disks, vec![("/a.img".into(), true)]);
+        assert_eq!(config.net, None);
         assert_eq!("vz".parse::<Backend>().unwrap(), Backend::Vz);
+
+        // With a network card: the helper gets the gateway's address.
+        let gw: std::net::SocketAddr = "127.0.0.1:4567".parse().unwrap();
+        let net = VmSpec {
+            net: Some(gw),
+            ..spec.clone()
+        };
+        let cmd = vmm.command(&net, dir.path()).unwrap();
+        let path = cmd.as_std().get_args().nth(1).unwrap().to_owned();
+        let config: super::super::vz::VzConfig =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(config.net, Some(gw));
+        // GPUs still need QEMU.
+        let gpu = VmSpec {
+            pci: vec!["0000:01:00.0".into()],
+            ..spec
+        };
+        assert!(vmm.command(&gpu, dir.path()).is_err());
     }
 }

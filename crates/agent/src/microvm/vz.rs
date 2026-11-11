@@ -16,7 +16,13 @@
 //!
 //! The VM gets the kernel and initramfs through `VZLinuxBootLoader`, one
 //! virtio-blk device per disk, an entropy device, and the guest console
-//! (`hvc0`) on the helper's stdout. Its devices are virtio-pci, so the
+//! (`hvc0`) on the helper's stdout. A task with `network = true` also gets
+//! a virtio-net card over `VZFileHandleNetworkDeviceAttachment`: one end
+//! of a datagram socket pair, one Ethernet frame per datagram, whose other
+//! end the helper joins to the agent's filtering gateway
+//! ([`super::net::bridge_datagrams`]), the same one QEMU's cards use. The
+//! framework's NAT and bridged attachments are not used: they would put
+//! the guest on the host's network, around the gateway's policy. Its devices are virtio-pci, so the
 //! guest kernel differs from Firecracker's: Firecracker's 6.1 CI build with
 //! PCI on Apple Silicon, and the same configuration as a bzImage on Intel,
 //! which is what `VZLinuxBootLoader` boots there (see `setup`).
@@ -52,6 +58,10 @@ pub struct VzConfig {
     pub disks: Vec<(PathBuf, bool)>,
     pub cpus: u32,
     pub mem_mib: u64,
+    /// The agent's network gateway for this VM ([`super::net::Gateway`]),
+    /// when the task asked for a network card.
+    #[serde(default)]
+    pub net: Option<std::net::SocketAddr>,
 }
 
 /// Makes sure `<dir>/pumasi-vz` is a signed copy of this binary, and
@@ -275,6 +285,42 @@ mod imp {
         }
     }
 
+    /// A virtio-net card whose frames reach the gateway at `gateway`.
+    fn network_device(gateway: std::net::SocketAddr) -> Result<Retained<AnyObject>> {
+        use std::os::fd::IntoRawFd;
+        let (vm_end, ours) = crate::microvm::net::datagram_pair()?;
+        crate::microvm::net::bridge_datagrams(ours, gateway)?;
+        let fd = vm_end.into_raw_fd();
+        // SAFETY (this whole function): documented Foundation and
+        // Virtualization.framework (macOS 11) selectors with arguments of
+        // the declared types. The file handle owns `fd` from here on.
+        let handle: Option<Retained<AnyObject>> = unsafe {
+            msg_send![
+                alloc(c"NSFileHandle")?,
+                initWithFileDescriptor: fd,
+                closeOnDealloc: Bool::YES
+            ]
+        };
+        let handle = handle.context("NSFileHandle for the network socket")?;
+        let attachment: Option<Retained<AnyObject>> = unsafe {
+            msg_send![
+                alloc(c"VZFileHandleNetworkDeviceAttachment")?,
+                initWithFileHandle: &*handle
+            ]
+        };
+        let attachment = attachment.context("VZFileHandleNetworkDeviceAttachment")?;
+        let dev = new(c"VZVirtioNetworkDeviceConfiguration")?;
+        let mac = nsstring(crate::microvm::net::GUEST_MAC)?;
+        unsafe {
+            let _: () = msg_send![&*dev, setAttachment: &*attachment];
+            let m: Option<Retained<AnyObject>> =
+                msg_send![alloc(c"VZMACAddress")?, initWithString: &*mac];
+            let m = m.context("VZMACAddress")?;
+            let _: () = msg_send![&*dev, setMACAddress: &*m];
+        }
+        Ok(dev)
+    }
+
     pub fn run(c: &VzConfig) -> Result<()> {
         load().map_err(anyhow::Error::msg)?;
         // The configuration is built and validated before asking whether
@@ -343,6 +389,13 @@ mod imp {
         }
         let entropy = new(c"VZVirtioEntropyDeviceConfiguration")?;
 
+        // Network card: frames go over a datagram socket to the gateway.
+        // The bridge threads live as long as this process (the VM).
+        let mut network = Vec::new();
+        if let Some(gateway) = c.net {
+            network.push(network_device(gateway)?);
+        }
+
         // CPUs and memory, within what the framework allows.
         let (min_cpus, max_cpus, min_mem, max_mem): (usize, usize, u64, u64) = unsafe {
             (
@@ -364,6 +417,9 @@ mod imp {
             let _: () = msg_send![&*config, setStorageDevices: &*array(&disks)?];
             let _: () = msg_send![&*config, setSerialPorts: &*array(&[console])?];
             let _: () = msg_send![&*config, setEntropyDevices: &*array(&[entropy])?];
+            if !network.is_empty() {
+                let _: () = msg_send![&*config, setNetworkDevices: &*array(&network)?];
+            }
             let mut err: *mut AnyObject = ptr::null_mut();
             let ok: Bool = msg_send![&*config, validateWithError: &mut err];
             if !ok.as_bool() {
@@ -429,10 +485,15 @@ mod tests {
             disks: vec![("/a.img".into(), true), ("/b.img".into(), false)],
             cpus: 2,
             mem_mib: 352,
+            net: Some("127.0.0.1:4567".parse().unwrap()),
         };
         let back: VzConfig = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
         assert_eq!(back.disks, c.disks);
         assert_eq!(back.mem_mib, 352);
+        assert_eq!(back.net, c.net);
+        // A config written by an older agent has no network card.
+        let old = r#"{"kernel":"/k","initrd":"/i","cmdline":"","disks":[["/a",true]],"cpus":1,"mem_mib":256}"#;
+        assert!(serde_json::from_str::<VzConfig>(old).unwrap().net.is_none());
     }
 
     #[cfg(not(target_os = "macos"))]

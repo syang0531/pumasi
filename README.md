@@ -590,10 +590,13 @@ The control plane downloads, from the GitHub release, the binary of every
 platform its nodes run, checks each against the release's `SHA256SUMS`,
 its executable header (platform) and its build marker (version), and
 rolls them out as below. Nodes already on that version or newer are left
-alone. The control plane and the dashboard on a machine whose agent
-upgraded watch their binary: once the rollout has settled they restart
-into the new version by themselves (`--no-follow-binary` turns that off;
-signed-in browsers sign in again). `pumasi cluster start --release-source
+alone. The control plane and the dashboard watch their binary: once the
+rollout has settled they restart into the new version by themselves
+(`--no-follow-binary` turns that off; signed-in browsers sign in again).
+On a machine whose agent is a member, the agent installs that binary; on
+a machine that runs only the control plane (no agent, or one removed with
+`pumasi remove-node`), the control plane fetches the release for its own
+platform too and installs it itself. `pumasi cluster start --release-source
 URL` points it at another GitHub releases page.
 
 To roll out binaries you have (another build, or a control plane without

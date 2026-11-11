@@ -47,6 +47,11 @@ impl Follow {
         Some(Self { exe, seen })
     }
 
+    /// The binary being watched.
+    pub fn exe(&self) -> &Path {
+        &self.exe
+    }
+
     /// Resolves with the new version once a newer pumasi that starts is
     /// installed where this one was started from.
     pub async fn newer(&mut self) -> String {

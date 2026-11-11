@@ -211,9 +211,54 @@ A backup holds the cluster key, the admin secret, SSO settings and the
 cluster's secrets: encrypt it and store it like the admin ticket. Back up
 daily (a cron job or timer running `pumasi backup`), and keep the file
 store's `blobs` directory with it. Restore on a fresh machine with
-`pumasi cluster restore FILE` and then `pumasi cluster start`; nodes
-reconnect when it is reachable where the old one was (same `--bind`
-address or relay). Practice a restore once before you need it.
+`pumasi cluster restore FILE` and then `pumasi cluster start`. Nodes,
+admin and access tickets know the control plane by the cluster key, not
+by its address, so in the default public network mode they find the
+restored one on any machine (its relay is published under that key);
+with `--net local` it needs the old IP address and `--bind` port.
+Practice a restore once before you need it.
+
+### Move the control plane to another machine
+
+To move a single control plane (and the dashboard) to another machine,
+move its cluster directory. The cluster key goes with it, so nodes
+reconnect on their own within seconds, including nodes that are off
+during the move, and every admin, access and join ticket keeps working.
+No node joins again and no ticket is made again. The steps on Windows
+(administrator PowerShell; on Linux and macOS the same with `sudo`,
+`cp -a` or `tar`, and the paths of step 1):
+
+1. On the old machine, note what the services run with (`sc.exe qc
+   pumasi-cluster`, `sc.exe qc pumasi-ui`; on Linux the unit files) and
+   take a backup for safety: `pumasi backup pumasi-before-move.backup`.
+2. Stop it for good, so the two never run at once: `pumasi service
+   uninstall ui`, `pumasi service uninstall cluster` (both keep the
+   data), and stop anything else that serves the same address, such as
+   a Cloudflare Tunnel connector (`cloudflared service uninstall`).
+3. Pack the directory and set the old copy aside:
+   `tar -cf pumasi-cluster.tar -C $env:USERPROFILE\.pumasi cluster`,
+   then `Rename-Item $env:USERPROFILE\.pumasi\cluster cluster.moved`.
+   The archive holds the cluster key and the admin secret: carry it on
+   a disk or a share you control, and delete it afterwards.
+4. On the new machine, with the same pumasi version:
+   `tar -xf pumasi-cluster.tar -C $env:USERPROFILE\.pumasi`, then
+   install the services with the options from step 1:
+   `pumasi service install cluster -- ...` and
+   `pumasi service install ui -- ...`. A machine that already runs an
+   agent keeps it; the agent's state is in `agent`, beside `cluster`.
+5. Check with `pumasi status` there: nodes come back online within a
+   minute (nodes that were asleep, when they wake). Move the tunnel or
+   reverse proxy to the new machine.
+
+To go back, do the same in the other direction with the new machine's
+directory (it has everything that happened since). Never start the old
+copy beside the new one: two control planes with the same key split the
+nodes between them and their ledgers diverge.
+
+Replicas (step 5) are not the way to move: a replica has its own
+endpoint key, so once the original machine is removed, nodes that were
+off while the replica was added, and tickets made before it, cannot
+reach the cluster any more.
 
 ## 5. High availability
 

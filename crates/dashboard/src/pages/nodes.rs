@@ -79,7 +79,7 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
         Nav::Nodes,
         html! { div class="page-head" { h1 { (l.t("Nodes", "노드")) } } },
         Some(("5s", live)),
-        conf,
+        html! { (super::upgrade::placeholder(ctx)) (conf) },
     ))
 }
 
@@ -422,7 +422,7 @@ fn labels(ctx: &Ctx, n: &NodeView) -> Markup {
     let admin = ctx.me.is_admin();
     html! {
         section {
-            h2 { (l.t("Labels and taints", "라벨과 테인트")) }
+            h2 { (l.t("Name, labels and taints", "이름, 라벨, 테인트")) }
             p class="labels" {
                 @for (k, vs) in &n.labels {
                     @let user = n.config.labels.contains_key(k);
@@ -447,6 +447,13 @@ fn labels(ctx: &Ctx, n: &NodeView) -> Markup {
                 }
             }
             @if admin {
+                form class="inline" hx-post={"/nodes/" (n.id) "/rename"} hx-target="#flash" {
+                    input name="value" value=(n.info.name) maxlength="64" size="16"
+                        aria-label=(l.t("Node name", "노드 이름"))
+                        title=(l.t("Leave empty to go back to the name the node's agent reports.",
+                                   "비우면 노드 에이전트가 알려 주는 이름으로 돌아갑니다."));
+                    button type="submit" { (l.t("Rename", "이름 변경")) }
+                }
                 form class="inline" hx-post={"/nodes/" (n.id) "/label"} hx-target="#flash" {
                     input name="key" placeholder=(l.t("key", "키")) required size="10";
                     input name="value" placeholder=(l.t("value", "값")) size="10";
@@ -474,6 +481,13 @@ pub async fn action(
     Form(f): Form<EditForm>,
 ) -> Response {
     match do_action(&ctx, &node, &action, f).await {
+        // A new name shows outside the live region too (title, labels).
+        Ok(msg) if action == "rename" => {
+            let mut r = ctx.done(msg);
+            r.headers_mut()
+                .insert("hx-refresh", axum::http::HeaderValue::from_static("true"));
+            r
+        }
         Ok(msg) => ctx.done(msg),
         Err(e) => ctx.fail(e, hx(&headers)),
     }
@@ -566,6 +580,24 @@ async fn do_action(ctx: &Ctx, node: &str, action: &str, f: EditForm) -> anyhow::
                 )
             }
             .into())
+        }
+        "rename" => {
+            let name = f.value.unwrap_or_default().trim().to_string();
+            let name = (!name.is_empty()).then_some(name);
+            ctx.call(AdminOp::RenameNode {
+                node: node.to_string(),
+                name: name.clone(),
+            })
+            .await?;
+            Ok(match name {
+                Some(n) => format!("{} {n}", l.t("Renamed to", "이름을 바꿨습니다:")),
+                None => l
+                    .t(
+                        "It goes by the name its agent reports again.",
+                        "에이전트가 알려 주는 이름으로 되돌렸습니다.",
+                    )
+                    .into(),
+            })
         }
         "label" => {
             let k = key()?;

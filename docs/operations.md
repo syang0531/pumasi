@@ -194,11 +194,17 @@ themselves; the browser sign-in and `--ldap` do not have this problem.
    who leads), then the leader, so a majority is always up. The database
    is migrated in place on first open; there is no way back to an older
    binary except restoring the backup.
-4. Roll the agents out from the admin's machine:
+4. Roll the agents out from the admin's machine: `pumasi upgrade latest
+   --wait` (the control plane downloads the release and checks it against
+   its SHA256SUMS), or with binaries you downloaded,
    `pumasi upgrade rollout pumasi-linux-x86_64 pumasi-macos-aarch64 pumasi-windows-x86_64.exe --wait`.
    Older agents keep connecting as long as the control plane still
    supports their protocol version, and the rollout replaces them.
-5. Restart `pumasi ui` with the new binary.
+5. Restart `pumasi ui` with the new binary. From 1.3 on, a control plane
+   and a dashboard that share their binary with an agent restart into the
+   new version by themselves once the rollout has settled, so on such a
+   machine steps 3 and 5 happen on their own (a protocol change still
+   needs the control plane first).
 
 ## 4. Back up and restore
 

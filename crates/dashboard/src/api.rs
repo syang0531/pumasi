@@ -44,7 +44,9 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
         .route("/jobs/{id}/receipts", get(receipts))
         .route("/jobs/{id}/outputs.zip", get(outputs_zip))
         .route("/jobs/{id}/tasks/{index}/logs", get(logs))
+        .route("/nodes/{node}/rename", post(rename_node))
         .route("/nodes/{node}/{action}", post(node_action))
+        .route("/upgrade", get(upgrade_status).post(upgrade_latest))
         .route("/accounts", get(accounts))
         .route("/ledger", get(ledger))
         .route("/datasets", get(datasets))
@@ -351,6 +353,59 @@ async fn node_action(
         }
     };
     simple(st, a, op).await
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    /// The new name; null or missing goes back to the agent's name.
+    name: Option<String>,
+}
+
+async fn rename_node(
+    axum::extract::State(st): S,
+    a: Api,
+    Path(node): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> Response {
+    simple(
+        st,
+        a,
+        AdminOp::RenameNode {
+            node,
+            name: body.name.filter(|n| !n.trim().is_empty()),
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct UpgradeQuery {
+    #[serde(default)]
+    check: bool,
+}
+
+async fn upgrade_status(
+    axum::extract::State(st): S,
+    a: Api,
+    Query(q): Query<UpgradeQuery>,
+) -> Response {
+    simple(st, a, AdminOp::LatestRelease { check: q.check }).await
+}
+
+#[derive(Deserialize, Default)]
+struct UpgradeBody {
+    version: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+async fn upgrade_latest(
+    axum::extract::State(st): S,
+    a: Api,
+    body: Option<Json<UpgradeBody>>,
+) -> Response {
+    let UpgradeBody { version, force } = body.map(|b| b.0).unwrap_or_default();
+    simple(st, a, AdminOp::UpgradeToLatest { version, force }).await
 }
 
 async fn accounts(axum::extract::State(st): S, a: Api) -> Response {

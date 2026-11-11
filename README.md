@@ -576,8 +576,26 @@ earlier keeps its state in `~/.pumasi`, owned by root.
 
 ### Upgrading every agent at once
 
-Download the new release's binaries, then roll them out from wherever the
-admin ticket is:
+From wherever the admin ticket is (or with the Upgrade button on the
+dashboard's Nodes page, or `POST /api/v1/upgrade`):
+
+```sh
+pumasi upgrade latest --check     # the newest release and each node's version
+pumasi upgrade latest --wait      # or --version v1.3.0
+```
+
+The control plane downloads, from the GitHub release, the binary of every
+platform its nodes run, checks each against the release's `SHA256SUMS`,
+its executable header (platform) and its build marker (version), and
+rolls them out as below. Nodes already on that version or newer are left
+alone. The control plane and the dashboard on a machine whose agent
+upgraded watch their binary: once the rollout has settled they restart
+into the new version by themselves (`--no-follow-binary` turns that off;
+signed-in browsers sign in again). `pumasi cluster start --release-source
+URL` points it at another GitHub releases page.
+
+To roll out binaries you have (another build, or a control plane without
+internet access), download them and roll them out yourself:
 
 ```sh
 pumasi upgrade rollout pumasi-linux-x86_64 pumasi-macos-aarch64 pumasi-windows-x86_64.exe --wait
@@ -1081,6 +1099,7 @@ defends against, including the API exposed to the internet.
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-confidential] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-confidential` confidential jobs in SEV-SNP or TDX microVMs, `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
 | `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- OPTIONS]` | Run the agent (default), the control plane or the dashboard/API as a service that starts at boot (systemd, launchd, Windows service). `status [ROLE]` and `uninstall [ROLE]` too. |
+| `pumasi upgrade latest [--check] [--version TAG] [--wait] [--force]` | Have the control plane download the newest GitHub release (or `TAG`) for every platform in the cluster, check it against its SHA256SUMS, and roll it out; `--check` only shows the newest release and each node's version. |
 | `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
@@ -1090,7 +1109,8 @@ defends against, including the API exposed to the internet.
 | `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
 | `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
 | `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency, GPUs) and recent jobs with their cost in CU. |
-| `pumasi node <ID> [--rebenchmark]` | One node's benchmark profile, billed score, GPUs, latency and checks; `--rebenchmark` asks it to measure again. |
+| `pumasi node <NODE> [--rebenchmark]` | One node's benchmark profile, billed score, GPUs, latency and checks; `--rebenchmark` asks it to measure again. |
+| `pumasi node rename <NODE> <NAME>` / `--reset` | Give a node a display name (status, dashboard, events, the `name` label, any NODE argument); it replaces the agent's `--name` until `--reset`. The dashboard's node page and `POST /api/v1/nodes/NODE/rename` do the same. |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | Benchmark this machine the way the agent does and print the profile. |
 | `pumasi job <ID> [--output] [--out DIR]` | Per-task state, node, attempts, time, cost and check result; stdout/stderr with `--output`; downloads output files with `--out`. |
 | `pumasi cu list \| add <ACCOUNT> <CU> \| payout <ACCOUNT> <CU> \| ledger [--account A]` | Balances in CU (available, held, spent, earned), grants, payouts, and the ledger (`pumasi credit` still works). |
@@ -1098,7 +1118,7 @@ defends against, including the API exposed to the internet.
 | `pumasi receipts <ID> [--export FILE]` | A job's signed usage receipts, with the GPU part of each price. |
 | `pumasi verify-receipts FILE [--cluster ID]` | Check exported receipts offline. |
 | `pumasi cancel <ID>` | Cancel queued and running tasks of a job. |
-| `pumasi remove-node <ID>` | Revoke a node. It needs a new ticket to come back. |
+| `pumasi remove-node <NODE>` | Revoke a node (by name or id prefix). It needs a new ticket to come back. |
 | `pumasi login <TICKET> [--sso \| --ldap USER]` | Manage a remote cluster from this machine, with the admin ticket or an access ticket; `--sso` (device flow) and `--ldap` sign in with a sign-in ticket from `pumasi sso ticket`. |
 | `pumasi sso status` / `sso oidc --issuer URL --client-id ID --client-secret-file F` / `sso ldap --url ldaps://... --user-base DN` / `sso map RULE ROLE` / `sso unmap RULE` / `sso session 12h` / `sso device on\|off` / `sso ticket` | Single sign-on: an OpenID Connect provider or an LDAP directory, rules (`group:`, `email:`, `domain:`, `anyone`) giving `admin`, `viewer` or `submitter:ACCOUNT`, how long a sign-in lasts, whether `pumasi login --sso` (device flow, off by default) is allowed, and the ticket people sign in with. `--off` turns a method off. |
 | `pumasi audit ls [--after N] [--limit N] [--json] [-f]` / `audit verify [--json] [--against HEAD]` / `audit export [--syslog udp://\|tcp://HOST:PORT] [--state F] [-f]` | The audit log: entries, a check of the whole hash chain with a head signed by the cluster key, and syslog (RFC 5424) export. |

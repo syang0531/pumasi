@@ -1,6 +1,7 @@
 //! `pumasi`: one binary for the control plane, the node agent and the
 //! admin CLI.
 
+mod follow;
 mod gpu_cmd;
 mod ha_cmd;
 mod manage;
@@ -145,10 +146,15 @@ enum Cmd {
     /// them (Docker, microVM passthrough, the cluster's GPU check).
     #[command(subcommand)]
     Gpu(gpu_cmd::GpuCmd),
-    /// Show one node: its benchmark profile, billed CPU score, latency and
-    /// checks. With --rebenchmark, ask it to measure itself again.
+    /// Show one node (NODE: name or id prefix): its benchmark profile,
+    /// billed CPU score, latency and checks. With --rebenchmark, ask it to
+    /// measure itself again. `pumasi node rename` changes its name.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Node {
-        id: String,
+        #[command(subcommand)]
+        cmd: Option<NodeCmd>,
+        #[arg(required = true, value_name = "NODE")]
+        id: Option<String>,
         #[arg(long)]
         rebenchmark: bool,
         #[command(flatten)]
@@ -221,7 +227,9 @@ enum Cmd {
         admin: AdminArgs,
     },
     /// Remove a node from the cluster (it must be re-invited to rejoin).
+    /// NODE: name or id prefix.
     RemoveNode {
+        #[arg(value_name = "NODE")]
         id: String,
         #[command(flatten)]
         admin: AdminArgs,
@@ -754,6 +762,26 @@ enum PricesCmd {
 }
 
 #[derive(Subcommand)]
+enum NodeCmd {
+    /// Give a node a display name, shown in `pumasi status`, the dashboard
+    /// and events, and usable wherever a command takes NODE. It replaces
+    /// the name the node's agent reports (`--name`, by default the host
+    /// name) until --reset.
+    Rename {
+        /// The node: its current name or an id prefix.
+        node: String,
+        /// The new name (up to 64 characters, unique in the cluster).
+        #[arg(required_unless_present = "reset", conflicts_with = "reset")]
+        name: Option<String>,
+        /// Go back to the name the node's agent reports.
+        #[arg(long)]
+        reset: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+}
+
+#[derive(Subcommand)]
 enum ClusterCmd {
     /// Start the control plane (creates the cluster on first run).
     Start {
@@ -771,6 +799,8 @@ enum ClusterCmd {
         storage_class: Option<StorageClassArg>,
         #[command(flatten)]
         metrics: MetricsArgs,
+        #[command(flatten)]
+        release: ReleaseArgs,
     },
     /// Join an existing cluster's control plane as a replica, with a
     /// ticket from `pumasi ha invite`, and run it (restart it later with
@@ -784,10 +814,25 @@ enum ClusterCmd {
         storage_class: Option<StorageClassArg>,
         #[command(flatten)]
         metrics: MetricsArgs,
+        #[command(flatten)]
+        release: ReleaseArgs,
     },
     /// Make a control plane from a `pumasi backup` file (into an empty
     /// cluster directory).
     Restore { file: PathBuf },
+}
+
+#[derive(Args, Clone, Default)]
+struct ReleaseArgs {
+    /// Where `pumasi upgrade latest` finds published releases: a GitHub
+    /// releases URL (`<url>/latest` must redirect to the newest tag).
+    #[arg(long, value_name = "URL", default_value = pumasi_proto::release::DEFAULT_RELEASE_SOURCE)]
+    release_source: String,
+    /// Keep running the old code when a newer pumasi is installed over
+    /// this binary (by default the control plane restarts into it once the
+    /// rollout has settled).
+    #[arg(long)]
+    no_follow_binary: bool,
 }
 
 #[derive(Args, Clone, Default)]
@@ -1197,6 +1242,7 @@ async fn run(cli: Cli) -> Result<i32> {
             no_token,
             storage_class,
             metrics,
+            release,
         }) => {
             cluster_start(
                 &home,
@@ -1205,8 +1251,10 @@ async fn run(cli: Cli) -> Result<i32> {
                 no_token,
                 storage_class,
                 metrics,
+                release,
                 None,
                 shutdown_signal(),
+                false,
             )
             .await
         }
@@ -1215,6 +1263,7 @@ async fn run(cli: Cli) -> Result<i32> {
             net,
             storage_class,
             metrics,
+            release,
         }) => {
             let ticket: pumasi_proto::ticket::ReplicaTicket = ticket.parse()?;
             cluster_start(
@@ -1224,8 +1273,10 @@ async fn run(cli: Cli) -> Result<i32> {
                 true,
                 storage_class,
                 metrics,
+                release,
                 Some(ticket),
                 shutdown_signal(),
+                false,
             )
             .await
         }
@@ -1336,19 +1387,54 @@ async fn run(cli: Cli) -> Result<i32> {
         } => bench(&home, dir, quick, json, cpus).await,
         Cmd::Gpu(cmd) => gpu_cmd::run(&home, cmd).await,
         Cmd::Node {
+            cmd:
+                Some(NodeCmd::Rename {
+                    node,
+                    name,
+                    reset,
+                    admin,
+                }),
+            ..
+        } => {
+            let client = connect_admin(&home, &admin).await?;
+            let name = if reset { None } else { name };
+            client
+                .call(AdminOp::RenameNode {
+                    node: node.clone(),
+                    name: name.clone(),
+                })
+                .await?;
+            client.close().await;
+            match name {
+                Some(n) => eprintln!("renamed {node} to {n}"),
+                None => eprintln!("{node} goes by the name its agent reports again"),
+            }
+            Ok(0)
+        }
+        Cmd::Node {
+            cmd: None,
             id,
             rebenchmark,
             admin,
         } => {
+            let id = id.unwrap_or_default();
             let client = connect_admin(&home, &admin).await?;
             let AdminResponse::Status(s) = client.call(AdminOp::Status).await? else {
                 bail!("unexpected response");
             };
-            let matches: Vec<&NodeView> = s
+            let by_name: Vec<&NodeView> = s
                 .nodes
                 .iter()
-                .filter(|n| n.id.starts_with(id.trim()))
+                .filter(|n| n.info.name == id.trim())
                 .collect();
+            let matches: Vec<&NodeView> = if by_name.len() == 1 {
+                by_name
+            } else {
+                s.nodes
+                    .iter()
+                    .filter(|n| n.id.starts_with(id.trim()))
+                    .collect()
+            };
             let n = match matches.as_slice() {
                 [one] => *one,
                 [] => bail!("no such node"),
@@ -1610,11 +1696,19 @@ async fn cluster_start(
     no_token: bool,
     storage_class: Option<StorageClassArg>,
     metrics: MetricsArgs,
+    release: ReleaseArgs,
     replica: Option<pumasi_proto::ticket::ReplicaTicket>,
     shutdown: impl std::future::Future<Output = ()>,
+    in_service: bool,
 ) -> Result<i32> {
     let mut config = ClusterConfig::new(home.join("cluster"));
     config.name = name;
+    config.release_source = release.release_source.clone();
+    let follow = if release.no_follow_binary {
+        None
+    } else {
+        follow::Follow::new()
+    };
     config.metrics_addr = metrics.metrics_addr;
     config.metrics_token = metrics.metrics_token.filter(|t| !t.is_empty());
     config.metrics_retention =
@@ -1652,10 +1746,7 @@ async fn cluster_start(
         );
         eprintln!("`pumasi ha status` shows the replicas; this one takes over if the leader fails");
         eprintln!();
-        shutdown.await;
-        eprintln!("shutting down");
-        cluster.shutdown().await?;
-        return Ok(0);
+        return stop_cluster(cluster, shutdown, follow, in_service).await;
     }
     let status = cluster.status();
     eprintln!(
@@ -1681,10 +1772,30 @@ async fn cluster_start(
         eprintln!("  pumasi agent join {ticket}");
     }
     eprintln!();
-    shutdown.await;
-    eprintln!("shutting down");
-    cluster.shutdown().await?;
-    Ok(0)
+    stop_cluster(cluster, shutdown, follow, in_service).await
+}
+
+/// Runs the control plane until `shutdown`, or until a newer binary was
+/// installed over this one and the rollout settled: then restarts into it.
+async fn stop_cluster(
+    cluster: Cluster,
+    shutdown: impl std::future::Future<Output = ()>,
+    follow: Option<follow::Follow>,
+    in_service: bool,
+) -> Result<i32> {
+    let stop = follow::until_stop(shutdown, follow, || cluster.rollout_settled()).await;
+    match stop {
+        follow::Stop::Shutdown => {
+            eprintln!("shutting down");
+            cluster.shutdown().await?;
+            Ok(0)
+        }
+        follow::Stop::Upgrade { version, exe } => {
+            eprintln!("restarting the control plane into pumasi {version}");
+            cluster.shutdown().await?;
+            follow::restart(in_service, &exe)
+        }
+    }
 }
 
 async fn ctrl_c() {
@@ -1852,7 +1963,7 @@ async fn agent(
 }
 
 /// The running binary, if the agent can replace it.
-fn own_exe() -> Option<PathBuf> {
+pub(crate) fn own_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe = exe.canonicalize().unwrap_or(exe);
     Some(if cfg!(windows) { plain_path(exe) } else { exe })
@@ -1875,7 +1986,7 @@ fn plain_path(p: PathBuf) -> PathBuf {
 }
 
 /// Runs the binary at `exe` again with this process's arguments.
-fn restart_self(exe: &Path) -> Result<i32> {
+pub(crate) fn restart_self(exe: &Path) -> Result<i32> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     #[cfg(unix)]
     {
@@ -1910,6 +2021,7 @@ async fn run_service(
             no_token,
             storage_class,
             metrics,
+            release,
         }) => {
             cluster_start(
                 &home,
@@ -1918,12 +2030,14 @@ async fn run_service(
                 no_token,
                 storage_class,
                 metrics,
+                release,
                 None,
                 shutdown,
+                true,
             )
             .await
         }
-        Cmd::Ui(args) => ui::run_until(&home, args, shutdown).await,
+        Cmd::Ui(args) => ui::run_until(&home, args, shutdown, true).await,
         _ => bail!("not {} options", role.as_str()),
     }
 }

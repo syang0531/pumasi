@@ -436,6 +436,8 @@ pub struct State {
     pub(crate) audit_tip: crate::audit::AuditTip,
     /// SSO settings and sign-ins under way (phase 17).
     pub(crate) sso: crate::sso::SsoState,
+    /// Display names an admin gave nodes (1.3), by node id.
+    pub(crate) names: std::collections::BTreeMap<String, crate::names::NameOverride>,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -514,6 +516,7 @@ impl State {
             conf: Default::default(),
             audit_tip: Default::default(),
             sso: Default::default(),
+            names: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -522,6 +525,7 @@ impl State {
         let mut job_origin: HashMap<u128, crate::remote::JobOrigin> =
             snap.job_origin.into_iter().collect();
         state.rollout = state.load_rollout()?;
+        state.names = state.load_node_names()?;
         state.convert_credit_receipts()?;
         state.ensure_account(OWNER_ACCOUNT)?;
         let mut jobs = snap.jobs;
@@ -713,6 +717,9 @@ impl State {
         info: &NodeInfo,
         secret: Option<&Secret>,
     ) -> Result<(Role, String)> {
+        let mut info = info.clone();
+        self.apply_node_name(id, &mut info);
+        let info = &info;
         if let Some(m) = self.members.get_mut(id) {
             if m.info != *info {
                 m.info = info.clone();
@@ -791,10 +798,10 @@ impl State {
         Ok(out)
     }
 
-    /// Removes a member. `id` may be a unique prefix, as `pumasi status`
-    /// shows only the first characters.
+    /// Removes a member. `id` is a node name or a unique id prefix, as
+    /// `pumasi status` shows only the first characters.
     pub fn remove_node(&mut self, id: &str) -> Result<()> {
-        let id = self.resolve_member(id)?;
+        let id = self.resolve_node(id)?;
         let id = id.as_str();
         let name = self.node_name(id);
         self.event(
@@ -811,6 +818,7 @@ impl State {
         self.conf.tees.remove(id);
         self.mgmt.node_config.remove(id);
         self.store.remove_member(id)?;
+        self.forget_node_name(id)?;
         if let Some(n) = self.nodes.get_mut(id)
             && let Some(kill) = n.kill.take()
         {
@@ -848,6 +856,8 @@ impl State {
         tx: mpsc::UnboundedSender<ToAgent>,
         kill: oneshot::Sender<()>,
     ) -> u64 {
+        let mut info = info;
+        self.apply_node_name(id, &mut info);
         // A reconnect replaces any previous session from the same node.
         if let Some(old) = self.nodes.get(id)
             && old.online

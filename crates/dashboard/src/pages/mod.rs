@@ -11,6 +11,7 @@ pub mod nodes;
 pub mod overview;
 pub mod prices;
 pub mod storage;
+pub mod upgrade;
 
 use axum::{
     Router,
@@ -59,6 +60,7 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
         .route("/access/{action}", post(access::action))
         .route("/prices", get(prices::page))
         .route("/events", get(events::page))
+        .route("/upgrade", get(upgrade::panel).post(upgrade::start))
 }
 
 /// What every page needs: who is asking, in which language, and where.

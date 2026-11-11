@@ -282,6 +282,37 @@ curl -fsS -X POST -H "Authorization: Bearer $PUMASI_TICKET" \
   "$PUMASI_URL/api/v1/jobs/$JOB/cancel"
 ```
 
+### Node names and upgrades (admin ticket)
+
+These take the cluster's admin ticket (or an admin-role access ticket),
+not the client's. Give a node a display name; it shows in the status, the
+dashboard and events, and works wherever a node name is taken. `null`
+goes back to the name its agent reports:
+
+<!-- ci: export PUMASI_ADMIN_TICKET=$(cat "$PUMASI_HOME/cluster/admin.ticket") -->
+```sh
+curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" \
+  -H 'Content-Type: application/json' -d '{"name": "living-room"}' \
+  "$PUMASI_URL/api/v1/nodes/node-a/rename"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/status" | grep -q '"living-room"' -->
+<!-- ci: curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{"name": null}' "$PUMASI_URL/api/v1/nodes/living-room/rename" -->
+
+`GET /api/v1/upgrade?check=true` shows the newest published release, and
+`POST /api/v1/upgrade` has the control plane download it for every
+platform in the cluster, check it against the release's SHA256SUMS and
+roll it out (body `{"version": "v1.3.0"}` for another release). It answers
+at once; poll `GET /api/v1/upgrade` until `fetch` is `Done` or `Failed`:
+
+```sh
+curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/upgrade"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/upgrade" | grep -q '"fetch":"Idle"' -->
+
+```json
+{"source":"https://github.com/syang0531/pumasi/releases","latest":"v1.3.0","checked_unix":1762851000,"check_error":null,"control_plane":"1.2.3","fetch":{"Running":{"version":"v1.3.0","step":"downloading pumasi-windows-x86_64.exe (31/72 MiB)","started_unix":1762851004}}}
+```
+
 Every route, with its parameters, is in `$PUMASI_URL/api/openapi.json`
 (OpenAPI 3.1), which code generators and tools such as Postman read.
 

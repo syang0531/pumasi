@@ -8,7 +8,10 @@ use pumasi_cluster::AdminClient;
 use pumasi_proto::{
     PROTOCOL_VERSION,
     msg::{AdminOp, AdminResponse, RELEASE_CHUNK, RolloutView, UpgradeState},
-    release::{ReleaseFile, detect_target, hex, read_build_info, sha256},
+    release::{
+        FetchState, LatestReleaseView, ReleaseFile, detect_target, hex, is_older, read_build_info,
+        sha256,
+    },
 };
 
 use crate::{AdminArgs, connect_admin, short, truncate, utc};
@@ -34,6 +37,34 @@ pub enum UpgradeCmd {
         wait: bool,
         /// Give up waiting after this long, e.g. 10m.
         #[arg(long, default_value = "15m")]
+        timeout: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Upgrade the cluster to the newest published release (or
+    /// --version). The control plane downloads the binary of every
+    /// platform its nodes run from GitHub, checks each against the
+    /// release's SHA256SUMS, its platform and its build marker, and rolls
+    /// them out like `pumasi upgrade rollout`. The control plane and the
+    /// dashboard on a machine whose agent upgraded restart into the new
+    /// binary once the rollout settles.
+    Latest {
+        /// A release tag such as v1.2.4 (default: the newest release).
+        #[arg(long)]
+        version: Option<String>,
+        /// Only show the newest release and the nodes' versions.
+        #[arg(long, conflicts_with_all = ["version", "force", "wait"])]
+        check: bool,
+        /// Allow binaries that speak another protocol version than the
+        /// control plane.
+        #[arg(long)]
+        force: bool,
+        /// Wait until every node has upgraded or cannot.
+        #[arg(long)]
+        wait: bool,
+        /// Give up waiting after this long, e.g. 10m (the download
+        /// counts too).
+        #[arg(long, default_value = "30m")]
         timeout: String,
         #[command(flatten)]
         admin: AdminArgs,
@@ -120,6 +151,20 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
             client.close().await;
             code
         }
+        UpgradeCmd::Latest {
+            version,
+            check,
+            force,
+            wait,
+            timeout,
+            admin,
+        } => {
+            let timeout = Duration::from_millis(pumasi_proto::job::parse_duration_ms(&timeout)?);
+            let client = connect_admin(home, &admin).await?;
+            let code = latest(&client, version, check, force, wait, timeout).await;
+            client.close().await;
+            code
+        }
         UpgradeCmd::Status { admin } => {
             let client = connect_admin(home, &admin).await?;
             let AdminResponse::Rollout(view) = client.call(AdminOp::RolloutStatus).await? else {
@@ -137,6 +182,103 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+async fn latest_view(client: &AdminClient, check: bool) -> Result<LatestReleaseView> {
+    match client.call(AdminOp::LatestRelease { check }).await? {
+        AdminResponse::LatestRelease(v) => Ok(*v),
+        _ => bail!("unexpected response"),
+    }
+}
+
+async fn latest(
+    client: &AdminClient,
+    version: Option<String>,
+    check: bool,
+    force: bool,
+    wait: bool,
+    timeout: Duration,
+) -> Result<i32> {
+    if check {
+        let v = latest_view(client, true).await?;
+        match (&v.latest, &v.check_error) {
+            (Some(tag), None) => println!("newest release: {tag} ({})", v.source),
+            (Some(tag), Some(e)) => {
+                println!("newest release: {tag} (seen earlier; checking now failed: {e})")
+            }
+            (None, Some(e)) => bail!("could not look up the newest release: {e}"),
+            (None, None) => println!("newest release: unknown"),
+        }
+        println!("control plane: {}", v.control_plane);
+        let AdminResponse::Rollout(view) = client.call(AdminOp::RolloutStatus).await? else {
+            bail!("unexpected response");
+        };
+        println!();
+        println!("{:<12} {:<16} {:<16} VERSION", "NODE", "NAME", "PLATFORM");
+        for n in &view.nodes {
+            let behind = v.latest.as_deref().is_some_and(|l| is_older(&n.version, l));
+            println!(
+                "{:<12} {:<16} {:<16} {}{}",
+                short(&n.id),
+                truncate(&n.name, 16),
+                n.target.to_string(),
+                n.version,
+                if behind { "  (upgrade available)" } else { "" }
+            );
+        }
+        if v.latest
+            .as_deref()
+            .is_some_and(|l| is_older(&v.control_plane, l))
+        {
+            println!();
+            println!("run `pumasi upgrade latest` to upgrade");
+        }
+        return Ok(0);
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let started = client
+        .call(AdminOp::UpgradeToLatest { version, force })
+        .await?;
+    let AdminResponse::LatestRelease(_) = started else {
+        bail!("unexpected response");
+    };
+    let mut last = String::new();
+    let done = loop {
+        let v = latest_view(client, false).await?;
+        match v.fetch {
+            FetchState::Running { version, step, .. } => {
+                let line = format!("{version}: {step}");
+                if line != last {
+                    eprintln!("{line}");
+                    last = line;
+                }
+            }
+            FetchState::Done {
+                version, summary, ..
+            } => break (version, summary),
+            FetchState::Failed {
+                version, reason, ..
+            } => bail!(
+                "upgrade to {} failed: {reason}",
+                version.as_deref().unwrap_or("the newest release")
+            ),
+            FetchState::Idle => bail!("the control plane forgot the download (did it restart?)"),
+        }
+        if tokio::time::Instant::now() > deadline {
+            bail!("timed out waiting for the download");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    eprintln!("{}: {}", done.0, done.1);
+    let AdminResponse::Rollout(view) = client.call(AdminOp::RolloutStatus).await? else {
+        bail!("unexpected response");
+    };
+    print_rollout(&view);
+    if !wait {
+        return Ok(0);
+    }
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    wait_rollout(client, left).await
 }
 
 async fn upload(client: &AdminClient, file: &ReleaseFile, bytes: &[u8]) -> Result<()> {

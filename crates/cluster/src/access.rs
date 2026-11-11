@@ -83,6 +83,10 @@ fn op_name(op: &AdminOp) -> &'static str {
         | LdapLogin { .. } => "sign in",
         ListJoinTokens => "list join tickets",
         RevokeJoinToken { .. } => "revoke join tickets",
+        RenameNode { .. } => "rename nodes",
+        LatestRelease { check: false } => "read the release check",
+        LatestRelease { check: true } => "check for releases",
+        UpgradeToLatest { .. } => "roll out upgrades",
     }
 }
 
@@ -114,6 +118,7 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | GetPolicy
             | GetStoragePolicy
             | RolloutStatus
+            | LatestRelease { check: false }
             | StoreList { .. }
             | StoreUsage
             | Quotas

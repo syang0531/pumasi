@@ -264,6 +264,19 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
             ),
         ),
         CancelRollout => ("rollout.cancel", none(), none()),
+        UpgradeToLatest { version, force } => (
+            "rollout.latest",
+            version.clone().unwrap_or_else(|| "latest".into()),
+            if *force { "forced".into() } else { none() },
+        ),
+        RenameNode { node, name } => (
+            "node.rename",
+            node.clone(),
+            match name {
+                Some(n) => format!("to {n:?}"),
+                None => "back to the agent's name".into(),
+            },
+        ),
         StoreCommit { name, account, .. } => (
             "store.commit",
             name.clone().unwrap_or_else(|| "(job input)".into()),
@@ -404,6 +417,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | Ledger { .. }
         | GetPolicy
         | RolloutStatus
+        | LatestRelease { .. }
         | StoreUpload { .. }
         | StoreList { .. }
         | StoreUsage

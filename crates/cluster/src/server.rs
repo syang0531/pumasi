@@ -97,6 +97,9 @@ pub struct ClusterConfig {
     /// Accept the test stand-in for a TEE, so confidential jobs run on
     /// machines without SEV-SNP or TDX (tests only: nothing is protected).
     pub insecure_test_tee: bool,
+    /// Where `pumasi upgrade latest` finds published releases (GitHub's
+    /// release pages of the pumasi repository by default).
+    pub release_source: String,
 }
 
 impl ClusterConfig {
@@ -118,6 +121,7 @@ impl ClusterConfig {
             keep_jobs: crate::retention::DEFAULT_KEEP_JOBS,
             mirror_every: Duration::from_secs(30),
             insecure_test_tee: false,
+            release_source: pumasi_proto::release::DEFAULT_RELEASE_SOURCE.into(),
         }
     }
 }
@@ -141,6 +145,8 @@ pub(crate) struct Shared {
     backup: Mutex<Option<CachedBackup>>,
     /// Follows Raft: starts and stops the services (replicas only).
     lead: Mutex<Option<JoinHandle<()>>>,
+    /// The newest published release and its download (1.3).
+    pub(crate) latest: Mutex<crate::latest::LatestState>,
 }
 
 impl Shared {
@@ -454,6 +460,7 @@ impl Cluster {
             active: RwLock::new(None),
             backup: Mutex::new(None),
             lead: Mutex::new(None),
+            latest: Mutex::new(Default::default()),
         });
 
         let blobs_protocol = {
@@ -597,6 +604,31 @@ impl Cluster {
 
     pub fn status(&self) -> ClusterStatus {
         self.inner().state().status()
+    }
+
+    /// Whether no upgrade is under way: no release download, and no node
+    /// still waiting for, draining for or installing the rollout. Always
+    /// true on a replica that does not lead. A control plane that follows
+    /// its binary restarts only then.
+    pub fn rollout_settled(&self) -> bool {
+        if matches!(
+            self.shared.latest.lock().unwrap().fetch,
+            pumasi_proto::release::FetchState::Running { .. }
+        ) {
+            return false;
+        }
+        let Some(inner) = self.shared.active() else {
+            return true;
+        };
+        let view = inner.state().rollout_view();
+        !view.nodes.iter().any(|n| {
+            matches!(
+                n.state,
+                pumasi_proto::msg::UpgradeState::Waiting
+                    | pumasi_proto::msg::UpgradeState::Draining
+                    | pumasi_proto::msg::UpgradeState::Upgrading
+            )
+        })
     }
 
     /// Where uploaded release binaries are kept.
@@ -1354,6 +1386,10 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
         Ok(op) => {
             let described = crate::audit::describe(&op);
             let resp = match handle_store_admin(inner, op).await {
+                Ok(r) => Ok(r),
+                Err(op) => handle_release_admin(inner, op).await,
+            };
+            let resp = match resp {
                 Ok(r) => r.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}"))),
                 Err(op) => handle_admin(inner, &caller, op),
             };
@@ -1574,6 +1610,191 @@ fn endpoint_id(bytes: &[u8; 32]) -> Result<iroh::EndpointId> {
 
 /// File store admin calls, which wait on the store. Other calls come back
 /// as `Err` for [`handle_admin`].
+/// Calls about published releases (1.3), which wait on the release
+/// site; the others come back as `Err`.
+async fn handle_release_admin(
+    inner: &Arc<Inner>,
+    op: AdminOp,
+) -> Result<Result<AdminResponse>, AdminOp> {
+    let source = inner.config.release_source.clone();
+    let view = |shared: &Shared| {
+        AdminResponse::LatestRelease(Box::new(shared.latest.lock().unwrap().view(&source)))
+    };
+    Ok(match op {
+        AdminOp::LatestRelease { check } => {
+            let stale = {
+                let l = inner.latest.lock().unwrap();
+                l.checked_unix + 60 <= crate::state::now_unix()
+            };
+            if check && stale {
+                let found = crate::latest::latest_tag(&source).await;
+                let mut l = inner.latest.lock().unwrap();
+                l.checked_unix = crate::state::now_unix();
+                match found {
+                    Ok(tag) => {
+                        l.latest = Some(tag);
+                        l.check_error = None;
+                    }
+                    Err(e) => l.check_error = Some(format!("{e:#}")),
+                }
+            }
+            Ok(view(inner))
+        }
+        AdminOp::UpgradeToLatest { version, force } => {
+            let res = (|| {
+                let tag = version
+                    .as_deref()
+                    .map(crate::latest::check_tag)
+                    .transpose()?;
+                let mut l = inner.latest.lock().unwrap();
+                if let pumasi_proto::release::FetchState::Running { version, .. } = &l.fetch {
+                    anyhow::bail!("already downloading {version}; wait for it to finish");
+                }
+                l.fetch = pumasi_proto::release::FetchState::Running {
+                    version: tag.clone().unwrap_or_else(|| "latest".into()),
+                    step: "looking up the release".into(),
+                    started_unix: crate::state::now_unix(),
+                };
+                Ok(tag)
+            })();
+            match res {
+                Ok(tag) => {
+                    tokio::spawn(upgrade_to_latest(inner.shared.clone(), tag, force));
+                    Ok(view(inner))
+                }
+                Err(e) => Err(e),
+            }
+        }
+        other => return Err(other),
+    })
+}
+
+/// Downloads a published release and starts its rollout, recording how
+/// far it got in `shared.latest`.
+async fn upgrade_to_latest(shared: Arc<Shared>, tag: Option<String>, force: bool) {
+    use pumasi_proto::release::{FetchState, Target, is_older, same_version};
+    let source = shared.config.release_source.clone();
+    let started = crate::state::now_unix();
+    let set_step = |version: &str, step: String| {
+        shared.latest.lock().unwrap().fetch = FetchState::Running {
+            version: version.to_string(),
+            step,
+            started_unix: started,
+        };
+    };
+    let tag_seen = Mutex::new(tag.clone());
+    let result: Result<(String, String)> = async {
+        let tag = match tag {
+            Some(t) => t,
+            None => {
+                let t = crate::latest::latest_tag(&source).await?;
+                let mut l = shared.latest.lock().unwrap();
+                l.latest = Some(t.clone());
+                l.checked_unix = crate::state::now_unix();
+                l.check_error = None;
+                t
+            }
+        };
+        *tag_seen.lock().unwrap() = Some(tag.clone());
+        set_step(&tag, "finding the platforms that need it".into());
+        let not_leader = || anyhow::anyhow!("this control plane replica stopped leading");
+        let inner = shared.active().ok_or_else(not_leader)?;
+        let (targets, current) = {
+            let st = inner.state();
+            let mut targets = std::collections::BTreeSet::new();
+            let mut current = 0;
+            for m in st.members.values() {
+                let v = &m.info.agent_version;
+                if same_version(v, &tag) || is_older(&tag, v) {
+                    current += 1;
+                } else {
+                    targets.insert(Target::new(&m.info.os, &m.info.arch));
+                }
+            }
+            (targets, current)
+        };
+        if targets.is_empty() {
+            return Ok((
+                tag.clone(),
+                format!("all {current} node(s) already run {tag} or newer; nothing to roll out"),
+            ));
+        }
+        let progress = |step: String| set_step(&tag, step);
+        let (fetched, missing) =
+            crate::latest::fetch_release(&source, &tag, &targets, &shared.releases, &progress)
+                .await?;
+        let missing = missing
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::ensure!(
+            !fetched.is_empty(),
+            "release {tag} has no binary for {missing}"
+        );
+        set_step(&tag, "starting the rollout".into());
+        let inner = shared.active().ok_or_else(not_leader)?;
+        let files = fetched;
+        let platforms = files
+            .iter()
+            .map(|f| f.target.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut summary = format!("rollout started for {platforms}");
+        if !missing.is_empty() {
+            summary.push_str(&format!(" (the release has no binary for {missing})"));
+        }
+        {
+            let mut st = inner.state();
+            st.start_rollout(files, force, |f| shared.releases.has(&f.sha256, f.size))?;
+            shared.releases.prune(&st.rollout_hashes());
+            st.event(
+                pumasi_proto::monitor::EventLevel::Info,
+                "rollout.latest",
+                None,
+                None,
+                format!("release {tag} downloaded and checked; {summary}"),
+            );
+        }
+        Ok((tag, summary))
+    }
+    .await;
+    let now = crate::state::now_unix();
+    let fetch = match result {
+        Ok((version, summary)) => {
+            info!(%version, "{summary}");
+            FetchState::Done {
+                version,
+                summary,
+                finished_unix: now,
+            }
+        }
+        Err(e) => {
+            let reason = format!("{e:#}");
+            warn!("upgrade to the published release failed: {reason}");
+            let version = tag_seen.lock().unwrap().clone();
+            if let Some(inner) = shared.active() {
+                inner.state().event(
+                    pumasi_proto::monitor::EventLevel::Warning,
+                    "rollout.latest.failed",
+                    None,
+                    None,
+                    format!(
+                        "upgrade to {} failed: {reason}",
+                        version.as_deref().unwrap_or("the newest release")
+                    ),
+                );
+            }
+            FetchState::Failed {
+                version,
+                reason,
+                finished_unix: now,
+            }
+        }
+    };
+    shared.latest.lock().unwrap().fetch = fetch;
+}
+
 async fn handle_store_admin(
     inner: &Arc<Inner>,
     op: AdminOp,
@@ -1860,6 +2081,10 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
         }
         AdminOp::EditNode { node, edit } => {
             inner.state().edit_node(&node, &edit)?;
+            Ok(AdminResponse::Ok)
+        }
+        AdminOp::RenameNode { node, name } => {
+            inner.state().rename_node(&node, name.as_deref())?;
             Ok(AdminResponse::Ok)
         }
         AdminOp::Drain { node } => Ok(AdminResponse::Drained {

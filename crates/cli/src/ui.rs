@@ -70,12 +70,17 @@ pub struct UiArgs {
     /// identity provider.
     #[arg(long)]
     public_url: Option<String>,
+    /// Keep running the old code when a newer pumasi is installed over
+    /// this binary (by default the dashboard restarts into it; signed-in
+    /// browsers then sign in again).
+    #[arg(long)]
+    no_follow_binary: bool,
     #[command(flatten)]
     admin: AdminArgs,
 }
 
 pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
-    run_until(home, args, crate::ctrl_c()).await
+    run_until(home, args, crate::ctrl_c(), false).await
 }
 
 /// Serves until `shutdown` resolves.
@@ -83,7 +88,13 @@ pub async fn run_until(
     home: &Path,
     args: UiArgs,
     shutdown: impl std::future::Future<Output = ()>,
+    in_service: bool,
 ) -> Result<i32> {
+    let follow = if args.no_follow_binary {
+        None
+    } else {
+        crate::follow::Follow::new()
+    };
     let (ticket, source) = load_ticket_with_source(home, &args.admin)?;
     let net = net_for_all(&ticket.candidates(), None);
     let probe = (ticket.clone(), ticket_hint(home, &ticket, &source));
@@ -150,12 +161,21 @@ pub async fn run_until(
             Err(e) => eprintln!("warning: cannot reach the control plane: {e:#}; {hint}"),
         }
     });
-    if !args.no_open && !args.api_only {
+    let restarted = std::env::var_os(crate::follow::RESTARTED_ENV).is_some();
+    if !args.no_open && !args.api_only && !restarted {
         open_browser(&url);
     }
+    // A newer binary installed over this one: restart into it (signed-in
+    // browsers sign in again).
+    let stop = crate::follow::until_stop(shutdown, follow, || true);
     tokio::select! {
         r = ui.wait() => r?,
-        _ = shutdown => {}
+        stop = stop => {
+            if let crate::follow::Stop::Upgrade { version, exe } = stop {
+                eprintln!("restarting the dashboard into pumasi {version}");
+                return crate::follow::restart(in_service, &exe);
+            }
+        }
     }
     Ok(0)
 }

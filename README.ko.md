@@ -285,7 +285,16 @@ macOS에서 `curl ... | sudo sh -s -- --ticket ...`으로 설치하면 에이전
 
 ### 모든 에이전트를 한 번에 업그레이드
 
-새 릴리스의 바이너리를 받아 관리자 티켓이 있는 곳에서 배포합니다.
+관리자 티켓이 있는 곳에서 실행합니다(대시보드 노드 화면의 업그레이드 버튼, `POST /api/v1/upgrade`도 같습니다).
+
+```sh
+pumasi upgrade latest --check     # 최신 릴리스와 노드별 버전
+pumasi upgrade latest --wait      # 또는 --version v1.3.0
+```
+
+컨트롤 플레인이 GitHub 릴리스에서 노드들이 쓰는 플랫폼의 바이너리를 받아, 릴리스의 `SHA256SUMS`, 실행 파일 헤더(플랫폼), 빌드 표식(버전)과 맞는지 확인한 뒤 아래와 같이 배포합니다. 이미 그 버전 이상인 노드는 건드리지 않습니다. 에이전트가 업그레이드된 PC의 컨트롤 플레인과 대시보드는 자기 바이너리를 지켜보다가 롤아웃이 끝나면 새 버전으로 스스로 재시작합니다(`--no-follow-binary`로 끔, 대시보드에 로그인한 브라우저는 다시 로그인). `pumasi cluster start --release-source URL`로 다른 GitHub 릴리스 주소를 쓸 수 있습니다.
+
+가진 바이너리를 배포하려면(다른 빌드, 인터넷이 안 되는 컨트롤 플레인) 직접 받아서 배포합니다.
 
 ```sh
 pumasi upgrade rollout pumasi-linux-x86_64 pumasi-macos-aarch64 pumasi-windows-x86_64.exe --wait
@@ -539,6 +548,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi agent join <티켓> [--allow-docker] [--allow-microvm] [--allow-webgpu] [--no-gpus]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업, `--allow-webgpu`면 GPU를 쓰는 wasm 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`, 테스트용 `--webgpu-software`). `--no-gpus`가 아니면 GPU도 제공 |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | 이전에 참가한 클러스터에 티켓 없이 재접속 |
 | `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- 옵션]` | 부팅 시 시작하는 서비스로 에이전트(기본), 컨트롤 플레인, 대시보드/API 설치 (systemd, launchd, Windows 서비스). `status [역할]`, `uninstall [역할]`도 있음 |
+| `pumasi upgrade latest [--check] [--version 태그] [--wait] [--force]` | 컨트롤 플레인이 최신 GitHub 릴리스(또는 `태그`)를 클러스터의 플랫폼별로 받아 SHA256SUMS로 확인하고 배포. `--check`는 최신 릴리스와 노드별 버전만 보여 줌 |
 | `pumasi upgrade rollout 파일... [--wait] [--force]` | 클러스터 키로 서명한 새 에이전트 바이너리를 노드에 배포. `upgrade status`로 노드별 상태, `upgrade cancel`로 중단 |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치. `--gpu-bundle`은 패스스루용 GPU 게스트 커널과 드라이버 추가 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
@@ -548,7 +558,8 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi secret set 이름 [값]` / `ls` / `rm 이름` | 클러스터 비밀. `registry/<호스트>`는 비공개 레지스트리 로그인 |
 | `pumasi run job.toml [--account A] [--priority N] [--after 작업] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
 | `pumasi status` | 노드(역할, 온라인 여부, 실행기, 슬롯, 실행 중, 검증 기록, 과금 CPU 점수, 디스크 종류, 지연, GPU)와 최근 작업 및 CU 비용 |
-| `pumasi node <ID> [--rebenchmark]` | 노드 하나의 벤치마크 프로필, 과금 점수, GPU, 지연, 검증 기록. `--rebenchmark`면 다시 재게 함 |
+| `pumasi node <노드> [--rebenchmark]` | 노드 하나의 벤치마크 프로필, 과금 점수, GPU, 지연, 검증 기록. `--rebenchmark`면 다시 재게 함 |
+| `pumasi node rename <노드> <이름>` / `--reset` | 노드 표시 이름 변경(상태, 대시보드, 이벤트, `name` 라벨, 노드를 받는 모든 명령). `--reset` 전까지 에이전트의 `--name` 대신 씀. 대시보드 노드 화면과 `POST /api/v1/nodes/노드/rename`도 같음 |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | 에이전트와 같은 방식으로 이 기기를 벤치마크해 프로필 출력 |
 | `pumasi job <ID> [--output] [--out DIR]` | 태스크별 상태, 노드, 시도 횟수, 시간, 비용, 검증 결과, 출력. `--out`이면 결과 파일 다운로드 |
 | `pumasi cu list \| add <계정> <CU> \| payout <계정> <CU> \| ledger` | CU 잔액(사용 가능, 보류, 지출, 수익), 지급, 지급 기록, 원장 (`pumasi credit`도 그대로 동작) |
@@ -556,7 +567,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi receipts <ID> [--export FILE]` | 작업의 서명된 사용 영수증(가격 중 GPU 몫 포함) |
 | `pumasi verify-receipts FILE [--cluster ID]` | 내보낸 영수증을 오프라인으로 검증 |
 | `pumasi cancel <ID>` | 작업 취소 |
-| `pumasi remove-node <ID>` | 노드 퇴출(다시 오려면 새 티켓 필요) |
+| `pumasi remove-node <노드>` | 노드 퇴출(이름 또는 id 앞부분, 다시 오려면 새 티켓 필요) |
 | `pumasi login <티켓>` | 다른 기기에서 관리자 티켓이나 접근 티켓으로 원격 클러스터 관리 |
 | `pumasi cordon \| uncordon \| drain <노드>` | 노드에 새 작업 중단, 재개, 또는 실행 중인 태스크까지 다른 노드로 이동 |
 | `pumasi label <노드> k=v... \| k-` / `taint <노드> key[=value]... \| key-` | selector용 노드 라벨, 허용하지 않는 작업을 막는 테인트 |

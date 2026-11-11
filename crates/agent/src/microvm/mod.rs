@@ -406,6 +406,15 @@ impl MicrovmExecutor {
                 config.dir.as_os_str().len()
             );
         }
+        // An upgrade can pin a new macOS guest kernel; fetch it here so
+        // agents need no second `pumasi vm setup`.
+        match setup::refresh_vz_kernel(&config.dir).await {
+            Ok(Some(k)) => info!("replaced the guest kernel with the pinned one: {k}"),
+            Ok(None) => {}
+            Err(e) => {
+                warn!("could not replace an older guest kernel (run `pumasi vm setup`): {e:#}")
+            }
+        }
         let assets = Assets::find(&config.dir);
         let kernel = assets.kernel.clone().with_context(|| {
             format!(

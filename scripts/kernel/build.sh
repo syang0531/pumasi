@@ -1,8 +1,9 @@
 #!/bin/sh
 # Builds the x86_64 guest kernel for Apple's Virtualization.framework on
 # Intel Macs: Firecracker's CI configuration for Linux 6.1 (virtio-pci,
-# virtio-blk, virtio-console, ext4, overlayfs, all built in, no modules) as
-# a bzImage, the format VZLinuxBootLoader boots on Intel. Apple Silicon
+# virtio-blk, virtio-console, virtio-net, ext4, overlayfs, all built in, no
+# modules) plus the EFI stub, as a bzImage, the format VZLinuxBootLoader
+# boots on Intel. Apple Silicon
 # Macs use Firecracker's own arm64 Image and Linux and Windows hosts its ELF
 # vmlinux, so only this one is built here.
 #
@@ -36,7 +37,14 @@ rm -rf "linux-$KERNEL_VERSION"
 tar xf "$tarball"
 cd "linux-$KERNEL_VERSION"
 cp ../fc.config .config
+# VZLinuxBootLoader on Intel enters the kernel through its EFI stub (the
+# framework has its own firmware), and Firecracker's configuration has no
+# EFI: such a bzImage never runs a single instruction under the framework
+# (no console output, an idle vCPU). Upstream's VZ boot regression in 6.2
+# was in that same stub (e346bebbd36b).
+scripts/config --enable EFI --enable EFI_STUB
 make olddefconfig >/dev/null
+grep -q '^CONFIG_EFI_STUB=y' .config
 
 export KBUILD_BUILD_TIMESTAMP="2025-01-01 00:00:00 UTC"
 export KBUILD_BUILD_USER=pumasi KBUILD_BUILD_HOST=pumasi KBUILD_BUILD_VERSION=1

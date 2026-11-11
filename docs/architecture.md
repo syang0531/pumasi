@@ -697,14 +697,23 @@ virtio-mmio only. Firecracker's 1.15 CI configuration for 6.1 has PCI and
 virtio-console, so Apple Silicon boots its arm64 `Image` (6.1.155) as is.
 On Intel, `VZLinuxBootLoader` boots a bzImage, which Firecracker does not
 publish: `scripts/kernel/build.sh` builds one from the same configuration
-(pinned source and config hashes, fixed build timestamp, user and host), and
+plus `CONFIG_EFI` and `CONFIG_EFI_STUB` (pinned source and config hashes,
+fixed build timestamp, user and host), and
 `.github/workflows/guest-kernel.yml` runs it on every change to the script.
-On main, the first build whose SHA-256 equals the pin in `setup.rs` is
-published as the prerelease `guest-kernel-6.1.155-1` (not "latest", so the
-install scripts keep finding the pumasi release); later builds are compared
-with it. The kernel file is `vz-kernel` on macOS so a phase 3 `vmlinux`
-there is not used by mistake. Kernels after 6.1 have an ACPI regression
-under Virtualization.framework on x86_64, one more reason to stay on 6.1.
+The framework enters an Intel kernel through its EFI stub: the first
+build (`guest-kernel-6.1.155-1`, pinned up to 1.3.0) had no stub and never
+ran an instruction there (empty console, idle vCPU, found on a 2014 iMac
+on Big Sur). On main, the first build whose SHA-256 equals the pin in
+`setup.rs` is published as the prerelease named in the workflow's
+`KERNEL_TAG`, now `guest-kernel-6.1.155-2` (not "latest", so the install
+scripts keep finding the pumasi release); later builds are compared with
+it. The kernel file is `vz-kernel` on macOS so a phase 3 `vmlinux` there is
+not used by mistake. A `vz-kernel` whose SHA-256 is not the pin is an
+older pin, so `pumasi vm setup` and the agent at start replace it
+(`setup::refresh_vz_kernel`); kernels on Linux and Windows are never
+replaced, since people use their own. Kernels after 6.1 have an ACPI and
+EFI stub regression under Virtualization.framework on x86_64 (upstream
+bugzilla 217485), one more reason to stay on 6.1.
 
 Hosted Mac runners are VMs without nested virtualization, so CI checks the
 helper up to the framework's answer (signing, entitlement, the

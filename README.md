@@ -855,8 +855,12 @@ pumasi cluster restore pumasi-2026-11-05.backup   # on a fresh machine, then `pu
 ```
 
 The file is a consistent copy (taken in one transaction) of the state and
-the cluster key, so nodes reconnect to the restored control plane when it
-is reachable where the old one was. It holds the cluster key, the admin
+the cluster key, and nodes and tickets know the control plane by that key,
+so they reconnect to the restored control plane on any machine (with
+`--net local`, only at the old address). To move a running control plane
+to another machine, move its `cluster` directory instead
+([operations guide](docs/operations.md), "Move the control plane to
+another machine"). It holds the cluster key, the admin
 secret and the cluster's secrets: keep it like the admin ticket. The
 file store's data (`~/.pumasi/cluster/blobs`) is not in it; copy that
 directory too. A restore makes one control plane; add replicas again with

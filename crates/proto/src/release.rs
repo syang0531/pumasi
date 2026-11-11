@@ -186,6 +186,105 @@ impl SignedRelease {
     }
 }
 
+/// Where published releases come from: GitHub's release pages of the
+/// pumasi repository. `<source>/latest` redirects to the newest release's
+/// tag, `<source>/download/<tag>/<asset>` serves its files.
+pub const DEFAULT_RELEASE_SOURCE: &str = "https://github.com/syang0531/pumasi/releases";
+
+/// The release asset holding the binary for `target`, as the release
+/// workflow names them (`pumasi-linux-x86_64`, `pumasi-windows-x86_64.exe`).
+pub fn asset_name(target: &Target) -> String {
+    let ext = if target.os == "windows" { ".exe" } else { "" };
+    format!("pumasi-{}-{}{ext}", target.os, target.arch)
+}
+
+/// Reads a `sha256sum` listing (`<hex>  <name>`, or `<hex> *<name>`) into
+/// (name, SHA-256) pairs. Lines that do not look like that are skipped.
+pub fn parse_sha256sums(text: &str) -> Vec<(String, [u8; 32])> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((h, name)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let name = name.trim_start().trim_start_matches('*').trim();
+        let Ok(bytes) = data_encoding::HEXLOWER_PERMISSIVE.decode(h.as_bytes()) else {
+            continue;
+        };
+        let Ok(sha) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+            continue;
+        };
+        if !name.is_empty() {
+            out.push((name.to_string(), sha));
+        }
+    }
+    out
+}
+
+/// Same release version, ignoring a leading `v` (tags are `v1.2.3`, the
+/// binaries say `1.2.3`).
+pub fn same_version(a: &str, b: &str) -> bool {
+    a.trim().trim_start_matches('v') == b.trim().trim_start_matches('v')
+}
+
+/// The newest published release, and the download started by
+/// `UpgradeToLatest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatestReleaseView {
+    /// Where releases are looked up.
+    pub source: String,
+    /// The newest release's tag, when it was looked up.
+    pub latest: Option<String>,
+    /// When `latest` was looked up (0: never).
+    pub checked_unix: u64,
+    /// Why the last lookup failed, if it did.
+    pub check_error: Option<String>,
+    /// The control plane's own version.
+    pub control_plane: String,
+    pub fetch: FetchState,
+}
+
+/// How far the download of a published release got.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FetchState {
+    Idle,
+    Running {
+        version: String,
+        /// What it is doing, for people.
+        step: String,
+        started_unix: u64,
+    },
+    /// Finished: the rollout of `version` started, or no node needed it.
+    Done {
+        version: String,
+        /// What happened, for people.
+        summary: String,
+        finished_unix: u64,
+    },
+    Failed {
+        version: Option<String>,
+        reason: String,
+        finished_unix: u64,
+    },
+}
+
+impl fmt::Display for FetchState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FetchState::Idle => write!(f, "idle"),
+            FetchState::Running { version, step, .. } => write!(f, "{version}: {step}"),
+            FetchState::Done {
+                version, summary, ..
+            } => write!(f, "{version}: {summary}"),
+            FetchState::Failed {
+                version: Some(v),
+                reason,
+                ..
+            } => write!(f, "{v} failed: {reason}"),
+            FetchState::Failed { reason, .. } => write!(f, "failed: {reason}"),
+        }
+    }
+}
+
 /// Version and protocol read from a binary's [`crate::BUILD_INFO`] marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildInfo {
@@ -437,5 +536,32 @@ mod tests {
             Target::new("windows", "aarch64")
         );
         assert!("linux".parse::<Target>().is_err());
+    }
+
+    #[test]
+    fn release_assets_and_sums() {
+        assert_eq!(
+            asset_name(&Target::new("windows", "x86_64")),
+            "pumasi-windows-x86_64.exe"
+        );
+        assert_eq!(
+            asset_name(&Target::new("macos", "x86_64")),
+            "pumasi-macos-x86_64"
+        );
+        let a = hex(&sha256(b"a"));
+        let b = hex(&sha256(b"b")).to_uppercase();
+        let text = format!(
+            "{a}  pumasi-linux-x86_64\n{b} *pumasi-windows-x86_64.exe\nnot a line\n\nabcd  short\n"
+        );
+        let sums = parse_sha256sums(&text);
+        assert_eq!(
+            sums,
+            vec![
+                ("pumasi-linux-x86_64".to_string(), sha256(b"a")),
+                ("pumasi-windows-x86_64.exe".to_string(), sha256(b"b")),
+            ]
+        );
+        assert!(same_version("v1.2.3", "1.2.3"));
+        assert!(!same_version("v1.2.3", "1.2.4"));
     }
 }

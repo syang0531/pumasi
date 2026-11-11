@@ -15,7 +15,7 @@ use pumasi_proto::{
     },
     net::NetMode,
     receipt::Receipt,
-    release::{Release, ReleaseFile, SignedRelease, Target, hex, sha256},
+    release::{FetchState, Release, ReleaseFile, SignedRelease, Target, hex, sha256},
     ticket::JoinTicket,
 };
 use tokio::task::JoinHandle;
@@ -2310,4 +2310,347 @@ async fn webgpu_jobs_run_on_nodes_that_offer_a_gpu() {
     g.kill().await;
     p.kill().await;
     cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn nodes_keep_the_name_an_admin_gave_them() {
+    init_tracing();
+    let dir = tempdir("rename");
+    let cluster = start_cluster(dir.clone()).await.unwrap();
+    let client = admin(&cluster).await;
+    let a_dir = tempdir("ra");
+    let a = agent("pc-a", 1, a_dir.clone()).await;
+    let a_id = a.id().to_string();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let a_run = spawn_join(a, ticket.clone());
+    let b = agent("pc-b", 1, tempdir("rb")).await;
+    let b_id = b.id().to_string();
+    let _b_run = spawn_join(b, ticket);
+    wait_online(&cluster, 2).await;
+    let name_of = |id: &str| {
+        cluster
+            .status()
+            .nodes
+            .into_iter()
+            .find(|n| n.id == id)
+            .map(|n| (n.info.name, n.labels.get("name").cloned()))
+            .unwrap()
+    };
+
+    // By the agent's name; then usable by the new one everywhere.
+    client
+        .call(AdminOp::RenameNode {
+            node: "pc-a".into(),
+            name: Some("거실 데스크톱".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        name_of(&a_id),
+        (
+            "거실 데스크톱".into(),
+            Some(vec!["거실 데스크톱".to_string()])
+        )
+    );
+    client
+        .call(AdminOp::EditNode {
+            node: "거실 데스크톱".into(),
+            edit: Box::new(pumasi_proto::manage::NodeEdit {
+                cordon: Some(true),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(
+        cluster
+            .status()
+            .nodes
+            .iter()
+            .any(|n| n.id == a_id && n.config.cordoned)
+    );
+
+    // Names stay unique, and bad ones are refused.
+    let err = client
+        .call(AdminOp::RenameNode {
+            node: b_id[..10].into(),
+            name: Some("거실 데스크톱".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already named"), "{err}");
+    let err = client
+        .call(AdminOp::RenameNode {
+            node: "pc-b".into(),
+            name: Some("x".repeat(65)),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("at most 64"), "{err}");
+
+    // The agent reconnecting with its own name keeps the admin's.
+    a_run.kill().await;
+    let a = agent("pc-a", 1, a_dir.clone()).await;
+    let a_run = RunningAgent {
+        endpoint: a.endpoint().clone(),
+        handle: tokio::spawn(a.resume()),
+    };
+    for _ in 0..100 {
+        if cluster
+            .status()
+            .nodes
+            .iter()
+            .any(|n| n.id == a_id && n.online)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(name_of(&a_id).0, "거실 데스크톱");
+
+    // It survives a control plane restart.
+    client.close().await;
+    a_run.kill().await;
+    cluster.shutdown().await.unwrap();
+    let cluster = start_cluster(dir).await.unwrap();
+    let client = admin(&cluster).await;
+    let named = |c: &Cluster, id: &str| {
+        c.status()
+            .nodes
+            .into_iter()
+            .find(|n| n.id == id)
+            .map(|n| n.info.name)
+    };
+    assert_eq!(named(&cluster, &a_id).as_deref(), Some("거실 데스크톱"));
+
+    // Back to the agent's name, even while it is offline.
+    client
+        .call(AdminOp::RenameNode {
+            node: "거실 데스크톱".into(),
+            name: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(named(&cluster, &a_id).as_deref(), Some("pc-a"));
+
+    // remove-node takes a name too.
+    client
+        .call(AdminOp::RemoveNode { id: "pc-b".into() })
+        .await
+        .unwrap();
+    assert_eq!(named(&cluster, &b_id), None);
+    client.close().await;
+}
+
+/// A small stand-in for a release binary of `version` for this platform:
+/// this test binary's executable header, then a build marker.
+fn binary_claiming(version: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut bytes = vec![0u8; 4096];
+    let mut f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+    f.read_exact(&mut bytes).unwrap();
+    bytes.extend_from_slice(
+        format!(
+            "\0pumasi-build-info:v={version};p={};\0",
+            pumasi_proto::PROTOCOL_VERSION
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// A version newer than this build's, of the same length.
+fn newer_version() -> String {
+    let mine = pumasi_proto::version();
+    let core_end = mine.find(['-', '+']).unwrap_or(mine.len());
+    let core: String = mine[..core_end]
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '9' } else { c })
+        .collect();
+    format!("{core}{}", &mine[core_end..])
+}
+
+#[tokio::test]
+async fn upgrades_to_the_newest_published_release() {
+    use axum::{
+        Router,
+        extract::{Path, State},
+        http::{StatusCode, header},
+        response::IntoResponse,
+        routing::get,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+    init_tracing();
+
+    let version = newer_version();
+    let tag = format!("v{version}");
+    let good = binary_claiming(&version);
+    let asset = pumasi_proto::release::asset_name(&Target::host());
+
+    // A release site: v<newer> is right; v<newer>-bad lists another hash.
+    type Files = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+    let files: Files = Default::default();
+    let sums = |bin: &[u8]| {
+        format!(
+            "{}  {asset}\n{}  pumasi-plan9-mips.exe\n",
+            hex(&sha256(bin)),
+            hex(&sha256(b"other"))
+        )
+    };
+    {
+        let mut f = files.lock().unwrap();
+        f.insert(format!("{tag}/SHA256SUMS"), sums(&good).into_bytes());
+        f.insert(format!("{tag}/{asset}"), good.clone());
+        let bad = format!("v{}", newer_version().replacen('9', "8", 1));
+        f.insert(
+            format!("{bad}/SHA256SUMS"),
+            sums(b"something else").into_bytes(),
+        );
+        f.insert(format!("{bad}/{asset}"), good.clone());
+    }
+    let latest_tag = tag.clone();
+    let app = Router::new()
+        .route(
+            "/releases/latest",
+            get(move || {
+                let tag = latest_tag.clone();
+                async move {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, format!("/releases/tag/{tag}"))],
+                    )
+                }
+            }),
+        )
+        .route(
+            "/releases/download/{tag}/{file}",
+            get(
+                |State(files): State<Files>, Path((tag, file)): Path<(String, String)>| async move {
+                    match files.lock().unwrap().get(&format!("{tag}/{file}")) {
+                        Some(b) => b.clone().into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                },
+            ),
+        )
+        .with_state(files.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let site = format!("http://{}/releases", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let mut config = ClusterConfig::new(tempdir("latest"));
+    config.net = NetMode::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.heartbeat = Duration::from_millis(200);
+    config.node_timeout = Duration::from_secs(2);
+    config.release_source = site.clone();
+    let cluster = Cluster::start(config).await.unwrap();
+    let client = admin(&cluster).await;
+
+    let exe = tempdir("latest-bin").join("pumasi");
+    std::fs::write(&exe, b"pumasi binary, old build").unwrap();
+    let node = upgradable("owner-pc", tempdir("lo"), exe.clone(), None).await;
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let run = spawn_join(node, ticket);
+    wait_online(&cluster, 1).await;
+
+    let latest = |check| {
+        let client = &client;
+        async move {
+            match client.call(AdminOp::LatestRelease { check }).await.unwrap() {
+                AdminResponse::LatestRelease(v) => *v,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    let v = latest(true).await;
+    assert_eq!(v.latest.as_deref(), Some(tag.as_str()));
+    assert_eq!(v.source, site);
+    assert_eq!(v.control_plane, pumasi_proto::version());
+
+    let settle = || async {
+        for _ in 0..300 {
+            let v = latest(false).await;
+            if !matches!(v.fetch, FetchState::Running { .. }) {
+                return v.fetch;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the download never finished");
+    };
+
+    // A release whose binary does not match its SHA256SUMS is refused and
+    // nothing is rolled out.
+    let bad = format!("v{}", newer_version().replacen('9', "8", 1));
+    client
+        .call(AdminOp::UpgradeToLatest {
+            version: Some(bad.clone()),
+            force: false,
+        })
+        .await
+        .unwrap();
+    let FetchState::Failed {
+        reason,
+        version: failed,
+        ..
+    } = settle().await
+    else {
+        panic!("a tampered release was accepted");
+    };
+    assert_eq!(failed.as_deref(), Some(bad.as_str()));
+    assert!(reason.contains("does not match SHA256SUMS"), "{reason}");
+    assert!(rollout_view(&client).await.releases.is_empty());
+    // A tag that is not one never reaches a URL.
+    assert!(
+        client
+            .call(AdminOp::UpgradeToLatest {
+                version: Some("../../etc".into()),
+                force: false,
+            })
+            .await
+            .is_err()
+    );
+
+    // The newest release: downloaded, checked, signed and rolled out.
+    client
+        .call(AdminOp::UpgradeToLatest {
+            version: None,
+            force: false,
+        })
+        .await
+        .unwrap();
+    let FetchState::Done {
+        version: v,
+        summary,
+        ..
+    } = settle().await
+    else {
+        panic!("the upgrade failed: {:?}", latest(false).await.fetch);
+    };
+    assert_eq!(v, tag);
+    assert!(summary.contains(&Target::host().to_string()), "{summary}");
+    let view = rollout_view(&client).await;
+    assert_eq!(view.releases.len(), 1);
+    assert_eq!(view.releases[0].file().version, version);
+    assert_eq!(view.releases[0].file().sha256, sha256(&good));
+    view.releases[0]
+        .verify(cluster.addr().id.as_bytes())
+        .unwrap();
+
+    let exit = tokio::time::timeout(Duration::from_secs(60), run.handle)
+        .await
+        .expect("the agent did not upgrade")
+        .unwrap()
+        .unwrap();
+    assert_eq!(exit, AgentExit::Upgraded { version });
+    assert_eq!(std::fs::read(&exe).unwrap(), good);
+    run.endpoint.close().await;
+    client.close().await;
 }

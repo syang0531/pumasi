@@ -423,6 +423,44 @@ keeps its earnings reclaimable meanwhile.
 
 ## Phase 4: distribution and upgrades
 
+### Upgrading to a published release (1.3)
+
+`AdminOp::UpgradeToLatest` (`pumasi upgrade latest`, the dashboard's
+Upgrade button, `POST /api/v1/upgrade`) runs on the leader in the
+background and reports through `AdminOp::LatestRelease`
+(`LatestReleaseView`: the newest tag, the control plane's version and a
+`FetchState`). It resolves the tag from the redirect of
+`<release source>/latest` (default
+`https://github.com/syang0531/pumasi/releases`), reads
+`download/<tag>/SHA256SUMS` (at most 64 KiB), and for every platform of a
+member not already on that version or newer downloads
+`download/<tag>/pumasi-<os>-<arch>[.exe]` (at most 256 MiB, 20 minutes).
+A binary is used only if its SHA-256 matches `SHA256SUMS`, its executable
+header names that platform and its build marker carries the tag's
+version; it then goes into the release store and `start_rollout` signs it
+as for `pumasi upgrade rollout`, so agents still check the cluster's
+signature, size and hash. A binary already in the store under that hash
+is not downloaded again. The tag is checked before it goes into a URL
+(letters, digits, `.-_+`).
+
+The control plane and `pumasi ui` remember the path they started from and
+`stat` it every 30 seconds (`crates/cli/src/follow.rs`). When a binary
+whose build marker is newer appears there (the local agent's upgrade or
+the install script) and it answers `--version`, `pumasi ui` restarts at
+once and the control plane restarts once `Cluster::rollout_settled` (no
+download running, no node waiting, draining or upgrading), the same way
+the agent does: `exec` on Unix, exit code 75 under the Windows service
+manager.
+
+### Node names (1.3)
+
+`AdminOp::RenameNode` stores `node id -> (admin's name, reported name)`
+under `meta.node_names` and puts the admin's name into the member's and
+the live node's `NodeInfo` whenever the agent's hello arrives
+(`State::apply_node_name`), so every view, event, metric and the built-in
+`name` label use it. Names given by an admin are unique; `resolve_node`
+(name first, then id prefix) is used by `RemoveNode` too.
+
 ### Release builds
 
 `.github/workflows/release.yml` runs on a `v*` tag. It builds `pumasi-cli`

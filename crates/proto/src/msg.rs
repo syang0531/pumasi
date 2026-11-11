@@ -760,6 +760,30 @@ pub enum AdminOp {
     RevokeJoinToken {
         id: String,
     },
+    // 1.3 from here.
+    /// Gives a node a display name (`None`: back to the name its agent
+    /// reports). `node` is a name or an id prefix. The name shows in the
+    /// status, the dashboard, events and the built-in `name` label, and
+    /// survives the agent restarting with another `--name`.
+    RenameNode {
+        node: String,
+        name: Option<String>,
+    },
+    /// The newest published pumasi release and the state of any
+    /// download for [`AdminOp::UpgradeToLatest`]. With `check`, asks the
+    /// release site first (otherwise answers with what it last saw).
+    LatestRelease {
+        check: bool,
+    },
+    /// Downloads a published release (`version`, default the newest) for
+    /// every platform in the cluster, checks it against the release's
+    /// SHA256SUMS and the binaries' build markers, and rolls it out like
+    /// `pumasi upgrade rollout`. Runs in the background: answers at once,
+    /// then [`AdminOp::LatestRelease`] tells how far it got.
+    UpgradeToLatest {
+        version: Option<String>,
+        force: bool,
+    },
 }
 
 impl AdminOp {
@@ -894,6 +918,8 @@ pub enum AdminResponse {
     },
     // 1.2 from here.
     JoinTokens(Vec<JoinTokenView>),
+    // 1.3 from here.
+    LatestRelease(Box<crate::release::LatestReleaseView>),
 }
 
 /// A join ticket or invite that can still be used; its secret is not

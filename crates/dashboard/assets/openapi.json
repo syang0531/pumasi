@@ -616,6 +616,71 @@
         ]
       }
     },
+    "/api/v1/nodes/{node}/rename": {
+      "post": {
+        "summary": "Give a node a display name, or go back to the name its agent reports",
+        "tags": [
+          "nodes"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Admin only. The name (up to 64 characters, unique in the cluster) shows in the status, the dashboard, events and the built-in `name` label, and can be used wherever a node name is taken. It survives the agent restarting with another `--name`. `null`, an empty string or a missing `name` goes back to the agent's name.",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Name or id prefix"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/nodes/{node}/{action}": {
       "post": {
         "summary": "Drain, cordon, uncordon, benchmark, trust or untrust a node (trust: it runs tier = \"trusted\" jobs)",
@@ -676,6 +741,106 @@
             }
           }
         ]
+      }
+    },
+    "/api/v1/upgrade": {
+      "get": {
+        "summary": "The newest published release and the state of an upgrade to it",
+        "tags": [
+          "nodes"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Answers `{source, latest, checked_unix, check_error, control_plane, fetch}`. `fetch` is `\"Idle\"`, `{\"Running\": {version, step, started_unix}}`, `{\"Done\": {version, summary, finished_unix}}` or `{\"Failed\": {version, reason, finished_unix}}`. With `check=true` (admin only) the control plane asks the release site first (at most once a minute); otherwise it answers with what it last saw. Where each node stands in the rollout: `POST /api/v1/op` with `\"RolloutStatus\"`.",
+        "parameters": [
+          {
+            "name": "check",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ]
+      },
+      "post": {
+        "summary": "Upgrade the cluster to the newest published release (or `version`)",
+        "tags": [
+          "nodes"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Admin only. The control plane downloads the binary of every platform its nodes run, checks each against the release's SHA256SUMS, its platform and its build marker, and rolls them out like `pumasi upgrade rollout` (signed with the cluster key; nodes install when idle and roll back on failure). Answers at once with the same view as `GET`; poll it until `fetch` is `Done` or `Failed`. Nodes already on that version or newer are left alone.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "version": {
+                    "type": "string",
+                    "description": "A release tag such as v1.3.0 (default: the newest release)"
+                  },
+                  "force": {
+                    "type": "boolean",
+                    "description": "Allow binaries of another protocol version than the control plane"
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/accounts": {

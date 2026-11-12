@@ -1557,10 +1557,13 @@ async fn a_sleeping_node_shows_as_asleep_and_wakes_from_the_api() {
         }
     };
 
-    // Awake: the report is in the API, and an online node is not woken.
+    // Awake: the reports are in the API (they follow the join), and an
+    // online node is not woken.
     let mut node = power_of("laptop").await;
     for _ in 0..100 {
-        if node["power"]["report"].is_object() {
+        if node["power"]["report"].is_object()
+            && power_of("desk").await["power"]["report"].is_object()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

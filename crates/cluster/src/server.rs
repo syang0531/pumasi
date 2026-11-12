@@ -711,7 +711,8 @@ impl Cluster {
             l.abort();
             let _ = l.await;
         }
-        if let Some(inner) = self.shared.active.write().unwrap().take() {
+        let active = self.shared.active.write().unwrap().take();
+        if let Some(inner) = active {
             inner.stop();
         }
         let ha = self.shared.ha.write().unwrap().take();
@@ -1127,7 +1128,11 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     }
                 }
                 Ok(Some(FromAgent::Done(report))) => {
-                    match inner.state().open_info(&report.task) {
+                    // In a statement of its own: as the `match`'s operand
+                    // the lock would be held through the arms, and the
+                    // second one takes it again.
+                    let open = inner.state().open_info(&report.task);
+                    match open {
                         Some(info) => {
                             let inner = inner.clone();
                             let node_id = node_id.clone();
@@ -2077,14 +2082,20 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
                 inner.state().status_for(Some(account)),
             ))
         }
-        AdminOp::Job { id, with_output } => match inner.state().job_view(id, with_output) {
-            Some(v) => Ok(AdminResponse::Job(Box::new(v))),
-            None => Ok(AdminResponse::Error(format!("no job {id}"))),
-        },
-        AdminOp::TaskDetails { id } => match inner.state().task_details(id) {
-            Some(v) => Ok(AdminResponse::TaskDetails(v)),
-            None => Ok(AdminResponse::Error(format!("no job {id}"))),
-        },
+        AdminOp::Job { id, with_output } => {
+            let view = inner.state().job_view(id, with_output);
+            match view {
+                Some(v) => Ok(AdminResponse::Job(Box::new(v))),
+                None => Ok(AdminResponse::Error(format!("no job {id}"))),
+            }
+        }
+        AdminOp::TaskDetails { id } => {
+            let details = inner.state().task_details(id);
+            match details {
+                Some(v) => Ok(AdminResponse::TaskDetails(v)),
+                None => Ok(AdminResponse::Error(format!("no job {id}"))),
+            }
+        }
         AdminOp::CheckJob { sub, upload_bytes } => {
             let submitter = matches!(caller, Caller::Submitter { .. });
             Ok(AdminResponse::JobCheck(Box::new(inner.state().check_job(

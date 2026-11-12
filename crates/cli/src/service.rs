@@ -162,6 +162,17 @@ pub enum ServiceCmd {
         #[arg(last = true)]
         changes: Vec<String>,
     },
+    /// Stop a service and start it again. Without a role, every Pumasi
+    /// service installed here: the control plane first, then the
+    /// dashboard and the agent, which find it again by themselves.
+    /// Restarting an agent stops its tasks; the control plane gives the
+    /// ones that were running to nodes again.
+    Restart {
+        #[arg(value_enum)]
+        role: Option<Role>,
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
     /// Stop and remove a service. An agent's machine stays a cluster
     /// member; a control plane keeps its data.
     Uninstall {
@@ -1624,7 +1635,10 @@ mod imp {
             && s.current_state != ServiceState::Stopped
         {
             let _ = service.stop();
-            for _ in 0..60 {
+            // A service that does not stop ends itself after
+            // `STOP_TIMEOUT`.
+            let tries = (super::windows::STOP_TIMEOUT + Duration::from_secs(10)).as_millis() / 500;
+            for _ in 0..tries {
                 std::thread::sleep(Duration::from_millis(500));
                 if service
                     .query_status()
@@ -1684,7 +1698,7 @@ mod imp {
 pub mod windows {
     use std::{
         ffi::OsString,
-        sync::{Mutex, OnceLock},
+        sync::{Arc, Mutex, OnceLock},
         time::Duration,
     };
 
@@ -1694,7 +1708,7 @@ pub mod windows {
             ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
             ServiceType,
         },
-        service_control_handler::{self, ServiceControlHandlerResult},
+        service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
         service_dispatcher,
     };
 
@@ -1730,47 +1744,114 @@ pub mod windows {
         *EXIT.lock().unwrap() = code;
     }
 
+    /// How long a stop may take (the systemd units' `TimeoutStopSec`).
+    /// systemd and launchd kill a service that takes longer; the Windows
+    /// service manager waits for ever, so the service ends itself.
+    pub(super) const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Set (in the service's `Environment` registry value) to make the
+    /// service ignore a stop, for the test of [`STOP_TIMEOUT`].
+    const STOP_HANGS_ENV: &str = "PUMASI_TEST_STOP_HANGS";
+
+    /// What the service manager is told for `state`.
+    fn service_status(state: ServiceState, code: i32) -> ServiceStatus {
+        let stopping = state == ServiceState::StopPending;
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: if state == ServiceState::Running {
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+            } else {
+                ServiceControlAccept::empty()
+            },
+            exit_code: if code == 0 {
+                ServiceExitCode::Win32(0)
+            } else {
+                ServiceExitCode::ServiceSpecific(code as u32)
+            },
+            checkpoint: u32::from(stopping),
+            wait_hint: if stopping {
+                STOP_TIMEOUT + Duration::from_secs(5)
+            } else {
+                Duration::from_secs(10)
+            },
+            process_id: None,
+        }
+    }
+
+    /// Reports the service's state to the service manager, from the main
+    /// thread and from the control handler's. Nothing is reported after
+    /// `Stopped`: a stop that arrives while the service ends by itself
+    /// must not turn it back into "StopPending".
+    struct Reporter(Mutex<Option<ServiceStatusHandle>>);
+
+    impl Reporter {
+        /// False when the service was reported as stopped before.
+        fn report(&self, state: ServiceState, code: i32) -> bool {
+            let mut handle = self.0.lock().unwrap();
+            let Some(status) = *handle else { return false };
+            let _ = status.set_service_status(service_status(state, code));
+            if state == ServiceState::Stopped {
+                *handle = None;
+            }
+            true
+        }
+
+        /// Ends the process if the service has not stopped
+        /// [`STOP_TIMEOUT`] after it was asked to: as stopped, so that
+        /// the failure actions do not start it again behind whoever asked.
+        fn end_if_stop_hangs(self: Arc<Self>, role: Role) {
+            std::thread::spawn(move || {
+                std::thread::sleep(STOP_TIMEOUT);
+                if self.report(ServiceState::Stopped, 0) {
+                    tracing::error!(
+                        "{} did not stop within {} s of being asked to; ending the process",
+                        role.as_str(),
+                        STOP_TIMEOUT.as_secs()
+                    );
+                    std::process::exit(0);
+                }
+            });
+        }
+    }
+
     fn run_service() -> Result<i32> {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let stop_tx = Mutex::new(Some(stop_tx));
+        let reporter = Arc::new(Reporter(Mutex::new(None)));
+        let stopping = reporter.clone();
+        let (role, home, args) =
+            ARGS.get()
+                .cloned()
+                .unwrap_or((Role::Agent, PathBuf::new(), Vec::new()));
         let handler = move |event| match event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
+                // Before the stop starts, so that whoever asked reads
+                // "StopPending" at once. Stopping takes seconds with nodes
+                // or tasks, and PowerShell's `Restart-Service` and
+                // `Stop-Service` give up on a service that still says
+                // "Running" 2 s after the stop (and then never start it
+                // again, while the service goes on to stop).
+                stopping.report(ServiceState::StopPending, 0);
                 if let Some(tx) = stop_tx.lock().unwrap().take() {
                     let _ = tx.send(());
+                    stopping.clone().end_if_stop_hangs(role);
                 }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         };
-        let (role, home, args) =
-            ARGS.get()
-                .cloned()
-                .unwrap_or((Role::Agent, PathBuf::new(), Vec::new()));
         let status = service_control_handler::register(role.name(), handler)?;
-        let report = |state, code: i32| {
-            let _ = status.set_service_status(ServiceStatus {
-                service_type: ServiceType::OWN_PROCESS,
-                current_state: state,
-                controls_accepted: if state == ServiceState::Running {
-                    ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
-                } else {
-                    ServiceControlAccept::empty()
-                },
-                exit_code: if code == 0 {
-                    ServiceExitCode::Win32(0)
-                } else {
-                    ServiceExitCode::ServiceSpecific(code as u32)
-                },
-                checkpoint: 0,
-                wait_hint: Duration::from_secs(10),
-                process_id: None,
-            });
-        };
-        report(ServiceState::Running, 0);
+        *reporter.0.lock().unwrap() = Some(status);
+        reporter.report(ServiceState::Running, 0);
         let rt = tokio::runtime::Runtime::new()?;
-        let code = rt.block_on(Box::pin(crate::run_service(role, home, args, async {
+        let stop_hangs = std::env::var_os(STOP_HANGS_ENV).is_some();
+        let code = rt.block_on(Box::pin(crate::run_service(role, home, args, async move {
             let _ = stop_rx.await;
+            if stop_hangs {
+                std::future::pending::<()>().await;
+            }
         })));
         let code = match code {
             Ok(c) => c,
@@ -1780,7 +1861,7 @@ pub mod windows {
             }
         };
         rt.shutdown_timeout(Duration::from_secs(5));
-        report(ServiceState::Stopped, code);
+        reporter.report(ServiceState::Stopped, code);
         Ok(code)
     }
 }

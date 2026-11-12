@@ -525,6 +525,50 @@ async fn failed_and_cancelled_jobs() {
     cluster.shutdown().await.unwrap();
 }
 
+/// A node that cannot start a task says so with `FromAgent::Done`, not
+/// with a result. Taking that report froze the control plane: it locked
+/// its state twice, and every later scheduling step, API call and the
+/// shutdown waited for that lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_that_cannot_start_fails_and_the_control_plane_goes_on() {
+    init_tracing();
+    // A frozen control plane also blocks this runtime's threads, so a
+    // tokio timeout would not fire.
+    let (finished, wait) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        use std::sync::mpsc::RecvTimeoutError::Timeout;
+        if wait.recv_timeout(Duration::from_secs(90)) == Err(Timeout) {
+            eprintln!("the control plane froze on a task that could not start");
+            std::process::abort();
+        }
+    });
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let a = spawn_join(agent("a", 1, tempdir("a")).await, ticket);
+    wait_online(&cluster, 1).await;
+    let client = admin(&cluster).await;
+
+    // A WASM header and nothing a node can load after it.
+    let mut sub = submission(vec![vec!["x"]]);
+    sub.module = b"\0asm\x01\0\0\0 not a module".to_vec();
+    sub.max_attempts = 1;
+    let id = submit(&client, sub).await;
+    let view = wait_job(&client, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Failed, "{view:#?}");
+
+    // The control plane still schedules, answers and stops.
+    let id = submit(&client, submission(vec![vec!["y"]])).await;
+    let view = wait_job(&client, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+
+    client.close().await;
+    a.kill().await;
+    cluster.shutdown().await.unwrap();
+    let _ = finished.send(());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn state_survives_a_control_plane_restart() {
     init_tracing();

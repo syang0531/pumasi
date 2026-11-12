@@ -633,7 +633,8 @@ impl Agent {
         let mut backoff = Duration::from_millis(500);
         let mut installed = self.installed.subscribe();
         loop {
-            if let Some(version) = installed.borrow_and_update().clone() {
+            let version = installed.borrow_and_update().clone();
+            if let Some(version) = version {
                 return Ok(AgentExit::Upgraded { version });
             }
             let (target, count) = {
@@ -860,7 +861,8 @@ impl Agent {
             let _ = out_tx.send(FromAgent::Perf(Box::new(p)));
         }
         let mut devices = self.devices.clone();
-        if let Some(d) = devices.borrow_and_update().clone() {
+        let known = devices.borrow_and_update().clone();
+        if let Some(d) = known {
             let _ = out_tx.send(FromAgent::Devices(Box::new(d)));
         }
         // The control plane is never older than its agents, so it knows this.
@@ -898,7 +900,8 @@ impl Agent {
                             if r.is_err() {
                                 break;
                             }
-                            match devices.borrow_and_update().clone() {
+                            let changed = devices.borrow_and_update().clone();
+                            match changed {
                                 Some(d) => FromAgent::Devices(Box::new(d)),
                                 None => continue,
                             }
@@ -1182,7 +1185,8 @@ impl Agent {
                     }
                 }
                 Ok(Some(ToAgent::Keys { task, reply })) => {
-                    if let Some(w) = self.key_waiters.lock().unwrap().remove(&task) {
+                    let waiter = self.key_waiters.lock().unwrap().remove(&task);
+                    if let Some(w) = waiter {
                         let _ = w.send(reply);
                     }
                 }

@@ -76,7 +76,10 @@ async fn start_cluster(dir: PathBuf) -> Result<Cluster> {
     config.net = NetMode::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
     config.heartbeat = Duration::from_millis(200);
-    config.node_timeout = Duration::from_secs(2);
+    // The default node timeout (10 s), not the 2 s of the test files that
+    // lose nodes: no test here does. On a Windows runner where every call
+    // took over a second for a while, healthy nodes went 2 s without a
+    // heartbeat read and had their runs rescheduled.
     Cluster::start(config).await
 }
 

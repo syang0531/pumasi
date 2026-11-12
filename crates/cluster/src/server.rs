@@ -459,7 +459,22 @@ impl Cluster {
         let files = FileStore::open(&config.data_dir.join("blobs"), config.gc_interval).await?;
         let endpoint = match endpoint {
             Some(e) => e,
-            None => Self::bind(&config, endpoint_key(&config.data_dir, &key)?).await?,
+            None => {
+                let bound = match endpoint_key(&config.data_dir, &key) {
+                    Ok(k) => Self::bind(&config, k).await,
+                    Err(e) => Err(e),
+                };
+                match bound {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // The file store keeps its database locked until
+                        // it is shut down: without this, a second start
+                        // in this process could not open it.
+                        files.store.shutdown().await.ok();
+                        return Err(e);
+                    }
+                }
+            }
         };
         let addr = dialable_addr(&endpoint, config.net).await;
         let shared = Arc::new(Shared {

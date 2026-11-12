@@ -357,6 +357,33 @@ async fn a_node_on_battery_takes_no_new_tasks_until_plugged_in() {
     cluster.shutdown().await.unwrap();
 }
 
+/// A control plane that cannot bind its address lets go of what it had
+/// opened, so the next start in the same directory works (on Windows the
+/// port of a control plane that just ended can stay taken for a moment).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_cannot_bind_leaves_the_data_directory_free() {
+    init_tracing();
+    let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dir = tempdir("c");
+    let config = || {
+        let mut config = ClusterConfig::new(dir.clone());
+        config.net = NetMode::Local;
+        config.bind = Some(taken.local_addr().unwrap());
+        config
+    };
+    for _ in 0..2 {
+        let err = match Cluster::start(config()).await {
+            Ok(_) => panic!("started on a taken address"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("bind"), "{err}");
+    }
+    let mut free = config();
+    free.bind = Some("127.0.0.1:0".parse().unwrap());
+    let cluster = Cluster::start(free).await.unwrap();
+    cluster.shutdown().await.unwrap();
+}
+
 /// A stand-in network: one card on a LAN no test machine is on, and a
 /// record of the magic packets asked for.
 struct Lan {

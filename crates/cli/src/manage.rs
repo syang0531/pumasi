@@ -682,8 +682,9 @@ pub async fn whoami(home: &Path, admin: &AdminArgs) -> Result<i32> {
                 Some(v) => (v.quota.describe(), v.policy.describe()),
                 None => ("none".to_string(), "none".to_string()),
             };
-            println!("quota of {account}: {quota}");
-            println!("job policy of {account}: {policy}");
+            // The account is in the role on the line above.
+            println!("quota: {quota}");
+            println!("job policy: {policy}");
         }
         Ok(())
     }

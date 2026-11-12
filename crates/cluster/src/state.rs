@@ -4419,7 +4419,7 @@ mod tests {
         let waits = check(&st, gpu).unwrap();
         assert!(waits.ready_nodes.is_empty());
         let why = waits.waiting.unwrap();
-        assert!(why.contains("docker-1") && why.contains("wasm-1"), "{why}");
+        assert!(why.contains("docker-1") && why.contains("wasm-1"));
 
         // At its quota the job would be accepted and wait.
         st.set_account_quota(

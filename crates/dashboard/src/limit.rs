@@ -207,7 +207,10 @@ impl<K: std::hash::Hash + Eq + Clone> Buckets<K> {
 
     /// Takes one token, or says how long until there is one.
     pub fn take(&self, key: &K) -> Result<(), Duration> {
-        let now = Instant::now();
+        self.take_at(key, Instant::now())
+    }
+
+    fn take_at(&self, key: &K, now: Instant) -> Result<(), Duration> {
         let mut map = self.map.lock().unwrap();
         if map.len() >= MAX_TRACKED && !map.contains_key(key) {
             // Full buckets are the same as none.
@@ -326,16 +329,25 @@ mod tests {
 
     #[test]
     fn buckets_refill() {
+        // At given times: with the clock, a slow machine refills the
+        // bucket between two takes.
         let b = Buckets::new(3.0, 1000.0);
         let k = 1u8;
+        let t = Instant::now();
         for _ in 0..3 {
-            b.take(&k).unwrap();
+            b.take_at(&k, t).unwrap();
         }
-        let wait = b.take(&k).unwrap_err();
-        assert!(wait <= Duration::from_millis(1));
-        std::thread::sleep(Duration::from_millis(5));
-        b.take(&k).unwrap();
-        b.take(&2u8).unwrap();
+        let wait = b.take_at(&k, t).unwrap_err();
+        assert_eq!(wait, Duration::from_millis(1));
+        let half = t + Duration::from_micros(500);
+        assert_eq!(b.take_at(&k, half).unwrap_err(), Duration::from_micros(500));
+        b.take_at(&2u8, half).unwrap();
+        let later = t + Duration::from_millis(5);
+        // Five tokens' worth of time fills it to the burst and no further.
+        for _ in 0..3 {
+            b.take_at(&k, later).unwrap();
+        }
+        b.take_at(&k, later).unwrap_err();
         let slow = Buckets::new(1.0, 0.5);
         slow.take(&k).unwrap();
         assert!(slow.take(&k).unwrap_err() > Duration::from_millis(1500));

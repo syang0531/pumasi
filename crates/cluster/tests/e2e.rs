@@ -947,16 +947,9 @@ async fn checks_catch_a_dishonest_provider() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7: benchmarks and compute units
+// Phase 7: compute units. The benchmark checks are in `bench.rs`: the
+// cluster times CPUs there, which needs a test binary of its own.
 // ---------------------------------------------------------------------------
-
-async fn benched(name: &str, dir: PathBuf, inflate: u32) -> Agent {
-    let mut config = agent_config(name, 1, dir.clone());
-    let mut bench = pumasi_agent::BenchConfig::quick(dir);
-    bench.inflate = inflate;
-    config.bench = Some(bench);
-    Agent::new(config).await.unwrap()
-}
 
 fn node_named(cluster: &Cluster, name: &str) -> pumasi_proto::msg::NodeView {
     cluster
@@ -965,92 +958,6 @@ fn node_named(cluster: &Cluster, name: &str) -> pumasi_proto::msg::NodeView {
         .into_iter()
         .find(|n| n.info.name == name)
         .unwrap()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
-    init_tracing();
-    let cluster = start_cluster(tempdir("c")).await.unwrap();
-    let client = admin(&cluster).await;
-    let ticket = cluster
-        .create_join_ticket(Duration::from_secs(60), None)
-        .unwrap();
-    let own = benched("own", tempdir("o"), 1).await;
-    let honest = benched("honest", tempdir("h"), 1).await;
-    // Claims a CPU eight times faster than it is.
-    let liar = benched("liar", tempdir("l"), 8).await;
-    let claimed = liar.perf().unwrap().profile.cpu.single;
-    let o = spawn_join(own, ticket);
-    let h = spawn_join(honest, invite(&cluster, "alice"));
-    let l = spawn_join(liar, invite(&cluster, "mallory"));
-    wait_online(&cluster, 3).await;
-
-    // Every node sends its signed profile; the cluster times the
-    // providers' CPU benchmark itself.
-    wait_for("profiles and checks", || {
-        let s = cluster.status();
-        s.nodes.iter().all(|n| n.perf.is_some())
-            && node_named(&cluster, "liar").strikes > 0
-            // Timed, or slow enough not to need it. Under load the
-            // cluster's timing can differ from the agent's a little, which
-            // caps the billed score but is no strike.
-            && !node_named(&cluster, "honest")
-                .perf_note
-                .is_some_and(|n| n.contains("not confirmed"))
-    })
-    .await;
-    let own = node_named(&cluster, "own");
-    let p = own.perf.as_ref().unwrap();
-    assert!(p.cpu.single > 0 && p.memory.copy_mb_s > 0);
-    let disk = p.disk.as_ref().expect("disk measured");
-    assert!(
-        disk.seq_read_mb_s > 0 && disk.rand_read_iops > 0,
-        "{disk:?}"
-    );
-    // Owner machines are billed at their own score, unchecked.
-    assert_eq!(
-        own.cpu_score,
-        pumasi_proto::economy::billing_score(p.cpu.per_vcpu())
-    );
-    assert!(own.rtt_us.is_some(), "the cluster measures latency");
-
-    let honest = node_named(&cluster, "honest");
-    assert_eq!(honest.strikes, 0, "{:?}", honest.perf_note);
-    let liar = node_named(&cluster, "liar");
-    assert_eq!(liar.perf.as_ref().unwrap().cpu.single, claimed);
-    assert!(
-        liar.perf_note.as_deref().unwrap_or("").contains("capped"),
-        "{:?}",
-        liar.perf_note
-    );
-    // Billed at about what the cluster timed (at most 1.25x its best
-    // timing, which a busy runner can put at twice the real speed), not
-    // the eightfold claim.
-    assert!(
-        (liar.cpu_score as u64) * 2 < liar.perf.as_ref().unwrap().cpu.per_vcpu() as u64,
-        "billed {} for a claim of {}",
-        liar.cpu_score,
-        liar.perf.as_ref().unwrap().cpu.per_vcpu()
-    );
-
-    // The owner can ask a node to measure again.
-    let before = node_named(&cluster, "honest").perf.unwrap();
-    client
-        .call(AdminOp::Benchmark {
-            id: node_named(&cluster, "honest").id,
-        })
-        .await
-        .unwrap();
-    wait_for("a new profile", || {
-        node_named(&cluster, "honest").perf.as_ref() != Some(&before)
-    })
-    .await;
-
-    client.close().await;
-    o.kill().await;
-    h.kill().await;
-    l.kill().await;
-    cluster.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1965,8 +1872,7 @@ async fn wait_upgrade_state(
 }
 
 async fn wait_for(what: &str, cond: impl Fn() -> bool) {
-    // A minute: a second timing of an inflated benchmark runs eight times
-    // longer than claimed, and slow CI runners run several tests at once.
+    // A minute: slow CI runners run several tests at once.
     for _ in 0..600 {
         if cond() {
             return;

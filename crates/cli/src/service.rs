@@ -1684,7 +1684,7 @@ mod imp {
 pub mod windows {
     use std::{
         ffi::OsString,
-        sync::{Mutex, OnceLock},
+        sync::{Arc, Mutex, OnceLock},
         time::Duration,
     };
 
@@ -1694,7 +1694,7 @@ pub mod windows {
             ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
             ServiceType,
         },
-        service_control_handler::{self, ServiceControlHandlerResult},
+        service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
         service_dispatcher,
     };
 
@@ -1730,11 +1730,67 @@ pub mod windows {
         *EXIT.lock().unwrap() = code;
     }
 
+    /// How long a stop may take before the service manager calls the
+    /// service hung (the systemd units' `TimeoutStopSec`).
+    const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
+
+    /// What the service manager is told for `state`.
+    fn service_status(state: ServiceState, code: i32) -> ServiceStatus {
+        let stopping = state == ServiceState::StopPending;
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: if state == ServiceState::Running {
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+            } else {
+                ServiceControlAccept::empty()
+            },
+            exit_code: if code == 0 {
+                ServiceExitCode::Win32(0)
+            } else {
+                ServiceExitCode::ServiceSpecific(code as u32)
+            },
+            checkpoint: u32::from(stopping),
+            wait_hint: if stopping {
+                STOP_WAIT_HINT
+            } else {
+                Duration::from_secs(10)
+            },
+            process_id: None,
+        }
+    }
+
+    /// Reports the service's state to the service manager, from the main
+    /// thread and from the control handler's. Nothing is reported after
+    /// `Stopped`: a stop that arrives while the service ends by itself
+    /// must not turn it back into "StopPending".
+    struct Reporter(Mutex<Option<ServiceStatusHandle>>);
+
+    impl Reporter {
+        fn report(&self, state: ServiceState, code: i32) {
+            let mut handle = self.0.lock().unwrap();
+            let Some(status) = *handle else { return };
+            let _ = status.set_service_status(service_status(state, code));
+            if state == ServiceState::Stopped {
+                *handle = None;
+            }
+        }
+    }
+
     fn run_service() -> Result<i32> {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let stop_tx = Mutex::new(Some(stop_tx));
+        let reporter = Arc::new(Reporter(Mutex::new(None)));
+        let stopping = reporter.clone();
         let handler = move |event| match event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
+                // Before the stop starts, so that whoever asked reads
+                // "StopPending" at once. Stopping takes seconds with nodes
+                // or tasks, and PowerShell's `Restart-Service` and
+                // `Stop-Service` give up on a service that still says
+                // "Running" 2 s after the stop (and then never start it
+                // again, while the service goes on to stop).
+                stopping.report(ServiceState::StopPending, 0);
                 if let Some(tx) = stop_tx.lock().unwrap().take() {
                     let _ = tx.send(());
                 }
@@ -1748,26 +1804,8 @@ pub mod windows {
                 .cloned()
                 .unwrap_or((Role::Agent, PathBuf::new(), Vec::new()));
         let status = service_control_handler::register(role.name(), handler)?;
-        let report = |state, code: i32| {
-            let _ = status.set_service_status(ServiceStatus {
-                service_type: ServiceType::OWN_PROCESS,
-                current_state: state,
-                controls_accepted: if state == ServiceState::Running {
-                    ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
-                } else {
-                    ServiceControlAccept::empty()
-                },
-                exit_code: if code == 0 {
-                    ServiceExitCode::Win32(0)
-                } else {
-                    ServiceExitCode::ServiceSpecific(code as u32)
-                },
-                checkpoint: 0,
-                wait_hint: Duration::from_secs(10),
-                process_id: None,
-            });
-        };
-        report(ServiceState::Running, 0);
+        *reporter.0.lock().unwrap() = Some(status);
+        reporter.report(ServiceState::Running, 0);
         let rt = tokio::runtime::Runtime::new()?;
         let code = rt.block_on(Box::pin(crate::run_service(role, home, args, async {
             let _ = stop_rx.await;
@@ -1780,7 +1818,7 @@ pub mod windows {
             }
         };
         rt.shutdown_timeout(Duration::from_secs(5));
-        report(ServiceState::Stopped, code);
+        reporter.report(ServiceState::Stopped, code);
         Ok(code)
     }
 }

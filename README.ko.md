@@ -689,7 +689,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~27단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채우며, 잠드는 기기부터 시작합니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채우며, 실사용에서 올라온 이슈와 잠드는 기기부터 시작합니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -710,14 +710,15 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 15 | 원격 API 클라이언트: 계정별 작업 정책(이미지·다이제스트, 실행기, 네트워크 차단, 강제 selector, toleration, 최대 제한 시간, 태스크당 GPU), 작업마다 제출자와 실제 이미지 다이제스트 기록, `queue_timeout`, 지금 그 계정 작업을 받을 노드 수와 못 받는 이유, 실행 중인 에이전트의 Docker 재확인, HTTPS(`--tls-cert`)와 인증 실패 제한이 있는 `pumasi ui --api-only`, Cloudflare Tunnel 안내, `?wait=` 롱폴링, CI에서 실행하는 curl 예제, 그리기용 GPU 드라이버 능력(`gpu.graphics`, `gpu check --docker-run`)과 Blender 예제 | 완료 |
 | 16 | 기밀 등급: `trusted`(내 기기와 신뢰하는 제공자)와 `confidential`(SEV-SNP·TDX microVM). 이미지와 입력을 컨트롤 플레인에서 봉인, AMD·Intel 인증서로 원격 증명 검증, 관리자가 신뢰한 실행 측정값의 새 게스트에만 키 전달, 봉인된 결과, `pumasi confidential` | 완료 |
 | 17 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델(인터넷에 노출된 API와 터널 시나리오 포함: 티켓 유출, 정책 우회, 요청 폭주), CI에 cargo-audit·cargo-deny·CodeQL·퍼징, Keycloak·OpenLDAP로 SSO 종단 테스트, 내부 보안 점검, 운영 문서, Linux·macOS 장시간 소크 테스트 뒤 1.0 태그. 함께: 작업 보관 기간(`--keep-jobs`), 관리자 시크릿 교체, 티켓별 요청 제한 | 완료(1.0) |
-| 20 | 잠드는 기기와 Docker 없는 기기: 태스크 실행 중 잠자기 막기, 잠들기 전에 알려 태스크를 바로 옮기기, 대기 작업이 있으면 Wake-on-LAN으로 깨우기, `executor = "image"`(Docker가 있으면 Docker, 없으면 microVM), Windows 서비스에서 유휴 감지, `--on-pause requeue` | 다음(1.4) |
-| 21 | 모니터링: microVM 실시간 출력, Windows 온도, Intel·AMD·Apple GPU 지표, 재시작해도 남는 최근 1시간 지표, 노드 간 지연·대역폭, 경보 일시 중지와 라벨별 임계값 | 예정(1.5) |
-| 22 | 대시보드: 재시작해도 유지되는 로그인, 경보·웹훅·요금·쿼터·스케줄·라벨·노드 가용 정책을 브라우저에서 수정, 카나리 배포, 실시간 차트, 휴대폰 화면 | 예정(1.6) |
-| 23 | 여러 기기에 걸친 파일 저장소: 소유자 노드 복제본과 복구·검사, 충분한 사본에 쓴 뒤 완료 응답, S3 호환 게이트웨이 | 예정(1.7) |
-| 24 | 스케줄링: 갱 스케줄링, 어피니티·안티어피니티, CPU·메모리 쿼터, 라벨별 쿼터, 선점·drain 뒤에도 이어지는 체크포인트, 스케줄 시간대 | 예정(1.8) |
-| 25 | GPU: WebGPU 제한 시간과 GPU 챌린지, AMD 벤치마크와 Docker 작업, GPU 나눠 쓰기(분수, MIG) | 예정(1.9) |
-| 26 | Windows: Pumasi가 관리하는 WSL 배포판의 Docker(Docker Desktop·로그인 불필요), ARM64 microVM, 확실히 빠르면 HCS 백엔드 | 예정(1.10) |
-| 27 | 운영: 공유·피어별 요청 제한, 서명된 체크포인트 뒤 감사 로그 정리, SCIM, HTTPS 프록시 뒤의 CLI, 팔로워 읽기 | 예정(1.11) |
+| 20 | 실사용 이슈: 서비스를 다시 설치하지 않고 에이전트 옵션 바꾸고 보기(`service set`), 대시보드와 문서화된 API로 계정 쿼터·작업 정책 수정(추가·삭제), 제출자가 자기 정책 확인과 `?validate=1`, 태스크별 이미지 받기·실행·업로드 시간, 태스크 표시에 노드 이름 | 다음(1.4) |
+| 21 | 잠드는 기기와 Docker 없는 기기: 태스크 실행 중 잠자기 막기, 잠들기 전에 알려 태스크를 바로 옮기기, 대기 작업이 있으면 Wake-on-LAN으로 깨우기, `executor = "image"`(Docker가 있으면 Docker, 없으면 microVM), Windows 서비스에서 유휴 감지, `--on-pause requeue` | 예정(1.5) |
+| 22 | 모니터링: microVM 실시간 출력, Windows 온도, Intel·AMD·Apple GPU 지표, 재시작해도 남는 최근 1시간 지표, 노드 간 지연·대역폭, 경보 일시 중지와 라벨별 임계값 | 예정(1.6) |
+| 23 | 대시보드: 재시작해도 유지되는 로그인, 경보·웹훅·요금·스케줄·라벨·노드 가용 정책을 브라우저에서 수정, 카나리 배포, 실시간 차트, 휴대폰 화면 | 예정(1.7) |
+| 24 | 여러 기기에 걸친 파일 저장소: 소유자 노드 복제본과 복구·검사, 충분한 사본에 쓴 뒤 완료 응답, S3 호환 게이트웨이 | 예정(1.8) |
+| 25 | 스케줄링: 갱 스케줄링, 어피니티·안티어피니티, CPU·메모리 쿼터, 라벨별 쿼터, 선점·drain 뒤에도 이어지는 체크포인트, 스케줄 시간대 | 예정(1.9) |
+| 26 | GPU: WebGPU 제한 시간과 GPU 챌린지, AMD 벤치마크와 Docker 작업, GPU 나눠 쓰기(분수, MIG) | 예정(1.10) |
+| 27 | Windows: Pumasi가 관리하는 WSL 배포판의 Docker(Docker Desktop·로그인 불필요), ARM64 microVM, 확실히 빠르면 HCS 백엔드 | 예정(1.11) |
+| 28 | 운영: 공유·피어별 요청 제한, 서명된 체크포인트 뒤 감사 로그 정리, SCIM, HTTPS 프록시 뒤의 CLI, 팔로워 읽기 | 예정(1.12) |
 | 18 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 보류 |
 | 19 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 보류 |
 

@@ -7,29 +7,69 @@ iMac on Big Sur, and Claude's cloud sessions using it through the HTTP
 API. Phases 18 and 19 (the hub, Madang, and buying CU) are **on hold**
 until the project owner asks for them; nothing below depends on them.
 
-Phases 20 to 27 cover what is still missing in the scope the project set
+Phases 20 to 28 cover what is still missing in the scope the project set
 itself: GPUs, Windows, old Intel Macs, the file store, k8s-style cluster
 management, the dashboard and monitoring. Most items come from the
-"What is not done yet" list in [architecture.md](architecture.md) and the
-README's known gaps; the order puts first what the home cluster runs into
-every day. Each phase is one pull request (or a few), ends in a minor
+issues filed from that use, the "What is not done yet" list in
+[architecture.md](architecture.md) and the README's known gaps; the order
+puts first what the home cluster runs into every day. Each phase is one pull request (or a few), ends in a minor
 release, and has a gate: what CI checks and what the owner checks by hand
 on real machines.
 
 | Phase | Release | Scope | Status |
 | --- | --- | --- | --- |
-| 20 | 1.4 | Machines that sleep and machines without Docker | next |
-| 21 | 1.5 | Monitoring: live microVM output, every GPU and temperature, node-to-node network | planned |
-| 22 | 1.6 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | planned |
-| 23 | 1.7 | File store on several machines and an S3-compatible gateway | planned |
-| 24 | 1.8 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | planned |
-| 25 | 1.9 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | planned |
-| 26 | 1.10 | Windows: Docker without Docker Desktop, ARM64 microVMs | planned |
-| 27 | 1.11 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | planned |
+| 20 | 1.4 | Issues from real use: account policies and agent options without a terminal, task timings and names | next |
+| 21 | 1.5 | Machines that sleep and machines without Docker | planned |
+| 22 | 1.6 | Monitoring: live microVM output, every GPU and temperature, node-to-node network | planned |
+| 23 | 1.7 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | planned |
+| 24 | 1.8 | File store on several machines and an S3-compatible gateway | planned |
+| 25 | 1.9 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | planned |
+| 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | planned |
+| 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | planned |
+| 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | planned |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
 | 19 | | Buying CU with won through the hub (Toss Payments) | on hold |
 
-## 20. Machines that sleep and machines without Docker (1.4)
+## 20. Issues from real use: account policies and agent options without a terminal, task timings and names (1.4)
+
+Why: the open GitHub issues, all filed while running the home cluster and
+using it from a cloud sandbox over the HTTP API. They are small next to
+the phases after this one, and phase 21 adds agent options that need #42
+to be practical.
+
+- **Agent options without reinstalling the service** ([#42](https://github.com/syang0531/pumasi/issues/42)).
+  The service keeps its agent options in `agent.toml` in the state
+  directory; `pumasi service status` prints them; `pumasi service set
+  [ROLE] -- --allow-webgpu --no-allow-docker` changes only the given ones
+  and restarts the service. Services installed by older releases are
+  moved to the file on their first `service set`.
+- **Account quotas and job policies from anywhere** ([#43](https://github.com/syang0531/pumasi/issues/43)).
+  A documented `GET`/`PATCH /api/v1/accounts/{name}/policy` in
+  `openapi.json`, where PATCH changes only the given fields and adds or
+  removes list entries (`{"images": {"add": [...], "remove": [...]}}`); the
+  CLI's `--add-images`/`--remove-images` (and the same for executors and
+  tolerations) next to the replacing `--images`; an Accounts page on the
+  dashboard where admins see and edit each account's quota and policy.
+- **Submitters can read their own policy** ([#38](https://github.com/syang0531/pumasi/issues/38)):
+  `whoami` includes it, `POST /api/v1/jobs?validate=1` runs the policy,
+  quota and capacity checks without creating the job, and `capacity` in
+  `/api/v1/status` counts only nodes that the caller's policy can use.
+- **Task timings** ([#40](https://github.com/syang0531/pumasi/issues/40)):
+  `queued_ms`, `pull_ms` (0 when the image was cached), `run_ms` and
+  `upload_ms` per task in the API, `pumasi job` and the dashboard, and the
+  docs say which of them `wall_ms` and the receipt cover.
+- **Node names in task views** ([#41](https://github.com/syang0531/pumasi/issues/41)):
+  `node_name` next to `node` in the API, and names in `pumasi job`.
+
+Gate: unit and end-to-end tests for `service set` on all three service
+managers (CI's service job), the PATCH semantics and its OpenAPI schema,
+`validate=1` answering 200 and 403 like a real submission, timings that add
+up to `wall_ms`, and a Playwright test of the Accounts page; the curl
+examples in docs/api.md run in CI. By hand: turn on WebGPU on every agent
+with one `service set` each, and add an image to the cloud account's
+policy from the dashboard through the tunnel.
+
+## 21. Machines that sleep and machines without Docker (1.5)
 
 Why: home machines sleep. When the iMac sleeps its node goes offline
 after 10 seconds and its running tasks start again elsewhere from the
@@ -79,7 +119,7 @@ an `image` job runs as Docker on a Windows PC and as a microVM on the
 iMac; a Windows agent service with `--idle-minutes 5` pauses while someone
 types.
 
-## 21. Monitoring: live microVM output, every GPU and temperature, node-to-node network (1.5)
+## 22. Monitoring: live microVM output, every GPU and temperature, node-to-node network (1.6)
 
 - **Live microVM output.** The guest streams stdout and stderr over a
   virtio console while the task runs (Firecracker, QEMU, WHPX and vz), so
@@ -104,16 +144,15 @@ a microVM task's output within a second on the iMac and a Windows PC;
 Windows PCs show a temperature; the iMac's AMD GPU and an Intel GPU show
 utilization.
 
-## 22. Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts (1.6)
+## 23. Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts (1.7)
 
 - **Sessions kept in the control plane's state**, so restarting or
   upgrading `pumasi ui` (which 1.3's one-button upgrade does) no longer
   signs everyone out; a list of signed-in sessions with Revoke.
 - **Edit in the browser** what is shown read-only now: alert rules,
-  webhooks and silences, prices, quotas and account job policies, cron
-  schedules, node labels and taints, and each node's availability (slots,
-  CPU cap, hours, AC power, idle minutes), pushed to the agent without
-  restarting its service. A `cluster.toml` editor shows the `apply` diff
+  webhooks and silences, prices, cron schedules, node labels and taints, and each node's availability (slots,
+  CPU cap, hours, AC power, idle minutes), written to the agent's
+  `agent.toml` (phase 20) and applied without a manual restart. A `cluster.toml` editor shows the `apply` diff
   before applying it.
 - **Canary rollouts:** `pumasi upgrade latest --canary NODE|SELECTOR`
   upgrades some nodes first and the rest after they have run tasks
@@ -126,7 +165,7 @@ the sign-in, and a canary rollout between two local agents. By hand: the
 owner changes an alert rule and a node's hours from a phone through the
 tunnel, and upgrades the cluster with a canary.
 
-## 23. File store on several machines and an S3-compatible gateway (1.7)
+## 24. File store on several machines and an S3-compatible gateway (1.8)
 
 Why: the store's only full copy lives on the control plane's machine; on
 a single control plane a lost disk loses every dataset.
@@ -151,7 +190,7 @@ back from node replicas, re-replicates after a node is removed, and runs
 hand: a dataset survives moving the control plane to another PC without
 copying `blobs`.
 
-## 24. Scheduling: gangs, affinity, CPU and memory quotas, checkpoints (1.8)
+## 25. Scheduling: gangs, affinity, CPU and memory quotas, checkpoints (1.9)
 
 - **Gang scheduling** (`gang = true`): all tasks of a job start together
   or none do.
@@ -168,7 +207,7 @@ copying `blobs`.
 Gate: end-to-end tests for each, including a checkpointed task moved off
 a drained node that finishes without starting over.
 
-## 25. GPUs: WebGPU timeouts and checks, AMD, shared GPUs (1.9)
+## 26. GPUs: WebGPU timeouts and checks, AMD, shared GPUs (1.10)
 
 - **WebGPU:** the job's timeout stops a runaway shader (work is split into
   bounded submissions and the device is dropped on timeout), a GPU
@@ -185,7 +224,7 @@ By hand: a never-ending shader stops at its timeout on the RTX 3080 and
 the iMac; two half-GPU jobs share the RTX 3080; AMD Docker jobs only where
 the owner has an AMD Linux machine.
 
-## 26. Windows: Docker without Docker Desktop, ARM64 microVMs (1.10)
+## 27. Windows: Docker without Docker Desktop, ARM64 microVMs (1.11)
 
 - **Docker for machines nobody signs into:** `pumasi docker setup`
   installs dockerd in a small WSL distro that Pumasi manages, started by
@@ -203,7 +242,7 @@ up to what nested virtualization allows). By hand: a fresh Windows PC
 without Docker Desktop runs Docker and GPU jobs as a service after a
 reboot, before anyone signs in.
 
-## 27. Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy (1.11)
+## 28. Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy (1.12)
 
 - Per-peer limits on unauthenticated sign-in calls at the control plane,
   and request limits and failed sign-in counts shared by every `pumasi ui`
@@ -228,6 +267,6 @@ CONNECT proxy.
 - Long-running services (Deployments, Services, ingress): Pumasi stays a
   batch system, as decided in the research.
 - MicroVMs on macOS 10.15 (Virtualization.framework needs macOS 11);
-  Catalina Macs stay WASM-only, or run Linux (phase 20's guide).
+  Catalina Macs stay WASM-only, or run Linux (phase 21's guide).
 - CUDA on Intel, AMD or Apple GPUs; those use WebGPU or, for AMD on Linux,
   ROCm images.

@@ -2069,9 +2069,9 @@ remotely; install a current binary on them once.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Remaining roadmap: phases 20 to 27 ([roadmap.md](roadmap.md)) take
-  on many of the gaps in this list, starting with sleeping machines and
-  Docker-less nodes; phases 18 and 19 (the hub and buying CU) are on hold.
+- Remaining roadmap: phases 20 to 28 ([roadmap.md](roadmap.md)) take
+  on many of the gaps in this list, starting with the open issues from
+  real use, then sleeping machines and Docker-less nodes; phases 18 and 19 (the hub and buying CU) are on hold.
 - Phase 17 leftovers: no per-peer limit on unauthenticated sign-in calls
   at the control plane, the audit log is never pruned (pruning behind a
   signed checkpoint), no SCIM provisioning (people appear when they first

@@ -1409,10 +1409,10 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
 Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md)). There has been no
-paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 27
+paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
-cluster management, the dashboard and monitoring, starting with machines
-that sleep; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+cluster management, the dashboard and monitoring, starting with the open
+issues from real use and then machines that sleep; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1434,14 +1434,15 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 15 | Remote API clients: per-account job policies (images and digests, executors, no network, forced selector, tolerations, longest timeout, GPUs per task), who submitted each job and the image digests it ran, `queue_timeout`, the nodes that can take an account's work now (and why the others cannot), Docker re-checked by running agents, `pumasi ui --api-only` with HTTPS (`--tls-cert`) and failed sign-in limits, a Cloudflare Tunnel guide, `?wait=` long polling, curl examples run in CI, GPU driver capabilities for drawing (`gpu.graphics`, `gpu check --docker-run`) and a Blender example | done |
 | 16 | Confidentiality tiers: `trusted` (owner machines and trusted providers) and `confidential` (SEV-SNP and TDX microVMs): images and inputs sealed on the control plane, remote attestation checked against AMD's and Intel's certificates (recorded reports and forgeries tested in CI), keys released only to a fresh guest with an admin-trusted launch measurement, sealed results, `pumasi confidential` and the dashboard's measurement list | done |
 | 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny, CodeQL and fuzzing in CI, an SSO end-to-end test against Keycloak and OpenLDAP, an internal security review, operations guide, long soak tests on Linux and macOS, then the 1.0 tag. Also: job retention (`--keep-jobs`), admin secret rotation, per-ticket request limits | done (1.0) |
-| 20 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue` | next (1.4) |
-| 21 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | planned (1.5) |
-| 22 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, quotas, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | planned (1.6) |
-| 23 | File store on several machines: replicas on owner nodes with repair and scrubbing, writes acknowledged on enough copies, an S3-compatible gateway | planned (1.7) |
-| 24 | Scheduling: gangs, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption and drain, schedule time zones | planned (1.8) |
-| 25 | GPUs: WebGPU timeouts and GPU challenge, AMD benchmark and Docker jobs, shared GPUs (fractions, MIG) | planned (1.9) |
-| 26 | Windows: Docker in a Pumasi-managed WSL distro (no Docker Desktop, no sign-in), ARM64 microVMs, an HCS backend if clearly faster | planned (1.10) |
-| 27 | Operations: shared and per-peer request limits, audit log pruning behind a signed checkpoint, SCIM, the CLI behind an HTTPS proxy, follower reads | planned (1.11) |
+| 20 | Issues from real use: agent options changed and shown without reinstalling the service (`service set`), account quotas and job policies from the dashboard and a documented API with add/remove, submitters reading their own policy and `?validate=1`, per-task pull, run and upload times, node names in task views | next (1.4) |
+| 21 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue` | planned (1.5) |
+| 22 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | planned (1.6) |
+| 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | planned (1.7) |
+| 24 | File store on several machines: replicas on owner nodes with repair and scrubbing, writes acknowledged on enough copies, an S3-compatible gateway | planned (1.8) |
+| 25 | Scheduling: gangs, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption and drain, schedule time zones | planned (1.9) |
+| 26 | GPUs: WebGPU timeouts and GPU challenge, AMD benchmark and Docker jobs, shared GPUs (fractions, MIG) | planned (1.10) |
+| 27 | Windows: Docker in a Pumasi-managed WSL distro (no Docker Desktop, no sign-in), ARM64 microVMs, an HCS backend if clearly faster | planned (1.11) |
+| 28 | Operations: shared and per-peer request limits, audit log pruning behind a signed checkpoint, SCIM, the CLI behind an HTTPS proxy, follower reads | planned (1.12) |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | on hold |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | on hold |
 

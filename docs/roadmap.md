@@ -19,7 +19,7 @@ on real machines.
 | Phase | Release | Scope | Status |
 | --- | --- | --- | --- |
 | 20 | 1.4 | Issues from real use: account policies and agent options without a terminal, task timings and names | done |
-| 21 | 1.5 | Machines that sleep and machines without Docker | next |
+| 21 | 1.5 | Machines that sleep and machines without Docker | done |
 | 22 | 1.6 | Monitoring: live microVM output, every GPU and temperature, node-to-node network | planned |
 | 23 | 1.7 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | planned |
 | 24 | 1.8 | File store on several machines and an S3-compatible gateway | planned |
@@ -76,6 +76,13 @@ with one `service set` each, and add an image to the cloud account's
 policy from the dashboard through the tunnel.
 
 ## 21. Machines that sleep and machines without Docker (1.5)
+
+Done in 1.5.0 ([release notes](releases/v1.5.0.md)). Two things differ
+from the plan below: on Windows the blocker is a power request
+(`PowerCreateRequest`), and the idle helper is started by the agent
+service in the user's session and read through an anonymous pipe, not a
+scheduled task with a named pipe
+([why](architecture.md#idle-time-under-a-windows-service)).
 
 Why: home machines sleep. When the iMac sleeps its node goes offline
 after 10 seconds and its running tasks start again elsewhere from the

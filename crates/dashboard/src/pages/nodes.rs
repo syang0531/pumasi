@@ -12,6 +12,7 @@ use pumasi_proto::{
     manage::NodeEdit,
     monitor::{MetricsView, NodeMetricsView},
     msg::{AdminOp, AdminResponse, NodeView},
+    power::{NodePowerView, format_mac},
 };
 use serde::Deserialize;
 
@@ -29,6 +30,15 @@ async fn metrics(ctx: &Ctx, node: Option<String>, since_secs: u64) -> MetricsVie
     }
 }
 
+/// What each node does about sleep and whether it is asleep (1.5). Empty
+/// for a control plane older than 1.5.
+async fn power(ctx: &Ctx) -> Vec<NodePowerView> {
+    match ctx.call(AdminOp::NodePower).await {
+        Ok(AdminResponse::NodePower(p)) => p,
+        _ => Vec::new(),
+    }
+}
+
 pub async fn list(ctx: Ctx) -> Response {
     match render_list(&ctx).await {
         Ok(r) => r,
@@ -40,13 +50,17 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
     let l = ctx.l;
     let s = status(ctx).await?;
     let m = metrics(ctx, None, 0).await;
+    let power = power(ctx).await;
     let mut nodes = s.nodes.clone();
     nodes.sort_by(|a, b| b.online.cmp(&a.online).then(a.info.name.cmp(&b.info.name)));
     let rows = nodes
         .iter()
         .map(|n| {
             let mv = m.nodes.iter().find(|x| x.id == n.id);
-            row(l, n, mv)
+            let asleep = power
+                .iter()
+                .any(|p| p.id == n.id && p.asleep_since_unix.is_some());
+            row(l, n, mv, asleep)
         })
         .collect();
     let live = table(
@@ -154,12 +168,12 @@ fn confidential(ctx: &Ctx, v: &pumasi_proto::confidential::ConfidentialView) -> 
     }
 }
 
-fn row(l: Lang, n: &NodeView, mv: Option<&NodeMetricsView>) -> Markup {
+fn row(l: Lang, n: &NodeView, mv: Option<&NodeMetricsView>, asleep: bool) -> Markup {
     let latest = mv.and_then(|m| m.latest.as_ref());
     html! {
         tr data-node=(n.info.name) {
             td { a href={"/nodes/" (n.id)} { strong { (n.info.name) } } br; code class="dim" { (fmt::short(&n.id)) } }
-            td { (fmt::node_state(l, n)) }
+            td { (fmt::node_state(l, n, asleep)) }
             td { (n.info.os) "/" (n.info.arch) br; span class="dim" { (n.info.cpus) " CPU · " (format_size(n.info.memory_bytes)) } }
             td { (n.role.to_string()) br; span class="dim" { (n.account) } }
             td { (n.running) " / " (n.info.slots) }
@@ -220,10 +234,19 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
     let since = range_secs(range);
     let m = metrics(ctx, Some(n.id.clone()), since).await;
     let mv = m.nodes.iter().find(|x| x.id == n.id).cloned();
+    let pw = power(ctx).await.into_iter().find(|p| p.id == n.id);
+    let asleep = pw.as_ref().is_some_and(|p| p.asleep_since_unix.is_some());
+    // Offered for any offline node that opted in: a machine that lost
+    // power or slept without saying so wakes the same way.
+    let wakeable = !n.online
+        && pw
+            .as_ref()
+            .and_then(|p| p.report.as_ref())
+            .is_some_and(|r| r.wake_on_lan);
 
     let top = html! {
         div class="page-head" {
-            h1 { (n.info.name) " " (fmt::node_state(l, &n)) }
+            h1 { (n.info.name) " " (fmt::node_state(l, &n, asleep)) }
             @if ctx.me.is_admin() {
                 div class="actions" {
                     @if n.config.cordoned {
@@ -237,6 +260,12 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
                         { (l.t("Drain", "비우기(drain)")) }
                     @if n.online {
                         button hx-post={"/nodes/" (n.id) "/benchmark"} hx-target="#flash" { (l.t("Benchmark again", "벤치마크 다시")) }
+                    }
+                    @if wakeable {
+                        button data-action="wake" hx-post={"/nodes/" (n.id) "/wake"} hx-target="#flash"
+                            title=(l.t("Send this machine's Wake-on-LAN magic packet from a machine on its LAN",
+                                       "같은 LAN에 있는 기기에서 이 기기의 Wake-on-LAN 매직 패킷을 보냅니다"))
+                            { (l.t("Wake", "깨우기")) }
                     }
                     @if n.role != pumasi_proto::msg::Role::Owner {
                         button hx-post={"/nodes/" (n.id) "/trust"} hx-target="#flash"
@@ -260,7 +289,7 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
     };
     let live = html! {
         (top)
-        (info(l, &n))
+        (info(l, &n, pw.as_ref()))
         @if let Some(mv) = &mv { (charts(l, mv, since)) }
         @else { p class="empty" { (l.t("No metrics from this node (agents before protocol 10 send none).", "이 노드의 지표가 없습니다(프로토콜 10 이전 에이전트는 보내지 않습니다).")) } }
     };
@@ -279,7 +308,32 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
     ))
 }
 
-fn info(l: Lang, n: &NodeView) -> Markup {
+/// `stays awake while tasks run · says goodbye before sleeping`.
+fn sleep_line(l: Lang, r: &pumasi_proto::power::PowerReport) -> String {
+    let mut parts = vec![if r.stays_awake {
+        l.t(
+            "stays awake while tasks run",
+            "태스크 실행 중에는 잠들지 않음",
+        )
+    } else {
+        l.t(
+            "may sleep while tasks run",
+            "태스크 실행 중에도 잠들 수 있음",
+        )
+    }];
+    if r.sleep_notice {
+        parts.push(l.t("says so before it sleeps", "잠들기 전에 알림"));
+    }
+    if r.on_pause == pumasi_proto::power::OnPause::Requeue {
+        parts.push(l.t(
+            "its tasks move when it pauses",
+            "일시 중지하면 태스크를 옮김",
+        ));
+    }
+    parts.join(" · ")
+}
+
+fn info(l: Lang, n: &NodeView, pw: Option<&NodePowerView>) -> Markup {
     html! {
         section { dl class="facts" {
             dt { "ID" } dd { code { (n.id) } }
@@ -294,6 +348,45 @@ fn info(l: Lang, n: &NodeView) -> Markup {
             }
             dt { (l.t("Checks", "검증")) } dd { (n.checks_passed) " " (l.t("passed", "통과")) ", " (n.strikes) " " (l.t("failed", "실패")) }
             @if let Some(p) = &n.paused { dt { (l.t("Paused", "일시 중지")) } dd { (p) } }
+            @if let Some(p) = pw {
+                @if let Some(t) = p.asleep_since_unix {
+                    dt { (l.t("Asleep", "잠듦")) } dd data-asleep="true" { (fmt::ago(l, t)) }
+                }
+                @if let Some(r) = &p.report {
+                    dt { (l.t("Sleep", "절전")) } dd {
+                        (sleep_line(l, r))
+                        @for note in &r.notes { br; span class="dim" { (note) } }
+                    }
+                    dt { "Wake-on-LAN" } dd data-wol=(r.wake_on_lan) {
+                        @if !r.wake_on_lan {
+                            span class="dim" { (l.t(
+                                "off (on that machine: pumasi service set -- --wake-on-lan)",
+                                "꺼짐 (그 기기에서: pumasi service set -- --wake-on-lan)")) }
+                        } @else if r.lan.is_empty() {
+                            span class="dim" { (l.t("on, but the agent found no LAN network card", "켜짐, 하지만 LAN 네트워크 카드를 찾지 못함")) }
+                        } @else {
+                            @for (i, c) in r.lan.iter().enumerate() {
+                                @if i > 0 { br; }
+                                code { (format_mac(&c.mac)) } " " (c.name) " " span class="dim" { (c.cidr()) }
+                                @if c.wireless { " " span class="badge warn" title=(l.t(
+                                    "Most Wi-Fi cards do not wake from a magic packet: use a wired connection.",
+                                    "대부분의 Wi-Fi 카드는 매직 패킷으로 깨어나지 않습니다. 유선 연결을 쓰세요.")) { "Wi-Fi" } }
+                            }
+                            @if !n.online && !p.can_wake {
+                                br; span class="dim" { (l.t(
+                                    "No machine of the cluster is online on its LAN now.",
+                                    "지금 같은 LAN에 온라인인 클러스터 기기가 없습니다.")) }
+                            }
+                        }
+                    }
+                    @if let Some(t) = p.last_wake_unix {
+                        dt { (l.t("Last wake", "마지막 깨우기")) } dd {
+                            (fmt::ago(l, t))
+                            @if let Some(by) = &p.last_wake_by { " · " (by) }
+                        }
+                    }
+                }
+            }
         } }
     }
 }
@@ -521,6 +614,14 @@ async fn do_action(ctx: &Ctx, node: &str, action: &str, f: EditForm) -> anyhow::
                 l.t("Uncordoned.", "차단을 풀었습니다.").into()
             })
         }
+        "wake" => match ctx.call(AdminOp::WakeNode { node: node.into() }).await? {
+            AdminResponse::Applied(lines) => Ok(format!(
+                "{} {}",
+                l.t("Magic packet sent:", "매직 패킷을 보냈습니다:"),
+                lines.join("; ")
+            )),
+            _ => anyhow::bail!("unexpected response"),
+        },
         "drain" => match ctx.call(AdminOp::Drain { node: node.into() }).await? {
             AdminResponse::Drained { moved } => Ok(format!(
                 "{} {moved}",

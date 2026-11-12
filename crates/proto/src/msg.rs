@@ -131,6 +131,24 @@ impl AgentHello {
     }
 }
 
+/// What follows an [`AgentHello`] in its frame (1.5). A control plane
+/// that does not know it ignores it. Fields are only ever added at the
+/// end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloTail {
+    /// The agent's [`crate::PROTOCOL_MINOR`].
+    pub minor: u32,
+}
+
+/// What follows a [`HelloReply::Welcome`] in its frame (1.5). An agent
+/// that does not know it ignores it. Fields are only ever added at the
+/// end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WelcomeTail {
+    /// The control plane's [`crate::PROTOCOL_MINOR`].
+    pub minor: u32,
+}
+
 /// Whether a node takes new tasks, as its owner's availability policy says
 /// (`pumasi agent start --only-on-ac`, `--idle-minutes`, `--hours`). Tasks
 /// already running when a node pauses finish.
@@ -323,6 +341,13 @@ pub enum ToAgent {
         task: TaskRef,
         reply: Result<Vec<u8>, String>,
     },
+    // Minor 1 (1.5) from here: only for agents whose hello said they know
+    // them ([`HelloTail`]).
+    /// Send the Wake-on-LAN magic packet of each of these network cards
+    /// on this machine's LAN: another node of the cluster sleeps there.
+    Wake {
+        macs: Vec<crate::power::Mac>,
+    },
 }
 
 /// How a task ended.
@@ -482,6 +507,13 @@ pub enum FromAgent {
         task: TaskRef,
         evidence: Box<crate::confidential::Evidence>,
     },
+    // Minor 1 (1.5) from here: only for a control plane whose welcome said
+    // it knows them ([`WelcomeTail`]).
+    /// The machine is about to sleep: its runs go back to the queue now,
+    /// and the node shows as asleep. The agent ends the session after it.
+    Sleeping,
+    /// How the machine sleeps and wakes, sent after the welcome.
+    Power(Box<crate::power::PowerReport>),
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +858,22 @@ pub enum AdminOp {
         sub: Box<JobSubmission>,
         upload_bytes: u64,
     },
+    // 1.5 from here.
+    /// Every node's sleep and wake state (the node views of
+    /// [`AdminOp::Status`] keep their layout, so older CLIs still read
+    /// them).
+    NodePower,
+    /// Sends a node's Wake-on-LAN magic packet from a machine on its LAN
+    /// (`node`: name or id prefix). Answers with what was sent, one line
+    /// each ([`AdminResponse::Applied`]).
+    WakeNode {
+        node: String,
+    },
+    /// The executor each task of a job ran with (or runs with), for
+    /// `executor = "image"` jobs: `None` until its first run is placed.
+    TaskExecutors {
+        id: JobId,
+    },
 }
 
 impl AdminOp {
@@ -965,6 +1013,9 @@ pub enum AdminResponse {
     // 1.4 from here.
     TaskDetails(Vec<TaskDetail>),
     JobCheck(Box<JobCheck>),
+    // 1.5 from here.
+    NodePower(Vec<crate::power::NodePowerView>),
+    TaskExecutors(Vec<Option<Executor>>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

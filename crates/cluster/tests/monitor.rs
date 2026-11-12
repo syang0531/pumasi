@@ -114,6 +114,7 @@ async fn spawn_agent(name: &str, ticket: JoinTicket) -> RunningAgent {
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        power: Default::default(),
         max_cpu_percent: None,
         availability: None,
         bench: None,

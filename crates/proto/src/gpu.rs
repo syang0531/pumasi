@@ -131,6 +131,7 @@ impl GpuInfo {
         match executor {
             Executor::Docker => self.docker,
             Executor::Microvm => self.vfio,
+            Executor::Image => self.docker || self.vfio,
             Executor::Wasm => false,
         }
     }

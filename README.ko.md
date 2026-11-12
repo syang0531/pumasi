@@ -56,6 +56,13 @@ pumasi run examples/python-wordcount/job.toml --output
 python3 examples/python-wordcount/merge.py pumasi-out/<작업 ID>
 ```
 
+이미지를 돌릴 수 있는 곳이면 어디서든 돌리려면 `executor = "image"`를 씁니다(1.5). 태스크마다 Docker가 있는 노드에서는 Docker로, microVM만 있는 노드(예: 구형 Mac)에서는 microVM으로 돌고, 파일과 출력은 같습니다. `pumasi job ID`가 태스크별로 무엇으로 돌았는지 보여 주고(`as=docker`, `as=microvm`), 요금은 실제로 돈 실행기 기준입니다.
+
+```toml
+image = "python:3.12-slim"
+executor = "image"
+```
+
 ### microVM 작업: 내 것이 아닌 기기에서 컨테이너 돌리기
 
 컨테이너는 호스트 커널을 공유하므로 Docker 작업은 내 기기용입니다. microVM 실행기는 같은 OCI 이미지를 태스크마다 가벼운 VM(KVM이 있는 Linux는 [Firecracker](https://firecracker-microvm.github.io/), macOS 11 이상은 Apple Virtualization.framework, Windows는 WHPX 가속 QEMU, 그 밖에는 QEMU) 안에서 자기 Linux 커널로 돌리고, 작업이 요청하지 않으면 네트워크도 없습니다. 작업 명세에는 `executor = "microvm"` 한 줄만 더합니다.
@@ -161,7 +168,7 @@ macOS 10.15 이상이면 어떤 Mac이든 에이전트를 돌릴 수 있습니�
 | iMac(Late 2013), MacBook Pro(Early 2013) | 10.15 Catalina | 가능 | 불가 | 불가 |
 | Apple Silicon | 최신 | 가능 | 가능 | Docker Desktop으로 가능 |
 
-macOS 11부터 microVM은 macOS에 내장된 Apple Virtualization.framework로 돌아서 따로 설치할 것이 없습니다. `pumasi vm setup`은 게스트 커널을 받고, 바이너리 사본에 서명해 VM 헬퍼로 둘 뿐입니다(이 프레임워크는 서명된 프로그램만 씁니다). Docker Desktop과 Homebrew의 QEMU는 최근 macOS만 지원하므로, 구형 Mac은 WASM과 microVM 작업을 받습니다.
+macOS 11부터 microVM은 macOS에 내장된 Apple Virtualization.framework로 돌아서 따로 설치할 것이 없습니다. `pumasi vm setup`은 게스트 커널을 받고, 바이너리 사본에 서명해 VM 헬퍼로 둘 뿐입니다(이 프레임워크는 서명된 프로그램만 씁니다). Docker Desktop과 Homebrew의 QEMU는 최근 macOS만 지원하므로, 구형 Mac은 WASM과 microVM 작업을 받습니다. macOS가 너무 오래되어 필요한 기능이 안 되는 Mac(Catalina는 microVM 불가, 모두 Docker 불가)에는 Linux를 설치할 수 있습니다. 2013~2014년 기종용 단계별 안내는 [docs/linux-on-old-macs.md](docs/linux-on-old-macs.md)에 있습니다(영문).
 
 ```sh
 curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.sh | sudo sh
@@ -181,8 +188,36 @@ sudo pumasi service install --ticket pumasijoin... -- --allow-microvm --only-on-
 | `--hours 22:00-07:00` | 이 현지 시각 밖에서는 새 작업을 받지 않음(여러 개: `00:00-08:00,12:00-13:00`) |
 | `--max-cpu-percent 50` | CPU의 절반만 제공: 더 필요한 이미지 작업은 다른 기기로 가고, 슬롯도 따라 줄어듦 |
 | `--slots N` | 동시 작업 수(기본: 제공 CPU당 하나, 단 메모리 2 GiB를 빼고 1 GiB당 하나까지) |
+| `--on-pause requeue` | 기기가 일시 정지하면 돌던 태스크를 바로 다른 노드로 옮김(기본 `finish`: 끝까지 실행) |
+| `--allow-sleep` | 태스크 실행 중에도 기기가 잠들 수 있게 둠 |
+| `--wake-on-lan` | 대기 중인 작업이 있으면 클러스터가 LAN으로 이 기기를 깨울 수 있게 허용 |
 
-일시 정지된 기기는 새 작업을 받지 않고, 돌던 작업은 끝까지 마칩니다. `pumasi status`에 `paused`와 이유(예: "on battery power")가 나옵니다. 유휴 시간은 macOS에서는 기기 전체 기준이라 LaunchDaemon에서도 보이고, Linux에서는 터미널과 데스크톱 세션 기준입니다. Windows에서는 에이전트가 사용자 세션에서 돌아야 입력을 볼 수 있습니다(서비스로 돌면 알 수 없다고 보고하고 정지 상태로 둡니다).
+일시 정지된 기기는 새 작업을 받지 않고, 돌던 작업은 끝까지 마칩니다(`--on-pause requeue`면 바로 돌려보내며, 태스크의 시도 횟수는 줄지 않습니다). `pumasi status`에 `paused`와 이유(예: "on battery power")가 나옵니다. 유휴 시간은 macOS에서는 기기 전체 기준이라 LaunchDaemon에서도 보이고, Linux에서는 터미널과 데스크톱 세션 기준입니다. Windows 서비스는 키보드·마우스를 볼 수 없으므로, 에이전트 서비스가 로그인한 사용자 세션에 작은 도우미(`pumasi idle-helper`, 창 없음)를 띄워 유휴 시간을 읽습니다. 로그인한 사람이 없으면 유휴로 봅니다. 따로 설정할 것은 없습니다.
+
+### 잠드는 기기
+
+데스크톱과 노트북은 잠듭니다. 1.5부터 에이전트가 이를 처리합니다.
+
+- **태스크가 도는 동안 기기를 깨워 둡니다.** 마지막 태스크가 끝나고 30초 뒤까지입니다(macOS 전원 어서션, Windows 전원 요청, Linux `systemd-inhibit`). 유휴 타이머만 막으므로 덮개, 전원 버튼, 잠자기 메뉴는 그대로 동작하고 화면도 꺼집니다. `--allow-sleep`로 끕니다.
+- **잠들기 전에 알립니다.** 컨트롤 플레인이 노드 타임아웃을 기다리지 않고 그 기기의 태스크를 바로 다른 노드로 옮기고(시도 횟수는 줄지 않음), 노드를 `offline`이 아니라 `asleep`으로 표시합니다. `node_offline` 경보도 울리지 않습니다. 기기가 깨면 에이전트가 스스로 다시 연결합니다.
+- **대기 작업이 있으면 클러스터가 깨웁니다**(Wake-on-LAN). 에이전트를 `--wake-on-lan`으로 실행한 기기만 해당합니다. 온라인 노드 중 아무도 못 돌리는 작업이면 바로, 바쁜 노드를 기다리는 작업이면 `--wake-after`(컨트롤 플레인 옵션, 기본 `10m`, `never`로 끔) 뒤에 깨웁니다. 직접 깨우려면 `pumasi node wake 노드` 또는 대시보드 노드 화면의 **깨우기** 버튼을 씁니다.
+
+```sh
+pumasi service set -- --wake-on-lan            # 깨울 기기에서
+pumasi node laptop                             # 네트워크 카드와, 클러스터가 깨울 수 있는지
+pumasi node wake laptop
+```
+
+매직 패킷은 공유기를 넘지 못하므로, 잠든 기기와 같은 LAN에 있는 클러스터 기기가 보냅니다. 컨트롤 플레인이 그 LAN에 있으면 직접 보내고, 온라인 에이전트(1.5 이상) 최대 둘에게도 부탁합니다. 그 LAN에 클러스터 기기가 하나뿐이면 깨울 수 없습니다. 에이전트는 기기 설정을 바꾸지 않으니 Wake-on-LAN을 한 번 켜 두세요.
+
+| 기기 | 설정 |
+| --- | --- |
+| Mac | 시스템 설정 > 에너지(노트북: 배터리 > 옵션) > **네트워크 연결 시 깨우기**, 또는 `sudo pmset -a womp 1`. 노트북은 전원에 연결되어 있을 때만 깨고, 유선(Thunderbolt·USB 어댑터 포함)이라야 확실합니다. |
+| Windows | 장치 관리자 > 네트워크 어댑터 > **전원 관리**: "이 장치를 사용하여 컴퓨터의 대기 모드를 해제할 수 있음"과 "매직 패킷에서만 컴퓨터의 대기 모드를 해제할 수 있음". **고급**: "Wake on Magic Packet" 사용. 종료 상태에서도 깨우려면 빠른 시작을 끕니다(제어판 > 전원 옵션 > 전원 단추 작동 설정). |
+| Linux | `sudo ethtool -s eth0 wol g`. 유지하려면 `nmcli connection modify "Wired connection 1" 802-3-ethernet.wake-on-lan magic`. |
+| BIOS / UEFI (PC) | "Wake on LAN"("Power on by PCI-E", "Resume by LAN"이라고도 함)을 켜고, 네트워크 카드 전원을 끊는 "ErP"나 "Deep sleep"을 끕니다. |
+
+Wi-Fi 카드는 매직 패킷으로 거의 깨어나지 않습니다. `pumasi node 노드`가 Wi-Fi 카드를 표시해 주며, 유선 연결을 써야 합니다.
 
 ### 다른 사람의 기기: 초대, 컴퓨팅 유닛, 검증
 
@@ -577,6 +612,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi run job.toml [--account A] [--priority N] [--after 작업] [--output] [--out DIR]` | 작업 제출 후 완료까지 대기. 결과 파일은 `DIR`(기본 `pumasi-out/<작업 ID>`)에 저장. 성공 시 종료 코드 0, 실패 태스크가 있으면 2. `--account`는 제공자 실행 비용을 낼 계정(기본 `owner`) |
 | `pumasi status` | 노드(역할, 온라인 여부, 실행기, 슬롯, 실행 중, 검증 기록, 과금 CPU 점수, 디스크 종류, 지연, GPU)와 최근 작업 및 CU 비용 |
 | `pumasi node <노드> [--rebenchmark]` | 노드 하나의 벤치마크 프로필, 과금 점수, GPU, 지연, 검증 기록. `--rebenchmark`면 다시 재게 함 |
+| `pumasi node wake <노드>` | `--wake-on-lan`으로 실행한 오프라인 노드의 Wake-on-LAN 매직 패킷을 같은 LAN의 클러스터 기기에서 보냄. 대시보드의 깨우기 버튼과 `POST /api/v1/nodes/노드/wake`도 같음 |
 | `pumasi node rename <노드> <이름>` / `--reset` | 노드 표시 이름 변경(상태, 대시보드, 이벤트, `name` 라벨, 노드를 받는 모든 명령). `--reset` 전까지 에이전트의 `--name` 대신 씀. 대시보드 노드 화면과 `POST /api/v1/nodes/노드/rename`도 같음 |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | 에이전트와 같은 방식으로 이 기기를 벤치마크해 프로필 출력 |
 | `pumasi job <ID> [--output] [--out DIR]` | 태스크별 상태, 노드, 시도 횟수, 시간, 비용, 검증 결과, 출력. `--out`이면 결과 파일 다운로드 |
@@ -707,7 +743,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 다음은 잠드는 기기입니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를 다뤘습니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -729,7 +765,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 16 | 기밀 등급: `trusted`(내 기기와 신뢰하는 제공자)와 `confidential`(SEV-SNP·TDX microVM). 이미지와 입력을 컨트롤 플레인에서 봉인, AMD·Intel 인증서로 원격 증명 검증, 관리자가 신뢰한 실행 측정값의 새 게스트에만 키 전달, 봉인된 결과, `pumasi confidential` | 완료 |
 | 17 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델(인터넷에 노출된 API와 터널 시나리오 포함: 티켓 유출, 정책 우회, 요청 폭주), CI에 cargo-audit·cargo-deny·CodeQL·퍼징, Keycloak·OpenLDAP로 SSO 종단 테스트, 내부 보안 점검, 운영 문서, Linux·macOS 장시간 소크 테스트 뒤 1.0 태그. 함께: 작업 보관 기간(`--keep-jobs`), 관리자 시크릿 교체, 티켓별 요청 제한 | 완료(1.0) |
 | 20 | 실사용 이슈: 서비스를 다시 설치하지 않고 에이전트 옵션 바꾸고 보기(`service set`), 대시보드와 문서화된 API로 계정 쿼터·작업 정책 수정(추가·삭제), 제출자가 자기 정책 확인과 `?validate=1`, 태스크별 이미지 받기·실행·업로드 시간, 태스크 표시에 노드 이름 | 완료(1.4) |
-| 21 | 잠드는 기기와 Docker 없는 기기: 태스크 실행 중 잠자기 막기, 잠들기 전에 알려 태스크를 바로 옮기기, 대기 작업이 있으면 Wake-on-LAN으로 깨우기, `executor = "image"`(Docker가 있으면 Docker, 없으면 microVM), Windows 서비스에서 유휴 감지, `--on-pause requeue` | 다음(1.5) |
+| 21 | 잠드는 기기와 Docker 없는 기기: 태스크 실행 중 잠자기 막기, 잠들기 전에 알려 태스크를 바로 옮기기, 대기 작업이 있으면 Wake-on-LAN으로 깨우기, `executor = "image"`(Docker가 있으면 Docker, 없으면 microVM), Windows 서비스에서 유휴 감지, `--on-pause requeue`, 2013~2014년 Mac에 Linux를 설치하는 안내 | 완료(1.5) |
 | 22 | 모니터링: microVM 실시간 출력, Windows 온도, Intel·AMD·Apple GPU 지표, 재시작해도 남는 최근 1시간 지표, 노드 간 지연·대역폭, 경보 일시 중지와 라벨별 임계값 | 예정(1.6) |
 | 23 | 대시보드: 재시작해도 유지되는 로그인, 경보·웹훅·요금·스케줄·라벨·노드 가용 정책을 브라우저에서 수정, 카나리 배포, 실시간 차트, 휴대폰 화면 | 예정(1.7) |
 | 24 | 여러 기기에 걸친 파일 저장소: 소유자 노드 복제본과 복구·검사, 충분한 사본에 쓴 뒤 완료 응답, S3 호환 게이트웨이 | 예정(1.8) |

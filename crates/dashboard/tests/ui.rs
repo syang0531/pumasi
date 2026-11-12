@@ -183,6 +183,7 @@ async fn start_cluster() -> (
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        power: Default::default(),
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1410,4 +1411,244 @@ async fn account_policy_validation_and_task_times() {
 
     ui.stop();
     agent_task.abort();
+}
+
+/// A stand-in LAN card, and the magic packets asked of it.
+struct Lan {
+    iface: pumasi_proto::power::LanIface,
+    sent: std::sync::Mutex<Vec<pumasi_proto::power::Mac>>,
+}
+
+impl Lan {
+    fn new(host: u8) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            iface: pumasi_proto::power::LanIface {
+                name: "en0".into(),
+                mac: [0x02, 0, 0, 0, 0, host],
+                addr: [198, 18, 78, host],
+                prefix: 24,
+                wireless: false,
+            },
+            sent: Default::default(),
+        })
+    }
+}
+
+impl pumasi_proto::power::WakeSender for Lan {
+    fn lan(&self) -> Vec<pumasi_proto::power::LanIface> {
+        vec![self.iface.clone()]
+    }
+    fn send(
+        &self,
+        mac: &pumasi_proto::power::Mac,
+        _from: &pumasi_proto::power::LanIface,
+    ) -> anyhow::Result<()> {
+        self.sent.lock().unwrap().push(*mac);
+        Ok(())
+    }
+}
+
+/// Release 1.5: a node that said it was going to sleep shows as asleep,
+/// its page offers Wake, and the API sends its magic packet through a
+/// machine on its LAN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sleeping_node_shows_as_asleep_and_wakes_from_the_api() {
+    use pumasi_agent::power::{FakePower, PowerEvent};
+    let (cluster, agent_task) = start_cluster().await;
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let os = std::sync::Arc::new(FakePower::default());
+    let lan = Lan::new(20);
+    let desk_lan = Lan::new(21);
+    let agent = |name: &str, power: pumasi_agent::PowerOptions| AgentConfig {
+        data_dir: tempdir(name),
+        name: name.into(),
+        slots: Some(1),
+        net: NetMode::Local,
+        relays: Vec::new(),
+        bind: Some("127.0.0.1:0".parse().unwrap()),
+        docker: None,
+        microvm: None,
+        upgrade: None,
+        corrupt_results: false,
+        store_cache_bytes: None,
+        gpus: false,
+        fake_gpus: None,
+        webgpu: None,
+        gpu_graphics: None,
+        docker_wsl_libs: None,
+        power,
+        max_cpu_percent: None,
+        availability: None,
+        bench: None,
+    };
+    let laptop = Agent::new(agent(
+        "laptop",
+        pumasi_agent::PowerOptions {
+            backend: Some(os.clone()),
+            wake_on_lan: true,
+            wake: Some(lan.clone()),
+            ..Default::default()
+        },
+    ))
+    .await
+    .unwrap();
+    let laptop_task = tokio::spawn(laptop.join(ticket.clone()));
+    let desk = Agent::new(agent(
+        "desk",
+        pumasi_agent::PowerOptions {
+            wake: Some(desk_lan.clone()),
+            ..Default::default()
+        },
+    ))
+    .await
+    .unwrap();
+    let desk_task = tokio::spawn(desk.join(ticket));
+    for _ in 0..200 {
+        if cluster.status().nodes.iter().filter(|n| n.online).count() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let admin = cluster.admin_ticket();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ui = pumasi_dashboard::start_on(
+        listener,
+        UiConfig {
+            ticket: admin.clone(),
+            net: NetMode::Local,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            login_only: false,
+            upload_limit: 64 << 20,
+            api_only: false,
+            tls: None,
+            real_ip_header: None,
+            public_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let addr = ui.addr();
+    let url = ui.url();
+    let r = request(addr, "GET", &url[url.find("/login").unwrap()..], &[], b"").await;
+    let cookie = r
+        .header("set-cookie")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let auth = ("Authorization", format!("Bearer {admin}"));
+    let power_of = |name: &'static str| {
+        let auth = auth.clone();
+        async move {
+            let s = request(addr, "GET", "/api/v1/status", &[auth], b"")
+                .await
+                .json();
+            s["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["info"]["name"] == name)
+                .unwrap_or_else(|| panic!("no node {name}: {s}"))
+                .clone()
+        }
+    };
+
+    // Awake: the report is in the API, and an online node is not woken.
+    let mut node = power_of("laptop").await;
+    for _ in 0..100 {
+        if node["power"]["report"].is_object() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node = power_of("laptop").await;
+    }
+    assert_eq!(node["power"]["report"]["wake_on_lan"], true, "{node}");
+    assert_eq!(
+        node["power"]["report"]["lan"][0]["mac"],
+        serde_json::json!([2, 0, 0, 0, 0, 20]),
+        "{node}"
+    );
+    assert!(node["power"]["asleep_since_unix"].is_null(), "{node}");
+    let id = node["id"].as_str().unwrap().to_string();
+    let r = request(
+        addr,
+        "POST",
+        &format!("/api/v1/nodes/{id}/wake"),
+        std::slice::from_ref(&auth),
+        b"",
+    )
+    .await;
+    assert_ne!(r.status, 200, "{}", r.text());
+    let page = request(
+        addr,
+        "GET",
+        &format!("/nodes/{id}"),
+        &[("Cookie", cookie.clone())],
+        b"",
+    )
+    .await
+    .text();
+    assert!(page.contains("02:00:00:00:00:14"), "{page}");
+    assert!(!page.contains("data-action=\"wake\""), "{page}");
+
+    // It goes to sleep.
+    let os2 = os.clone();
+    tokio::task::spawn_blocking(move || os2.announce(PowerEvent::Sleep))
+        .await
+        .unwrap();
+    let mut node = power_of("laptop").await;
+    for _ in 0..100 {
+        if node["power"]["asleep_since_unix"].is_u64() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node = power_of("laptop").await;
+    }
+    assert!(node["power"]["asleep_since_unix"].is_u64(), "{node}");
+    assert_eq!(node["online"], false, "{node}");
+    assert_eq!(node["power"]["can_wake"], true, "{node}");
+    let list = request(addr, "GET", "/nodes", &[("Cookie", cookie.clone())], b"")
+        .await
+        .text();
+    assert!(list.contains("data-state=\"asleep\""), "{list}");
+    let page = request(
+        addr,
+        "GET",
+        &format!("/nodes/{id}"),
+        &[("Cookie", cookie.clone())],
+        b"",
+    )
+    .await
+    .text();
+    assert!(page.contains("data-state=\"asleep\""), "{page}");
+    assert!(page.contains("data-action=\"wake\""), "{page}");
+
+    // Wake: a machine on its LAN sends the packet.
+    let r = request(
+        addr,
+        "POST",
+        &format!("/api/v1/nodes/{id}/wake"),
+        std::slice::from_ref(&auth),
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.text().contains("magic packet"), "{}", r.text());
+    for _ in 0..100 {
+        if !desk_lan.sent.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(desk_lan.sent.lock().unwrap()[0], lan.iface.mac);
+
+    os.announce(PowerEvent::Wake);
+    ui.stop();
+    agent_task.abort();
+    laptop_task.abort();
+    desk_task.abort();
 }

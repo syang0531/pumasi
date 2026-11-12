@@ -547,8 +547,17 @@ impl AccountPolicy {
     /// says what the policy refuses.
     pub fn admit(&self, sub: &mut JobSubmission) -> Result<()> {
         if !self.executors.is_empty() {
+            // An image job runs as Docker or as a microVM: it is admitted
+            // for those of the two the policy allows.
+            let ways: Vec<Executor> = sub
+                .executor
+                .runs_as()
+                .iter()
+                .copied()
+                .filter(|e| self.executors.contains(e))
+                .collect();
             ensure!(
-                self.executors.contains(&sub.executor),
+                self.executors.contains(&sub.executor) || !ways.is_empty(),
                 "this account's policy allows only {} jobs, not {}",
                 self.executors
                     .iter()
@@ -557,6 +566,11 @@ impl AccountPolicy {
                     .join(", "),
                 sub.executor
             );
+            if !self.executors.contains(&sub.executor)
+                && let [only] = ways.as_slice()
+            {
+                sub.executor = *only;
+            }
         }
         if let Some(d) = &sub.docker {
             if !self.allows_image(&d.image) {
@@ -729,13 +743,14 @@ impl ListPatch {
     }
 }
 
-/// `wasm`, `docker` or `microvm`.
+/// `wasm`, `docker`, `microvm` or `image`.
 pub fn parse_executor(s: &str) -> Result<Executor> {
     match s.trim() {
         "wasm" => Ok(Executor::Wasm),
         "docker" => Ok(Executor::Docker),
         "microvm" => Ok(Executor::Microvm),
-        other => bail!("unknown executor {other:?} (wasm, docker or microvm)"),
+        "image" => Ok(Executor::Image),
+        other => bail!("unknown executor {other:?} (wasm, docker, microvm or image)"),
     }
 }
 

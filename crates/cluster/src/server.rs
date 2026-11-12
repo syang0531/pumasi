@@ -100,6 +100,9 @@ pub struct ClusterConfig {
     /// Where `pumasi upgrade latest` finds published releases (GitHub's
     /// release pages of the pumasi repository by default).
     pub release_source: String,
+    /// Wake a sleeping node (Wake-on-LAN) for work that has waited this
+    /// long for a busy node. `None`: only for work no online node can run.
+    pub wake_after: Option<Duration>,
 }
 
 impl ClusterConfig {
@@ -122,6 +125,7 @@ impl ClusterConfig {
             mirror_every: Duration::from_secs(30),
             insecure_test_tee: false,
             release_source: pumasi_proto::release::DEFAULT_RELEASE_SOURCE.into(),
+            wake_after: Some(Duration::from_secs(600)),
         }
     }
 }
@@ -301,6 +305,7 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
         true,
     );
     state.set_metrics_retention(config.metrics_retention);
+    state.power.wake_after = config.wake_after;
     if config.insecure_test_tee {
         warn!(
             "--insecure-test-tee: confidential tasks may run without a TEE; nothing they hold is protected"
@@ -981,6 +986,13 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
         return Ok(());
     };
     let hello = AgentHello::decode(&frame).context("decode hello")?;
+    // What the agent knows beyond its protocol version (agents from 1.5
+    // say so after the hello; the tail is only looked for when the hello
+    // itself decodes as this protocol's).
+    let minor = postcard::take_from_bytes::<AgentHello>(&frame)
+        .ok()
+        .and_then(|(_, rest)| postcard::from_bytes::<pumasi_proto::msg::HelloTail>(rest).ok())
+        .map_or(0, |t| t.minor);
     let Some(inner) = shared.active() else {
         // A replica that is not the leader: say where it is to agents that
         // understand, close on older ones (they retry).
@@ -1040,7 +1052,7 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
     };
 
     let cluster_name = inner.state().cluster_name.clone();
-    write_msg(
+    pumasi_proto::wire::write_msg_tail(
         &mut send,
         &HelloReply::Welcome {
             cluster_name,
@@ -1048,6 +1060,9 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
             role,
             account: account.clone(),
         },
+        Some(&pumasi_proto::msg::WelcomeTail {
+            minor: pumasi_proto::PROTOCOL_MINOR,
+        }),
     )
     .await?;
 
@@ -1068,6 +1083,7 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
         tx,
         kill_tx,
     );
+    inner.state().on_minor(&node_id, generation, minor);
     // Release downloads come on their own streams of this connection.
     let fetcher = tokio::spawn(serve_fetches(inner.clone(), conn.clone(), node_id.clone()));
     info!(node = %node_id, name = %hello.node.name, slots = hello.node.slots, %role, %account, "node online");
@@ -1250,6 +1266,14 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
                     st.on_image(&node_id, generation, task, image, digest);
+                }
+                Ok(Some(FromAgent::Power(r))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_power(&node_id, generation, *r);
+                }
+                Ok(Some(FromAgent::Sleeping)) => {
+                    inner.state().on_sleeping(&node_id, generation);
                 }
                 Ok(Some(FromAgent::Tee(r))) => {
                     let mut st = inner.state();
@@ -2096,6 +2120,15 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
                 None => Ok(AdminResponse::Error(format!("no job {id}"))),
             }
         }
+        AdminOp::TaskExecutors { id } => {
+            let ran = inner.state().task_executors(id);
+            match ran {
+                Some(v) => Ok(AdminResponse::TaskExecutors(v)),
+                None => Ok(AdminResponse::Error(format!("no job {id}"))),
+            }
+        }
+        AdminOp::NodePower => Ok(AdminResponse::NodePower(inner.state().node_power())),
+        AdminOp::WakeNode { node } => Ok(AdminResponse::Applied(inner.state().wake_node(&node)?)),
         AdminOp::CheckJob { sub, upload_bytes } => {
             let submitter = matches!(caller, Caller::Submitter { .. });
             Ok(AdminResponse::JobCheck(Box::new(inner.state().check_job(

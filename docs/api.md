@@ -265,6 +265,9 @@ curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JO
 | `run_ms` | running: creating the container or VM, the program, copying its output out |
 | `upload_ms` | storing the output in the file store; `0` when it is small enough to travel with the result |
 
+A task of an `executor = "image"` job also has `ran_as` (1.5): `docker`
+or `microvm`, whichever its node ran it with.
+
 `wall_ms` is `run_ms`, and it is the only time the receipt bills: a task
 that waited ten minutes for a cold image pays the same as one that found
 the image cached. `pumasi job ID` and the dashboard show the same
@@ -417,6 +420,24 @@ curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" \
 ```
 <!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/status" | grep -q '"living-room"' -->
 <!-- ci: curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{"name": null}' "$PUMASI_URL/api/v1/nodes/living-room/rename" -->
+
+A node that told the cluster it was going to sleep has
+`power.asleep_since_unix` in `GET /api/v1/status` (1.5), next to what its
+agent reported: `power.report.wake_on_lan`, its LAN cards in
+`power.report.lan`, and `power.can_wake` (a machine of the cluster is
+online on its LAN). Send the Wake-on-LAN magic packet of an offline node
+that runs with `--wake-on-lan`:
+
+```sh
+curl -sS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" \
+  "$PUMASI_URL/api/v1/nodes/node-a/wake"
+```
+<!-- ci: curl -sS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/nodes/node-a/wake" | grep -q 'is online' -->
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/status" | jq -e '.nodes[0].power | .asleep_since_unix == null and .report.wake_on_lan == false' -->
+
+It answers with one line per machine that sent the packet, or an error
+that says why none could (the node is online, did not opt in, or no
+machine of the cluster is on its LAN).
 
 `GET /api/v1/upgrade?check=true` shows the newest published release, and
 `POST /api/v1/upgrade` has the control plane download it for every

@@ -330,6 +330,21 @@ async fn task_details(ctx: &Ctx, id: JobId) -> Vec<pumasi_proto::msg::TaskDetail
     }
 }
 
+/// What each task of an `executor = "image"` job ran as (1.5): docker or
+/// microvm. Empty for other jobs and for an older control plane.
+async fn task_executors(
+    ctx: &Ctx,
+    v: &pumasi_proto::msg::JobView,
+) -> Vec<Option<pumasi_proto::job::Executor>> {
+    if v.executor != pumasi_proto::job::Executor::Image {
+        return Vec::new();
+    }
+    match ctx.call(AdminOp::TaskExecutors { id: v.summary.id }).await {
+        Ok(AdminResponse::TaskExecutors(e)) => e,
+        _ => Vec::new(),
+    }
+}
+
 /// `fetch 1.2 s · pull 40.0 s · upload 3.1 s`: the parts of a run that
 /// are not its billed time, when there were any.
 fn other_times(l: Lang, d: &pumasi_proto::msg::TaskDetail) -> String {
@@ -413,6 +428,7 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
     let v = job_view(ctx, id).await?;
     let names = node_names(ctx).await;
     let details = task_details(ctx, id).await;
+    let ran = task_executors(ctx, &v).await;
     let s = &v.summary;
     let terminal = s.state.is_terminal();
     let top = html! {
@@ -437,7 +453,10 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
                     td { a href={"/jobs/" (s.id) "/tasks/" (t.index)} { "#" (t.index) } }
                     td { (task_state(l, &t.state, &names)) }
                     td { (t.attempts) @if t.preempted > 0 { " " span class="dim" { "(" (t.preempted) " " (l.t("moved", "이동")) ")" } } }
-                    td { @if let Some(n) = &t.node { a href={"/nodes/" (n)} { (name_of(&names, n)) } } }
+                    td {
+                        @if let Some(n) = &t.node { a href={"/nodes/" (n)} { (name_of(&names, n)) } }
+                        @if let Some(Some(e)) = ran.get(t.index as usize) { " " span class="chip" data-ran-as=(e.to_string()) { (e.to_string()) } }
+                    }
                     td class="queued" { @if let Some(d) = d { @if t.node.is_some() { (fmt::ms(d.queued_ms)) } } }
                     td class="run" {
                         @if t.wall_ms > 0 { (fmt::ms(t.wall_ms)) }
@@ -713,6 +732,7 @@ async fn render_task(ctx: &Ctx, id: &str, index: u32) -> anyhow::Result<Response
         .ok_or_else(|| anyhow::anyhow!("no such task: {index}"))?
         .clone();
     let names = node_names(ctx).await;
+    let ran = task_executors(ctx, &v).await;
     let detail = task_details(ctx, id)
         .await
         .into_iter()
@@ -728,6 +748,7 @@ async fn render_task(ctx: &Ctx, id: &str, index: u32) -> anyhow::Result<Response
             dt { (l.t("State", "상태")) } dd { (task_state(l, &t.state, &names)) }
             dt { (l.t("Attempts", "시도")) } dd { (t.attempts) }
             @if let Some(n) = &t.node { dt { (l.t("Node", "노드")) } dd { a href={"/nodes/" (n)} { (name_of(&names, n)) } } }
+            @if let Some(Some(e)) = ran.get(index as usize) { dt { (l.t("Ran as", "실행 방식")) } dd data-ran-as=(e.to_string()) { (e.to_string()) } }
             @if let Some(d) = &detail {
                 dt { (l.t("Queued", "대기")) } dd data-time="queued" { (fmt::ms(d.queued_ms)) }
                 dt { (l.t("Fetching inputs", "입력 가져오기")) } dd data-time="fetch" { (fmt::ms(d.fetch_ms)) }

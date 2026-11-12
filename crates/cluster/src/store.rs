@@ -118,6 +118,8 @@ const TRUSTED_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("truste
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 /// 1.4. How long the parts of a task's run took, by (job id, task index).
 const TASK_TIMES: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_times");
+/// The executor an `executor = "image"` task's run was placed with (1.5).
+const TASK_EXEC: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_exec");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -177,7 +179,8 @@ macro_rules! tables {
             MEASUREMENTS,
             TRUSTED_NODES,
             AUDIT,
-            TASK_TIMES
+            TASK_TIMES,
+            TASK_EXEC
         )
     };
 }
@@ -421,6 +424,7 @@ pub struct Snapshot {
     pub job_ext: Vec<(u128, JobExt)>,
     pub task_ext: Vec<((u128, u32), TaskExt)>,
     pub task_times: Vec<((u128, u32), crate::state::TaskTimes)>,
+    pub task_exec: Vec<((u128, u32), pumasi_proto::job::Executor)>,
     pub datasets: Vec<DatasetRecord>,
     pub quotas: Vec<(String, u64)>,
     pub secrets: Vec<(String, u64, String)>,
@@ -573,6 +577,7 @@ impl Store {
         tx.open_table(TRUSTED_NODES)?;
         tx.open_table(AUDIT)?;
         tx.open_table(TASK_TIMES)?;
+        tx.open_table(TASK_EXEC)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -993,6 +998,10 @@ impl Store {
             let (k, v) = row?;
             snap.task_times.push((k.value(), dec(v.value())?));
         }
+        for row in tx.open_table(TASK_EXEC)?.iter()? {
+            let (k, v) = row?;
+            snap.task_exec.push((k.value(), dec(v.value())?));
+        }
         for row in tx.open_table(DATASETS)?.iter()? {
             let (_, v) = row?;
             snap.datasets.push(dec(v.value())?);
@@ -1173,6 +1182,7 @@ impl Store {
                 b.del(TASKS, (job, i));
                 b.del(TASK_EXT, (job, i));
                 b.del(TASK_TIMES, (job, i));
+                b.del(TASK_EXEC, (job, i));
                 b.del(PREEMPTED, (job, i, false));
                 b.del(PREEMPTED, (job, i, true));
             }
@@ -1207,6 +1217,10 @@ impl Store {
                 b.del(TASK_TIMES, (job, *i));
             } else {
                 b.put(TASK_TIMES, (job, *i), enc(&task.times).as_slice());
+            }
+            match &task.ran {
+                Some(e) => b.put(TASK_EXEC, (job, *i), enc(e).as_slice()),
+                None => b.del(TASK_EXEC, (job, *i)),
             }
         }
         self.commit(b)
@@ -1935,6 +1949,7 @@ pub(crate) mod legacy {
     impl From<TaskRecord> for crate::state::TaskRecord {
         fn from(t: TaskRecord) -> Self {
             Self {
+                ran: None,
                 input: t.input,
                 state: t.state,
                 attempts: t.attempts,

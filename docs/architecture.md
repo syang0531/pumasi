@@ -2018,6 +2018,119 @@ which the 1.4 CLI and dashboard treat as "no details"; `?validate=1`
 against a 1.3 control plane is an error. Upgrade the control plane
 first, as always.
 
+## Phase 21: machines that sleep, and `executor = "image"` (1.5)
+
+Home machines sleep. Before 1.5 a sleeping node went offline after the
+node timeout and its tasks started again elsewhere after that; nothing
+could wake it for waiting work; and a node without Docker took no image
+job even though the same image runs there in a microVM.
+
+### Staying awake and saying goodbye
+
+`crates/agent/src/power` has one backend per OS behind `PowerBackend`
+(`stay_awake`, `watch`):
+
+| OS | Blocker | Sleep and wake events |
+| --- | --- | --- |
+| macOS | IOKit assertion `PreventUserIdleSystemSleep` | `IORegisterForSystemPower` on its own run loop thread; sleep is acknowledged with `IOAllowPowerChange` |
+| Windows | `PowerCreateRequest` + `PowerRequestSystemRequired` | `PowerRegisterSuspendResumeNotification` (`PBT_APMSUSPEND`, `PBT_APMRESUMEAUTOMATIC`) |
+| Linux | `systemd-inhibit --what=sleep --mode=block` | logind's `PrepareForSleep` signal, held back with a `delay` inhibitor |
+
+The blocker is held from the first running task until 30 seconds after
+the last (so a queue of short tasks does not flap). It stops the idle
+timer only: closing the lid or choosing Sleep still sleeps the machine,
+which is then the second case.
+
+When the OS announces sleep, the agent sends `FromAgent::Sleeping` and
+holds the OS back until the control plane has closed the connection, at
+most 2.5 seconds. The control plane (`State::on_sleeping`) takes the
+node's runs back with the same path as a drain (no attempt is counted,
+`preempted` is), marks the node `asleep`, writes a `node.asleep` event
+instead of `node.offline`, and the `node_offline` alert rule skips it.
+The record (`asleep since`, the agent's power report) is kept in the
+`meta` table under `node_power`, so a restarted control plane still knows
+who is asleep. After the wake event the agent reconnects to the same
+replica without the usual backoff.
+
+`--on-pause requeue` uses the same path: when the agent reports that it
+paused (battery, input, hours), the control plane moves its runs.
+
+### Wake-on-LAN
+
+Each agent reports its LAN cards (name, MAC, IPv4 address and prefix,
+whether it is Wi-Fi; virtual switches, tunnels and loopback are left
+out), whether it holds the blocker, whether it will say goodbye, and
+whether its owner opted in with `--wake-on-lan`.
+
+A magic packet is six `0xff` bytes and the MAC sixteen times, sent to UDP
+port 9 on the subnet's broadcast address and on 255.255.255.255, three
+times. Routers do not forward it, so it has to come from the node's own
+LAN: the control plane sends it itself when one of its cards is on that
+subnet, and asks up to two online agents there (`ToAgent::Wake`, the
+owner's machines first).
+
+`State::tick_wake` looks at the first 256 queued runs. A run that an
+online node would take now is left to the scheduler. A run that online
+nodes would take if they were not busy waits `--wake-after` (10 minutes
+by default; `never` turns this case off). A run that no online node can
+take (selector, executor, GPU, memory) wakes a sleeping node that fits it
+at once. One node is woken per run, the account's own machines first.
+The packet is sent again after 60 seconds, doubling up to 15 minutes; the
+third packet without the node coming back writes a `node.wake_failed`
+warning. Only nodes that said goodbye are woken automatically (a machine
+that was shut down or lost power is not asleep as far as the cluster
+knows); `pumasi node wake`, the dashboard button and
+`POST /api/v1/nodes/NODE/wake` send the packet for any offline node that
+opted in.
+
+### Idle time under a Windows service
+
+A service runs in session 0 and sees no keyboard or mouse. The agent
+service (LocalSystem) starts `pumasi idle-helper` in each signed-in
+session with that user's token (`WTSQueryUserToken`,
+`CreateProcessAsUserW`, no window) and reads the session's idle time
+from the helper's standard output through an anonymous pipe, every two
+seconds. The machine's idle time is the smallest of the sessions'; with
+nobody signed in it is idle. The roadmap planned a scheduled task and a
+named pipe; starting the helper from the service needs no setup step, no
+pipe name another program could take first, and nothing to remove on
+uninstall.
+
+### `executor = "image"`
+
+`Executor::Image` is a kind of job, not of run. The scheduler picks per
+placement (`State::run_as`): Docker when the node offers Docker, a
+microVM when it offers only that. The assignment the agent gets names
+the concrete executor, so agents need nothing new, and the receipt and
+the price are the concrete executor's. What ran is kept per task in the
+table `task_exec` and answered by `AdminOp::TaskExecutors`.
+
+A job that needs what only one of the two has is settled at submission:
+the confidential tier runs as a microVM, and `gpu.capabilities` (driver
+capabilities for drawing) as Docker. An account policy that allows only
+one of `docker` and `microvm` narrows an image job to that one; a policy
+that allows neither refuses it.
+
+### Compatibility
+
+Protocol stays 14 and storage layout stays 7. Instead of a protocol
+bump, which would make 1.4 and 1.5 refuse each other during a rollout,
+the two sides tell each other a minor number in bytes after the hello
+and the welcome frame's message (a peer that does not know them ignores
+trailing bytes). `Sleeping`, the power report and `Wake` are only sent
+to a peer whose minor has them: a 1.5 agent with a 1.4 control plane
+behaves like a 1.4 agent (but still keeps its machine awake), and a 1.4
+agent in a 1.5 cluster is simply never asleep and never asked to send a
+packet. `NodeView` and `TaskDetail` are unchanged; the new data comes
+through `AdminOp::NodePower`, `TaskExecutors` and `WakeNode`, appended
+to their enums. A CLI or dashboard older than 1.5 cannot show an image
+job (it does not know the executor's name): upgrade them with the
+control plane.
+
+Not covered: Wake-on-LAN over Wi-Fi or across subnets, waking a machine
+the cluster never saw go to sleep without a person asking, and stopping
+a lid-close sleep.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster

@@ -98,10 +98,14 @@ pub fn task_state(l: Lang, s: &TaskState) -> Markup {
 }
 
 /// Online, offline, paused, cordoned, suspended.
-pub fn node_state(l: Lang, n: &NodeView) -> Markup {
+/// The node's state, where `asleep` says the machine told the cluster it
+/// was going to sleep (1.5): asleep rather than lost.
+pub fn node_state(l: Lang, n: &NodeView, asleep: bool) -> Markup {
     html! {
         @if n.online {
             span class="badge ok" data-state="online" { (l.t("online", "온라인")) }
+        } @else if asleep {
+            span class="badge muted" data-state="asleep" { (l.t("asleep", "잠듦")) }
         } @else {
             span class="badge bad" data-state="offline" { (l.t("offline", "오프라인")) }
         }

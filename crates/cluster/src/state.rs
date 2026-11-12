@@ -218,6 +218,11 @@ pub struct TaskRecord {
     /// table.
     #[serde(skip)]
     pub times: TaskTimes,
+    /// The executor its run was placed with, for `executor = "image"` jobs
+    /// (1.5), persisted in its own table. `None` for other jobs and until
+    /// the first run is placed.
+    #[serde(skip)]
+    pub ran: Option<Executor>,
 }
 
 /// How long the parts of a task's run took: of the run that counts (the
@@ -325,6 +330,8 @@ pub(crate) struct Need {
     pub cpus: u32,
     pub store_job: bool,
     pub gpu: Option<GpuRequest>,
+    /// An image job that wants a network: a node that would run it in a
+    /// microVM must be able to give its microVMs one.
     pub vm_network: bool,
     /// Private image jobs: the architectures it is ready for.
     pub images: Option<Vec<(String, ImageBlob)>>,
@@ -465,6 +472,8 @@ pub struct State {
     pub(crate) sso: crate::sso::SsoState,
     /// Display names an admin gave nodes (1.3), by node id.
     pub(crate) names: std::collections::BTreeMap<String, crate::names::NameOverride>,
+    /// Nodes' sleep and wake state (1.5).
+    pub(crate) power: crate::power::PowerState,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -544,6 +553,7 @@ impl State {
             audit_tip: Default::default(),
             sso: Default::default(),
             names: Default::default(),
+            power: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -555,6 +565,8 @@ impl State {
             snap.job_origin.into_iter().collect();
         state.rollout = state.load_rollout()?;
         state.names = state.load_node_names()?;
+        state.power.nodes = state.load_power()?;
+        let mut task_exec: HashMap<(u128, u32), Executor> = snap.task_exec.into_iter().collect();
         state.convert_credit_receipts()?;
         state.ensure_account(OWNER_ACCOUNT)?;
         let mut jobs = snap.jobs;
@@ -581,6 +593,7 @@ impl State {
             }
             for (i, t) in tasks.iter_mut().enumerate() {
                 t.ext = task_ext.remove(&(meta.id.0, i as u32)).unwrap_or_default();
+                t.ran = task_exec.remove(&(meta.id.0, i as u32));
                 t.times = task_times
                     .remove(&(meta.id.0, i as u32))
                     .unwrap_or_default();
@@ -851,6 +864,7 @@ impl State {
         self.conf.trusted_nodes.remove(id);
         self.conf.tees.remove(id);
         self.mgmt.node_config.remove(id);
+        self.forget_power(id);
         self.store.remove_member(id)?;
         self.forget_node_name(id)?;
         if let Some(n) = self.nodes.get_mut(id)
@@ -949,6 +963,7 @@ impl State {
                 gpu_graphics: false,
             },
         );
+        self.power_on_connect(id);
         let name = self.node_name(id);
         self.event(
             EventLevel::Info,
@@ -996,6 +1011,12 @@ impl State {
                 format!("node {name} takes tasks again"),
             ),
         }
+        // `--on-pause requeue`: its runs stop and go elsewhere.
+        if let Some(reason) = self.nodes.get(id).and_then(|n| n.paused.clone())
+            && self.requeues_on_pause(id)
+        {
+            self.move_runs(id, &format!("node paused ({reason})"));
+        }
         self.schedule();
     }
 
@@ -1024,7 +1045,10 @@ impl State {
             0 => format!("node {name} offline"),
             n => format!("node {name} offline; {n} runs moved back to the queue"),
         };
-        self.event(EventLevel::Warning, "node.offline", Some(id), None, msg);
+        // A node that said it sleeps is asleep, not lost.
+        if !self.asleep(id) {
+            self.event(EventLevel::Warning, "node.offline", Some(id), None, msg);
+        }
         for t in lost {
             self.requeue(t, "node disconnected");
         }
@@ -1119,6 +1143,7 @@ impl State {
         self.tick_schedules(now_unix());
         self.tick_queue_timeouts();
         self.tick_files();
+        self.tick_wake();
         self.expire_upgrades();
         self.expire_challenges();
         self.expire_gpu_challenges();
@@ -1163,6 +1188,7 @@ impl State {
         by: String,
     ) -> Result<JobId> {
         sub.validate()?;
+        sub.narrow_executor();
         let account = sub.account.take().unwrap_or_else(|| OWNER_ACCOUNT.into());
         validate_account(&account)?;
         let cap = self.priority_cap(&account, submitter);
@@ -1181,7 +1207,7 @@ impl State {
                 blobs.push((h, std::mem::take(&mut sub.module)));
                 Some(h)
             }
-            Executor::Docker | Executor::Microvm => None,
+            Executor::Docker | Executor::Microvm | Executor::Image => None,
         };
         let files_hash = if sub.files.is_empty() {
             None
@@ -1232,6 +1258,7 @@ impl State {
             .into_iter()
             .zip(task_exts)
             .map(|(input, ext)| TaskRecord {
+                ran: None,
                 input,
                 state: TaskState::Pending,
                 attempts: 0,
@@ -1489,8 +1516,21 @@ impl State {
         let node: PublicKey = node_id.parse().context("bad node id")?;
         check_usage(signed, &node, &self.key.public(), report.task, digest)?;
         let u = &signed.usage;
+        // An image job's run is Docker or a microVM, as it was placed.
+        let placed = match meta.executor {
+            Executor::Image => self
+                .jobs
+                .get(&meta.id)
+                .and_then(|j| j.tasks.get(report.task.index as usize))
+                .and_then(|t| t.ran)
+                .filter(|_| !report.task.check),
+            e => Some(e),
+        };
         anyhow::ensure!(
-            u.executor == meta.executor,
+            match placed {
+                Some(e) => u.executor == e,
+                None => meta.executor.runs_as().contains(&u.executor),
+            },
             "receipt names another executor"
         );
         anyhow::ensure!(
@@ -1815,7 +1855,7 @@ impl State {
             },
             store_job: job.meta.ext.needs_store,
             gpu: job.meta.gpu.clone(),
-            vm_network: executor == Executor::Microvm
+            vm_network: executor.runs_images()
                 && job.meta.docker.as_ref().is_some_and(|d| d.network),
             images,
             consumer,
@@ -1862,9 +1902,70 @@ impl State {
         extra_slots: u32,
         freed: &[u32],
     ) -> Option<Refusal<'a>> {
+        self.refusal_as(id, n, need, labels, extra_slots, freed, false)
+    }
+
+    /// The executor node `id` would run the need with: the job's own, or
+    /// for an image job the first of Docker and a microVM that the node
+    /// has and that gives the job what it asks for (a network, GPUs).
+    pub(crate) fn run_as<'a>(
+        &'a self,
+        id: &str,
+        n: &'a NodeRuntime,
+        need: &'a Need,
+    ) -> Result<Executor, Refusal<'a>> {
+        use Refusal as R;
+        let mut refused = None;
+        for &e in need.executor.runs_as() {
+            if !n.executors.contains(&e) {
+                continue;
+            }
+            if e == Executor::Microvm
+                && need.vm_network
+                && !(n.perf.protocol >= DEVICES_PROTOCOL
+                    && self
+                        .devices
+                        .get(id)
+                        .is_some_and(|d| d.signed.profile.microvm_network))
+            {
+                refused.get_or_insert(R::VmNetwork);
+                continue;
+            }
+            // GPUs this executor reaches on the node at all (busy or not).
+            if let Some(req) = &need.gpu
+                && self.pick_gpus(id, req, e, &HashSet::new()).is_none()
+            {
+                refused.get_or_insert(R::Gpu);
+                continue;
+            }
+            return Ok(e);
+        }
+        Err(refused.unwrap_or_else(|| {
+            let why = n
+                .unavailable
+                .iter()
+                .find(|(e, _)| need.executor.runs_as().contains(e))
+                .map(|(_, w)| w.as_str());
+            R::Executor(need.executor, why)
+        }))
+    }
+
+    /// [`Self::refusal`], or with `awake` what it would be if the node
+    /// (asleep now) were online and not paused.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refusal_as<'a>(
+        &'a self,
+        id: &str,
+        n: &'a NodeRuntime,
+        need: &'a Need,
+        labels: &HashMap<String, LabelSet>,
+        extra_slots: u32,
+        freed: &[u32],
+        awake: bool,
+    ) -> Option<Refusal<'a>> {
         use Refusal as R;
         let config = self.node_config(id);
-        if !n.online {
+        if !n.online && !awake {
             return Some(R::Offline);
         }
         if n.suspended {
@@ -1873,7 +1974,9 @@ impl State {
         if n.draining || self.upgrading.contains_key(id) {
             return Some(R::Upgrading);
         }
-        if let Some(why) = &n.paused {
+        if let Some(why) = &n.paused
+            && !awake
+        {
             return Some(R::Paused(why));
         }
         if n.perf.wanted || n.perf.challenge.is_some() {
@@ -1882,14 +1985,10 @@ impl State {
         if config.is_some_and(|c| c.cordoned) {
             return Some(R::Cordoned);
         }
-        if !n.executors.contains(&need.executor) {
-            let why = n
-                .unavailable
-                .iter()
-                .find(|(e, _)| *e == need.executor)
-                .map(|(_, w)| w.as_str());
-            return Some(R::Executor(need.executor, why));
-        }
+        let run_as = match self.run_as(id, n, need) {
+            Ok(e) => e,
+            Err(why) => return Some(why),
+        };
         if need.exclude_nodes.iter().any(|x| x == id) || need.exclude_accounts.contains(&n.account)
         {
             return Some(R::RanItAlready);
@@ -1934,15 +2033,6 @@ impl State {
         }) {
             return Some(R::ImageArch);
         }
-        if need.vm_network
-            && !(n.perf.protocol >= DEVICES_PROTOCOL
-                && self
-                    .devices
-                    .get(id)
-                    .is_some_and(|d| d.signed.profile.microvm_network))
-        {
-            return Some(R::VmNetwork);
-        }
         if let Some(t) = config
             .map(|c| c.taints.as_slice())
             .unwrap_or_default()
@@ -1965,7 +2055,7 @@ impl State {
             for g in freed {
                 busy.remove(g);
             }
-            if self.pick_gpus(id, req, need.executor, &busy).is_none() {
+            if self.pick_gpus(id, req, run_as, &busy).is_none() {
                 return Some(R::Gpu);
             }
         }
@@ -2099,6 +2189,7 @@ impl State {
             Some(_) => return None,
             None => None,
         };
+        let run_as = self.run_as(node_id, self.nodes.get(node_id)?, need).ok()?;
         let job = self.jobs.get_mut(&item.job)?;
         let task = job.tasks.get_mut(item.index as usize)?;
         let node = self.nodes.get_mut(node_id)?;
@@ -2158,7 +2249,7 @@ impl State {
                     &self.webgpu,
                     node_id,
                     req,
-                    need.executor,
+                    run_as,
                     &node.gpu.busy_set(),
                 )
             })
@@ -2167,7 +2258,7 @@ impl State {
             gpus: gpus.clone(),
             task: r,
             program: job.meta.name.clone(),
-            executor: job.meta.executor,
+            executor: run_as,
             module_hash,
             module,
             docker: job.meta.docker.clone(),
@@ -2227,6 +2318,7 @@ impl State {
                 node: node_id.to_string(),
             };
             task.node = Some(node_id.to_string());
+            task.ran = (job.meta.executor == Executor::Image).then_some(run_as);
             // A new run: its own wait, and nothing from the node yet.
             task.times = TaskTimes {
                 queued_ms: item.since.elapsed().as_millis() as u64,
@@ -2546,7 +2638,7 @@ mod tests {
             executor,
             module: match executor {
                 Executor::Wasm => b"\0asm\x01\0\0\0".to_vec(),
-                Executor::Docker | Executor::Microvm => vec![],
+                Executor::Docker | Executor::Microvm | Executor::Image => vec![],
             },
             docker: executor.runs_images().then(|| DockerSpec {
                 image: "busybox".into(),
@@ -4506,5 +4598,317 @@ mod tests {
         assert_eq!((cap.ready_gpu, cap.ready_gpu_graphics), (0, 0));
         // Other accounts are not held to it.
         assert_eq!(st.capacity("owner").ready_gpu, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Release 1.5: machines that sleep, Wake-on-LAN, --on-pause, image jobs
+    // -----------------------------------------------------------------------
+
+    use pumasi_proto::power::{LanIface, Mac, OnPause, PowerReport, WakeSender};
+
+    fn lan(last: u8, mac: u8) -> LanIface {
+        LanIface {
+            name: "eth0".into(),
+            mac: [mac; 6],
+            addr: [192, 168, 0, last],
+            prefix: 24,
+            wireless: false,
+        }
+    }
+
+    /// Tells the cluster how a node sleeps and wakes, as a 1.5 agent does.
+    fn power(st: &mut State, id: &str, wake_on_lan: bool, on_pause: OnPause, lan: Vec<LanIface>) {
+        let generation = st.nodes[id].generation;
+        st.on_minor(id, generation, pumasi_proto::PROTOCOL_MINOR);
+        st.on_power(
+            id,
+            generation,
+            PowerReport {
+                stays_awake: true,
+                sleep_notice: true,
+                wake_on_lan,
+                lan,
+                on_pause,
+                notes: vec![],
+            },
+        );
+    }
+
+    /// The control plane's own network card, recording what it sends.
+    struct TestWake {
+        lan: Vec<LanIface>,
+        sent: std::sync::Mutex<Vec<Mac>>,
+    }
+
+    impl WakeSender for TestWake {
+        fn lan(&self) -> Vec<LanIface> {
+            self.lan.clone()
+        }
+        fn send(&self, mac: &Mac, _from: &LanIface) -> Result<()> {
+            self.sent.lock().unwrap().push(*mac);
+            Ok(())
+        }
+    }
+
+    fn wakes(rx: &mut mpsc::UnboundedReceiver<ToAgent>) -> Vec<Vec<Mac>> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let ToAgent::Wake { macs } = m {
+                out.push(macs);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_node_that_says_it_sleeps_is_asleep_and_its_runs_move_at_once() {
+        let mut st = state();
+        st.power.sender = Arc::new(TestWake {
+            lan: vec![],
+            sent: Default::default(),
+        });
+        let (a, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        power(&mut st, &a, false, OnPause::Finish, vec![lan(10, 0xaa)]);
+        let mut sub = job(Executor::Wasm, 2);
+        sub.max_attempts = 1;
+        let id = st.submit(sub).unwrap();
+        assert_eq!(assigned(&mut a_rx).len(), 2);
+        let generation = st.nodes[&a].generation;
+        st.on_sleeping(&a, generation);
+        // Back in the queue, not counted against max_attempts = 1.
+        assert!(
+            st.jobs[&id]
+                .tasks
+                .iter()
+                .all(|t| t.state == TaskState::Pending)
+        );
+        assert!(st.asleep(&a) && !st.nodes[&a].online);
+        let events = events_of(&st);
+        assert!(events.contains(&"node.asleep".to_string()), "{events:?}");
+        assert!(!events.contains(&"node.offline".to_string()), "{events:?}");
+        // No node-offline alert, however long it sleeps.
+        st.monitor.policy.node_offline_secs = Some(1);
+        let alerts = st.wanted_alerts(now_unix() + 3600);
+        assert!(
+            alerts.keys().all(|(rule, _)| rule != "node_offline"),
+            "{alerts:?}"
+        );
+        let view = &st.node_power()[0];
+        assert!(view.asleep_since_unix.is_some() && !view.can_wake);
+        // A stale session's notice changes nothing; the state survives a
+        // restart of the control plane (it is in `meta`).
+        st.on_sleeping(&a, generation);
+        let saved = st.load_power().unwrap();
+        assert!(saved[&a].asleep_since.is_some());
+        assert_eq!(saved[&a].report.as_ref().unwrap().lan, vec![lan(10, 0xaa)]);
+
+        // It wakes and reconnects: online, and it takes the work back.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (kill, _) = oneshot::channel();
+        let info = st.nodes[&a].info.clone();
+        st.on_connect(
+            &a,
+            pumasi_proto::PROTOCOL_VERSION,
+            info,
+            None,
+            Availability::Available,
+            tx,
+            kill,
+        );
+        assert!(!st.asleep(&a));
+        let got = assigned(&mut rx);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|x| x.task.attempt == 2));
+        // A node that just drops is offline as before.
+        let generation = st.nodes[&a].generation;
+        st.on_disconnect(&a, generation);
+        assert!(events_of(&st).contains(&"node.offline".to_string()));
+        assert!(
+            st.wanted_alerts(now_unix() + 3600)
+                .keys()
+                .any(|(r, _)| r == "node_offline")
+        );
+    }
+
+    #[test]
+    fn queued_work_wakes_a_sleeping_node_over_its_lan() {
+        let mut st = state();
+        let cp = Arc::new(TestWake {
+            lan: vec![lan(5, 0x05)],
+            sent: Default::default(),
+        });
+        st.power.sender = cp.clone();
+        st.power.wake_after = None;
+        let (a, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm, Executor::Docker], None);
+        let (b, mut b_rx) = join(&mut st, "b", vec![Executor::Wasm], None);
+        // A node on another LAN is never asked.
+        let (c, mut c_rx) = join(&mut st, "c", vec![Executor::Wasm], None);
+        power(&mut st, &a, true, OnPause::Finish, vec![lan(10, 0xaa)]);
+        power(&mut st, &b, false, OnPause::Finish, vec![lan(11, 0xbb)]);
+        let mut far = lan(12, 0xcc);
+        far.addr = [10, 0, 0, 12];
+        power(&mut st, &c, false, OnPause::Finish, vec![far]);
+        let generation = st.nodes[&a].generation;
+        st.on_sleeping(&a, generation);
+        assert!(st.node_power().iter().find(|p| p.id == a).unwrap().can_wake);
+
+        // Wasm work runs on the nodes that are up: nobody is woken.
+        st.submit(job(Executor::Wasm, 1)).unwrap();
+        st.tick_wake();
+        assert!(cp.sent.lock().unwrap().is_empty());
+
+        // A docker job fits only the sleeping node: the control plane
+        // sends its magic packet and asks the agent on its LAN to.
+        let docker = st.submit(job(Executor::Docker, 1)).unwrap();
+        st.tick_wake();
+        assert_eq!(*cp.sent.lock().unwrap(), vec![[0xaa; 6]]);
+        assert_eq!(wakes(&mut b_rx), vec![vec![[0xaa; 6]]]);
+        assert!(wakes(&mut c_rx).is_empty());
+        assert!(events_of(&st).contains(&"node.wake".to_string()));
+        // Not again right away.
+        st.tick_wake();
+        assert_eq!(cp.sent.lock().unwrap().len(), 1);
+        st.cancel(docker).unwrap();
+
+        // Work that only waits for a busy node wakes nobody, until it has
+        // waited `--wake-after`.
+        st.submit(job(Executor::Wasm, 6)).unwrap();
+        assert!(!st.queue.is_empty());
+        st.power.nodes.get_mut(&a).unwrap().last_wake = None;
+        st.tick_wake();
+        assert_eq!(cp.sent.lock().unwrap().len(), 1);
+        st.power.wake_after = Some(Duration::ZERO);
+        st.tick_wake();
+        assert_eq!(cp.sent.lock().unwrap().len(), 2);
+
+        // By hand: the same packet; not for a node that is up or one that
+        // did not opt in.
+        let lines = st.wake_node("a").unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("aa:aa:aa:aa:aa:aa")),
+            "{lines:?}"
+        );
+        assert!(
+            st.wake_node("b")
+                .unwrap_err()
+                .to_string()
+                .contains("online")
+        );
+        let generation = st.nodes[&b].generation;
+        st.on_sleeping(&b, generation);
+        let err = st.wake_node("b").unwrap_err().to_string();
+        assert!(err.contains("--wake-on-lan"), "{err}");
+        let _ = a_rx.try_recv();
+    }
+
+    #[test]
+    fn on_pause_requeue_moves_a_paused_nodes_runs() {
+        let mut st = state();
+        let (a, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        power(&mut st, &a, false, OnPause::Requeue, vec![]);
+        let mut sub = job(Executor::Wasm, 1);
+        sub.max_attempts = 1;
+        let id = st.submit(sub).unwrap();
+        assert_eq!(assigned(&mut a_rx).len(), 1);
+        let generation = st.nodes[&a].generation;
+        let paused = Availability::Paused {
+            reason: "in use".into(),
+        };
+        st.on_availability(&a, generation, paused.clone());
+        let (_, cancelled) = cancels(&mut a_rx);
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+        assert_eq!(st.job_view(id, false).unwrap().tasks[0].preempted, 1);
+
+        // The default lets them finish.
+        let (b, mut b_rx) = join(&mut st, "b", vec![Executor::Wasm], None);
+        power(&mut st, &b, false, OnPause::Finish, vec![]);
+        assert_eq!(assigned(&mut b_rx).len(), 1);
+        let generation = st.nodes[&b].generation;
+        st.on_availability(&b, generation, paused);
+        assert!(cancels(&mut b_rx).1.is_empty());
+        assert!(matches!(
+            st.jobs[&id].tasks[0].state,
+            TaskState::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn image_jobs_run_as_docker_where_there_is_docker_and_in_a_microvm_elsewhere() {
+        let mut st = state();
+        let (d, mut d_rx) = join(&mut st, "d", vec![Executor::Wasm, Executor::Docker], None);
+        let (m, mut m_rx) = join(&mut st, "m", vec![Executor::Wasm, Executor::Microvm], None);
+        let (_, mut w_rx) = join(&mut st, "w", vec![Executor::Wasm], None);
+        // Capacity keeps to the executors nodes have (a 1.4 CLI reads it).
+        let cap = st.capacity(OWNER_ACCOUNT);
+        assert_eq!(cap.ready_for(Executor::Image), 0);
+        assert_eq!(cap.ready_for(Executor::Docker), 1);
+        assert_eq!(cap.ready_for(Executor::Microvm), 1);
+        let id = st.submit(job(Executor::Image, 4)).unwrap();
+        let on_d = assigned(&mut d_rx);
+        let on_m = assigned(&mut m_rx);
+        assert_eq!((on_d.len(), on_m.len()), (2, 2));
+        assert!(on_d.iter().all(|a| a.executor == Executor::Docker));
+        assert!(on_m.iter().all(|a| a.executor == Executor::Microvm));
+        assert!(assigned(&mut w_rx).is_empty());
+        assert_eq!(st.job_view(id, false).unwrap().executor, Executor::Image);
+        let ran = st.task_executors(id).unwrap();
+        for a in &on_d {
+            assert_eq!(ran[a.task.index as usize], Some(Executor::Docker));
+        }
+        for a in &on_m {
+            assert_eq!(ran[a.task.index as usize], Some(Executor::Microvm));
+        }
+        // Kept across a restart of the control plane.
+        assert_eq!(st.store.load().unwrap().task_exec.len(), 4);
+        st.cancel(id).unwrap();
+
+        // A node with both runs it as Docker.
+        let (_, mut both_rx) = join(
+            &mut st,
+            "both",
+            vec![Executor::Wasm, Executor::Docker, Executor::Microvm],
+            None,
+        );
+        st.nodes.get_mut(&d).unwrap().online = false;
+        st.nodes.get_mut(&m).unwrap().online = false;
+        st.submit(job(Executor::Image, 1)).unwrap();
+        assert_eq!(assigned(&mut both_rx)[0].executor, Executor::Docker);
+        // With a network it goes where the microVMs have one, or to Docker:
+        // m's microVMs have none.
+        st.nodes.get_mut(&m).unwrap().online = true;
+        let mut sub = job(Executor::Image, 2);
+        sub.docker.as_mut().unwrap().network = true;
+        let id = st.submit(sub).unwrap();
+        assert!(assigned(&mut m_rx).is_empty());
+        assert_eq!(assigned(&mut both_rx).len(), 1);
+        assert_eq!(st.task_executors(id).unwrap().iter().flatten().count(), 1);
+
+        // What a job asks for can settle it: a confidential job is a
+        // microVM job, GPU capabilities are Docker's, and an account's
+        // policy that allows one of the two leaves that one.
+        let mut sub = job(Executor::Image, 1);
+        sub.tier = Tier::Confidential;
+        sub.narrow_executor();
+        assert_eq!(sub.executor, Executor::Microvm);
+        let mut sub = job(Executor::Image, 1);
+        let policy = pumasi_proto::manage::AccountPolicy {
+            executors: vec![Executor::Wasm, Executor::Microvm],
+            ..Default::default()
+        };
+        policy.admit(&mut sub).unwrap();
+        assert_eq!(sub.executor, Executor::Microvm);
+        let wasm_only = pumasi_proto::manage::AccountPolicy {
+            executors: vec![Executor::Wasm],
+            ..Default::default()
+        };
+        assert!(wasm_only.admit(&mut job(Executor::Image, 1)).is_err());
+        let both = pumasi_proto::manage::AccountPolicy {
+            executors: vec![Executor::Docker, Executor::Microvm],
+            ..Default::default()
+        };
+        let mut sub = job(Executor::Image, 1);
+        both.admit(&mut sub).unwrap();
+        assert_eq!(sub.executor, Executor::Image);
     }
 }

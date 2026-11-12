@@ -361,7 +361,7 @@ impl State {
             },
             store_job: ext.needs_store || upload_bytes > 0,
             gpu: sub.gpu.clone(),
-            vm_network: sub.executor == Executor::Microvm
+            vm_network: sub.executor.runs_images()
                 && sub.docker.as_ref().is_some_and(|d| d.network),
             // A private image is pulled into the store after the job is
             // submitted, for the architectures of the nodes that fit.
@@ -482,10 +482,17 @@ impl State {
     /// the account's policy.
     pub fn capacity(&self, account: &str) -> Capacity {
         let policy = self.account_policy(account);
+        // An image job (1.5) runs where docker or microvm does, so it has
+        // no entry of its own: a CLI older than 1.5 reads this answer too.
         let executors: Vec<Executor> = if policy.executors.is_empty() {
             vec![Executor::Wasm, Executor::Docker, Executor::Microvm]
         } else {
-            policy.executors.clone()
+            policy
+                .executors
+                .iter()
+                .copied()
+                .filter(|e| *e != Executor::Image)
+                .collect()
         };
         let floor = self.policy.ledger.floor();
         let can_pay = self

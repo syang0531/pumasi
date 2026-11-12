@@ -779,6 +779,15 @@ enum NodeCmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Wake a sleeping node over the LAN: every machine of the cluster on
+    /// its LAN sends its network card the magic packet. The node must
+    /// have opted in (`--wake-on-lan`).
+    Wake {
+        /// The node: its name or an id prefix.
+        node: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -852,6 +861,11 @@ struct MetricsArgs {
     /// and small outputs; receipts and the audit log stay.
     #[arg(long, default_value = "30d")]
     keep_jobs: String,
+    /// Wake a sleeping node (one started with --wake-on-lan) for work
+    /// that has waited this long for a busy node, e.g. 10m; `never` wakes
+    /// nodes only for work that no online node can run at all.
+    #[arg(long, default_value = "10m", value_name = "DURATION|never")]
+    wake_after: String,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -925,6 +939,22 @@ struct AgentOpts {
     /// `00:00-08:00,12:00-13:00`.
     #[arg(long, value_name = "HH:MM-HH:MM[,...]", value_parser = parse_hours)]
     hours: Option<Hours>,
+    /// What happens to the tasks this machine is running when it pauses
+    /// (on battery, in use, outside its hours): `finish` lets them finish,
+    /// `requeue` stops them and runs them on another machine.
+    #[arg(long, value_name = "finish|requeue", default_value = "finish")]
+    on_pause: pumasi_proto::power::OnPause,
+    /// Let the machine sleep on its usual schedule even while it runs
+    /// tasks. By default the agent keeps it awake (not its display) from
+    /// the first running task until the last one ends.
+    #[arg(long)]
+    allow_sleep: bool,
+    /// Let the cluster wake this machine over the LAN when work waits for
+    /// it (and with `pumasi node wake`): another machine of the cluster on
+    /// the same LAN sends its network card the magic packet. Wake-on-LAN
+    /// must also be on in the firmware and the OS (see the README).
+    #[arg(long)]
+    wake_on_lan: bool,
     /// Also run docker jobs on this machine. Only for machines you own:
     /// containers share this machine's kernel.
     #[arg(long)]
@@ -1053,6 +1083,21 @@ fn main() {
     {
         let config = PathBuf::from(args.next().unwrap_or_default());
         std::process::exit(pumasi_agent::microvm::vz::run_main(&config));
+    }
+    // `pumasi idle-helper`: started by the Windows agent service in each
+    // signed-in session, to learn when someone is using the machine.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == pumasi_agent::availability::IDLE_HELPER)
+    {
+        let code = match pumasi_agent::availability::idle_helper_main() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        };
+        std::process::exit(code);
     }
     let cli = Cli::parse();
     let long_running = matches!(
@@ -1425,6 +1470,24 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Node {
+            cmd: Some(NodeCmd::Wake { node, admin }),
+            ..
+        } => {
+            let client = connect_admin(&home, &admin).await?;
+            let res = client.call(AdminOp::WakeNode { node }).await;
+            client.close().await;
+            let AdminResponse::Applied(lines) = res? else {
+                bail!("unexpected response");
+            };
+            for l in lines {
+                println!("{l}");
+            }
+            eprintln!(
+                "it takes a machine up to a minute to wake and reconnect; `pumasi status` shows it"
+            );
+            Ok(0)
+        }
+        Cmd::Node {
             cmd: None,
             id,
             rebenchmark,
@@ -1460,8 +1523,9 @@ async fn run(cli: Cli) -> Result<i32> {
                     n.info.name
                 );
             }
+            let power = node_power(&client).await;
             client.close().await;
-            print_node(n);
+            print_node(n, power.iter().find(|p| p.id == n.id));
             Ok(0)
         }
         Cmd::Receipts { id, export, admin } => {
@@ -1517,7 +1581,8 @@ async fn run(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             let view = wait_for_job(&client, id).await?;
-            print_job(&view, &task_details(&client, id).await, output);
+            let ran = task_executors(&client, &view).await;
+            print_job(&view, &task_details(&client, id).await, &ran, output);
             let dir = out.unwrap_or_else(|| PathBuf::from("pumasi-out").join(id.to_string()));
             download_outputs(&client, &view, &dir, false).await?;
             client.close().await;
@@ -1534,8 +1599,9 @@ async fn run(cli: Cli) -> Result<i32> {
             let AdminResponse::Status(status) = client.call(AdminOp::Status).await? else {
                 bail!("unexpected response");
             };
+            let power = node_power(&client).await;
             client.close().await;
-            print_status(&status);
+            print_status(&status, &power);
             Ok(0)
         }
         Cmd::Job {
@@ -1555,7 +1621,8 @@ async fn run(cli: Cli) -> Result<i32> {
             else {
                 bail!("unexpected response");
             };
-            print_job(&view, &task_details(&client, id).await, output);
+            let ran = task_executors(&client, &view).await;
+            print_job(&view, &task_details(&client, id).await, &ran, output);
             if let Some(dir) = out {
                 download_outputs(&client, &view, &dir, true).await?;
             }
@@ -1727,6 +1794,12 @@ async fn cluster_start(
     config.metrics_retention =
         Duration::from_millis(parse_duration_ms(&metrics.metrics_retention)?);
     config.keep_jobs = Duration::from_millis(parse_duration_ms(&metrics.keep_jobs)?);
+    config.wake_after = match metrics.wake_after.trim() {
+        "never" => None,
+        d => Some(Duration::from_millis(
+            parse_duration_ms(d).context("--wake-after")?,
+        )),
+    };
     config.disk_class = match storage_class {
         Some(StorageClassArg::Hdd) => DiskClass::Hdd,
         Some(StorageClassArg::Ssd) => DiskClass::Ssd,
@@ -2014,6 +2087,11 @@ async fn agent(
         store_cache_bytes: opts.store_cache.as_deref().map(parse_size).transpose()?,
         gpu_graphics: opts.gpu_graphics.forced(),
         docker_wsl_libs: opts.docker_wsl_libs.forced(),
+        power: pumasi_agent::PowerOptions::system(
+            opts.allow_sleep,
+            opts.wake_on_lan,
+            opts.on_pause,
+        ),
     };
     let exe = config.upgrade.as_ref().map(|u| u.exe.clone());
     let agent = Agent::new(config).await?;
@@ -2602,7 +2680,12 @@ async fn wait_for_job(client: &AdminClient, id: JobId) -> Result<JobView> {
     }
 }
 
-fn print_status(s: &ClusterStatus) {
+fn print_status(s: &ClusterStatus, power: &[pumasi_proto::power::NodePowerView]) {
+    let asleep = |id: &str| {
+        power
+            .iter()
+            .any(|p| p.id == id && p.asleep_since_unix.is_some())
+    };
     println!("cluster {} ({})", s.cluster_name, short(&s.cluster_id));
     println!();
     println!(
@@ -2635,6 +2718,8 @@ fn print_status(s: &ClusterStatus) {
             "paused"
         } else if n.online {
             "online"
+        } else if asleep(&n.id) {
+            "asleep"
         } else {
             "offline"
         };
@@ -2687,6 +2772,30 @@ fn print_status(s: &ClusterStatus) {
     for n in s.nodes.iter() {
         for w in &n.webgpu {
             println!("{:<16} {}", truncate(&n.info.name, 16), webgpu_line(w));
+        }
+    }
+    for p in power {
+        let Some(n) = s.nodes.iter().find(|n| n.id == p.id && !n.online) else {
+            continue;
+        };
+        if let Some(since) = p.asleep_since_unix {
+            let wake = match (&p.report, p.can_wake) {
+                (Some(r), true) if r.wake_on_lan => {
+                    format!(
+                        "; `pumasi node wake {}` wakes it, and so does work that waits for it",
+                        n.info.name
+                    )
+                }
+                (Some(r), false) if r.wake_on_lan => {
+                    "; no machine of the cluster is online on its LAN to wake it".to_string()
+                }
+                _ => String::new(),
+            };
+            println!(
+                "{} is asleep since {}{wake}",
+                truncate(&n.info.name, 16),
+                monitor::local_time(since, true)
+            );
         }
     }
     for n in s.nodes.iter().filter(|n| n.online) {
@@ -2781,7 +2890,36 @@ fn task_times(d: &pumasi_proto::msg::TaskDetail) -> String {
     .collect()
 }
 
-fn print_job(v: &JobView, details: &[pumasi_proto::msg::TaskDetail], output: bool) {
+/// Every node's sleep and wake state (1.5). Empty when the control plane
+/// is older and does not answer.
+async fn node_power(client: &AdminClient) -> Vec<pumasi_proto::power::NodePowerView> {
+    match client.call(AdminOp::NodePower).await {
+        Ok(AdminResponse::NodePower(p)) => p,
+        _ => Vec::new(),
+    }
+}
+
+/// Whether each task of an `executor = "image"` job runs as Docker or in
+/// a microVM. Empty for other jobs.
+async fn task_executors(client: &AdminClient, v: &JobView) -> Vec<Option<Executor>> {
+    if v.executor != Executor::Image {
+        return Vec::new();
+    }
+    match client
+        .call(AdminOp::TaskExecutors { id: v.summary.id })
+        .await
+    {
+        Ok(AdminResponse::TaskExecutors(e)) => e,
+        _ => Vec::new(),
+    }
+}
+
+fn print_job(
+    v: &JobView,
+    details: &[pumasi_proto::msg::TaskDetail],
+    ran: &[Option<Executor>],
+    output: bool,
+) {
     let s = &v.summary;
     println!("job {} \"{}\": {}", s.id, s.name, s.state);
     match &v.image {
@@ -2893,6 +3031,11 @@ fn print_job(v: &JobView, details: &[pumasi_proto::msg::TaskDetail], output: boo
                 .and_then(|d| d.node_name.as_deref())
                 .or(t.node.as_deref().map(short))
                 .unwrap_or("-");
+            // An image job's task: what it ran (or runs) as.
+            let node = match ran.get(t.index as usize).copied().flatten() {
+                Some(e) => format!("{node} as={e}"),
+                None => node.to_string(),
+            };
             let _ = writeln!(
                 stdout,
                 "  [{}] {} node={} attempts={} {}ms{}{}{}",
@@ -4112,7 +4255,7 @@ fn print_profile(p: &PerfProfile) {
     }
 }
 
-fn print_node(n: &NodeView) {
+fn print_node(n: &NodeView, power: Option<&pumasi_proto::power::NodePowerView>) {
     println!("node {} \"{}\"", n.id, n.info.name);
     let state = if n.suspended {
         "suspended"
@@ -4120,6 +4263,8 @@ fn print_node(n: &NodeView) {
         "paused"
     } else if n.online {
         "online"
+    } else if power.is_some_and(|p| p.asleep_since_unix.is_some()) {
+        "asleep"
     } else {
         "offline"
     };
@@ -4137,6 +4282,65 @@ fn print_node(n: &NodeView) {
     }
     if n.config.cordoned {
         println!("  cordoned: takes no new tasks (`pumasi uncordon` to undo)");
+    }
+    if let Some(p) = power {
+        if let (Some(since), false) = (p.asleep_since_unix, n.online) {
+            println!("  asleep since {}", monitor::local_time(since, true));
+        }
+        if let Some(r) = &p.report {
+            let mut sleep = vec![
+                if r.stays_awake {
+                    "stays awake while it runs tasks"
+                } else {
+                    "may sleep while it runs tasks"
+                }
+                .to_string(),
+            ];
+            if r.sleep_notice {
+                sleep.push("says so before it sleeps".into());
+            }
+            if r.on_pause == pumasi_proto::power::OnPause::Requeue {
+                sleep.push("moves its tasks when it pauses".into());
+            }
+            println!("  sleep: {}", sleep.join(", "));
+            for note in &r.notes {
+                println!("    {note}");
+            }
+            let cards: Vec<String> = r
+                .lan
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{} {} ({}{})",
+                        i.name,
+                        pumasi_proto::power::format_mac(&i.mac),
+                        i.cidr(),
+                        if i.wireless { ", Wi-Fi" } else { "" }
+                    )
+                })
+                .collect();
+            println!(
+                "  wake-on-lan: {}{}",
+                if !r.wake_on_lan {
+                    "off (agent option --wake-on-lan)"
+                } else if p.can_wake {
+                    "on"
+                } else {
+                    "on, but no machine of the cluster is online on its LAN"
+                },
+                if cards.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", cards.join(", "))
+                }
+            );
+            if let (Some(at), Some(by)) = (p.last_wake_unix, &p.last_wake_by) {
+                println!(
+                    "  last magic packet: {} by {by}",
+                    monitor::local_time(at, true)
+                );
+            }
+        }
     }
     let labels: Vec<String> = n
         .labels

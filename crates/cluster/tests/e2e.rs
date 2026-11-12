@@ -79,7 +79,9 @@ async fn start_cluster(dir: PathBuf) -> Result<Cluster> {
     config.net = NetMode::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
     config.heartbeat = Duration::from_millis(200);
-    config.node_timeout = Duration::from_secs(2);
+    // The default node timeout (10 s): a node that is killed closes its
+    // connection, which the control plane sees at once, and with 2 s a
+    // slow CI runner lost healthy nodes ("node missed heartbeats").
     Cluster::start(config).await
 }
 

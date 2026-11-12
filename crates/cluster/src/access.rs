@@ -87,6 +87,8 @@ fn op_name(op: &AdminOp) -> &'static str {
         LatestRelease { check: false } => "read the release check",
         LatestRelease { check: true } => "check for releases",
         UpgradeToLatest { .. } => "roll out upgrades",
+        TaskDetails { .. } => "read jobs",
+        CheckJob { .. } => "check jobs",
     }
 }
 
@@ -111,6 +113,7 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
         Caller::Viewer { .. } => match op {
             Status
             | Job { .. }
+            | TaskDetails { .. }
             | TaskFiles { .. }
             | Receipts { .. }
             | Accounts
@@ -184,6 +187,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | Receipts { id }
         | TaskFiles { id, .. }
         | Job { id, .. }
+        | TaskDetails { id }
         | Logs { job: id, .. } => own_job(st, account, id)?,
         RemoveSchedule { name } | RunSchedule { name } => {
             if let Some(other) = st.schedule_account(name) {
@@ -202,7 +206,22 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
             st.admit_policy(account, &mut sub)?;
             Submit(sub)
         }
-        op @ (Cancel { .. } | Receipts { .. } | TaskFiles { .. } | Job { .. } | Logs { .. }) => op,
+        // Checked exactly as the submission would be.
+        CheckJob {
+            mut sub,
+            upload_bytes,
+        } => {
+            pin(&mut sub.account, account)?;
+            own_mounts(st, account, &sub)?;
+            st.admit_policy(account, &mut sub)?;
+            CheckJob { sub, upload_bytes }
+        }
+        op @ (Cancel { .. }
+        | Receipts { .. }
+        | TaskFiles { .. }
+        | Job { .. }
+        | TaskDetails { .. }
+        | Logs { .. }) => op,
         op @ (Metrics { .. } | Events { .. } | Alerts) => op,
         op @ (Status
         | Accounts

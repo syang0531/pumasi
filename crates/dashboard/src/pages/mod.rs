@@ -3,6 +3,7 @@
 //! and show their result in the flash area at the top.
 
 pub mod access;
+pub mod accounts;
 pub mod cu;
 pub mod events;
 pub mod jobs;
@@ -56,6 +57,12 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
         .route("/storage/{name}/download.zip", get(storage::download))
         .route("/cu", get(cu::page))
         .route("/cu/{action}", post(cu::action))
+        .route("/accounts", get(accounts::list))
+        .route("/accounts/open", get(accounts::open))
+        .route(
+            "/accounts/{name}",
+            get(accounts::detail).post(accounts::save),
+        )
         .route("/access", get(access::page))
         .route("/access/{action}", post(access::action))
         .route("/prices", get(prices::page))
@@ -275,6 +282,7 @@ pub enum Nav {
     Jobs,
     Storage,
     Cu,
+    Accounts,
     Access,
     Prices,
     Events,
@@ -295,6 +303,7 @@ const NAV: &[(Nav, &str, &str, &str)] = &[
     (Nav::Jobs, "/jobs", "Jobs", "작업"),
     (Nav::Storage, "/storage", "Storage", "저장소"),
     (Nav::Cu, "/cu", "CU", "CU"),
+    (Nav::Accounts, "/accounts", "Accounts", "계정"),
     (Nav::Access, "/access", "Invites", "초대"),
     (Nav::Prices, "/prices", "Prices", "요금"),
     (Nav::Events, "/events", "Events", "이벤트"),

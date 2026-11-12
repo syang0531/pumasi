@@ -30,8 +30,15 @@ sudo pumasi --home /var/lib/pumasi service status cluster
 ```
 
 It adds `--no-token` (no join ticket in the log at every start; make them
-with `pumasi token`). For a hardened unit like the one below, write it
-yourself:
+with `pumasi token`). The options are kept in `control-plane.toml` in the
+home; `service status cluster` prints them and `service set` changes
+them and restarts the service, keeping the ones it does not name:
+
+```sh
+sudo pumasi --home /var/lib/pumasi service set cluster -- --keep-jobs 180d
+```
+
+For a hardened unit like the one below, write it yourself:
 
 ```ini
 # /etc/systemd/system/pumasi-cluster.service
@@ -254,8 +261,10 @@ No node joins again and no ticket is made again. The steps on Windows
 (administrator PowerShell; on Linux and macOS the same with `sudo`,
 `cp -a` or `tar`, and the paths of step 1):
 
-1. On the old machine, note what the services run with (`sc.exe qc
-   pumasi-cluster`, `sc.exe qc pumasi-ui`; on Linux the unit files) and
+1. On the old machine, note what the services run with (`pumasi service
+   status` prints each service's options; for a service installed before
+   1.4 they are also in `sc.exe qc pumasi-cluster`, `sc.exe qc pumasi-ui`
+   or the unit files) and
    take a backup for safety: `pumasi backup pumasi-before-move.backup`.
 2. Stop it for good, so the two never run at once: `pumasi service
    uninstall ui`, `pumasi service uninstall cluster` (both keep the

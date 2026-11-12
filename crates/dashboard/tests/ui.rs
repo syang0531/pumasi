@@ -1024,3 +1024,390 @@ async fn sso_sign_in_and_request_limits() {
     agent_task.abort();
     cluster.shutdown().await.unwrap();
 }
+
+/// A multipart job submission of one job.toml and nothing else.
+fn toml_form(boundary: &str, job: &str) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"job\"\r\n\r\n{job}\r\n--{boundary}--\r\n"
+    )
+    .into_bytes()
+}
+
+/// Release 1.4: an account's policy over HTTP (GET, and PATCH changing
+/// only what the body names), `whoami` carrying it, `?validate=1`
+/// answering like a real submission without submitting, and each task's
+/// node name and times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_policy_validation_and_task_times() {
+    let (cluster, agent_task) = start_cluster().await;
+    let admin = cluster.admin_ticket();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ui = pumasi_dashboard::start_on(
+        listener,
+        UiConfig {
+            ticket: admin.clone(),
+            net: NetMode::Local,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            login_only: false,
+            upload_limit: 64 << 20,
+            api_only: false,
+            tls: None,
+            real_ip_header: None,
+            public_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let addr = ui.addr();
+    let auth = ("Authorization", format!("Bearer {admin}"));
+    let json = ("Content-Type", "application/json".to_string());
+    let op = |body: serde_json::Value| {
+        let headers = [auth.clone(), json.clone()];
+        async move {
+            let r = request(
+                addr,
+                "POST",
+                "/api/v1/op",
+                &headers,
+                body.to_string().as_bytes(),
+            )
+            .await;
+            assert_eq!(r.status, 200, "{}", r.text());
+            r.json()
+        }
+    };
+    let ticket = |name: &'static str, role: serde_json::Value| {
+        let made = op(serde_json::json!({
+            "CreateAccess": {"name": name, "role": role, "ttl_secs": null}
+        }));
+        async move {
+            let t = made.await["ticket"].as_str().unwrap().to_string();
+            ("Authorization", format!("Bearer {t}"))
+        }
+    };
+    let lab = ticket(
+        "lab scripts",
+        serde_json::json!({"Submitter": {"account": "lab"}}),
+    )
+    .await;
+    let viewer = ticket("watcher", serde_json::json!("Viewer")).await;
+    op(serde_json::json!({"Deposit": {"account": "lab", "amount": 100_000, "memo": "test"}})).await;
+    let policy = "/api/v1/accounts/lab/policy";
+    let patch = |who: &(&'static str, String), body: serde_json::Value| {
+        let headers = [who.clone(), json.clone()];
+        async move { request(addr, "PATCH", policy, &headers, body.to_string().as_bytes()).await }
+    };
+
+    // An account nobody has touched is not there; a new one reads as
+    // "everything allowed".
+    let r = request(
+        addr,
+        "GET",
+        "/api/v1/accounts/nobody/policy",
+        std::slice::from_ref(&auth),
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 404, "{}", r.text());
+    let r = request(addr, "GET", policy, std::slice::from_ref(&auth), b"").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!(v["account"], "lab");
+    assert_eq!(v["images"], serde_json::json!([]));
+    assert_eq!(v["network"], "allow");
+    assert_eq!(v["tolerations"], serde_json::Value::Null);
+    assert_eq!(v["quota"]["slots"], serde_json::Value::Null);
+
+    // PATCH sets what it names.
+    let r = patch(
+        &auth,
+        serde_json::json!({
+            "executors": ["wasm"],
+            "images": ["ghcr.io/lab/*"],
+            "network": "deny",
+            "max_timeout_ms": 600_000,
+            "quota": {"slots": 2},
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // ... and nothing else: adding one image keeps the rest.
+    let r = patch(
+        &auth,
+        serde_json::json!({"images": {"add": ["python:3.12-slim"]}}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!(
+        v["images"],
+        serde_json::json!(["ghcr.io/lab/*", "python:3.12-slim"])
+    );
+    assert_eq!(v["executors"], serde_json::json!(["wasm"]));
+    assert_eq!(v["network"], "deny");
+    assert_eq!(v["max_timeout_ms"], 600_000);
+    assert_eq!(v["quota"]["slots"], 2);
+    // Add and remove in one call; null lifts a limit; the quota's other
+    // fields stay.
+    let r = patch(
+        &auth,
+        serde_json::json!({
+            "images": {"add": ["node:22-slim"], "remove": ["python:3.12-slim"]},
+            "max_timeout_ms": null,
+            "tolerations": [],
+            "quota": {"gpus": 1},
+        }),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!(
+        v["images"],
+        serde_json::json!(["ghcr.io/lab/*", "node:22-slim"])
+    );
+    assert_eq!(v["max_timeout_ms"], serde_json::Value::Null);
+    assert_eq!(v["tolerations"], serde_json::json!([]));
+    assert_eq!(v["quota"]["slots"], 2);
+    assert_eq!(v["quota"]["gpus"], 1);
+    // What GET answers goes back in unchanged.
+    let before = request(addr, "GET", policy, std::slice::from_ref(&auth), b"")
+        .await
+        .json();
+    let r = patch(&auth, before.clone()).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json(), before);
+
+    // Removing what is not there changes nothing, so a call can be
+    // repeated.
+    let r = patch(
+        &auth,
+        serde_json::json!({"images": {"add": ["node:22-slim"], "remove": ["alpine"]}}),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json(), before);
+
+    // Refused, and nothing changes: the last entry of a list, an unknown
+    // field, another account's body, a ticket that is not an admin's.
+    for (body, status, text) in [
+        (
+            serde_json::json!({"executors": {"remove": ["wasm"]}}),
+            400,
+            "would allow any",
+        ),
+        (serde_json::json!({"image": ["a"]}), 400, "image"),
+        (serde_json::json!({"account": "other"}), 400, "other"),
+        (serde_json::json!({"executors": ["vm"]}), 400, "vm"),
+    ] {
+        let r = patch(&auth, body.clone()).await;
+        assert_eq!(r.status, status, "{body}: {}", r.text());
+        let error = r.json()["error"].as_str().unwrap().to_string();
+        assert!(error.contains(text), "{body}: {error}");
+    }
+    for who in [&lab, &viewer] {
+        let r = patch(who, serde_json::json!({"network": "allow"})).await;
+        assert_eq!(r.status, 403, "{}", r.text());
+        let r = patch(who, serde_json::json!({})).await;
+        assert_eq!(r.status, 403, "{}", r.text());
+    }
+    let after = request(addr, "GET", policy, std::slice::from_ref(&auth), b"")
+        .await
+        .json();
+    assert_eq!(after, before);
+
+    // A submitter reads its own account's policy, not another's; a
+    // viewer reads any.
+    let r = request(addr, "GET", policy, std::slice::from_ref(&lab), b"").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json(), before);
+    let r = request(
+        addr,
+        "GET",
+        "/api/v1/accounts/other/policy",
+        std::slice::from_ref(&lab),
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.text());
+    let r = request(addr, "GET", policy, std::slice::from_ref(&viewer), b"").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    // whoami: a submitter sees what its jobs may ask for.
+    let me = request(
+        addr,
+        "GET",
+        "/api/v1/whoami",
+        std::slice::from_ref(&lab),
+        b"",
+    )
+    .await
+    .json();
+    assert_eq!(me["name"], "lab scripts");
+    assert_eq!(me["account"], "lab");
+    for field in [
+        "images",
+        "require_digest",
+        "executors",
+        "network",
+        "selector",
+        "tolerations",
+        "max_timeout_ms",
+        "max_gpus_per_task",
+    ] {
+        assert_eq!(me["policy"][field], before[field], "{field}");
+    }
+    assert_eq!(me["quota"], before["quota"]);
+    assert_eq!(me["usage"]["running"], 0);
+    let me = request(
+        addr,
+        "GET",
+        "/api/v1/whoami",
+        std::slice::from_ref(&auth),
+        b"",
+    )
+    .await
+    .json();
+    assert_eq!(me["role"], "Admin");
+    assert_eq!(me["policy"], serde_json::Value::Null);
+
+    // validate=1: the answer a real submission would get, and no job.
+    let boundary = "pumasi-test-boundary";
+    let form = (
+        "Content-Type",
+        format!("multipart/form-data; boundary={boundary}"),
+    );
+    let submit = |path: &'static str, body: Vec<u8>| {
+        let headers = [lab.clone(), form.clone()];
+        async move { request(addr, "POST", path, &headers, &body).await }
+    };
+    let jobs = || async {
+        request(
+            addr,
+            "GET",
+            "/api/v1/status",
+            std::slice::from_ref(&auth),
+            b"",
+        )
+        .await
+        .json()["jobs"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let r = submit("/api/v1/jobs?validate=1", job_form(boundary, "checked")).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!(v["valid"], true);
+    assert_eq!(v["account"], "lab");
+    assert_eq!(v["tasks"], 2);
+    assert_eq!(v["ready_nodes"], serde_json::json!(["ui-node"]));
+    assert_eq!(v["waiting"], serde_json::Value::Null);
+    assert_eq!(jobs().await, 0);
+
+    let docker = "name = \"refused\"\nimage = \"python:3.12-slim\"\ncommand = [\"true\"]\n";
+    let checked = submit("/api/v1/jobs?validate=1", toml_form(boundary, docker)).await;
+    assert_eq!(checked.status, 403, "{}", checked.text());
+    let real = submit("/api/v1/jobs", toml_form(boundary, docker)).await;
+    assert_eq!(real.status, 403, "{}", real.text());
+    assert_eq!(checked.json(), real.json());
+    assert!(
+        real.json()["error"].as_str().unwrap().contains("docker"),
+        "{}",
+        real.text()
+    );
+    // A job that is wrong in itself is a 400 either way.
+    let broken = "name = \"broken\"\nmodule = \"missing.wasm\"\n";
+    let checked = submit("/api/v1/jobs?validate=1", toml_form(boundary, broken)).await;
+    assert_eq!(checked.status, 400, "{}", checked.text());
+    let real = submit("/api/v1/jobs", toml_form(boundary, broken)).await;
+    assert_eq!(real.status, 400, "{}", real.text());
+    for r in [&checked, &real] {
+        assert!(r.text().contains("missing.wasm"), "{}", r.text());
+    }
+    let r = submit("/api/v1/jobs?validate=maybe", job_form(boundary, "x")).await;
+    assert_eq!(r.status, 400, "{}", r.text());
+    assert_eq!(jobs().await, 0);
+
+    // A real run: each task says which node ran it and how long each
+    // part took.
+    let r = submit("/api/v1/jobs", job_form(boundary, "timed")).await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let mut job = serde_json::Value::Null;
+    for _ in 0..300 {
+        job = request(
+            addr,
+            "GET",
+            &format!("/api/v1/jobs/{id}"),
+            std::slice::from_ref(&lab),
+            b"",
+        )
+        .await
+        .json();
+        if job["summary"]["state"] != "Running" && job["summary"]["state"] != "Queued" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(job["summary"]["state"], "Succeeded", "{job}");
+    let tasks = job["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
+    for t in tasks {
+        assert_eq!(t["node_name"], "ui-node", "{t}");
+        assert!(t["node"].as_str().is_some_and(|n| n != "ui-node"), "{t}");
+        assert_eq!(t["run_ms"], t["wall_ms"], "{t}");
+        assert!(t["run_ms"].as_u64().unwrap() > 0, "{t}");
+        assert_eq!(t["pull_ms"], 0, "{t}");
+        for field in ["queued_ms", "fetch_ms", "upload_ms"] {
+            assert!(t[field].is_u64(), "{field}: {t}");
+        }
+    }
+
+    // The dashboard: the Accounts page and the job's times.
+    let url = ui.url();
+    let r = request(addr, "GET", &url[url.find("/login").unwrap()..], &[], b"").await;
+    let cookie = r
+        .header("set-cookie")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let page = request(addr, "GET", "/accounts", &[("Cookie", cookie.clone())], b"").await;
+    assert_eq!(page.status, 200, "{}", page.text());
+    assert!(
+        page.text().contains("data-account=\"lab\""),
+        "{}",
+        page.text()
+    );
+    let page = request(
+        addr,
+        "GET",
+        "/accounts/lab",
+        &[("Cookie", cookie.clone())],
+        b"",
+    )
+    .await;
+    assert_eq!(page.status, 200, "{}", page.text());
+    assert!(page.text().contains("node:22-slim"), "{}", page.text());
+    let page = request(
+        addr,
+        "GET",
+        &format!("/jobs/{id}/tasks/0"),
+        &[("Cookie", cookie.clone())],
+        b"",
+    )
+    .await;
+    assert_eq!(page.status, 200, "{}", page.text());
+    for part in ["queued", "fetch", "pull", "run", "upload"] {
+        assert!(
+            page.text().contains(&format!("data-time=\"{part}\"")),
+            "{part}: {}",
+            page.text()
+        );
+    }
+    assert!(page.text().contains("ui-node"), "{}", page.text());
+
+    ui.stop();
+    agent_task.abort();
+}

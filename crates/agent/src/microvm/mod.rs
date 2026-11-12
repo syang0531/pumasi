@@ -704,7 +704,8 @@ impl MicrovmExecutor {
                 stderr: vec![],
                 files: vec![],
                 fuel_used: 0,
-                wall_ms: start.elapsed().as_millis() as u64,
+                // The pull is not the task's run.
+                wall_ms: (start.elapsed().as_millis() as u64).saturating_sub(io.pull.ms()),
                 peak_memory_bytes: None,
                 out_dir: None,
             },
@@ -752,10 +753,20 @@ impl MicrovmExecutor {
         } else {
             None
         };
-        let image = match &io.image {
-            Some(img) => self.ensure_local_image(img, cancel).await?,
-            None => self.ensure_image(&spec.image, cancel).await?,
+        let pull_start = Instant::now();
+        let had_image = match &io.image {
+            Some(img) => self.load_image(&img.digest).is_some(),
+            None => self.cached(&spec.image).is_some(),
         };
+        let image = match &io.image {
+            Some(img) => self.ensure_local_image(img, cancel).await,
+            None => self.ensure_image(&spec.image, cancel).await,
+        };
+        // An image the node already had took no time worth showing.
+        if !had_image {
+            io.pull.set(pull_start);
+        }
+        let image = image?;
         // The timeout covers the run itself, not the image pull.
         let run_start = Instant::now();
         let scratch = TempDir::new_in(&self.run_dir, &format!("{}-{}", task.job, task.index))?;

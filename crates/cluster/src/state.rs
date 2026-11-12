@@ -214,6 +214,30 @@ pub struct TaskRecord {
     /// File store details, persisted in their own table.
     #[serde(skip)]
     pub ext: TaskExt,
+    /// How long the parts of its run took (1.4), persisted in their own
+    /// table.
+    #[serde(skip)]
+    pub times: TaskTimes,
+}
+
+/// How long the parts of a task's run took: of the run that counts (the
+/// last one placed). `wall_ms` is in the task record itself. The layout
+/// is stored: new figures go in a new table, not here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTimes {
+    /// In the queue before the run was placed on a node.
+    pub queued_ms: u64,
+    /// As the node reported them ([`pumasi_proto::msg::TaskTiming`]); 0
+    /// from agents older than 1.4.
+    pub fetch_ms: u64,
+    pub pull_ms: u64,
+    pub upload_ms: u64,
+}
+
+impl TaskTimes {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A provider earning waiting out the hold period.
@@ -288,6 +312,9 @@ pub(crate) struct QueueItem {
     pub check: bool,
     /// The job's priority: the queue is ordered by it, highest first.
     pub priority: i32,
+    /// When it entered the queue (after a restart of the control plane,
+    /// when that started).
+    pub since: Instant,
 }
 
 /// What a queued run needs from a node.
@@ -522,6 +549,8 @@ impl State {
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
         let mut job_ext: HashMap<u128, JobExt> = snap.job_ext.into_iter().collect();
         let mut task_ext: HashMap<(u128, u32), TaskExt> = snap.task_ext.into_iter().collect();
+        let mut task_times: HashMap<(u128, u32), TaskTimes> = snap.task_times.into_iter().collect();
+        let loaded = Instant::now();
         let mut job_origin: HashMap<u128, crate::remote::JobOrigin> =
             snap.job_origin.into_iter().collect();
         state.rollout = state.load_rollout()?;
@@ -552,6 +581,9 @@ impl State {
             }
             for (i, t) in tasks.iter_mut().enumerate() {
                 t.ext = task_ext.remove(&(meta.id.0, i as u32)).unwrap_or_default();
+                t.times = task_times
+                    .remove(&(meta.id.0, i as u32))
+                    .unwrap_or_default();
             }
             let mut changed = Vec::new();
             for (i, t) in tasks.iter_mut().enumerate() {
@@ -577,12 +609,14 @@ impl State {
                         index,
                         check: false,
                         priority: meta.sched.priority,
+                        since: loaded,
                     }),
                     TaskState::Verifying => state.queue.push_back(QueueItem {
                         job: meta.id,
                         index,
                         check: true,
                         priority: meta.sched.priority,
+                        since: loaded,
                     }),
                     _ => {}
                 }
@@ -1210,6 +1244,7 @@ impl State {
                 check: None,
                 cost: 0,
                 ext,
+                times: TaskTimes::default(),
             })
             .collect();
         let blob_refs: Vec<(ModuleHash, &[u8])> =
@@ -1334,6 +1369,7 @@ impl State {
         stored: Option<StoredOutput>,
         opened: Option<crate::confidential::Opened>,
     ) {
+        let timing = self.mgmt.report_timing.remove(&report.task);
         let Some(node) = self.nodes.get_mut(node_id) else {
             return;
         };
@@ -1405,6 +1441,17 @@ impl State {
         } else {
             self.set_stored(r.job, r.index, stored);
             self.note_run(node_id, r, &report.outcome);
+            // No part of a run took longer than the run was out.
+            if let Some(t) = timing
+                && let Some(task) = self
+                    .jobs
+                    .get_mut(&r.job)
+                    .and_then(|j| j.tasks.get_mut(r.index as usize))
+            {
+                task.times.fetch_ms = t.fetch_ms.min(observed_ms);
+                task.times.pull_ms = t.pull_ms.min(observed_ms);
+                task.times.upload_ms = t.upload_ms.min(observed_ms);
+            }
             self.on_primary_report(node_id, report, digest);
         }
         self.schedule();
@@ -1413,6 +1460,7 @@ impl State {
     /// A report whose stored output is not (completely) in the store: the
     /// run is done again, without counting against the node.
     pub fn on_report_rejected(&mut self, node_id: &str, generation: u64, task: TaskRef, why: &str) {
+        self.mgmt.report_timing.remove(&task);
         let Some(node) = self.nodes.get_mut(node_id) else {
             return;
         };
@@ -2179,6 +2227,11 @@ impl State {
                 node: node_id.to_string(),
             };
             task.node = Some(node_id.to_string());
+            // A new run: its own wait, and nothing from the node yet.
+            task.times = TaskTimes {
+                queued_ms: item.since.elapsed().as_millis() as u64,
+                ..Default::default()
+            };
         }
         Some(n_gpus)
     }
@@ -4044,6 +4097,7 @@ mod tests {
                 index: 0,
                 check: false,
                 priority: 0,
+                since: Instant::now(),
             })
             .unwrap();
         let n = &st.nodes[&node];
@@ -4166,5 +4220,291 @@ mod tests {
         let snap = st.store.load().unwrap();
         assert_eq!(snap.measurements.len(), 2);
         assert!(snap.measurements.iter().all(|(_, r)| !r.trusted));
+    }
+
+    // -----------------------------------------------------------------------
+    // Release 1.4: task timings, node names, checking a job
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_times_and_node_names_are_kept() {
+        use pumasi_proto::msg::TaskTiming;
+        let path =
+            std::env::temp_dir().join(format!("pumasi-state-{}.redb", rand::random::<u64>()));
+        let key = SecretKey::generate();
+        let open = |key: &SecretKey| {
+            State::load(
+                "t".into(),
+                key.public().to_string(),
+                Store::open(&path).unwrap(),
+                key.clone(),
+            )
+            .unwrap()
+        };
+        let mut st = open(&key);
+        let (node, node_key, mut rx) = join_keyed(&mut st, "render-1", 1);
+        let id = st.submit(job(Executor::Wasm, 2)).unwrap();
+        let first = assigned(&mut rx).pop().expect("one slot, one run");
+        // Nothing measured yet; the node already has its name.
+        let d = st.task_details(id).unwrap();
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].node_name.as_deref(), Some("render-1"));
+        assert_eq!(d[1].node_name, None);
+        assert_eq!((d[0].pull_ms, d[0].run_ms), (0, 0));
+
+        // The second task waits for the slot while the first runs.
+        std::thread::sleep(Duration::from_millis(40));
+        let generation = st.nodes[&node].generation;
+        // What the node measured comes with its report. It is the node's
+        // word, so nothing is longer than the run was seen to take.
+        st.note_timing(
+            &node,
+            generation,
+            first.task,
+            TaskTiming {
+                fetch_ms: 5,
+                pull_ms: 20,
+                upload_ms: 3_600_000,
+            },
+        );
+        finish(&mut st, &node, &node_key, &first);
+        let d = st.task_details(id).unwrap();
+        assert_eq!((d[0].fetch_ms, d[0].pull_ms), (5, 20));
+        assert!(d[0].upload_ms < 60_000, "{}", d[0].upload_ms);
+        assert_eq!(d[0].run_ms, 1, "the run is the report's wall time");
+        assert_eq!(d[0].run_ms, st.jobs[&id].tasks[0].wall_ms);
+
+        let second = assigned(&mut rx).pop().expect("the slot is free");
+        let d = st.task_details(id).unwrap();
+        assert!(d[1].queued_ms >= 40, "{}", d[1].queued_ms);
+        assert!(d[0].queued_ms < d[1].queued_ms);
+        // A report without timings (an agent older than 1.4) leaves them 0.
+        finish(&mut st, &node, &node_key, &second);
+        let d = st.task_details(id).unwrap();
+        assert_eq!((d[1].fetch_ms, d[1].pull_ms, d[1].upload_ms), (0, 0, 0));
+        // Timings for a run the node does not have are dropped.
+        st.note_timing(&node, generation, second.task, TaskTiming::default());
+        assert!(st.mgmt.report_timing.is_empty());
+        assert!(st.task_details(JobId(1)).is_none());
+
+        // They survive a restart, and go with the job.
+        let before = st.task_details(id).unwrap();
+        drop(st);
+        let st = open(&key);
+        // The node is offline now; its name is still the member's.
+        let after = st.task_details(id).unwrap();
+        assert_eq!(after[0].node_name.as_deref(), Some("render-1"));
+        assert_eq!(after, before);
+        assert_eq!(st.store.load().unwrap().task_times.len(), 2);
+        st.store.delete_jobs(&[(id.0, 2)], &[]).unwrap();
+        assert!(st.store.load().unwrap().task_times.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn checking_a_job_answers_like_submitting_it() {
+        use crate::manage::Caller;
+        use pumasi_proto::manage::AccountPolicy;
+        let mut st = state();
+        st.deposit("ci", 1_000_000, "").unwrap();
+        let (_, _rx) = join(
+            &mut st,
+            "docker-1",
+            vec![Executor::Wasm, Executor::Docker],
+            None,
+        );
+        let (_, _rx2) = join(&mut st, "wasm-1", vec![Executor::Wasm], None);
+        st.set_account_policy(
+            "ci",
+            AccountPolicy {
+                images: vec!["python:3.12-slim".into()],
+                deny_network: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ticket = st
+            .create_access(
+                "ci bot",
+                AccessRole::Submitter {
+                    account: "ci".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let caller = st.access_caller(&ticket.secret).unwrap();
+        assert!(matches!(caller, Caller::Submitter { .. }));
+        let check = |st: &State, sub: JobSubmission| -> Result<pumasi_proto::msg::JobCheck> {
+            let op = crate::access::admit(
+                st,
+                &caller,
+                AdminOp::CheckJob {
+                    sub: Box::new(sub),
+                    upload_bytes: 0,
+                },
+            )?;
+            let AdminOp::CheckJob { sub, upload_bytes } = op else {
+                panic!()
+            };
+            st.check_job(*sub, upload_bytes, true)
+        };
+        let submit = |st: &mut State, sub: JobSubmission| -> Result<JobId> {
+            let AdminOp::Submit(sub) =
+                crate::access::admit(st, &caller, AdminOp::Submit(Box::new(sub)))?
+            else {
+                panic!()
+            };
+            st.submit_from(*sub, true, None)
+        };
+        let image = |name: &str| {
+            let mut j = job(Executor::Docker, 3);
+            j.docker.as_mut().unwrap().image = name.into();
+            j
+        };
+
+        // Allowed: says which nodes would take it, and creates nothing.
+        let jobs = st.jobs.len();
+        let ok = check(&st, image("python:3.12-slim")).unwrap();
+        assert_eq!(ok.account, "ci");
+        assert_eq!(ok.tasks, 3);
+        assert_eq!(ok.ready_nodes, ["docker-1"]);
+        assert_eq!(ok.waiting, None);
+        assert_eq!(st.jobs.len(), jobs);
+        assert!(st.queue.is_empty());
+
+        // Refused with the words the submission is refused with.
+        for bad in [
+            image("blender:latest"),
+            {
+                let mut j = image("python:3.12-slim");
+                j.docker.as_mut().unwrap().network = true;
+                j
+            },
+            {
+                let mut j = image("python:3.12-slim");
+                j.priority = 5;
+                j
+            },
+            {
+                let mut j = image("python:3.12-slim");
+                j.account = Some("someone-else".into());
+                j
+            },
+            {
+                let mut j = image("python:3.12-slim");
+                j.after = vec![JobId(42)];
+                j
+            },
+        ] {
+            let checked = format!("{:#}", check(&st, bad.clone()).unwrap_err());
+            let submitted = format!("{:#}", submit(&mut st, bad).unwrap_err());
+            assert_eq!(checked, submitted);
+        }
+        let err = format!("{:#}", check(&st, image("blender:latest")).unwrap_err());
+        assert!(
+            err.contains("account's policy does not allow the image"),
+            "{err}"
+        );
+        assert_eq!(st.jobs.len(), jobs);
+
+        // Accepted, but nothing would run it now: the answer says why.
+        let wasm_only = check(&st, job(Executor::Wasm, 1)).unwrap();
+        assert_eq!(wasm_only.ready_nodes, ["docker-1", "wasm-1"]);
+        let mut gpu = image("python:3.12-slim");
+        gpu.gpu = Some(GpuRequest {
+            count: 1,
+            vendor: None,
+            min_vram_mib: 0,
+        });
+        let waits = check(&st, gpu).unwrap();
+        assert!(waits.ready_nodes.is_empty());
+        let why = waits.waiting.unwrap();
+        assert!(why.contains("docker-1") && why.contains("wasm-1"));
+
+        // At its quota the job would be accepted and wait.
+        st.set_account_quota(
+            "ci",
+            AccountQuota {
+                slots: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        submit(&mut st, image("python:3.12-slim")).unwrap();
+        let waits = check(&st, image("python:3.12-slim")).unwrap();
+        assert!(waits.ready_nodes.is_empty());
+        assert!(waits.waiting.unwrap().contains("quota"));
+
+        // A job that waits for another says so.
+        let first = *st.jobs.keys().next().unwrap();
+        let mut after = image("python:3.12-slim");
+        after.after = vec![first];
+        let waits = check(&st, after).unwrap();
+        assert!(waits.waiting.unwrap().contains("waits for job"));
+
+        // Viewers may not check (they may not submit); admins are not
+        // held to the policy.
+        let viewer = st.create_access("v", AccessRole::Viewer, None).unwrap();
+        let viewer = st.access_caller(&viewer.secret).unwrap();
+        assert!(
+            crate::access::admit(
+                &st,
+                &viewer,
+                AdminOp::CheckJob {
+                    sub: Box::new(job(Executor::Wasm, 1)),
+                    upload_bytes: 0,
+                },
+            )
+            .is_err()
+        );
+        let mut admins = image("blender:latest");
+        admins.account = Some("ci".into());
+        assert!(st.check_job(admins, 0, false).is_ok());
+    }
+
+    #[test]
+    fn capacity_counts_only_what_the_policy_allows() {
+        use pumasi_proto::manage::AccountPolicy;
+        let mut st = state();
+        st.deposit("ci", 1_000_000, "").unwrap();
+        let (a, _, _rx) = join_gpus(&mut st, "gpu-a", vec![gpu(0, 12_700, 0)], None);
+        let (_, _, _rx2) = join_gpus(&mut st, "gpu-b", vec![gpu(0, 12_700, 0)], None);
+        labels(&mut st, &a, &[("zone", "lab")]);
+        let cap = st.capacity("ci");
+        assert_eq!(cap.ready_for(Executor::Docker), 2);
+        assert_eq!(cap.ready_gpu, 2);
+
+        // Executors and the selector the policy adds to every job.
+        st.set_account_policy(
+            "ci",
+            AccountPolicy {
+                executors: vec![Executor::Docker],
+                selector: "zone=lab".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cap = st.capacity("ci");
+        assert_eq!(cap.ready.len(), 1, "only the executors it may use");
+        assert_eq!(cap.ready_for(Executor::Docker), 1);
+        assert_eq!(cap.ready_gpu, 1);
+        let other = cap.nodes.iter().find(|n| n.node == "gpu-b").unwrap();
+        assert!(other.executors.is_empty());
+        assert!(other.reason.is_some());
+
+        // A policy that gives tasks no GPU has no GPU node ready.
+        st.set_account_policy(
+            "ci",
+            AccountPolicy {
+                max_gpus_per_task: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cap = st.capacity("ci");
+        assert_eq!(cap.ready_for(Executor::Docker), 2);
+        assert_eq!((cap.ready_gpu, cap.ready_gpu_graphics), (0, 0));
+        // Other accounts are not held to it.
+        assert_eq!(st.capacity("owner").ready_gpu, 2);
     }
 }

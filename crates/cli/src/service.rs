@@ -2,12 +2,19 @@
 //! as an OS service that starts at boot and restarts when it stops
 //! (systemd on Linux, launchd on macOS, the service manager on Windows).
 //!
-//! The service runs `pumasi --home <home> agent start <args>` (or
-//! `cluster start`, or `ui`; on Windows `... service run --role <role> --
-//! <args>`, which speaks the service control protocol). When the agent
-//! installs an upgrade it restarts in place: `exec` on Unix, and on
-//! Windows the service exits with [`RESTART_EXIT_CODE`], which the failure
-//! actions set at install turn into a restart.
+//! The service runs `pumasi --home <home> service run --role <role>`,
+//! which reads the role's options from a file in the home (`agent.toml`,
+//! `control-plane.toml`, `ui.toml`) and runs `agent start`, `cluster
+//! start` or `ui` with them (1.4); on Windows it also speaks the service
+//! control protocol. `pumasi service set` changes the options in the file
+//! and restarts the service. Services installed by releases before 1.4
+//! carry their options in the service definition instead (`pumasi --home
+//! <home> agent start <options>`): they keep working, and their first
+//! `service set` moves them to the file.
+//!
+//! When the agent installs an upgrade it restarts in place: `exec` on
+//! Unix, and on Windows the service exits with [`RESTART_EXIT_CODE`],
+//! which the failure actions set at install turn into a restart.
 
 use std::path::{Path, PathBuf};
 
@@ -85,12 +92,23 @@ impl Role {
     }
 
     /// The subcommand the service runs.
-    fn command(self) -> &'static [&'static str] {
+    pub fn command(self) -> &'static [&'static str] {
         match self {
             Role::Agent => &["agent", "start"],
             Role::Cluster => &["cluster", "start"],
             Role::Ui => &["ui"],
         }
+    }
+
+    /// The file in the home that holds the service's options (1.4). The
+    /// control plane's is not `cluster.toml`: that is what the examples
+    /// call the file `pumasi apply` takes.
+    pub fn options_file(self, home: &Path) -> PathBuf {
+        home.join(match self {
+            Role::Agent => "agent.toml",
+            Role::Cluster => "control-plane.toml",
+            Role::Ui => "ui.toml",
+        })
     }
 }
 
@@ -114,12 +132,35 @@ pub enum ServiceCmd {
         /// Print the service definition instead of installing it.
         #[arg(long)]
         dry_run: bool,
+        /// Keep the options in the service definition, as releases
+        /// before 1.4 did, instead of in the options file: for testing
+        /// that such services still work and can be changed.
+        #[arg(long, hide = true)]
+        inline_options: bool,
         /// Options for the command the service runs, after `--`: as for
         /// `pumasi agent start` (`-- --allow-microvm --auto-upgrade`),
         /// `pumasi cluster start` (`-- --name home`) or `pumasi ui`
-        /// (`-- --api-only`).
+        /// (`-- --api-only`). Change them later with `pumasi service set`.
         #[arg(last = true)]
         args: Vec<String>,
+    },
+    /// Change the options of an installed service and restart it. The
+    /// options it has stay; the ones given after `--` are added or
+    /// replaced, and `--no-OPTION` removes one: `pumasi service set --
+    /// --allow-webgpu --no-allow-docker --slots 4`. `pumasi service
+    /// status` shows the options.
+    Set {
+        #[arg(value_enum, default_value_t = Role::Agent)]
+        role: Role,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// Print the options the service would get, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// The changes, after `--`: `--OPTION [VALUE]` adds an option or
+        /// replaces its value, `--no-OPTION` removes it.
+        #[arg(last = true)]
+        changes: Vec<String>,
     },
     /// Stop and remove a service. An agent's machine stays a cluster
     /// member; a control plane keeps its data.
@@ -137,7 +178,9 @@ pub enum ServiceCmd {
         #[command(flatten)]
         scope: ScopeArgs,
     },
-    /// Entry point the Windows service manager runs.
+    /// What an installed service runs: the role's command with the
+    /// options in its options file (or, for services installed before
+    /// 1.4 on Windows, the ones after `--`).
     #[command(hide = true)]
     Run {
         #[arg(long, value_enum, default_value_t = Role::Agent)]
@@ -147,7 +190,7 @@ pub enum ServiceCmd {
     },
 }
 
-#[derive(Args, Clone, Copy, Default)]
+#[derive(Args, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScopeArgs {
     /// A service of the current user (systemd --user, a LaunchAgent that
     /// starts at login) instead of a system service. The default is a
@@ -187,6 +230,14 @@ impl ScopeArgs {
             _ => None,
         }
     }
+
+    #[cfg_attr(windows, allow(dead_code))]
+    fn of(scope: Scope) -> Self {
+        ScopeArgs {
+            user: scope == Scope::User,
+            system: scope == Scope::System,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -205,7 +256,10 @@ pub struct Spec {
     pub role: Role,
     pub exe: PathBuf,
     pub home: PathBuf,
-    pub args: Vec<String>,
+    /// `None`: the service reads its options from the options file.
+    /// `Some`: they go in the service definition, the form of releases
+    /// before 1.4.
+    pub inline: Option<Vec<String>>,
     /// The account a system service runs as (Linux, macOS); `None` for
     /// root.
     pub user: Option<String>,
@@ -218,18 +272,24 @@ impl Spec {
             "--home".to_string(),
             self.home.to_string_lossy().into_owned(),
         ];
-        if cfg!(windows) {
-            a.extend([
-                "service".into(),
-                "run".into(),
-                "--role".into(),
-                self.role.as_str().into(),
-                "--".into(),
-            ]);
-        } else {
-            a.extend(self.role.command().iter().map(|s| s.to_string()));
+        let run = [
+            "service".to_string(),
+            "run".into(),
+            "--role".into(),
+            self.role.as_str().into(),
+        ];
+        match &self.inline {
+            None => a.extend(run),
+            Some(options) => {
+                if cfg!(windows) {
+                    a.extend(run);
+                    a.push("--".into());
+                } else {
+                    a.extend(self.role.command().iter().map(|s| s.to_string()));
+                }
+                a.extend(options.iter().cloned());
+            }
         }
-        a.extend(self.args.iter().cloned());
         a
     }
 
@@ -290,14 +350,345 @@ pub fn install(spec: &Spec, scope: ScopeArgs, dry_run: bool) -> Result<i32> {
 }
 
 pub fn uninstall(role: Role, scope: ScopeArgs) -> Result<i32> {
-    imp::uninstall(role, scope)
+    // The options go with the service.
+    let options = installed(role, scope)
+        .ok()
+        .flatten()
+        .and_then(|i| i.definition(role).ok())
+        .map(|d| role.options_file(&d.home));
+    let code = imp::uninstall(role, scope)?;
+    if let Some(file) = options
+        && file.exists()
+        && std::fs::remove_file(&file).is_ok()
+    {
+        println!("removed {}", file.display());
+    }
+    Ok(code)
+}
+
+/// The installed service, as its service manager has it: `None` when it
+/// is not installed.
+pub fn installed(role: Role, scope: ScopeArgs) -> Result<Option<Installed>> {
+    imp::definition(role, scope)
+}
+
+/// Stops the service and starts it again.
+pub fn restart(role: Role, scope: ScopeArgs) -> Result<()> {
+    imp::restart(role, scope)
+}
+
+/// Fails, before anything is changed, when this user may not restart the
+/// service.
+pub fn can_control(role: Role, scope: ScopeArgs) -> Result<()> {
+    imp::can_control(role, scope)
+}
+
+/// A service as its service manager has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    /// The binary it runs.
+    pub exe: PathBuf,
+    /// The arguments after the binary.
+    pub argv: Vec<String>,
+    /// The account it runs as, when the definition names one.
+    pub user: Option<String>,
+    /// Where it is installed (always the system on Windows).
+    pub scope: ScopeArgs,
+}
+
+/// What a service definition says about the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Definition {
+    pub home: PathBuf,
+    /// The options in the definition itself (a service installed before
+    /// 1.4). `None`: the service reads the options file.
+    pub inline: Option<Vec<String>>,
+}
+
+impl Installed {
+    /// Reads `--home HOME service run --role ROLE [-- OPTIONS]` or
+    /// `--home HOME agent start OPTIONS` (and the other roles' commands).
+    pub fn definition(&self, role: Role) -> Result<Definition> {
+        let odd = || {
+            anyhow::anyhow!(
+                "the {} service's definition is not one `pumasi service install` wrote: {} {}",
+                role.as_str(),
+                self.exe.display(),
+                show_options(&self.argv)
+            )
+        };
+        let mut rest = self.argv.as_slice();
+        let home = match rest {
+            [flag, home, tail @ ..] if flag == "--home" => {
+                rest = tail;
+                PathBuf::from(home)
+            }
+            _ => return Err(odd()),
+        };
+        let run = ["service", "run", "--role", role.as_str()];
+        if rest.len() >= run.len() && rest[..run.len()].iter().eq(run.iter()) {
+            let inline = match &rest[run.len()..] {
+                [] => None,
+                [dashes, options @ ..] if dashes == "--" => {
+                    // Before 1.4 the Windows service always had the
+                    // `--`, with or without options after it.
+                    (!options.is_empty() || !role.options_file(&home).exists())
+                        .then(|| options.to_vec())
+                }
+                _ => return Err(odd()),
+            };
+            return Ok(Definition { home, inline });
+        }
+        let command = role.command();
+        if rest.len() >= command.len() && rest[..command.len()].iter().eq(command.iter()) {
+            return Ok(Definition {
+                home,
+                inline: Some(rest[command.len()..].to_vec()),
+            });
+        }
+        Err(odd())
+    }
+}
+
+/// The options file: `options = ["--allow-docker", "--slots", "4"]`.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct OptionsFile {
+    #[serde(default)]
+    options: Vec<String>,
+}
+
+/// The options in the role's options file; `None` when there is no file.
+pub fn read_options(role: Role, home: &Path) -> Result<Option<Vec<String>>> {
+    let path = role.options_file(home);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let file: OptionsFile =
+        toml::from_str(&text).with_context(|| format!("bad options file {}", path.display()))?;
+    Ok(Some(file.options))
+}
+
+/// Writes the role's options file, readable only by its owner (a
+/// dashboard's options may hold an admin ticket). A file root writes into
+/// a home someone else owns is given to that owner, whom a system control
+/// plane or dashboard runs as.
+pub fn write_options(role: Role, home: &Path, options: &[String]) -> Result<PathBuf> {
+    let path = role.options_file(home);
+    let body = toml::to_string(&OptionsFile {
+        options: options.to_vec(),
+    })
+    .context("write the options")?;
+    let text = format!(
+        "# Options of the Pumasi {} service on this machine: what `pumasi {}` would take.\n\
+         # Change them with `pumasi service set {} -- --OPTION` (`--no-OPTION` removes one),\n\
+         # which also restarts the service. After editing this file by hand, restart it.\n{body}",
+        role.as_str(),
+        role.command().join(" "),
+        role.as_str(),
+    );
+    std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
+    // Written whole, then moved into place: a service that starts now
+    // reads the old options or the new ones.
+    let tmp = path.with_extension("toml.tmp");
+    pumasi_proto::net::write_private(&tmp, text.as_bytes())
+        .with_context(|| format!("write {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if is_root()
+            && let Ok(m) = std::fs::metadata(home)
+            && m.uid() != 0
+        {
+            let _ = std::os::unix::fs::chown(&tmp, Some(m.uid()), Some(m.gid()));
+        }
+    }
+    std::fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+/// The options a service started as `service run` runs with: the ones in
+/// its definition when it has any (installed before 1.4), else the file's.
+pub fn run_options(role: Role, home: &Path, inline: Vec<String>) -> Result<Vec<String>> {
+    if !inline.is_empty() {
+        return Ok(inline);
+    }
+    Ok(read_options(role, home)?.unwrap_or_default())
+}
+
+/// Options on one line, for people: quoted where they hold spaces, and
+/// without the value of `--admin` (a ticket).
+pub fn show_options(options: &[String]) -> String {
+    let mut out = Vec::new();
+    let mut hide = false;
+    for o in options {
+        let shown = if std::mem::take(&mut hide) {
+            "***".to_string()
+        } else if let Some((name, _)) = o.split_once('=')
+            && name == "--admin"
+        {
+            "--admin=***".to_string()
+        } else if o.is_empty() || o.contains(char::is_whitespace) || o.contains('"') {
+            format!("{o:?}")
+        } else {
+            o.clone()
+        };
+        hide = o == "--admin";
+        out.push(shown);
+    }
+    if out.is_empty() {
+        "(none)".into()
+    } else {
+        out.join(" ")
+    }
+}
+
+/// One option of a list: its name without the dashes, and its values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Opt {
+    name: String,
+    values: Vec<String>,
+}
+
+/// What `command` says about its option `--name`: whether it takes a
+/// value, and whether it may be given more than once.
+fn option_kind(command: &clap::Command, name: &str) -> Option<(bool, bool)> {
+    command
+        .get_arguments()
+        .find(|a| a.get_long() == Some(name) && !a.is_positional())
+        .map(|a| {
+            let action = a.get_action();
+            (
+                action.takes_values(),
+                matches!(action, clap::ArgAction::Append),
+            )
+        })
+}
+
+/// Splits `--name value --flag --other=value` into options, by what
+/// `command` says takes a value. With `changes`, `--no-NAME` and other
+/// names the command does not have are let through for the caller.
+fn split_options(command: &clap::Command, args: &[String], changes: bool) -> Result<Vec<Opt>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        i += 1;
+        let Some(body) = arg.strip_prefix("--").filter(|b| !b.is_empty()) else {
+            bail!("{arg:?}: options start with `--` (long names only)");
+        };
+        let (name, inline) = match body.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_string())),
+            None => (body, None),
+        };
+        ensure_changeable(name)?;
+        let values = match option_kind(command, name) {
+            Some((true, _)) => match inline {
+                Some(v) => vec![v],
+                None => {
+                    let v = args
+                        .get(i)
+                        .with_context(|| format!("--{name} needs a value"))?;
+                    i += 1;
+                    vec![v.clone()]
+                }
+            },
+            Some((false, _)) => {
+                if inline.is_some() {
+                    bail!("--{name} takes no value");
+                }
+                Vec::new()
+            }
+            None if changes && inline.is_none() => Vec::new(),
+            None => bail!("no such option: --{name}"),
+        };
+        out.push(Opt {
+            name: name.to_string(),
+            values,
+        });
+    }
+    Ok(out)
+}
+
+fn ensure_changeable(name: &str) -> Result<()> {
+    if matches!(name, "home" | "help" | "version") {
+        bail!("--{name} is not an option of the service");
+    }
+    Ok(())
+}
+
+/// The options of a service after `changes`: the current ones stay,
+/// `--NAME [VALUE]` adds one or replaces its value (an option that may
+/// repeat, such as `--relay`, gets one more value), and `--no-NAME`
+/// removes `--NAME`. Flags that come in pairs (`--auto-upgrade` and
+/// `--no-auto-upgrade`) replace each other, and a flag that only has a
+/// `--no-` form (`--no-gpus`) is removed with the plain name (`--gpus`).
+/// `command` is the command the service runs.
+pub fn merge_options(
+    command: &clap::Command,
+    current: &[String],
+    changes: &[String],
+) -> Result<Vec<String>> {
+    let mut options = split_options(command, current, false)
+        .context("the service's current options are not what this pumasi takes")?;
+    let known = |name: &str| option_kind(command, name).is_some();
+    for change in split_options(command, changes, true)? {
+        let name = change.name.as_str();
+        if let Some((_, repeats)) = option_kind(command, name) {
+            // A flag and its opposite do not stay together.
+            let opposite = match name.strip_prefix("no-") {
+                Some(plain) => plain.to_string(),
+                None => format!("no-{name}"),
+            };
+            if known(&opposite) {
+                options.retain(|o| o.name != opposite);
+            }
+            if repeats {
+                if !options.contains(&change) {
+                    options.push(change);
+                }
+            } else if let Some(old) = options.iter_mut().find(|o| o.name == name) {
+                *old = change;
+            } else {
+                options.push(change);
+            }
+        } else if let Some(plain) = name.strip_prefix("no-").filter(|p| known(p)) {
+            // `--no-NAME`: remove `--NAME`.
+            options.retain(|o| o.name != plain);
+        } else if known(&format!("no-{name}")) {
+            // `--NAME` where only `--no-NAME` exists: remove that.
+            let no = format!("no-{name}");
+            options.retain(|o| o.name != no);
+        } else {
+            bail!(
+                "no such option: --{name} (see `pumasi {} --help`)",
+                command_path(command)
+            );
+        }
+    }
+    Ok(options
+        .into_iter()
+        .flat_map(|o| std::iter::once(format!("--{}", o.name)).chain(o.values))
+        .collect())
+}
+
+fn command_path(command: &clap::Command) -> String {
+    command
+        .get_bin_name()
+        .unwrap_or(command.get_name())
+        .trim_start_matches("pumasi ")
+        .to_string()
 }
 
 /// Exit code 0 when the service runs, 3 when it is not installed or
 /// stopped; without a role, 0 when every installed one runs.
 pub fn status(role: Option<Role>, scope: ScopeArgs) -> Result<i32> {
     if let Some(role) = role {
-        return imp::status(role, scope, true);
+        let code = imp::status(role, scope, true)?;
+        print_options(role, scope);
+        return Ok(code);
     }
     let mut any = false;
     let mut all_running = true;
@@ -311,12 +702,41 @@ pub fn status(role: Option<Role>, scope: ScopeArgs) -> Result<i32> {
         any = true;
         println!("{}:", role.as_str());
         all_running &= imp::status(role, scope, false)? == 0;
+        print_options(role, scope);
     }
     if !any {
         println!("no Pumasi service is installed");
         return Ok(3);
     }
     Ok(if all_running { 0 } else { 3 })
+}
+
+/// The `options:` line of `service status`: what the service runs with,
+/// and where that is kept.
+fn print_options(role: Role, scope: ScopeArgs) {
+    let Ok(Some(installed)) = installed(role, scope) else {
+        return;
+    };
+    let Ok(def) = installed.definition(role) else {
+        return;
+    };
+    let file = role.options_file(&def.home);
+    match &def.inline {
+        Some(options) => {
+            println!("options:  {}", show_options(options));
+            println!(
+                "          (in the service definition, from a release before 1.4; `pumasi service set` moves them to {})",
+                file.display()
+            );
+        }
+        None => match read_options(role, &def.home) {
+            Ok(options) => {
+                println!("options:  {}", show_options(&options.unwrap_or_default()));
+                println!("          ({})", file.display());
+            }
+            Err(e) => println!("options:  unreadable ({e:#})"),
+        },
+    }
 }
 
 fn run_cmd(program: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -359,6 +779,63 @@ fn systemd_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The arguments of an `ExecStart=` line: what [`systemd_quote`] wrote,
+/// and plain words.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn systemd_split(exec: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut has, mut quoted) = (false, false);
+    let mut chars = exec.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                has = true;
+            }
+            '\\' if quoted => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            '%' | '$' if chars.peek() == Some(&c) => {
+                chars.next();
+                cur.push(c);
+                has = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if std::mem::take(&mut has) {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if has {
+        out.push(cur);
+    }
+    out
+}
+
+/// The binary, its arguments and the account of a unit file.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn systemd_definition(unit: &str) -> Option<(PathBuf, Vec<String>, Option<String>)> {
+    let line = |key: &str| {
+        unit.lines()
+            .find_map(|l| l.trim().strip_prefix(key))
+            .map(str::trim)
+    };
+    let mut argv = systemd_split(line("ExecStart=")?);
+    if argv.is_empty() {
+        return None;
+    }
+    let exe = PathBuf::from(argv.remove(0));
+    Some((exe, argv, line("User=").map(str::to_string)))
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -449,6 +926,41 @@ mod imp {
 
     pub fn installed(role: Role, scope: ScopeArgs) -> Result<bool> {
         Ok(unit_path(role, installed_scope(role, scope)?)?.exists())
+    }
+
+    pub fn definition(role: Role, scope: ScopeArgs) -> Result<Option<Installed>> {
+        let scope = installed_scope(role, scope)?;
+        let path = unit_path(role, scope)?;
+        let unit = match std::fs::read_to_string(&path) {
+            Ok(u) => u,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        let (exe, argv, user) = systemd_definition(&unit)
+            .with_context(|| format!("{} has no ExecStart", path.display()))?;
+        Ok(Some(Installed {
+            exe,
+            argv,
+            user,
+            scope: ScopeArgs::of(scope),
+        }))
+    }
+
+    pub fn can_control(role: Role, scope: ScopeArgs) -> Result<()> {
+        if installed_scope(role, scope)? == Scope::System && !is_root() {
+            bail!(
+                "the {} service is a system service: use sudo",
+                role.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn restart(role: Role, scope: ScopeArgs) -> Result<()> {
+        let scope = installed_scope(role, scope)?;
+        systemctl(scope, &["restart", &format!("{}.service", role.name())])
+            .context("restart the service (a system service needs root)")?;
+        Ok(())
     }
 
     pub fn install(spec: &Spec, scope: ScopeArgs, dry_run: bool) -> Result<i32> {
@@ -557,6 +1069,56 @@ fn xml_escape(s: &str) -> String {
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The `<string>` values between `open` and `close` in `text`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn xml_strings(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<string>") {
+        let after = &rest[start + "<string>".len()..];
+        let Some(end) = after.find("</string>") else {
+            break;
+        };
+        out.push(xml_unescape(&after[..end]));
+        rest = &after[end + "</string>".len()..];
+    }
+    out
+}
+
+/// The binary, its arguments and the account of a plist that
+/// [`launchd_plist`] wrote.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn launchd_definition(plist: &str) -> Option<(PathBuf, Vec<String>, Option<String>)> {
+    let after = |key: &str| {
+        let k = format!("<key>{key}</key>");
+        plist.find(&k).map(|i| &plist[i + k.len()..])
+    };
+    let args = after("ProgramArguments")?;
+    let array = &args[args.find("<array>")?..args.find("</array>")?];
+    let mut argv = xml_strings(array);
+    if argv.is_empty() {
+        return None;
+    }
+    let exe = PathBuf::from(argv.remove(0));
+    // The value right after the key, not a later string.
+    let user = after("UserName").and_then(|rest| {
+        let rest = rest.trim_start();
+        rest.starts_with("<string>")
+            .then(|| xml_strings(rest).into_iter().next())
+            .flatten()
+    });
+    Some((exe, argv, user))
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn launchd_plist(spec: &Spec, system: bool) -> String {
     let mut args = format!(
         "        <string>{}</string>\n",
@@ -644,6 +1206,52 @@ mod imp {
 
     pub fn installed(role: Role, scope: ScopeArgs) -> Result<bool> {
         Ok(plist_path(role, installed_scope(role, scope)?)?.exists())
+    }
+
+    pub fn definition(role: Role, scope: ScopeArgs) -> Result<Option<Installed>> {
+        let scope = installed_scope(role, scope)?;
+        let path = plist_path(role, scope)?;
+        let plist = match std::fs::read_to_string(&path) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        let (exe, argv, user) = launchd_definition(&plist)
+            .with_context(|| format!("{} has no ProgramArguments", path.display()))?;
+        Ok(Some(Installed {
+            exe,
+            argv,
+            user,
+            scope: ScopeArgs::of(scope),
+        }))
+    }
+
+    pub fn can_control(role: Role, scope: ScopeArgs) -> Result<()> {
+        if installed_scope(role, scope)? == Scope::System && !is_root() {
+            bail!(
+                "the {} service is a system service: use sudo",
+                role.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn restart(role: Role, scope: ScopeArgs) -> Result<()> {
+        let scope = installed_scope(role, scope)?;
+        let target = format!("{}/{}", domain(scope), role.label());
+        if run_cmd("launchctl", &["kickstart", "-k", &target]).is_ok_and(|o| o.status.success()) {
+            return Ok(());
+        }
+        // Not loaded (or an older launchctl): load it again.
+        let path = plist_path(role, scope)?;
+        unload(role, scope, &path);
+        let p = path.to_string_lossy().into_owned();
+        let boot = run_cmd("launchctl", &["bootstrap", &domain(scope), &p])?;
+        if !boot.status.success() {
+            check_cmd("launchctl", &["load", "-w", &p])
+                .context("restart the service (a system service needs root)")?;
+        }
+        Ok(())
     }
 
     fn unload(role: Role, scope: Scope, path: &Path) {
@@ -772,6 +1380,58 @@ mod imp {
 // Windows: the service control manager
 // ---------------------------------------------------------------------------
 
+/// Splits a Windows command line (a service's binary path with its
+/// arguments) the way the C runtime does: quotes group, and backslashes
+/// are literal except before a quote.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn split_command_line(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut has, mut quoted) = (false, false);
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                let start = i;
+                while i < chars.len() && chars[i] == '\\' {
+                    i += 1;
+                }
+                let n = i - start;
+                if chars.get(i) == Some(&'"') {
+                    cur.extend(std::iter::repeat_n('\\', n / 2));
+                    if n % 2 == 1 {
+                        cur.push('"');
+                        i += 1;
+                    }
+                } else {
+                    cur.extend(std::iter::repeat_n('\\', n));
+                }
+                has = true;
+                continue;
+            }
+            '"' => {
+                quoted = !quoted;
+                has = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if std::mem::take(&mut has) {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
+        i += 1;
+    }
+    if has {
+        out.push(cur);
+    }
+    out
+}
+
 #[cfg(windows)]
 mod imp {
     use std::{ffi::OsString, time::Duration};
@@ -797,6 +1457,52 @@ mod imp {
         Ok(mgr
             .open_service(role.name(), ServiceAccess::QUERY_STATUS)
             .is_ok())
+    }
+
+    pub fn definition(role: Role, scope: ScopeArgs) -> Result<Option<Installed>> {
+        let mgr = manager(ServiceManagerAccess::CONNECT)?;
+        let Ok(service) = mgr.open_service(role.name(), ServiceAccess::QUERY_CONFIG) else {
+            return Ok(None);
+        };
+        let config = service.query_config().context("read the service")?;
+        // The binary path holds the whole command line.
+        let mut argv = split_command_line(&config.executable_path.to_string_lossy());
+        if argv.is_empty() {
+            bail!("the {} service has no command line", role.name());
+        }
+        let exe = PathBuf::from(argv.remove(0));
+        Ok(Some(Installed {
+            exe,
+            argv,
+            user: None,
+            scope,
+        }))
+    }
+
+    pub fn can_control(role: Role, _scope: ScopeArgs) -> Result<()> {
+        let mgr = manager(ServiceManagerAccess::CONNECT)?;
+        mgr.open_service(
+            role.name(),
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::STOP
+                | ServiceAccess::START
+                | ServiceAccess::DELETE,
+        )
+        .context("changing the service needs an administrator PowerShell")?;
+        Ok(())
+    }
+
+    pub fn restart(role: Role, _scope: ScopeArgs) -> Result<()> {
+        let mgr = manager(ServiceManagerAccess::CONNECT)?;
+        let service = mgr
+            .open_service(
+                role.name(),
+                ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+            )
+            .context("open the service (run from an administrator PowerShell)")?;
+        stop_and_wait(&service);
+        service.start::<&str>(&[]).context("start the service")?;
+        Ok(())
     }
 
     pub fn install(spec: &Spec, _scope: ScopeArgs, dry_run: bool) -> Result<i32> {
@@ -1083,14 +1789,19 @@ pub mod windows {
 mod tests {
     use super::*;
 
+    /// A service as releases before 1.4 installed it: options inline.
     fn spec() -> Spec {
         Spec {
             role: Role::Agent,
             exe: PathBuf::from("/opt/pumasi dir/pumasi"),
             home: PathBuf::from("/var/lib/pumasi"),
-            args: vec!["--name".into(), "100% \"node\" $1".into()],
+            inline: Some(vec!["--name".into(), "100% \"node\" $1".into()]),
             user: None,
         }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -1116,7 +1827,7 @@ mod tests {
     fn control_plane_units_run_as_the_homes_owner() {
         let mut s = spec();
         s.role = Role::Cluster;
-        s.args = vec!["--no-token".into()];
+        s.inline = Some(vec!["--no-token".into()]);
         s.user = Some("stan".into());
         let unit = systemd_unit(&s, false);
         assert!(unit.contains("Description=Pumasi control plane"));
@@ -1140,10 +1851,334 @@ mod tests {
     #[test]
     fn launchd_plists_escape_arguments() {
         let mut s = spec();
-        s.args = vec!["--name".into(), "a<b&c".into()];
+        s.inline = Some(vec!["--name".into(), "a<b&c".into()]);
         let plist = launchd_plist(&s, true);
         assert!(plist.contains("<string>a&lt;b&amp;c</string>"));
         assert!(plist.contains("<string>/opt/pumasi dir/pumasi</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+    }
+    #[test]
+    fn new_services_read_their_options_from_the_file() {
+        let mut s = spec();
+        s.inline = None;
+        let unit = systemd_unit(&s, false);
+        let exec = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStart="))
+            .unwrap();
+        assert_eq!(
+            exec,
+            r#""/opt/pumasi dir/pumasi" "--home" "/var/lib/pumasi" "service" "run" "--role" "agent""#
+        );
+        assert_eq!(
+            Role::Agent.options_file(&s.home),
+            PathBuf::from("/var/lib/pumasi/agent.toml")
+        );
+        // Not the name the `pumasi apply` examples use.
+        assert!(
+            Role::Cluster
+                .options_file(&s.home)
+                .ends_with("control-plane.toml")
+        );
+        assert!(Role::Ui.options_file(&s.home).ends_with("ui.toml"));
+    }
+
+    #[test]
+    fn definitions_are_read_back() {
+        // systemd: what `systemd_unit` wrote, with its quoting.
+        let mut s = spec();
+        s.user = Some("stan".into());
+        let (exe, argv, user) = systemd_definition(&systemd_unit(&s, false)).unwrap();
+        assert_eq!(exe, s.exe);
+        assert_eq!(argv, s.args());
+        assert_eq!(user.as_deref(), Some("stan"));
+        s.inline = None;
+        s.user = None;
+        let (exe, argv, user) = systemd_definition(&systemd_unit(&s, true)).unwrap();
+        assert_eq!((exe, argv, user), (s.exe.clone(), s.args(), None));
+        // A unit written by hand, without quotes.
+        let (exe, argv, _) = systemd_definition(
+            "[Service]\nExecStart=/usr/local/bin/pumasi --home /var/lib/pumasi agent start --slots 2\n",
+        )
+        .unwrap();
+        assert_eq!(exe, PathBuf::from("/usr/local/bin/pumasi"));
+        assert_eq!(
+            argv,
+            strs(&[
+                "--home",
+                "/var/lib/pumasi",
+                "agent",
+                "start",
+                "--slots",
+                "2"
+            ])
+        );
+        assert!(systemd_definition("[Service]\nRestart=always\n").is_none());
+
+        // launchd: what `launchd_plist` wrote, with its escaping; the log
+        // path and the label are not arguments.
+        let mut s = spec();
+        s.inline = Some(strs(&["--name", "a<b&c \"d\"", "--allow-docker"]));
+        s.user = Some("stan".into());
+        let (exe, argv, user) = launchd_definition(&launchd_plist(&s, true)).unwrap();
+        assert_eq!(exe, s.exe);
+        assert_eq!(argv, s.args());
+        assert_eq!(user.as_deref(), Some("stan"));
+        let (_, argv, user) = launchd_definition(&launchd_plist(&s, false)).unwrap();
+        assert_eq!(argv, s.args());
+        assert_eq!(user, None);
+
+        // Windows: the service's command line.
+        assert_eq!(
+            split_command_line(
+                r#""C:\Program Files\Pumasi\pumasi.exe" --home C:\Users\stan\.pumasi service run --role agent -- --name "my node" --allow-docker"#
+            ),
+            strs(&[
+                r"C:\Program Files\Pumasi\pumasi.exe",
+                "--home",
+                r"C:\Users\stan\.pumasi",
+                "service",
+                "run",
+                "--role",
+                "agent",
+                "--",
+                "--name",
+                "my node",
+                "--allow-docker",
+            ])
+        );
+        // Backslashes are literal except before a quote.
+        assert_eq!(
+            split_command_line(r#"a\b "c d\\" "e \"f\"" g\\h """#),
+            strs(&[r"a\b", r"c d\", r#"e "f""#, r"g\\h", ""])
+        );
+        assert!(split_command_line("   ").is_empty());
+    }
+
+    fn installed(argv: &[&str]) -> Installed {
+        Installed {
+            exe: PathBuf::from("/usr/local/bin/pumasi"),
+            argv: strs(argv),
+            user: None,
+            scope: ScopeArgs::default(),
+        }
+    }
+
+    #[test]
+    fn definitions_say_where_the_options_are() {
+        let home = std::env::temp_dir().join(format!("pumasi-svc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let h = home.to_string_lossy().into_owned();
+        // 1.4: the options file.
+        let d = installed(&["--home", &h, "service", "run", "--role", "agent"])
+            .definition(Role::Agent)
+            .unwrap();
+        assert_eq!(d.home, home);
+        assert_eq!(d.inline, None);
+        // Before 1.4 on Linux and macOS: the role's command and options.
+        let d = installed(&["--home", &h, "agent", "start", "--allow-docker"])
+            .definition(Role::Agent)
+            .unwrap();
+        assert_eq!(d.inline, Some(strs(&["--allow-docker"])));
+        let d = installed(&[
+            "--home",
+            &h,
+            "ui",
+            "--api-only",
+            "--listen",
+            "127.0.0.1:7400",
+        ])
+        .definition(Role::Ui)
+        .unwrap();
+        assert_eq!(
+            d.inline,
+            Some(strs(&["--api-only", "--listen", "127.0.0.1:7400"]))
+        );
+        let d = installed(&["--home", &h, "cluster", "start"])
+            .definition(Role::Cluster)
+            .unwrap();
+        assert_eq!(d.inline, Some(vec![]));
+        // Before 1.4 on Windows: `service run -- OPTIONS`, with the `--`
+        // even without options.
+        let d = installed(&[
+            "--home", &h, "service", "run", "--role", "agent", "--", "--slots", "2",
+        ])
+        .definition(Role::Agent)
+        .unwrap();
+        assert_eq!(d.inline, Some(strs(&["--slots", "2"])));
+        let bare = installed(&["--home", &h, "service", "run", "--role", "agent", "--"]);
+        assert_eq!(bare.definition(Role::Agent).unwrap().inline, Some(vec![]));
+
+        // The file: written private, read back, and what `service run`
+        // uses unless the definition carries options.
+        assert_eq!(read_options(Role::Agent, &home).unwrap(), None);
+        assert!(run_options(Role::Agent, &home, vec![]).unwrap().is_empty());
+        let options = strs(&["--allow-docker", "--name", "my \"node\"", "--slots", "2"]);
+        let path = write_options(Role::Agent, &home, &options).unwrap();
+        assert_eq!(path, home.join("agent.toml"));
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("# "));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            read_options(Role::Agent, &home).unwrap(),
+            Some(options.clone())
+        );
+        assert_eq!(run_options(Role::Agent, &home, vec![]).unwrap(), options);
+        assert_eq!(
+            run_options(Role::Agent, &home, strs(&["--slots", "9"])).unwrap(),
+            strs(&["--slots", "9"])
+        );
+        // With a file there, a bare `--` is not a list of options.
+        assert_eq!(bare.definition(Role::Agent).unwrap().inline, None);
+        // A file that is not ours is an error, not no options.
+        std::fs::write(home.join("ui.toml"), "option = [\"--api-only\"]\n").unwrap();
+        assert!(read_options(Role::Ui, &home).is_err());
+        std::fs::remove_dir_all(&home).ok();
+
+        // Not a definition `service install` wrote.
+        for odd in [
+            &["agent", "start"][..],
+            &["--home", &h, "agent", "join", "ticket"],
+            &["--home", &h, "service", "run", "--role", "ui"],
+            &["--home", &h, "service", "run", "--role", "agent", "extra"],
+        ] {
+            assert!(installed(odd).definition(Role::Agent).is_err(), "{odd:?}");
+        }
+    }
+
+    /// Options like the agent's: flags, values, a pair and a list.
+    fn agent_like() -> clap::Command {
+        use clap::{Arg, ArgAction};
+        let flag = |name: &'static str| Arg::new(name).long(name).action(ArgAction::SetTrue);
+        let value = |name: &'static str| Arg::new(name).long(name).action(ArgAction::Set);
+        clap::Command::new("start")
+            .arg(value("name"))
+            .arg(value("slots"))
+            .arg(value("net"))
+            .arg(flag("allow-docker"))
+            .arg(flag("allow-microvm"))
+            .arg(flag("allow-webgpu"))
+            .arg(flag("auto-upgrade"))
+            .arg(flag("no-auto-upgrade"))
+            .arg(flag("no-gpus"))
+            .arg(Arg::new("relay").long("relay").action(ArgAction::Append))
+            .arg(Arg::new("home").long("home").action(ArgAction::Set))
+    }
+
+    #[test]
+    fn service_set_keeps_what_it_does_not_name() {
+        let cmd = agent_like();
+        let merge = |current: &[&str], changes: &[&str]| {
+            merge_options(&cmd, &strs(current), &strs(changes)).map(|v| v.join(" "))
+        };
+        // The issue's case: one more flag on an agent that has others.
+        assert_eq!(
+            merge(&["--allow-docker", "--net", "local"], &["--allow-webgpu"]).unwrap(),
+            "--allow-docker --net local --allow-webgpu"
+        );
+        assert_eq!(
+            merge(
+                &["--allow-docker", "--allow-microvm"],
+                &["--allow-webgpu", "--no-allow-docker"]
+            )
+            .unwrap(),
+            "--allow-microvm --allow-webgpu"
+        );
+        // Values are replaced in place, in either spelling, or removed.
+        assert_eq!(
+            merge(&["--slots", "2", "--name", "my node"], &["--slots=8"]).unwrap(),
+            "--slots 8 --name my node"
+        );
+        assert_eq!(
+            merge(&["--slots=2", "--allow-docker"], &["--no-slots"]).unwrap(),
+            "--allow-docker"
+        );
+        // The same change twice changes nothing more; removing what is
+        // not there is fine.
+        let once = merge(&["--allow-docker"], &["--allow-webgpu", "--slots", "4"]).unwrap();
+        let again = merge_options(
+            &cmd,
+            &once.split(' ').map(String::from).collect::<Vec<_>>(),
+            &strs(&["--allow-webgpu", "--slots", "4"]),
+        )
+        .unwrap()
+        .join(" ");
+        assert_eq!(once, again);
+        assert_eq!(merge(&[], &["--no-allow-docker"]).unwrap(), "");
+        // A flag and its opposite replace each other.
+        assert_eq!(
+            merge(&["--auto-upgrade"], &["--no-auto-upgrade"]).unwrap(),
+            "--no-auto-upgrade"
+        );
+        assert_eq!(
+            merge(&["--no-auto-upgrade"], &["--auto-upgrade"]).unwrap(),
+            "--auto-upgrade"
+        );
+        // A flag with only a `--no-` form: the plain name removes it.
+        assert_eq!(merge(&[], &["--no-gpus"]).unwrap(), "--no-gpus");
+        assert_eq!(
+            merge(&["--no-gpus", "--slots", "1"], &["--gpus"]).unwrap(),
+            "--slots 1"
+        );
+        assert_eq!(merge(&["--no-gpus"], &["--no-no-gpus"]).unwrap(), "");
+        // An option that repeats gets one more value; `--no-` clears it.
+        assert_eq!(
+            merge(
+                &["--relay", "https://a"],
+                &["--relay", "https://b", "--relay", "https://a"]
+            )
+            .unwrap(),
+            "--relay https://a --relay https://b"
+        );
+        assert_eq!(
+            merge(
+                &["--relay", "https://a", "--relay", "https://b"],
+                &["--no-relay", "--relay", "https://c"]
+            )
+            .unwrap(),
+            "--relay https://c"
+        );
+        // Refused.
+        for bad in [
+            &["--frobnicate"][..],
+            &["--no-frobnicate"],
+            &["extra"],
+            &["-s", "2"],
+            &["--slots"],
+            &["--allow-docker=yes"],
+            &["--home", "/tmp/x"],
+            &["--help"],
+        ] {
+            assert!(merge(&["--allow-docker"], bad).is_err(), "{bad:?}");
+        }
+        // Current options this pumasi does not take are an error too,
+        // not silently dropped.
+        assert!(merge(&["--gone"], &["--allow-webgpu"]).is_err());
+    }
+
+    #[test]
+    fn shown_options_hide_tickets() {
+        assert_eq!(show_options(&[]), "(none)");
+        assert_eq!(
+            show_options(&strs(&["--name", "my node", "--allow-docker"])),
+            r#"--name "my node" --allow-docker"#
+        );
+        assert_eq!(
+            show_options(&strs(&[
+                "--api-only",
+                "--admin",
+                "pumasiadminsecret",
+                "--no-open"
+            ])),
+            "--api-only --admin *** --no-open"
+        );
+        assert_eq!(
+            show_options(&strs(&["--admin=pumasiadminsecret"])),
+            "--admin=***"
+        );
     }
 }

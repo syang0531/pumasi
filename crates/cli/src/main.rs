@@ -312,7 +312,7 @@ enum Cmd {
         #[arg(long)]
         clear: bool,
         #[command(flatten)]
-        policy: manage::PolicyArgs,
+        policy: Box<manage::PolicyArgs>,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -1235,6 +1235,19 @@ fn net_for_all(addrs: &[iroh::EndpointAddr], explicit: Option<NetMode>) -> NetMo
 
 async fn run(cli: Cli) -> Result<i32> {
     let home = home_dir(&cli.home)?;
+    // An installed service (systemd, launchd): the role's command with
+    // the options in its options file. The Windows service manager's
+    // entry point is taken in `main`.
+    #[cfg(not(windows))]
+    if let Cmd::Service(service::ServiceCmd::Run { role, args }) = &cli.cmd {
+        let options = service::run_options(*role, &home, args.clone())?;
+        let cmd = parse_service_args(*role, &options)?;
+        return Box::pin(run(Cli {
+            home: cli.home,
+            cmd,
+        }))
+        .await;
+    }
     match cli.cmd {
         Cmd::Cluster(ClusterCmd::Start {
             name,
@@ -1504,7 +1517,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             let view = wait_for_job(&client, id).await?;
-            print_job(&view, output);
+            print_job(&view, &task_details(&client, id).await, output);
             let dir = out.unwrap_or_else(|| PathBuf::from("pumasi-out").join(id.to_string()));
             download_outputs(&client, &view, &dir, false).await?;
             client.close().await;
@@ -1542,7 +1555,7 @@ async fn run(cli: Cli) -> Result<i32> {
             else {
                 bail!("unexpected response");
             };
-            print_job(&view, output);
+            print_job(&view, &task_details(&client, id).await, output);
             if let Some(dir) = out {
                 download_outputs(&client, &view, &dir, true).await?;
             }
@@ -1633,7 +1646,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 max_priority,
                 storage,
                 clear,
-                policy,
+                *policy,
             )
             .await
         }
@@ -2083,7 +2096,8 @@ pub(crate) fn restart_self(exe: &Path) -> Result<i32> {
 }
 
 /// What the Windows service runs: `agent start`, `cluster start` or `ui`
-/// with the given options, until `shutdown` resolves.
+/// with the options in the role's options file (or, for a service
+/// installed before 1.4, the given ones), until `shutdown` resolves.
 #[cfg_attr(not(windows), allow(dead_code))]
 async fn run_service(
     role: service::Role,
@@ -2091,6 +2105,7 @@ async fn run_service(
     args: Vec<String>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<i32> {
+    let args = service::run_options(role, &home, args)?;
     match parse_service_args(role, &args)? {
         Cmd::Agent(cmd) => agent(&home, cmd, shutdown, true).await,
         Cmd::Cluster(ClusterCmd::Start {
@@ -2184,14 +2199,131 @@ fn service_defaults(role: service::Role, home: &Path, mut args: Vec<String>) -> 
     args
 }
 
+/// The command a service of `role` runs (`pumasi agent start`...), to
+/// tell which of its options take a value.
+fn service_command(role: service::Role) -> clap::Command {
+    let mut root = <Cli as clap::CommandFactory>::command();
+    root.build();
+    let mut cmd = &root;
+    for name in role.command() {
+        cmd = cmd
+            .find_subcommand(name)
+            .expect("the commands services run exist");
+    }
+    cmd.clone()
+}
+
+/// Writes the service's options where the service reads them, then
+/// installs and starts it. `inline_options` keeps them in the service
+/// definition instead, as releases before 1.4 did.
+fn install_service(
+    mut spec: service::Spec,
+    options: Vec<String>,
+    inline_options: bool,
+    scope: service::ScopeArgs,
+    dry_run: bool,
+) -> Result<i32> {
+    let file = spec.role.options_file(&spec.home);
+    if inline_options {
+        if !dry_run {
+            let _ = std::fs::remove_file(&file);
+        }
+        spec.inline = Some(options);
+    } else if dry_run {
+        eprintln!(
+            "options ({}): {}",
+            file.display(),
+            service::show_options(&options)
+        );
+    } else {
+        service::write_options(spec.role, &spec.home, &options)?;
+        println!(
+            "options: {} ({}; change them with `pumasi service set`)",
+            service::show_options(&options),
+            file.display()
+        );
+    }
+    service::install(&spec, scope, dry_run)
+}
+
+/// `pumasi service set`: the installed service's options with `changes`
+/// applied, written to its options file, and the service restarted. A
+/// service installed before 1.4 is installed again in the form that reads
+/// the file.
+fn service_set(
+    role: service::Role,
+    scope: service::ScopeArgs,
+    dry_run: bool,
+    changes: &[String],
+) -> Result<i32> {
+    let Some(installed) = service::installed(role, scope)? else {
+        bail!(
+            "the {0} service is not installed here (`pumasi service install {0}`)",
+            role.as_str()
+        );
+    };
+    let def = installed.definition(role)?;
+    let current = match &def.inline {
+        Some(options) => options.clone(),
+        None => service::read_options(role, &def.home)?.unwrap_or_default(),
+    };
+    let merged = service::merge_options(&service_command(role), &current, changes)?;
+    let merged = service_defaults(role, &def.home, merged);
+    parse_service_args(role, &merged)?;
+    let file = role.options_file(&def.home);
+    let moves = def.inline.is_some();
+    if dry_run {
+        println!("options:  {}", service::show_options(&merged));
+        println!("          (nothing changed: --dry-run)");
+        return Ok(0);
+    }
+    if merged == current && !moves {
+        println!("options:  {}", service::show_options(&merged));
+        println!("          (nothing to change)");
+        return Ok(0);
+    }
+    service::can_control(role, installed.scope)?;
+    service::write_options(role, &def.home, &merged)?;
+    if moves {
+        service::install(
+            &service::Spec {
+                role,
+                exe: installed.exe.clone(),
+                home: def.home.clone(),
+                inline: None,
+                user: installed.user.clone(),
+            },
+            installed.scope,
+            false,
+        )?;
+        println!(
+            "moved the options from the service definition to {}",
+            file.display()
+        );
+    } else {
+        service::restart(role, installed.scope)?;
+        println!("restarted the {} service", role.as_str());
+    }
+    println!("options:  {}", service::show_options(&merged));
+    println!("          ({})", file.display());
+    Ok(0)
+}
+
 fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
     use service::{Role, ServiceCmd};
     match cmd {
+        ServiceCmd::Set {
+            role,
+            scope,
+            dry_run,
+            changes,
+        } => service_set(role, scope, dry_run, &changes),
         ServiceCmd::Install {
             role: role @ (Role::Cluster | Role::Ui),
             ticket,
             scope,
             dry_run,
+            inline_options,
             args,
         } => {
             if ticket.is_some() {
@@ -2235,14 +2367,16 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
                 }
             }
             let exe = own_exe().context("cannot find this binary's path")?;
-            let code = service::install(
-                &service::Spec {
+            let code = install_service(
+                service::Spec {
                     role,
                     exe,
                     home: home.clone(),
-                    args: args.clone(),
+                    inline: None,
                     user,
                 },
+                args.clone(),
+                inline_options,
                 scope,
                 dry_run,
             )?;
@@ -2259,6 +2393,7 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
             ticket,
             scope,
             dry_run,
+            inline_options,
             args: agent_args,
         } => {
             parse_agent_args(&agent_args)?;
@@ -2281,14 +2416,16 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
                 }
             }
             let exe = own_exe().context("cannot find this binary's path")?;
-            service::install(
-                &service::Spec {
+            install_service(
+                service::Spec {
                     role: Role::Agent,
                     exe,
                     home,
-                    args: agent_args,
+                    inline: None,
                     user: None,
                 },
+                agent_args,
+                inline_options,
                 scope,
                 dry_run,
             )
@@ -2297,7 +2434,7 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
         ServiceCmd::Status { role, scope } => service::status(role, scope),
         ServiceCmd::Run { role, .. } => {
             bail!(
-                "`service run` is what the Windows service manager runs; use `pumasi {}`",
+                "`service run` is what the service manager runs; use `pumasi {}`",
                 match role {
                     Role::Agent => "agent start",
                     Role::Cluster => "cluster start",
@@ -2582,7 +2719,32 @@ fn print_capacity(c: &pumasi_proto::msg::Capacity) {
 /// asked for their output.
 const MAX_TASK_LINES: usize = 100;
 
-fn print_job(v: &JobView, output: bool) {
+/// Where each task of a job ran, by name, and how long the parts of its
+/// run took (1.4). Empty when the control plane is older and does not
+/// answer: the job is then printed without them.
+async fn task_details(client: &AdminClient, id: JobId) -> Vec<pumasi_proto::msg::TaskDetail> {
+    match client.call(AdminOp::TaskDetails { id }).await {
+        Ok(AdminResponse::TaskDetails(d)) => d,
+        _ => Vec::new(),
+    }
+}
+
+/// ` queued=120ms pull=55000ms`: the parts of a run beside its billed
+/// time, when there were any.
+fn task_times(d: &pumasi_proto::msg::TaskDetail) -> String {
+    [
+        ("queued", d.queued_ms),
+        ("fetch", d.fetch_ms),
+        ("pull", d.pull_ms),
+        ("upload", d.upload_ms),
+    ]
+    .into_iter()
+    .filter(|(_, ms)| *ms > 0)
+    .map(|(what, ms)| format!(" {what}={ms}ms"))
+    .collect()
+}
+
+fn print_job(v: &JobView, details: &[pumasi_proto::msg::TaskDetail], output: bool) {
     let s = &v.summary;
     println!("job {} \"{}\": {}", s.id, s.name, s.state);
     match &v.image {
@@ -2687,14 +2849,22 @@ fn print_job(v: &JobView, output: bool) {
         let show_line =
             output || !matches!(t.state, TaskState::Succeeded) || v.tasks.len() <= MAX_TASK_LINES;
         if show_line {
+            let detail = details.iter().find(|d| d.index == t.index);
+            // The node's name when the control plane gives it, else the
+            // start of its id.
+            let node = detail
+                .and_then(|d| d.node_name.as_deref())
+                .or(t.node.as_deref().map(short))
+                .unwrap_or("-");
             let _ = writeln!(
                 stdout,
-                "  [{}] {} node={} attempts={} {}ms{}{}",
+                "  [{}] {} node={} attempts={} {}ms{}{}{}",
                 t.index,
                 state,
-                t.node.as_deref().map(short).unwrap_or("-"),
+                node,
                 t.attempts,
                 t.wall_ms,
+                detail.map(task_times).unwrap_or_default(),
                 cost,
                 check
             );
@@ -4168,6 +4338,81 @@ fn utc(unix: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_set_changes_the_real_commands_options() {
+        use service::Role;
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Issue #42: `--allow-webgpu` on an agent that has other options.
+        let agent = service_command(Role::Agent);
+        let merged = service::merge_options(
+            &agent,
+            &strs(&["--allow-docker", "--net", "local", "--name", "win-1"]),
+            &strs(&["--allow-webgpu", "--no-allow-docker", "--slots", "4"]),
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            strs(&[
+                "--net",
+                "local",
+                "--name",
+                "win-1",
+                "--allow-webgpu",
+                "--slots",
+                "4"
+            ])
+        );
+        let Cmd::Agent(AgentCmd::Start { opts }) =
+            parse_service_args(Role::Agent, &merged).unwrap()
+        else {
+            panic!()
+        };
+        assert!(opts.allow_webgpu && !opts.allow_docker);
+        assert_eq!(opts.slots, Some(4));
+        // Flags that come in pairs, and ones with only a `--no-` form.
+        let merged = service::merge_options(
+            &agent,
+            &strs(&["--auto-upgrade", "--no-gpus", "--no-benchmark"]),
+            &strs(&["--no-auto-upgrade", "--gpus", "--no-no-benchmark"]),
+        )
+        .unwrap();
+        assert_eq!(merged, strs(&["--no-auto-upgrade"]));
+        // What the result must still be: valid options of the command.
+        let broken = service::merge_options(
+            &agent,
+            &strs(&["--allow-microvm", "--allow-confidential"]),
+            &strs(&["--no-allow-microvm"]),
+        )
+        .unwrap();
+        assert!(parse_service_args(Role::Agent, &broken).is_err());
+        assert!(service::merge_options(&agent, &[], &strs(&["--home", "/x"])).is_err());
+
+        // The control plane and the dashboard keep what a service needs.
+        let home = Path::new("/var/lib/pumasi");
+        let ui = service_command(Role::Ui);
+        let current = service_defaults(Role::Ui, home, strs(&["--api-only"]));
+        let merged = service::merge_options(
+            &ui,
+            &current,
+            &strs(&["--listen", "0.0.0.0:7443", "--no-no-open"]),
+        )
+        .unwrap();
+        let merged = service_defaults(Role::Ui, home, merged);
+        assert!(has_flag(&merged, "--no-open") && has_flag(&merged, "--api-only"));
+        assert_eq!(merged.iter().filter(|a| *a == "--listen").count(), 1);
+        assert!(merged.contains(&"0.0.0.0:7443".to_string()));
+        parse_service_args(Role::Ui, &merged).unwrap();
+        let cluster = service_command(Role::Cluster);
+        let merged = service::merge_options(
+            &cluster,
+            &strs(&["--no-token", "--name", "home"]),
+            &strs(&["--relay", "https://relay.example.com"]),
+        )
+        .unwrap();
+        parse_service_args(Role::Cluster, &merged).unwrap();
+        assert!(has_flag(&merged, "--no-token"));
+    }
 
     #[test]
     fn plain_windows_paths() {

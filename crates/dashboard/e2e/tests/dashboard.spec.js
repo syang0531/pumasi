@@ -53,6 +53,20 @@ test("submit, watch the output live, download the outputs", async ({ page }) => 
   await expect(page.locator('#job-state [data-state="succeeded"]')).toBeVisible({ timeout: 90_000 });
   await expect(page.locator("tr[data-task]")).toHaveCount(2);
 
+  // Where each task ran, by name, and where its time went (1.4).
+  for (const t of [0, 1]) {
+    const row = page.locator(`tr[data-task="${t}"]`);
+    await expect(row.locator("a", { hasText: /^node-[ab]$/ })).toBeVisible();
+    await expect(row.locator("td.queued")).toHaveText(/^\d+(\.\d)? m?s$/);
+    await expect(row.locator("td.run")).toContainText(/^\d+\.\d s/);
+  }
+  await page.goto(`${state().base}/jobs/${id}/tasks/0`);
+  for (const part of ["queued", "fetch", "pull", "run", "upload"]) {
+    await expect(page.locator(`dd[data-time="${part}"]`)).toHaveText(/^\d+(\.\d)? m?s$/);
+  }
+  await expect(page.locator('dd[data-time="pull"]')).toHaveText("0 ms");
+  await page.goto(`${state().base}/jobs/${id}`);
+
   // One file.
   const one = page.waitForEvent("download");
   await page.locator('tr[data-task="1"] td.files a', { hasText: "result.txt" }).click();
@@ -137,6 +151,101 @@ test("a viewer ticket reads but cannot change anything", async ({ page, browser 
   await ctx.close();
 });
 
+test("an admin edits an account's quota and job policy", async ({ page, browser, request }) => {
+  const base = state().base;
+  const auth = { Authorization: `Bearer ${state().adminTicket}` };
+  await signIn(page);
+  await page.getByRole("link", { name: "Accounts", exact: true }).click();
+  await expect(page.locator("h1").first()).toHaveText("Accounts");
+
+  // A new account, from the list.
+  await page.locator('form[action="/accounts/open"] input[name="account"]').fill("e2e-lab");
+  await page.getByRole("button", { name: "Open or create" }).click();
+  await expect(page).toHaveURL(`${base}/accounts/e2e-lab`);
+  const form = page.locator("#account-form");
+  await expect(form.locator("#images")).toHaveValue("");
+  await form.locator("#images").fill("ghcr.io/lab/*\npython:3.12-slim");
+  await form.locator('input[name="exec_wasm"]').check();
+  await form.locator('input[name="exec_docker"]').check();
+  await form.locator("#network").selectOption("deny");
+  await form.locator("#max_timeout").fill("30m");
+  await form.locator("#slots").fill("4");
+  await form.getByRole("button", { name: "Save" }).click();
+  await expect(page.locator("#flash .flash.ok")).toContainText("Saved e2e-lab");
+
+  // The API answers what the form saved.
+  const url = `${base}/api/v1/accounts/e2e-lab/policy`;
+  const saved = await (await request.get(url, { headers: auth })).json();
+  expect(saved.account).toBe("e2e-lab");
+  expect(saved.images).toEqual(["ghcr.io/lab/*", "python:3.12-slim"]);
+  expect(saved.executors).toEqual(["docker", "wasm"]);
+  expect(saved.network).toBe("deny");
+  expect(saved.max_timeout_ms).toBe(30 * 60 * 1000);
+  expect(saved.tolerations).toBeNull();
+  expect(saved.quota.slots).toBe(4);
+  expect(saved.quota.gpus).toBeNull();
+
+  // One more image through the API: the form shows it, and the rest is
+  // as it was.
+  const patched = await request.patch(url, {
+    headers: { ...auth, "Content-Type": "application/json" },
+    data: JSON.stringify({ images: { add: ["node:22-slim"] } }),
+  });
+  expect(patched.status()).toBe(200);
+  await page.reload();
+  await expect(form.locator("#images")).toHaveValue("ghcr.io/lab/*\npython:3.12-slim\nnode:22-slim");
+  await expect(form.locator('input[name="exec_wasm"]')).toBeChecked();
+  await expect(form.locator('input[name="exec_docker"]')).toBeChecked();
+  await expect(form.locator('input[name="exec_microvm"]')).not.toBeChecked();
+  await expect(form.locator("#network")).toHaveValue("deny");
+  await expect(form.locator("#max_timeout")).toHaveValue("30m");
+  await expect(form.locator("#slots")).toHaveValue("4");
+
+  // Change one field in the form; a wrong value is refused and says why.
+  await form.locator("#max_timeout").fill("soon");
+  await form.getByRole("button", { name: "Save" }).click();
+  await expect(page.locator("#flash .flash.bad")).toBeVisible();
+  await form.locator("#max_timeout").fill("");
+  await form.locator("#tolerations_mode").selectOption("none");
+  await form.getByRole("button", { name: "Save" }).click();
+  await expect(page.locator("#flash .flash.ok")).toContainText("Saved e2e-lab");
+  const again = await (await request.get(url, { headers: auth })).json();
+  expect(again.max_timeout_ms).toBeNull();
+  expect(again.tolerations).toEqual([]);
+  expect(again.images).toEqual(["ghcr.io/lab/*", "python:3.12-slim", "node:22-slim"]);
+  expect(again.quota.slots).toBe(4);
+
+  // The list shows the account with its use, limit and policy.
+  await page.goto(`${base}/accounts`);
+  const row = page.locator('tr[data-account="e2e-lab"]');
+  await expect(row).toContainText("0 / 4");
+  await expect(row.locator("td.policy")).toContainText("node:22-slim");
+
+  // A viewer reads the page and cannot change it.
+  const made = await request.post(`${base}/api/v1/op`, {
+    headers: { ...auth, "Content-Type": "application/json" },
+    data: JSON.stringify({ CreateAccess: { name: "e2e-accounts-viewer", role: "Viewer", ttl_secs: 3600 } }),
+  });
+  const ticket = (await made.json()).ticket;
+  const ctx = await browser.newContext();
+  const viewer = await ctx.newPage();
+  await viewer.goto(base + "/login");
+  await viewer.locator("#ticket").fill(ticket);
+  await viewer.getByRole("button", { name: "Sign in" }).click();
+  await viewer.goto(`${base}/accounts/e2e-lab`);
+  await expect(viewer.locator("#account-form #images")).toHaveValue("ghcr.io/lab/*\npython:3.12-slim\nnode:22-slim");
+  await expect(viewer.locator("#account-form #images")).toBeDisabled();
+  await expect(viewer.getByRole("button", { name: "Save" })).toHaveCount(0);
+  await viewer.goto(`${base}/accounts`);
+  await expect(viewer.locator('form[action="/accounts/open"]')).toHaveCount(0);
+  const refused = await viewer.request.patch(url, {
+    headers: { Authorization: `Bearer ${ticket}`, "Content-Type": "application/json" },
+    data: JSON.stringify({ network: "allow" }),
+  });
+  expect(refused.status()).toBe(403);
+  await ctx.close();
+});
+
 test("the JSON API takes a bearer ticket", async ({ request }) => {
   const base = state().base;
   expect((await request.get(`${base}/api/v1/status`)).status()).toBe(401);
@@ -183,6 +292,7 @@ test("the other pages load", async ({ page }) => {
   await signIn(page);
   for (const [path, heading] of [
     ["/cu", "Compute units (CU)"],
+    ["/accounts", "Accounts"],
     ["/prices", "Prices"],
     ["/events", "Events and alerts"],
     ["/access", "Invites and access"],

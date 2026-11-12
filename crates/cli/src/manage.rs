@@ -8,10 +8,11 @@ use clap::{Subcommand, ValueEnum};
 use pumasi_cluster::AdminClient;
 use pumasi_proto::{
     economy::{format_cu, parse_cu, validate_account},
-    job::{Executor, JobFile, JobId, parse_duration_ms},
+    job::{JobFile, JobId, parse_duration_ms},
     manage::{
-        AccessRole, AccessView, AccountPolicy, AccountQuota, ClusterFile, NodeEdit, QuotaView,
-        ScheduleSpec, ScheduleView, Selector, Taint, Toleration, parse_network_rule,
+        AccessRole, AccessView, AccountPolicy, AccountQuota, ClusterFile, ListPatch, NodeEdit,
+        PolicyPatch, QuotaView, ScheduleSpec, ScheduleView, Selector, Taint, Toleration,
+        parse_executor, parse_network_rule,
     },
     msg::{AccountView, AdminOp, AdminResponse, ClusterStatus, NodeView},
     store::{format_size, parse_size},
@@ -330,6 +331,24 @@ pub struct PolicyArgs {
     /// Most GPUs per task; `none` lifts it.
     #[arg(long)]
     max_gpus_per_task: Option<String>,
+    /// Adds image patterns to the ones allowed and keeps the rest.
+    #[arg(long, value_delimiter = ',', conflicts_with = "images")]
+    add_images: Vec<String>,
+    /// Removes image patterns from the ones allowed.
+    #[arg(long, value_delimiter = ',', conflicts_with = "images")]
+    remove_images: Vec<String>,
+    /// Adds executors to the ones allowed and keeps the rest.
+    #[arg(long, value_delimiter = ',', conflicts_with = "executors")]
+    add_executors: Vec<String>,
+    /// Removes executors from the ones allowed.
+    #[arg(long, value_delimiter = ',', conflicts_with = "executors")]
+    remove_executors: Vec<String>,
+    /// Adds tolerations to the ones its jobs may carry.
+    #[arg(long, value_delimiter = ',', conflicts_with = "tolerations")]
+    add_tolerations: Vec<String>,
+    /// Removes tolerations from the ones its jobs may carry.
+    #[arg(long, value_delimiter = ',', conflicts_with = "tolerations")]
+    remove_tolerations: Vec<String>,
 }
 
 impl PolicyArgs {
@@ -342,6 +361,23 @@ impl PolicyArgs {
             || self.tolerations.is_some()
             || self.max_timeout.is_some()
             || self.max_gpus_per_task.is_some()
+            || !self.edits().is_empty()
+    }
+
+    /// `--add-...` and `--remove-...`: changes to the lists that keep the
+    /// entries they do not name.
+    fn edits(&self) -> PolicyPatch {
+        let edit = |add: &[String], remove: &[String]| ListPatch {
+            set: None,
+            add: add.to_vec(),
+            remove: remove.to_vec(),
+        };
+        PolicyPatch {
+            images: edit(&self.add_images, &self.remove_images),
+            executors: edit(&self.add_executors, &self.remove_executors),
+            tolerations: edit(&self.add_tolerations, &self.remove_tolerations),
+            ..Default::default()
+        }
     }
 
     fn apply(&self, p: &mut AccountPolicy) -> Result<()> {
@@ -366,12 +402,7 @@ impl PolicyArgs {
             } else {
                 let mut e = v
                     .iter()
-                    .map(|e| match e.trim() {
-                        "wasm" => Ok(Executor::Wasm),
-                        "docker" => Ok(Executor::Docker),
-                        "microvm" => Ok(Executor::Microvm),
-                        other => bail!("unknown executor {other:?} (wasm, docker or microvm)"),
-                    })
+                    .map(|e| parse_executor(e))
                     .collect::<Result<Vec<_>>>()?;
                 e.sort_by_key(|e| e.to_string());
                 e.dedup();
@@ -406,7 +437,8 @@ impl PolicyArgs {
         })? {
             p.max_gpus_per_task = v;
         }
-        p.validate()
+        // Checks the result too.
+        self.edits().apply(p)
     }
 }
 
@@ -633,11 +665,32 @@ fn print_access(list: &[AccessView]) {
 }
 
 pub async fn whoami(home: &Path, admin: &AdminArgs) -> Result<i32> {
-    let AdminResponse::WhoAmI { name, role } = call(home, admin, AdminOp::WhoAmI).await? else {
-        bail!("unexpected response");
-    };
-    println!("{name}: {role}");
-    Ok(0)
+    let client = connect_admin(home, admin).await?;
+    let res = async {
+        let AdminResponse::WhoAmI { name, role } = client.call(AdminOp::WhoAmI).await? else {
+            bail!("unexpected response");
+        };
+        println!("{name}: {role}");
+        // A submitter's jobs are held to its account's policy and quota:
+        // show them, so it need not send a job to learn what is refused.
+        if let AccessRole::Submitter { account } = &role {
+            let own = quotas(&client)
+                .await?
+                .into_iter()
+                .find(|v| v.account == *account);
+            let (quota, policy) = match own {
+                Some(v) => (v.quota.describe(), v.policy.describe()),
+                None => ("none".to_string(), "none".to_string()),
+            };
+            // The account is in the role on the line above.
+            println!("quota: {quota}");
+            println!("job policy: {policy}");
+        }
+        Ok(())
+    }
+    .await;
+    client.close().await;
+    res.map(|()| 0)
 }
 
 pub async fn schedule(home: &Path, cmd: ScheduleCmd) -> Result<i32> {
@@ -936,7 +989,7 @@ async fn describe_inner(client: &AdminClient, kind: DescribeKind, name: &str) ->
             else {
                 bail!("unexpected response");
             };
-            print_job(&v, false);
+            print_job(&v, &crate::task_details(client, id).await, false);
         }
         DescribeKind::Account => {
             let list = quotas(client).await?;

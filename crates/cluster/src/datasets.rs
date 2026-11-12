@@ -885,7 +885,7 @@ impl State {
             .or(self.files.policy.default_quota)
     }
 
-    fn check_quota(&self, account: &str, adding: u64) -> Result<()> {
+    pub(crate) fn check_quota(&self, account: &str, adding: u64) -> Result<()> {
         if let Some(q) = self.quota_of(account) {
             let used = self
                 .usage_by_account()

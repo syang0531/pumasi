@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use pumasi_proto::manage::AccessRole;
 use pumasi_proto::{
     job::JobId,
     manage::NodeEdit,
@@ -25,13 +26,16 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{St, auth::Api, pages};
+use crate::{St, accounts, auth::Api, pages};
 
 pub const OPENAPI: &str = include_str!("../assets/openapi.json");
 
 /// The API's routes; `uploads` is the body limit of job submissions.
 pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
     let op_limit = DefaultBodyLimit::max(crate::OP_BODY_LIMIT);
+    // Named here so that every route below stays on one line, which is
+    // how the test finds them.
+    let policy = get(account_policy).patch(patch_account_policy);
     Router::new()
         .route("/whoami", get(whoami))
         .route("/status", get(status))
@@ -48,6 +52,7 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
         .route("/nodes/{node}/{action}", post(node_action))
         .route("/upgrade", get(upgrade_status).post(upgrade_latest))
         .route("/accounts", get(accounts))
+        .route("/accounts/{name}/policy", policy)
         .route("/ledger", get(ledger))
         .route("/datasets", get(datasets))
         .route("/storage", get(storage))
@@ -108,8 +113,36 @@ fn job_id(s: &str) -> Result<JobId, Response> {
 
 type S = axum::extract::State<St>;
 
+/// The ticket's name and role, and for a submitter what its account may
+/// do (1.4): the job policy its submissions are held to, its quota and
+/// what it uses now. Admin and viewer tickets are not held to a policy.
 async fn whoami(axum::extract::State(st): S, a: Api) -> Response {
-    simple(st, a, AdminOp::WhoAmI).await
+    let (name, role) = match call(&st, &a, AdminOp::WhoAmI).await {
+        Ok(AdminResponse::WhoAmI { name, role }) => (name, role),
+        Ok(_) => return error(StatusCode::BAD_GATEWAY, "unexpected response"),
+        Err(r) => return r,
+    };
+    let mut out = json!({
+        "name": name,
+        "role": role,
+        "account": null,
+        "policy": null,
+        "quota": null,
+        "usage": null,
+    });
+    if let AccessRole::Submitter { account } = &role {
+        match accounts::get(&st, a.0.secret, &role, account).await {
+            Ok(Some(v)) => {
+                out["account"] = json!(v.account);
+                out["policy"] = accounts::policy_json(&v.policy);
+                out["quota"] = accounts::quota_json(&v.quota);
+                out["usage"] = accounts::usage_json(&v);
+            }
+            Ok(None) => {}
+            Err(e) => return fail(e),
+        }
+    }
+    Json(out).into_response()
 }
 
 async fn status(axum::extract::State(st): S, a: Api) -> Response {
@@ -224,14 +257,88 @@ async fn job(
         };
         let now = tokio::time::Instant::now();
         if done || now >= deadline {
-            return payload(r);
+            return match r {
+                AdminResponse::Job(j) => job_json(&st, &a, id, &j).await,
+                r => payload(r),
+            };
         }
         tokio::time::sleep(pause.min(deadline - now)).await;
         pause = (pause * 2).min(Duration::from_secs(2));
     }
 }
 
-async fn submit(axum::extract::State(st): S, a: Api, form: Multipart) -> Response {
+/// A job view with, on each task, the name of its node and how long each
+/// part of the run took (1.4). Those come from a second call that control
+/// planes older than 1.4 do not answer; the tasks then go without them.
+async fn job_json(st: &St, a: &Api, id: JobId, job: &pumasi_proto::msg::JobView) -> Response {
+    let mut v = match serde_json::to_value(job) {
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if let Ok(AdminResponse::TaskDetails(details)) = st
+        .backend
+        .call(a.0.secret, AdminOp::TaskDetails { id })
+        .await
+        && let Some(tasks) = v.get_mut("tasks").and_then(|t| t.as_array_mut())
+    {
+        for d in details {
+            let Some(t) = tasks
+                .get_mut(d.index as usize)
+                .and_then(|t| t.as_object_mut())
+            else {
+                continue;
+            };
+            t.insert("node_name".into(), json!(d.node_name));
+            t.insert("queued_ms".into(), json!(d.queued_ms));
+            t.insert("fetch_ms".into(), json!(d.fetch_ms));
+            t.insert("pull_ms".into(), json!(d.pull_ms));
+            t.insert("run_ms".into(), json!(d.run_ms));
+            t.insert("upload_ms".into(), json!(d.upload_ms));
+        }
+    }
+    Json(v).into_response()
+}
+
+#[derive(Deserialize)]
+struct SubmitQuery {
+    /// `1` or `true`: check the job without creating it.
+    validate: Option<String>,
+}
+
+async fn submit(
+    axum::extract::State(st): S,
+    a: Api,
+    Query(q): Query<SubmitQuery>,
+    form: Multipart,
+) -> Response {
+    let validate = match q.validate.as_deref() {
+        None | Some("0" | "false") => false,
+        Some("1" | "true" | "") => true,
+        Some(other) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                &format!("validate is 1 or 0, not {other:?}"),
+            );
+        }
+    };
+    if validate {
+        let res = async {
+            let up = crate::uploads::receive(form, "job").await?;
+            pages::jobs::check_upload(&st, a.0.secret, up).await
+        }
+        .await;
+        return match res {
+            Ok(c) => Json(json!({
+                "valid": true,
+                "account": c.account,
+                "tasks": c.tasks,
+                "ready_nodes": c.ready_nodes,
+                "waiting": c.waiting,
+            }))
+            .into_response(),
+            Err(e) => fail(e),
+        };
+    }
     let res = async {
         let up = crate::uploads::receive(form, "job").await?;
         pages::jobs::submit_upload(&st, a.0.secret, up).await
@@ -410,6 +517,36 @@ async fn upgrade_latest(
 
 async fn accounts(axum::extract::State(st): S, a: Api) -> Response {
     simple(st, a, AdminOp::Accounts).await
+}
+
+/// An account's job policy, quota and use (1.4). Admins and viewers may
+/// read any account, a submitter its own.
+async fn account_policy(axum::extract::State(st): S, a: Api, Path(name): Path<String>) -> Response {
+    match accounts::get(&st, a.0.secret, &a.0.role, &name).await {
+        Ok(Some(v)) => Json(accounts::view_json(&v)).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, &format!("no such account: {name}")),
+        Err(e) => fail(e),
+    }
+}
+
+/// Changes the fields the body names and leaves the others (1.4). Admin
+/// only: the control plane refuses the change from other tickets.
+async fn patch_account_policy(
+    axum::extract::State(st): S,
+    a: Api,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let res = async {
+        pumasi_proto::economy::validate_account(&name)?;
+        let (policy, quota) = accounts::parse_patch(&name, &body)?;
+        accounts::patch(&st, a.0.secret, &a.0.role, &name, &policy, &quota).await
+    }
+    .await;
+    match res {
+        Ok(v) => Json(accounts::view_json(&v)).into_response(),
+        Err(e) => fail(e),
+    }
 }
 
 #[derive(Deserialize)]

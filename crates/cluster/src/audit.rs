@@ -413,6 +413,8 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | Job { .. }
         | TaskFiles { .. }
         | Receipts { .. }
+        | TaskDetails { .. }
+        | CheckJob { .. }
         | Accounts
         | Ledger { .. }
         | GetPolicy

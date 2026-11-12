@@ -16,11 +16,14 @@ usage() {
   cat <<'EOF'
 usage: pumasi-remote <command> [args]
 
-  whoami                      the ticket's name, role and account
+  whoami                      the ticket's name, role and account, and
+                              what the account's jobs may ask for
   status                      nodes that can take this account's work now
   jobs                        this account's jobs
   submit DIR|JOB.toml [opts]  send a job, print its id
         --account A  --priority N  --after ID[,ID]
+  check DIR|JOB.toml [opts]   would the cluster take this job? Submits
+                              nothing; exit 0 if it would
   wait JOB [--timeout 30m]    until it ends; exit 0 only if it succeeded
   logs JOB [TASK]             stdout and stderr of one task (default 0)
   outputs JOB [DEST]          download and unpack (default pumasi-out/JOB)
@@ -181,6 +184,8 @@ quote() {
   printf '"%s"' "${s//\"/\\\"}"
 }
 
+# `check` sends the same request with ?validate=1 (Pumasi 1.4).
+check_only=no
 submit() {
   need_url
   [ $# -ge 1 ] || die "submit needs a folder or a job file"
@@ -216,6 +221,11 @@ submit() {
   if [ "$total" -gt $((95 * 1024 * 1024)) ]; then
     say "sending $((total / 1024 / 1024)) MiB: Cloudflare's Free and Pro plans refuse" \
       "bodies over 100 MB (put big inputs in the store and mount store:NAME)"
+  fi
+  if [ "$check_only" = yes ]; then
+    api POST "/api/v1/jobs?validate=1" "$tmp/submit" ${form[@]+"${form[@]}"} || exit 1
+    jq . "$tmp/submit"
+    return
   fi
   api POST /api/v1/jobs "$tmp/submit" ${form[@]+"${form[@]}"} || exit 1
   jq -r .id "$tmp/submit"
@@ -350,6 +360,7 @@ case $cmd in
     need_url
     get_json /api/v1/status | jq -r '.jobs[] | "\(.id)  \(.state)  \(.succeeded)/\(.tasks)  \(.name)"' ;;
   submit) submit "$@" ;;
+  check) check_only=yes; submit "$@" ;;
   wait) wait_job "$@" ;;
   logs) logs "$@" ;;
   outputs) outputs "$@" ;;

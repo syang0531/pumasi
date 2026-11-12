@@ -28,7 +28,8 @@ echo "$TICKET"   # hand this to whoever runs the scripts
 ```
 
 Then say what the account's jobs may do. The control plane refuses
-anything else with `403`, whoever submits it:
+anything else with `403`, whichever submitter ticket of the account sends
+it (admin tickets are not held to the policy):
 
 ```sh
 pumasi quota lab --slots 4 --executors wasm,docker \
@@ -47,8 +48,21 @@ pumasi cu add lab 100   # CU its jobs pay the machines they run on
 | `--tolerations none` | jobs that tolerate taints (so they stay off tainted nodes) |
 | `--max-timeout 30m`, `--max-gpus-per-task 1` | longer or bigger tasks |
 
-`none` or `any` lifts one limit, `--clear` all of them. The policy can
-also live in the cluster file (`pumasi apply`):
+`none` or `any` lifts one limit, `--clear` all of them. To change one
+entry of a list and keep the rest, add or remove it:
+
+```sh
+pumasi quota lab --add-images 'node:22-slim'
+pumasi quota lab --remove-images 'node:22-slim'
+```
+<!-- ci: pumasi quota lab 2>&1 | grep -q 'images ghcr.io/lab/\* python:3.12-slim,' -->
+
+`--add-executors`, `--remove-executors`, `--add-tolerations` and
+`--remove-tolerations` do the same for their lists. The same change over
+HTTP is `PATCH /api/v1/accounts/lab/policy`
+([below](#account-policies-admin-ticket)), and the dashboard's
+**Accounts** page edits it in a form. The policy can also live in the
+cluster file (`pumasi apply`):
 
 ```bash
 cat > cluster.toml <<'EOF'
@@ -164,17 +178,29 @@ export PUMASI_TICKET=pumasiadmin...
 ```
 <!-- ci: export PUMASI_TICKET="$TICKET" -->
 
-Who am I, and what can the cluster do for my account right now:
+Who am I, what may my jobs ask for, and what can the cluster do for my
+account right now:
 
 ```sh
-curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/whoami"
+curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/whoami" \
+  | tee whoami.json | jq '{name, role, account, policy, quota, usage}'
 curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/status" \
   | jq '.capacity | {ready, ready_gpu, nodes: [.nodes[] | {node, free_slots, reason}]}'
 ```
+<!-- ci: test "$(jq -c '[.account, .policy.network, .policy.executors, .policy.images, .policy.max_timeout_ms, .quota.slots]' whoami.json)" = '["lab","deny",["docker","wasm"],["ghcr.io/lab/*","python:3.12-slim"],1800000,4]' -->
+
+For a submitter ticket, `whoami` carries its account's job policy
+(`images`, `require_digest`, `executors`, `network`, `selector`,
+`tolerations`, `max_timeout_ms`, `max_gpus_per_task`), its `quota` and
+what is in `usage` now, so a client can see what it may submit without an
+admin ticket. An empty `images` or `executors` list allows any, and
+`null` is no limit. `pumasi whoami` prints the same.
 
 `capacity` counts the online nodes that would take this account's work
 now, per executor, and says why each other node would not (offline,
-paused, full, no Docker, the selector, a taint, the quota...).
+paused, full, no Docker, the selector, a taint, the quota...). Nodes the
+account's policy rules out (an executor it may not use, GPUs when
+`max_gpus_per_task` is 0) are not counted as ready.
 
 ### Submit a job
 
@@ -218,6 +244,34 @@ echo "$STATE"
 ```
 <!-- ci: test "$STATE" = Succeeded -->
 
+### Where the time went
+
+Each task says which node ran it, by id (`node`) and by name
+(`node_name`), and how long each part took, in milliseconds:
+
+```sh
+curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB" \
+  | tee job.json \
+  | jq '.tasks[] | {index, node_name, queued_ms, fetch_ms, pull_ms, run_ms, upload_ms, wall_ms}'
+```
+<!-- ci: test "$(jq -c '[.tasks[] | .node_name] | unique' job.json)" = '["node-a"]' -->
+<!-- ci: jq -e '.tasks | length == 2 and all(.[]; .run_ms == .wall_ms and .pull_ms == 0 and (.queued_ms | type) == "number" and (.fetch_ms | type) == "number" and (.upload_ms | type) == "number")' job.json -->
+
+| Field | Time spent |
+| --- | --- |
+| `queued_ms` | waiting in the queue for a node (for a task that ran again, the wait of its last run) |
+| `fetch_ms` | on the node, fetching what the task mounts from the cluster's file store (datasets, large inputs, a private image) |
+| `pull_ms` | pulling the image; `0` when the node already had it |
+| `run_ms` | running: creating the container or VM, the program, copying its output out |
+| `upload_ms` | storing the output in the file store; `0` when it is small enough to travel with the result |
+
+`wall_ms` is `run_ms`, and it is the only time the receipt bills: a task
+that waited ten minutes for a cold image pays the same as one that found
+the image cached. `pumasi job ID` and the dashboard show the same
+numbers. Agents older than 1.4 report no `fetch_ms`, `pull_ms` or
+`upload_ms` (they read `0`), and their Docker tasks still count the pull
+in `wall_ms`.
+
 ### Logs and outputs
 
 ```sh
@@ -248,6 +302,30 @@ curl -sS -H "Authorization: Bearer $PUMASI_TICKET" -F "files=@net-job.toml;filen
 jq -r .error refused.json
 ```
 <!-- ci: grep -q "does not allow network access" refused.json -->
+
+To ask first, add `?validate=1`: the job goes through the same checks
+(the ticket, the account's policy and quotas, the files it names) and
+nothing is submitted. The answer is `200`, or the status and error a real
+submission would get:
+
+```sh
+CHECK=$(curl -sS -H "Authorization: Bearer $PUMASI_TICKET" \
+  -F files=@job.toml -F files=@ticker.wasm \
+  -o check.json -w '%{http_code}' "$PUMASI_URL/api/v1/jobs?validate=1")
+echo "$CHECK"; jq . check.json
+REFUSED=$(curl -sS -H "Authorization: Bearer $PUMASI_TICKET" \
+  -F "files=@net-job.toml;filename=job.toml" \
+  -o check-refused.json -w '%{http_code}' "$PUMASI_URL/api/v1/jobs?validate=1")
+echo "$REFUSED"; jq -r .error check-refused.json
+```
+<!-- ci: test "$CHECK" = 200 -->
+<!-- ci: test "$(jq -c '[.valid, .account, .tasks, .ready_nodes, .waiting]' check.json)" = '[true,"lab",2,["node-a"],null]' -->
+<!-- ci: test "$REFUSED" = 403 -->
+<!-- ci: test "$(jq -r .error check-refused.json)" = "$(jq -r .error refused.json)" -->
+
+`ready_nodes` names the nodes that would start a task right now; when
+there are none, `waiting` says why the job would sit in the queue (the
+jobs it waits for, the quota, or each node's reason).
 
 | Status | Means |
 | --- | --- |
@@ -282,14 +360,56 @@ curl -fsS -X POST -H "Authorization: Bearer $PUMASI_TICKET" \
   "$PUMASI_URL/api/v1/jobs/$JOB/cancel"
 ```
 
-### Node names and upgrades (admin ticket)
+### Account policies (admin ticket)
 
 These take the cluster's admin ticket (or an admin-role access ticket),
-not the client's. Give a node a display name; it shows in the status, the
+not the client's. `GET /api/v1/accounts/NAME/policy` answers an account's
+policy, quota and use (a submitter ticket may read its own account's);
+`PATCH` changes only the fields in the body and answers the result. A
+list takes the whole list, or what to add and remove, so allowing one
+more image needs no read first:
+
+<!-- ci: export PUMASI_ADMIN_TICKET=$(cat "$PUMASI_HOME/cluster/admin.ticket") -->
+```sh
+curl -fsS -X PATCH -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" \
+  -H 'Content-Type: application/json' \
+  -d '{"images": {"add": ["node:22-slim"]}, "max_timeout_ms": 3600000}' \
+  "$PUMASI_URL/api/v1/accounts/lab/policy" | tee policy.json | jq '{images, max_timeout_ms, executors, network}'
+```
+<!-- ci: test "$(jq -c '[.images, .max_timeout_ms, .executors, .network, .quota.slots]' policy.json)" = '[["ghcr.io/lab/*","python:3.12-slim","node:22-slim"],3600000,["docker","wasm"],"deny",4]' -->
+
+```sh
+curl -fsS -X PATCH -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" \
+  -H 'Content-Type: application/json' \
+  -d '{"images": {"remove": ["node:22-slim"]}, "max_timeout_ms": 1800000, "quota": {"slots": 4}}' \
+  "$PUMASI_URL/api/v1/accounts/lab/policy" >/dev/null
+curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/accounts/lab/policy" \
+  | tee policy.json | jq '{account, images, quota}'
+```
+<!-- ci: test "$(jq -c '[.account, .images, .max_timeout_ms]' policy.json)" = '["lab",["ghcr.io/lab/*","python:3.12-slim"],1800000]' -->
+<!-- ci: test "$(curl -sS -X PATCH -H "Authorization: Bearer $PUMASI_TICKET" -H 'Content-Type: application/json' -d '{"network": "allow"}' -o /dev/null -w '%{http_code}' "$PUMASI_URL/api/v1/accounts/lab/policy")" = 403 -->
+<!-- ci: test "$(curl -sS -X PATCH -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{"image": ["a"]}' -o /dev/null -w '%{http_code}' "$PUMASI_URL/api/v1/accounts/lab/policy")" = 400 -->
+<!-- ci: test "$(curl -sS -H "Authorization: Bearer $PUMASI_TICKET" -o /dev/null -w '%{http_code}' "$PUMASI_URL/api/v1/accounts/other/policy")" = 403 -->
+
+| In the body | Does |
+| --- | --- |
+| a field left out | nothing: it keeps its value |
+| `"images": ["a", "b"]` | replaces the list (`[]` allows any image) |
+| `"images": {"add": ["c"], "remove": ["a"]}` | changes the list; adding what is there or removing what is not changes nothing, so the call can be repeated. Removing the last entry is an error, because an empty list allows everything |
+| `"executors"`, `"tolerations"` | lists like `images`; `"tolerations": null` allows any taint |
+| `"network": "deny"`, `"require_digest": true`, `"selector": "gpu=nvidia"` | sets the value |
+| `"max_timeout_ms": null`, `"max_gpus_per_task": null` | lifts the limit |
+| `"quota": {"slots": 4, "gpus": null}` | sets or lifts the quotas it names (`slots`, `gpus`, `cu_per_day`, `max_priority`, `storage_bytes`) |
+
+What `GET` answers can be sent back as it is, and an unknown field is a
+`400`. The schema is in `/api/openapi.json` (`AccountPolicyPatch`).
+
+### Node names and upgrades (admin ticket)
+
+These also take an admin ticket. Give a node a display name; it shows in the status, the
 dashboard and events, and works wherever a node name is taken. `null`
 goes back to the name its agent reports:
 
-<!-- ci: export PUMASI_ADMIN_TICKET=$(cat "$PUMASI_HOME/cluster/admin.ticket") -->
 ```sh
 curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" \
   -H 'Content-Type: application/json' -d '{"name": "living-room"}' \
@@ -342,9 +462,12 @@ unpacks the outputs:
 ```sh
 mkdir -p hello && cp job.toml ticker.wasm hello/
 pumasi-remote whoami
+pumasi-remote check hello | tee hello-check.json
 pumasi-remote run hello hello-out
 ls hello-out
 ```
+<!-- ci: jq -e '.valid and .tasks == 2' hello-check.json -->
+<!-- ci: ! pumasi-remote check net-job.toml -->
 <!-- ci: grep -q "pumasi dashboard ok" hello-out/task-0/result.txt -->
 
 - It sends only the files `job.toml` names (`module`, `stdin`, `files`,
@@ -358,6 +481,9 @@ ls hello-out
 - When something in front of the API answers instead of Pumasi (a
   Cloudflare challenge page, a company proxy), it says so instead of
   failing on HTML.
+- `whoami` shows what the account's jobs may ask for, and `check DIR`
+  asks whether the cluster would take a job (`?validate=1`) without
+  submitting it.
 - `submit`, `wait`, `logs`, `outputs`, `cancel`, `status` and `jobs` do
   one step each; `pumasi-remote --help` lists them. `wait` and `run` exit
   0 only if the job succeeded, and 2 if `--timeout` ran out first (the
@@ -398,9 +524,10 @@ the hosts it names, after they leave the session.
    ```text
    A Pumasi cluster is available through `pumasi-remote` (PUMASI_URL is
    set, the proxy adds the ticket). For heavy builds, tests or data jobs,
-   write a job folder (job.toml plus the files it names; images allowed:
-   python:3.12-slim, rust:1-slim, node:22-slim; no network) and run
-   `pumasi-remote run DIR`. For jobs over a minute, `pumasi-remote submit
+   write a job folder (job.toml plus the files it names; `pumasi-remote
+   whoami` lists the images and executors the account may use) and run
+   `pumasi-remote run DIR`; `pumasi-remote check DIR` says beforehand
+   whether the job would be accepted. For jobs over a minute, `pumasi-remote submit
    DIR`, then `pumasi-remote wait ID` in the background. Check
    `pumasi-remote status` first; if no node is ready, run locally.
    ```

@@ -4,10 +4,14 @@
 #
 #   1. start a control plane (local network mode),
 #   2. install the agent (the "old" binary) as a service with a join ticket,
+#      the way releases before 1.4 did (options in the service definition),
 #      wait until it is online, restart the service, wait again,
-#   3. `pumasi upgrade rollout` the "new" binary and wait until the node runs
+#   3. change its options with `pumasi service set`: the first change moves
+#      them to agent.toml and keeps the ones it does not name, the second
+#      only rewrites the file; `pumasi service status` shows them each time,
+#   4. `pumasi upgrade rollout` the "new" binary and wait until the node runs
 #      it (the agent downloads it, verifies it, swaps it in and restarts),
-#   4. uninstall the service and check the node goes offline.
+#   5. uninstall the service and check the node goes offline.
 #
 # Usage: service-upgrade.sh OLD_BINARY NEW_BINARY WORK_DIR [--foreground]
 #
@@ -85,6 +89,10 @@ wait_until() { # description, command...
 
 node_online() { admin status | grep -E "^[0-9a-f]+ +$NODE +online"; }
 node_offline() { ! node_online; }
+svc() { as_root "$AGENT_BIN" --home "$(nat "$AHOME")" service "$@"; }
+# The `options:` line of `service status` must hold (or not hold) a text.
+status_has() { svc status | tee "$WORK/status.txt"; grep -q -e "$1" "$WORK/status.txt"; }
+status_lacks() { svc status >"$WORK/status.txt" || true; ! grep -q -e "$1" "$WORK/status.txt"; }
 
 echo "--- starting the control plane"
 "$OLD" --home "$(nat "$CHOME")" cluster start --net local --no-token --name ci \
@@ -95,9 +103,13 @@ TICKET=$(admin token --ttl 1h)
 
 echo "--- installing the agent ($MODE)"
 if [ "$MODE" = service ]; then
-  as_root "$AGENT_BIN" --home "$(nat "$AHOME")" service install --ticket "$TICKET" \
-    -- --net local --name "$NODE" --slots 1
-  as_root "$AGENT_BIN" --home "$(nat "$AHOME")" service status
+  # As a release before 1.4 installed it: the options in the definition.
+  svc install --inline-options --ticket "$TICKET" -- --net local --name "$NODE" --slots 1
+  status_has "options: *--net local --name $NODE --slots 1"
+  status_has "in the service definition"
+  if as_root test -e "$AHOME/agent.toml"; then
+    echo "agent.toml exists before the first service set"; exit 1
+  fi
   if [ "$OS" = windows ]; then
     # The firewall rule for direct connections, with a plain program path
     # (netsh refuses \\?\ paths).
@@ -120,6 +132,33 @@ if [ "$MODE" = service ]; then
   esac
   sleep 2
   wait_until "the node to rejoin after a restart" node_online
+
+  echo "--- changing the service's options"
+  # The first change moves the options to agent.toml. The ones it does not
+  # name (--net local) stay, or the node could not come back. No --home:
+  # the service's own definition says where its home is.
+  NODE=ci-node-b
+  as_root "$AGENT_BIN" service set -- --name "$NODE" --slots 2 --no-gpus | tee "$WORK/set.txt"
+  grep -q "moved the options from the service definition" "$WORK/set.txt"
+  as_root test -s "$AHOME/agent.toml"
+  wait_until "the node to come back under its new name" node_online
+  status_has "options: *--net local --name $NODE --slots 2 --no-gpus"
+  status_lacks "in the service definition"
+  # From now on a change rewrites the file and restarts the service.
+  as_root "$AGENT_BIN" service set -- --gpus --slots 1 | tee "$WORK/set.txt"
+  grep -q "restarted the agent service" "$WORK/set.txt"
+  sleep 2
+  wait_until "the node to rejoin after the second change" node_online
+  status_has "options: *--net local --name $NODE --slots 1"
+  status_lacks "no-gpus"
+  # Nothing to change: nothing restarts.
+  as_root "$AGENT_BIN" service set -- --slots 1 | tee "$WORK/set.txt"
+  grep -q "nothing to change" "$WORK/set.txt"
+  # A change the command would refuse is refused before anything changes.
+  if as_root "$AGENT_BIN" service set -- --allow-confidential; then
+    echo "an option that needs --allow-microvm was accepted without it"; exit 1
+  fi
+  status_has "options: *--net local --name $NODE --slots 1"
 fi
 
 echo "--- rolling out the new binary"
@@ -144,15 +183,19 @@ admin status | grep -E "$NODE +online .*${NEW_VERSION//+/\\+}" || {
   echo "node does not report version $NEW_VERSION"; admin status; dump; exit 1;
 }
 if [ "$MODE" = service ]; then
-  as_root "$AGENT_BIN" --home "$(nat "$AHOME")" service status
+  # The upgraded binary runs with the same options.
+  status_has "options: *--net local --name $NODE --slots 1"
 fi
 
 if [ "$MODE" = service ]; then
   echo "--- uninstalling the service"
-  as_root "$AGENT_BIN" --home "$(nat "$AHOME")" service uninstall
+  svc uninstall
   wait_until "the node to go offline" node_offline
-  if as_root "$AGENT_BIN" --home "$(nat "$AHOME")" service status; then
+  if svc status; then
     echo "service still reported as running"; exit 1
+  fi
+  if as_root test -e "$AHOME/agent.toml"; then
+    echo "agent.toml is still there after the uninstall"; exit 1
   fi
 fi
 echo "--- ok"

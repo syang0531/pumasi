@@ -9,12 +9,15 @@ use std::{collections::HashMap, time::Instant};
 
 use anyhow::Result;
 use pumasi_proto::{
-    economy::validate_account,
+    economy::{validate_account, vcpus},
     gpu::GpuRequest,
-    job::{Executor, GpuCapability, JobId, JobSubmission, format_duration_ms},
+    job::{Executor, GpuCapability, JobId, JobSubmission, Tier, format_duration_ms},
     manage::{AccountPolicy, LabelSet},
     monitor::EventLevel,
-    msg::{Capacity, ExecutorReport, NodeCapacity, Outcome, TaskRef, TaskState},
+    msg::{
+        Capacity, ExecutorReport, JobCheck, NodeCapacity, OWNER_ACCOUNT, Outcome, TaskDetail,
+        TaskRef, TaskState, TaskTiming,
+    },
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -275,6 +278,7 @@ impl State {
             index,
             check: false,
             priority,
+            since: Instant::now(),
         };
         let Some(need) = self.need_for(&item) else {
             return "the task is not waiting".into();
@@ -309,6 +313,160 @@ impl State {
         parts.join(", ")
     }
 
+    // -- checking a job before it is submitted (1.4) -------------------------
+
+    /// What [`Self::submit_by`] checks, without creating the job, and
+    /// which nodes would take one of its tasks right now.
+    pub fn check_job(
+        &self,
+        mut sub: JobSubmission,
+        upload_bytes: u64,
+        submitter: bool,
+    ) -> Result<JobCheck> {
+        sub.validate()?;
+        let account = sub.account.take().unwrap_or_else(|| OWNER_ACCOUNT.into());
+        validate_account(&account)?;
+        let cap = self.priority_cap(&account, submitter);
+        anyhow::ensure!(
+            sub.priority <= cap,
+            "priority {} is above the {cap} account {account} may use (`pumasi quota {account} --max-priority`)",
+            sub.priority
+        );
+        let wait = self.check_deps(&sub.after)?;
+        let (ext, _) = self.prepare_store(&sub, &account)?;
+        // Input files too large to go with the job are stored first.
+        if upload_bytes > 0 {
+            self.check_quota(&account, upload_bytes)?;
+        }
+        let floor = self.policy.ledger.floor();
+        let can_pay = self
+            .accounts
+            .get(&account)
+            .is_some_and(|a| a.balance > floor)
+            && !self.over_daily(&account);
+        let confidential = sub.tier == Tier::Confidential;
+        let need = Need {
+            item: QueueItem {
+                job: JobId(0),
+                index: 0,
+                check: false,
+                priority: sub.priority,
+                since: Instant::now(),
+            },
+            executor: sub.executor,
+            memory: sub.limits.memory_bytes,
+            cpus: match sub.executor {
+                Executor::Wasm => 1,
+                _ => vcpus(sub.limits.cpu_millis),
+            },
+            store_job: ext.needs_store || upload_bytes > 0,
+            gpu: sub.gpu.clone(),
+            vm_network: sub.executor == Executor::Microvm
+                && sub.docker.as_ref().is_some_and(|d| d.network),
+            // A private image is pulled into the store after the job is
+            // submitted, for the architectures of the nodes that fit.
+            images: None,
+            consumer: account.clone(),
+            can_pay,
+            exclude_nodes: Vec::new(),
+            exclude_accounts: Vec::new(),
+            selector: sub.selector.clone(),
+            tolerations: sub.tolerations.clone(),
+            gpu_caps: !sub.gpu_capabilities.is_empty(),
+            gpu_graphics: sub.needs_gpu_graphics(),
+            trusted_only: sub.tier == Tier::Trusted,
+            // Sealed once the job exists; the nodes must have a TEE.
+            confidential: None,
+        };
+        let labels = self.online_labels();
+        let mut ready_nodes = Vec::new();
+        let mut reasons = Vec::new();
+        let mut ids: Vec<&String> = self.members.keys().collect();
+        ids.sort_by_key(|id| (self.node_name(id), (*id).clone()));
+        for id in ids {
+            let name = self.node_name(id);
+            let why = match self.nodes.get(id) {
+                None => Some("offline".to_string()),
+                Some(n) => match self.refusal(id, n, &need, &labels, 0, &[]) {
+                    Some(r) => Some(r.to_string()),
+                    None if confidential
+                        && (n.perf.protocol < pumasi_proto::CONFIDENTIAL_PROTOCOL
+                            || self.conf.usable_tees(id).is_empty()) =>
+                    {
+                        Some("does not start confidential VMs (SEV-SNP or TDX)".to_string())
+                    }
+                    None => None,
+                },
+            };
+            match why {
+                None => ready_nodes.push(name),
+                Some(why) => reasons.push(format!("{name} ({why})")),
+            }
+        }
+        let waiting = if wait {
+            Some(match sub.after.as_slice() {
+                [one] => format!("it waits for job {one}"),
+                many => format!("it waits for {} jobs", many.len()),
+            })
+        } else if !self.within_quota(&need, &self.account_usage()) {
+            ready_nodes.clear();
+            Some(format!(
+                "account {account} is at its quota (`pumasi quota {account}`)"
+            ))
+        } else if !ready_nodes.is_empty() {
+            None
+        } else if reasons.is_empty() {
+            Some("the cluster has no nodes".into())
+        } else {
+            Some(format!("no node takes it now: {}", reasons.join(", ")))
+        };
+        if wait {
+            ready_nodes.clear();
+        }
+        Ok(JobCheck {
+            account,
+            tasks: sub.tasks.len() as u32,
+            ready_nodes,
+            waiting,
+        })
+    }
+
+    // -- task details (1.4) ---------------------------------------------------
+
+    /// What a node measured of a run, kept until the run's report is
+    /// applied (the report follows at once).
+    pub fn note_timing(&mut self, node_id: &str, generation: u64, task: TaskRef, t: TaskTiming) {
+        let running = self
+            .nodes
+            .get(node_id)
+            .is_some_and(|n| n.generation == generation && n.running.contains_key(&task));
+        if running {
+            self.mgmt.report_timing.insert(task, t);
+        }
+    }
+
+    /// Where each task of a job ran, by name, and how long its parts took.
+    pub fn task_details(&self, id: JobId) -> Option<Vec<TaskDetail>> {
+        let job = self.jobs.get(&id)?;
+        Some(
+            job.tasks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| TaskDetail {
+                    index: i as u32,
+                    node_name: t.node.as_deref().map(|n| self.node_name(n)),
+                    queued_ms: t.times.queued_ms,
+                    fetch_ms: t.times.fetch_ms,
+                    pull_ms: t.times.pull_ms,
+                    // Agents from 1.4 on leave the pull out of `wall_ms`;
+                    // an older one's `wall_ms` holds it, unmeasured.
+                    run_ms: t.wall_ms,
+                    upload_ms: t.times.upload_ms,
+                })
+                .collect(),
+        )
+    }
+
     fn online_labels(&self) -> HashMap<String, LabelSet> {
         self.nodes
             .iter()
@@ -341,6 +499,7 @@ impl State {
                 index: 0,
                 check: false,
                 priority: 0,
+                since: Instant::now(),
             },
             executor,
             memory: 64 * 1024,
@@ -420,10 +579,14 @@ impl State {
             for e in &ok {
                 *ready.entry(*e).or_default() += 1;
             }
+            // A policy that gives its tasks no GPU has no GPU node ready.
+            let gpu_allowed = policy.max_gpus_per_task != Some(0);
             let image_gpu = |graphics: bool| {
                 [Executor::Docker, Executor::Microvm]
                     .into_iter()
-                    .filter(|e| ok.contains(e) && (!graphics || *e == Executor::Docker))
+                    .filter(|e| {
+                        gpu_allowed && ok.contains(e) && (!graphics || *e == Executor::Docker)
+                    })
                     .any(|e| {
                         self.refusal(
                             id,

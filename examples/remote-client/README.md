@@ -14,10 +14,11 @@ pumasi-remote run ../python-wordcount # submit, wait, unpack to pumasi-out/<id>
 
 | Command | Does |
 | --- | --- |
-| `whoami` | the ticket's name, role and account |
+| `whoami` | the ticket's name, role and account, and the account's job policy, quota and use |
 | `status` | nodes that can take this account's work now, and why the others cannot |
 | `jobs` | this account's jobs |
 | `submit DIR\|JOB.toml [--account A] [--priority N] [--after ID]` | sends the job file and the files it names, prints the job id |
+| `check DIR\|JOB.toml [submit options]` | asks whether the cluster would take the job (role, policy, quotas, files) without submitting it; exit 0 if it would, else the reason (Pumasi 1.4 or later) |
 | `wait JOB [--timeout 30m]` | follows it with long polls; exit 0 if it succeeded, 1 if not, 2 on timeout |
 | `logs JOB [TASK]` | stdout (and stderr on stderr) of one task |
 | `outputs JOB [DEST]` | downloads `outputs.zip` and unpacks it (default `pumasi-out/JOB`) |

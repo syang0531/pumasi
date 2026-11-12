@@ -665,6 +665,147 @@ impl AccountPolicy {
     }
 }
 
+/// A change to one list of a policy (1.4): a whole new list, or entries
+/// to add and to remove. Adding what is there and removing what is not
+/// change nothing, so the same change can be sent twice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListPatch {
+    pub set: Option<Vec<String>>,
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+}
+
+impl ListPatch {
+    pub fn is_empty(&self) -> bool {
+        self.set.is_none() && self.add.is_empty() && self.remove.is_empty()
+    }
+
+    fn check(&self, what: &str) -> Result<()> {
+        ensure!(
+            self.set.is_none() || (self.add.is_empty() && self.remove.is_empty()),
+            "{what}: give the whole list, or entries to add and remove, not both"
+        );
+        Ok(())
+    }
+
+    /// Applies the change to `list`. `open` says an empty list means no
+    /// limit, so removing the last entry is refused: it would allow
+    /// everything where the caller asked for less.
+    fn apply<T: PartialEq + Clone>(
+        &self,
+        list: &mut Vec<T>,
+        what: &str,
+        open: bool,
+        parse: impl Fn(&str) -> Result<T>,
+    ) -> Result<()> {
+        self.check(what)?;
+        let parse_all = |v: &[String]| {
+            v.iter()
+                .map(|s| parse(s.trim()))
+                .collect::<Result<Vec<T>>>()
+        };
+        if let Some(v) = &self.set {
+            *list = Vec::new();
+            for e in parse_all(v)? {
+                if !list.contains(&e) {
+                    list.push(e);
+                }
+            }
+            return Ok(());
+        }
+        for e in parse_all(&self.add)? {
+            if !list.contains(&e) {
+                list.push(e);
+            }
+        }
+        let remove = parse_all(&self.remove)?;
+        let before = list.len();
+        list.retain(|e| !remove.contains(e));
+        ensure!(
+            !(open && before > 0 && list.is_empty()),
+            "{what}: removing the last entry would allow any; set the whole list to an empty one if that is meant"
+        );
+        Ok(())
+    }
+}
+
+/// `wasm`, `docker` or `microvm`.
+pub fn parse_executor(s: &str) -> Result<Executor> {
+    match s.trim() {
+        "wasm" => Ok(Executor::Wasm),
+        "docker" => Ok(Executor::Docker),
+        "microvm" => Ok(Executor::Microvm),
+        other => bail!("unknown executor {other:?} (wasm, docker or microvm)"),
+    }
+}
+
+/// A change to an account's job policy that leaves what it does not name
+/// as it is (1.4): `PATCH /api/v1/accounts/NAME/policy`, `pumasi quota
+/// NAME --add-images ...` and the dashboard's Accounts page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyPatch {
+    pub images: ListPatch,
+    pub require_digest: Option<bool>,
+    pub executors: ListPatch,
+    pub deny_network: Option<bool>,
+    pub selector: Option<Selector>,
+    /// Entries as written on the command line (`key`, `key=value`, `*`).
+    pub tolerations: ListPatch,
+    /// Lifts the limit on tolerations (the policy's `None`).
+    pub any_toleration: bool,
+    pub max_timeout_ms: Option<Option<u64>>,
+    pub max_gpus_per_task: Option<Option<u32>>,
+}
+
+impl PolicyPatch {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Changes `p` and checks the result.
+    pub fn apply(&self, p: &mut AccountPolicy) -> Result<()> {
+        self.images.apply(&mut p.images, "images", true, |s| {
+            ensure!(!s.is_empty(), "an image pattern is empty");
+            Ok(s.to_string())
+        })?;
+        self.executors
+            .apply(&mut p.executors, "executors", true, parse_executor)?;
+        p.executors.sort_by_key(|e| e.to_string());
+        if let Some(v) = self.require_digest {
+            p.require_digest = v;
+        }
+        if let Some(v) = self.deny_network {
+            p.deny_network = v;
+        }
+        if let Some(s) = &self.selector {
+            p.selector = s.clone();
+        }
+        ensure!(
+            !(self.any_toleration && !self.tolerations.is_empty()),
+            "tolerations: lift the limit or change the list, not both"
+        );
+        if self.any_toleration {
+            p.tolerations = None;
+        } else if !self.tolerations.is_empty() {
+            ensure!(
+                p.tolerations.is_some() || self.tolerations.remove.is_empty(),
+                "tolerations: the account may carry any toleration, so there is nothing to remove; set the whole list first"
+            );
+            let mut list = p.tolerations.take().unwrap_or_default();
+            self.tolerations
+                .apply(&mut list, "tolerations", false, |s| s.parse::<Toleration>())?;
+            p.tolerations = Some(list);
+        }
+        if let Some(v) = self.max_timeout_ms {
+            p.max_timeout_ms = v;
+        }
+        if let Some(v) = self.max_gpus_per_task {
+            p.max_gpus_per_task = v;
+        }
+        p.validate()
+    }
+}
+
 /// An image reference with Docker's defaults filled in:
 /// `python:3.12` is `docker.io/library/python:3.12`, `me/app` is
 /// `docker.io/me/app:latest`.
@@ -1477,6 +1618,153 @@ impl ClusterFile {
 mod tests {
     use super::*;
     use chrono::{FixedOffset, Utc};
+
+    #[test]
+    fn policy_patch_changes_only_what_it_names() {
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut p = AccountPolicy {
+            images: strs(&["python:3.12-slim", "rust:1-slim"]),
+            executors: vec![Executor::Docker],
+            deny_network: true,
+            max_timeout_ms: Some(60_000),
+            ..Default::default()
+        };
+        let before = p.clone();
+
+        // Nothing named: nothing changes.
+        PolicyPatch::default().apply(&mut p).unwrap();
+        assert_eq!(p, before);
+
+        // Add and remove entries; the rest stays.
+        let patch = PolicyPatch {
+            images: ListPatch {
+                add: strs(&["node:22-slim", "rust:1-slim"]),
+                remove: strs(&["python:3.12-slim", "not-there"]),
+                ..Default::default()
+            },
+            executors: ListPatch {
+                add: strs(&["microvm"]),
+                ..Default::default()
+            },
+            tolerations: ListPatch {
+                add: strs(&["spot", "owner=alice"]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        patch.apply(&mut p).unwrap();
+        assert_eq!(p.images, strs(&["rust:1-slim", "node:22-slim"]));
+        assert_eq!(p.executors, vec![Executor::Docker, Executor::Microvm]);
+        assert_eq!(
+            p.tolerations,
+            Some(vec![
+                "spot".parse().unwrap(),
+                "owner=alice".parse().unwrap()
+            ])
+        );
+        assert!(p.deny_network);
+        assert_eq!(p.max_timeout_ms, Some(60_000));
+        // The same change again changes nothing.
+        let once = p.clone();
+        patch.apply(&mut p).unwrap();
+        assert_eq!(p, once);
+
+        // Removing the last image would allow every image: refused, and
+        // the policy is not touched by a caller that checks the result.
+        let mut q = p.clone();
+        let err = PolicyPatch {
+            images: ListPatch {
+                remove: strs(&["rust:1-slim", "node:22-slim"]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .apply(&mut q)
+        .unwrap_err();
+        assert!(err.to_string().contains("would allow any"), "{err}");
+        // A whole new list may be empty.
+        PolicyPatch {
+            images: ListPatch {
+                set: Some(Vec::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .apply(&mut p)
+        .unwrap();
+        assert!(p.images.is_empty());
+
+        // Tolerations: removing down to none is fine (none is allowed
+        // then), lifting the limit is its own switch.
+        PolicyPatch {
+            tolerations: ListPatch {
+                remove: strs(&["spot", "owner=alice"]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .apply(&mut p)
+        .unwrap();
+        assert_eq!(p.tolerations, Some(Vec::new()));
+        PolicyPatch {
+            any_toleration: true,
+            ..Default::default()
+        }
+        .apply(&mut p)
+        .unwrap();
+        assert_eq!(p.tolerations, None);
+        assert!(
+            PolicyPatch {
+                tolerations: ListPatch {
+                    remove: strs(&["spot"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .apply(&mut p)
+            .is_err()
+        );
+
+        // Limits: set, and lifted with an explicit nothing.
+        PolicyPatch {
+            max_timeout_ms: Some(None),
+            max_gpus_per_task: Some(Some(2)),
+            deny_network: Some(false),
+            selector: Some("gpu=nvidia".parse().unwrap()),
+            ..Default::default()
+        }
+        .apply(&mut p)
+        .unwrap();
+        assert_eq!(p.max_timeout_ms, None);
+        assert_eq!(p.max_gpus_per_task, Some(2));
+        assert!(!p.deny_network);
+        assert_eq!(p.selector.to_string(), "gpu=nvidia");
+
+        // A list and edits together, and bad entries, are refused.
+        assert!(
+            PolicyPatch {
+                images: ListPatch {
+                    set: Some(strs(&["a"])),
+                    add: strs(&["b"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .apply(&mut p)
+            .is_err()
+        );
+        assert!(
+            PolicyPatch {
+                executors: ListPatch {
+                    add: strs(&["podman"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .apply(&mut p)
+            .is_err()
+        );
+    }
 
     #[test]
     fn image_names_and_patterns() {

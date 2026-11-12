@@ -1916,6 +1916,108 @@ appended at the end of their enums, so older CLIs keep working against
 this control plane (and get an unknown-response error for the new
 calls). Storage layout stays 7.
 
+## Phase 20: issues from real use (1.4)
+
+Five issues filed from the home cluster and from cloud sessions using it
+over the HTTP API. Nothing here changes what a job is or where it runs.
+
+### Service options
+
+Before 1.4 a service's options were its command line, inside the unit
+file, the plist or the Windows service's arguments: changing one meant
+`service install` again with every option, and nothing showed what a
+service ran with. Now the definition is the same on every OS, `pumasi
+--home H service run --role R`, and the options are in a file in the
+home: `agent.toml`, `control-plane.toml` or `ui.toml`, holding `options =
+["--allow-docker", ...]` (mode 0600, owned by the home's owner). `service
+run` reads the file and runs the role's command with them, so the file is
+the only place they are.
+
+`pumasi service set [ROLE] -- CHANGES` reads the current options (from
+the file, or from the definition of a service installed by an older
+release), merges the changes, parses the result with the role's real
+clap command (so a wrong option is refused before anything is written),
+writes the file, rewrites an older definition in the new form, and
+restarts the service: `systemctl restart`, `launchctl kickstart -k`, or
+stop and start through the Windows service manager. The merge works on
+the command's own argument definitions: `--NAME [VALUE]` replaces a
+single-valued option and adds to a repeatable one, `--no-NAME` removes
+`--NAME`, and a pair such as `--auto-upgrade`/`--no-auto-upgrade`
+replaces each other. `--home` is not an option of the service.
+`service status` prints the options and where they are, hiding the value
+of `--admin`. An older definition keeps working until its first `service
+set`; a service in the new form needs a 1.4 binary (`service run` on
+Unix is new), which is the one thing to know before rolling a machine
+back.
+
+### Account policies over HTTP and in the dashboard
+
+`GET` and `PATCH /api/v1/accounts/{name}/policy` live in `pumasi ui`
+(`dashboard/src/accounts.rs`), not in the control plane: a PATCH reads
+the account (`Quotas`), applies a `PolicyPatch` and a quota patch, and
+sends `SetAccountPolicy` and `SetQuota` only for what changed, so a 1.3
+control plane serves it too. `PolicyPatch` (proto) is shared by the API,
+the CLI's `--add-images`/`--remove-images` family and the dashboard's
+Accounts page: a list is replaced, or entries are added and removed;
+adding what is there and removing what is not change nothing, and
+removing the last entry of `images` or `executors` is refused because an
+empty list means "any". The JSON is flat and what GET answers can be sent
+back; unknown fields are refused. Two admins patching the same account at
+the same moment can still overwrite each other (the control plane has no
+compare-and-set for policies); the window is one request.
+
+### What a submitter can find out
+
+`GET /api/v1/whoami` adds the account's policy, quota and use for a
+submitter ticket (`Quotas` already answers a submitter with its own
+account). `POST /api/v1/jobs?validate=1` builds the same `JobSubmission`
+a real submission would and sends `AdminOp::CheckJob`: the control plane
+runs `check_job`, which is the first half of `submit` (role, policy,
+quotas, storage for the upload, dependencies, the job's own validation)
+without creating anything, and answers the account, the task count, the
+nodes that would start a task now and, when there are none, why the job
+would wait. Errors go through the same mapping as a submission, so a
+refusal is the same status and text. `capacity` skips nodes the policy
+rules out: executors it does not list, and GPUs when `max_gpus_per_task`
+is 0.
+
+### Task times and node names
+
+A task has five times. The control plane measures `queued_ms`: each queue
+item carries the instant it became runnable (submitted, dependencies
+done, or the run before it failed or was preempted), and placing it
+records that wait as the task's (a task that runs again shows the wait and
+the times of its last run). The node measures the rest and only it can:
+`fetch_ms` (mounts and large inputs from the file store), `pull_ms`
+(image pull, or building a microVM disk; 0 when the node had it) and
+`upload_ms` (output to the file store). They travel as a `ReportTail`
+after the `FromAgent::Report` message in the same frame
+(`wire::write_msg_tail`): postcard ignores bytes after a message, so a
+1.3 control plane reads the report as before, and a 1.3 agent sends no
+tail and its tasks read 0. `run_ms` is the task's `wall_ms`.
+
+Billing follows from that: the receipt has always billed `wall_ms`, and
+for Docker it used to start before the pull. Now Docker's clock starts
+when the container is created, as the microVM's already did, so a cold
+image costs the same as a cached one and `wall_ms` means the same thing
+for every executor.
+
+`AdminOp::TaskDetails` answers one `TaskDetail` per task (the times and
+`node_name`, the node's name when asked) instead of widening `TaskView`,
+which is stored in snapshots and decoded by older clients. The API merges
+them into each task of `GET /api/v1/jobs/{id}`; `pumasi job` and the
+dashboard ask for them and show what they get, and against a 1.3 control
+plane they show what they did before.
+
+### Compatibility
+
+Protocol stays 14 and storage layout stays 7. The new table `task_times`
+comes last. `AdminOp::TaskDetails` and `CheckJob` and their responses are
+appended to their enums: a 1.3 control plane closes the stream on them,
+which the 1.4 CLI and dashboard treat as "no details"; `?validate=1`
+against a 1.3 control plane is an error. Upgrade the control plane
+first, as always.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -1995,6 +2097,11 @@ last in `tables!`) and the meta key `sso`. Expired jobs are deleted from
 `jobs`, `job_ext`, `job_gpu`, `job_sched`, `job_origin`, `tasks`,
 `task_ext`, `preempted` and `modules`.
 
+Phase 20 (1.4) keeps layout 7 and adds the table `task_times` (by job
+and task index, last in `tables!`): the queue wait and the node's fetch,
+pull and upload times of the run that counted. They are deleted with
+their job.
+
 `PROTOCOL_VERSION` is 14 (phase 16, above): protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
@@ -2053,8 +2160,9 @@ remotely; install a current binary on them once.
   plane restart; alert rules are cluster-wide (no per-node or per-label
   thresholds, no silences or repeat notices); node-to-node latency is not
   measured.
-- Dashboard: prices, alert rules, webhooks, quotas, schedules and
-  rollouts are shown (or left to the CLI) but not edited in the browser;
+- Dashboard: prices, alert rules, webhooks, schedules and rollouts are
+  shown (or left to the CLI) but not edited in the browser (account
+  quotas and job policies are, since 1.4);
   sessions are in memory only; charts are server-drawn snapshots
   that refresh every 10 seconds rather than streaming.
 - WebGPU: compute shaders only (no textures, samplers or render
@@ -2069,9 +2177,9 @@ remotely; install a current binary on them once.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Remaining roadmap: phases 20 to 28 ([roadmap.md](roadmap.md)) take
-  on many of the gaps in this list, starting with the open issues from
-  real use, then sleeping machines and Docker-less nodes; phases 18 and 19 (the hub and buying CU) are on hold.
+- Remaining roadmap: phases 21 to 28 ([roadmap.md](roadmap.md)) take
+  on many of the gaps in this list, starting with sleeping machines and
+  Docker-less nodes (phase 20, the open issues from real use, is done); phases 18 and 19 (the hub and buying CU) are on hold.
 - Phase 17 leftovers: no per-peer limit on unauthenticated sign-in calls
   at the control plane, the audit log is never pruned (pruning behind a
   signed checkpoint), no SCIM provisioning (people appear when they first

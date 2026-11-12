@@ -116,6 +116,8 @@ const TRUSTED_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("truste
 /// Self-hosting 1.0 (phase 17). The audit log, a hash chain, by sequence
 /// number.
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
+/// 1.4. How long the parts of a task's run took, by (job id, task index).
+const TASK_TIMES: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_times");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -174,7 +176,8 @@ macro_rules! tables {
             JOB_ORIGIN,
             MEASUREMENTS,
             TRUSTED_NODES,
-            AUDIT
+            AUDIT,
+            TASK_TIMES
         )
     };
 }
@@ -417,6 +420,7 @@ pub struct Store {
 pub struct Snapshot {
     pub job_ext: Vec<(u128, JobExt)>,
     pub task_ext: Vec<((u128, u32), TaskExt)>,
+    pub task_times: Vec<((u128, u32), crate::state::TaskTimes)>,
     pub datasets: Vec<DatasetRecord>,
     pub quotas: Vec<(String, u64)>,
     pub secrets: Vec<(String, u64, String)>,
@@ -568,6 +572,7 @@ impl Store {
         tx.open_table(MEASUREMENTS)?;
         tx.open_table(TRUSTED_NODES)?;
         tx.open_table(AUDIT)?;
+        tx.open_table(TASK_TIMES)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -984,6 +989,10 @@ impl Store {
             let (k, v) = row?;
             snap.task_ext.push((k.value(), dec(v.value())?));
         }
+        for row in tx.open_table(TASK_TIMES)?.iter()? {
+            let (k, v) = row?;
+            snap.task_times.push((k.value(), dec(v.value())?));
+        }
         for row in tx.open_table(DATASETS)?.iter()? {
             let (_, v) = row?;
             snap.datasets.push(dec(v.value())?);
@@ -1163,6 +1172,7 @@ impl Store {
             for i in 0..tasks {
                 b.del(TASKS, (job, i));
                 b.del(TASK_EXT, (job, i));
+                b.del(TASK_TIMES, (job, i));
                 b.del(PREEMPTED, (job, i, false));
                 b.del(PREEMPTED, (job, i, true));
             }
@@ -1192,6 +1202,11 @@ impl Store {
                 b.del(TASK_EXT, (job, *i));
             } else {
                 b.put(TASK_EXT, (job, *i), enc(&task.ext).as_slice());
+            }
+            if task.times.is_empty() {
+                b.del(TASK_TIMES, (job, *i));
+            } else {
+                b.put(TASK_TIMES, (job, *i), enc(&task.times).as_slice());
             }
         }
         self.commit(b)
@@ -1932,6 +1947,7 @@ pub(crate) mod legacy {
                 check: None,
                 cost: 0,
                 ext: Default::default(),
+                times: Default::default(),
             }
         }
     }

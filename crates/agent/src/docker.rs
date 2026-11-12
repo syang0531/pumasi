@@ -231,20 +231,22 @@ impl DockerExecutor {
         Ok(inspect.status.success())
     }
 
-    async fn ensure_image(&self, image: &str, cancel: &AtomicBool) -> Result<()> {
+    /// Makes sure Docker has `image`. `false` when it already had it, so
+    /// the task did not wait for a pull.
+    async fn ensure_image(&self, image: &str, cancel: &AtomicBool) -> Result<bool> {
         if self.has_image(image).await? {
-            return Ok(());
+            return Ok(false);
         }
         let _pull = self.pull_lock.lock().await;
         // Another task may have pulled it while we waited.
         if self.has_image(image).await? {
-            return Ok(());
+            return Ok(true);
         }
         let mut delay = Duration::from_secs(2);
         let mut attempt = 1;
         loop {
             match self.pull(image, cancel).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(true),
                 Err(e) if attempt < 3 && !cancel.load(Ordering::Relaxed) => {
                     warn!(%image, "pull failed (attempt {attempt}), retrying: {e:#}");
                     tokio::time::sleep(delay).await;
@@ -294,15 +296,16 @@ impl DockerExecutor {
     }
 
     /// Loads an image taken from the file store into Docker (as
-    /// `docker save` would have written it) and returns its local tag.
-    async fn load_local_image(&self, image: &LocalImage) -> Result<String> {
+    /// `docker save` would have written it) and returns its local tag,
+    /// and `false` when Docker already had it.
+    async fn load_local_image(&self, image: &LocalImage) -> Result<(String, bool)> {
         let tag = docker_tag(&image.digest);
         if self.has_image(&tag).await? {
-            return Ok(tag);
+            return Ok((tag, false));
         }
         let _pull = self.pull_lock.lock().await;
         if self.has_image(&tag).await? {
-            return Ok(tag);
+            return Ok((tag, true));
         }
         info!(image = %tag, "loading a private image from the file store");
         let manifest: ImageManifest = serde_json::from_slice(
@@ -364,7 +367,7 @@ impl DockerExecutor {
             );
         }
         fed.context("docker load")??;
-        Ok(tag)
+        Ok((tag, true))
     }
 
     /// Runs one task to completion.
@@ -418,7 +421,8 @@ impl DockerExecutor {
                 stderr: vec![],
                 files: vec![],
                 fuel_used: 0,
-                wall_ms: start.elapsed().as_millis() as u64,
+                // The pull is not the task's run.
+                wall_ms: (start.elapsed().as_millis() as u64).saturating_sub(io.pull.ms()),
                 peak_memory_bytes: None,
                 out_dir: None,
             },
@@ -438,18 +442,29 @@ impl DockerExecutor {
         io: &TaskIo,
     ) -> Result<RunResult> {
         let local;
-        let spec = match &io.image {
-            Some(img) => {
+        let ready = match &io.image {
+            Some(img) => self
+                .load_local_image(img)
+                .await
+                .map(|(tag, fresh)| (Some(tag), fresh)),
+            None => self
+                .ensure_image(&spec.image, cancel)
+                .await
+                .map(|fresh| (None, fresh)),
+        };
+        // An image the node already had took no time worth showing.
+        if !matches!(ready, Ok((_, false))) {
+            io.pull.set(start);
+        }
+        let spec = match ready? {
+            (Some(image), _) => {
                 local = DockerSpec {
-                    image: self.load_local_image(img).await?,
+                    image,
                     ..spec.clone()
                 };
                 &local
             }
-            None => {
-                self.ensure_image(&spec.image, cancel).await?;
-                spec
-            }
+            (None, _) => spec,
         };
         if let Some(r) = &io.image_report {
             match &io.image {
@@ -462,7 +477,8 @@ impl DockerExecutor {
                 }
             }
         }
-        // The timeout covers the run itself, not the image pull.
+        // The timeout and the billed time cover the run itself, not the
+        // image pull.
         let run_start = Instant::now();
 
         let name = format!(
@@ -571,7 +587,7 @@ impl DockerExecutor {
             stderr,
             files,
             fuel_used: 0,
-            wall_ms: start.elapsed().as_millis() as u64,
+            wall_ms: run_start.elapsed().as_millis() as u64,
             peak_memory_bytes: None,
             out_dir,
         })

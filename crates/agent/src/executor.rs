@@ -90,6 +90,28 @@ pub struct TaskIo {
     /// A confidential task's sealed image and input, and the way to the
     /// key broker (phase 16).
     pub confidential: Option<ConfidentialIo>,
+    /// How long getting the image ready took, which the executor writes
+    /// for the task's timings (1.4).
+    pub pull: PullTime,
+}
+
+/// The time one run spent getting its image ready: pulling it, building a
+/// microVM's disk from it, or loading a private one. Stays 0 when the node
+/// already had the image.
+#[derive(Debug, Clone, Default)]
+pub struct PullTime(Arc<std::sync::atomic::AtomicU64>);
+
+impl PullTime {
+    pub fn set(&self, since: std::time::Instant) {
+        self.0.store(
+            since.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub fn ms(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// What a confidential task runs from: everything sealed.

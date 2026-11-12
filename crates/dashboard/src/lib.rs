@@ -14,6 +14,7 @@
 //! client address (see [`limit`]). A Cloudflare Tunnel or a reverse proxy
 //! in front works too.
 
+mod accounts;
 mod api;
 mod auth;
 mod backend;

@@ -27,7 +27,7 @@ use pumasi_proto::{
     RAFT_ALPN, Secret, blobs,
     msg::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
-        FromAgent, HelloReply, Invite, RELEASE_CHUNK, Role, TaskReport, ToAgent,
+        FromAgent, HelloReply, Invite, RELEASE_CHUNK, ReportTail, Role, TaskReport, ToAgent,
     },
     net::{NetMode, bind_endpoint_with, dialable_addr, load_or_create_key, write_private},
     perf::DiskClass,
@@ -36,7 +36,7 @@ use pumasi_proto::{
     secrets_eq,
     store::{BlobHash, MAX_STORE_OUTPUT_BYTES, StoreTarget, StoredOutput, format_size},
     ticket::{AdminTicket, JoinTicket, ReplicaTicket},
-    wire::{read_frame, read_msg, write_msg},
+    wire::{read_frame, read_msg, read_msg_tail, write_msg},
 };
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -1079,10 +1079,12 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
             }
         }
     });
+    // What followed the last message in its frame.
+    let mut tail: Option<ReportTail> = None;
 
     let result: Result<()> = loop {
         tokio::select! {
-            msg = read_msg::<_, FromAgent>(&mut recv) => match msg {
+            msg = read_msg_tail::<_, FromAgent, ReportTail>(&mut recv) => match split_tail(msg, &mut tail) {
                 Ok(Some(FromAgent::Heartbeat { .. })) => {
                     let (rtt, relayed) = path_rtt(&conn);
                     let mut st = inner.state();
@@ -1142,6 +1144,12 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     }
                 }
                 Ok(Some(FromAgent::Report { report, stored })) => {
+                    // What the node measured of the run (agents from 1.4).
+                    if let Some(t) = tail.take() {
+                        inner
+                            .state()
+                            .note_timing(&node_id, generation, report.task, t.timing);
+                    }
                     // A stored output must be complete in the store and be
                     // what the report says before the result counts.
                     let verdict: Result<(), String> = match &stored {
@@ -1286,6 +1294,20 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
     // waits for sessions really releases the database.
     let _ = fetcher.await;
     result
+}
+
+/// Takes the tail off a message read with `read_msg_tail`, so the agent loop
+/// matches on the message alone. `tail` holds what came with this message, or
+/// nothing: a tail never outlives the message it followed.
+fn split_tail(
+    msg: Result<Option<(FromAgent, Option<ReportTail>)>>,
+    tail: &mut Option<ReportTail>,
+) -> Result<Option<FromAgent>> {
+    *tail = None;
+    Ok(msg?.map(|(msg, t)| {
+        *tail = t;
+        msg
+    }))
 }
 
 /// Round-trip time of the connection's selected path, and whether that
@@ -2059,6 +2081,18 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             Some(v) => Ok(AdminResponse::Job(Box::new(v))),
             None => Ok(AdminResponse::Error(format!("no job {id}"))),
         },
+        AdminOp::TaskDetails { id } => match inner.state().task_details(id) {
+            Some(v) => Ok(AdminResponse::TaskDetails(v)),
+            None => Ok(AdminResponse::Error(format!("no job {id}"))),
+        },
+        AdminOp::CheckJob { sub, upload_bytes } => {
+            let submitter = matches!(caller, Caller::Submitter { .. });
+            Ok(AdminResponse::JobCheck(Box::new(inner.state().check_job(
+                *sub,
+                upload_bytes,
+                submitter,
+            )?)))
+        }
         AdminOp::TaskFiles { id, index } => {
             Ok(AdminResponse::Files(inner.state().task_files(id, index)?))
         }

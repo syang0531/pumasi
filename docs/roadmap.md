@@ -18,8 +18,8 @@ on real machines.
 
 | Phase | Release | Scope | Status |
 | --- | --- | --- | --- |
-| 20 | 1.4 | Issues from real use: account policies and agent options without a terminal, task timings and names | next |
-| 21 | 1.5 | Machines that sleep and machines without Docker | planned |
+| 20 | 1.4 | Issues from real use: account policies and agent options without a terminal, task timings and names | done |
+| 21 | 1.5 | Machines that sleep and machines without Docker | next |
 | 22 | 1.6 | Monitoring: live microVM output, every GPU and temperature, node-to-node network | planned |
 | 23 | 1.7 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | planned |
 | 24 | 1.8 | File store on several machines and an S3-compatible gateway | planned |
@@ -32,6 +32,8 @@ on real machines.
 
 ## 20. Issues from real use: account policies and agent options without a terminal, task timings and names (1.4)
 
+Done in 1.4.0 ([release notes](releases/v1.4.0.md)).
+
 Why: the open GitHub issues, all filed while running the home cluster and
 using it from a cloud sandbox over the HTTP API. They are small next to
 the phases after this one, and phase 21 adds agent options that need #42
@@ -42,7 +44,9 @@ to be practical.
   directory; `pumasi service status` prints them; `pumasi service set
   [ROLE] -- --allow-webgpu --no-allow-docker` changes only the given ones
   and restarts the service. Services installed by older releases are
-  moved to the file on their first `service set`.
+  moved to the file on their first `service set`. The control plane and
+  the dashboard services work the same way (`control-plane.toml`,
+  `ui.toml`).
 - **Account quotas and job policies from anywhere** ([#43](https://github.com/syang0531/pumasi/issues/43)).
   A documented `GET`/`PATCH /api/v1/accounts/{name}/policy` in
   `openapi.json`, where PATCH changes only the given fields and adds or
@@ -55,16 +59,18 @@ to be practical.
   quota and capacity checks without creating the job, and `capacity` in
   `/api/v1/status` counts only nodes that the caller's policy can use.
 - **Task timings** ([#40](https://github.com/syang0531/pumasi/issues/40)):
-  `queued_ms`, `pull_ms` (0 when the image was cached), `run_ms` and
-  `upload_ms` per task in the API, `pumasi job` and the dashboard, and the
-  docs say which of them `wall_ms` and the receipt cover.
+  `queued_ms`, `fetch_ms`, `pull_ms` (0 when the image was cached),
+  `run_ms` and `upload_ms` per task in the API, `pumasi job` and the
+  dashboard, and the docs say which of them `wall_ms` and the receipt
+  cover: `run_ms` only, for Docker as it already was for microVMs.
 - **Node names in task views** ([#41](https://github.com/syang0531/pumasi/issues/41)):
   `node_name` next to `node` in the API, and names in `pumasi job`.
 
 Gate: unit and end-to-end tests for `service set` on all three service
 managers (CI's service job), the PATCH semantics and its OpenAPI schema,
-`validate=1` answering 200 and 403 like a real submission, timings that add
-up to `wall_ms`, and a Playwright test of the Accounts page; the curl
+`validate=1` answering 200 and 403 like a real submission, timings whose
+`run_ms` is the task's `wall_ms` with the pull told apart, and a
+Playwright test of the Accounts page; the curl
 examples in docs/api.md run in CI. By hand: turn on WebGPU on every agent
 with one `service set` each, and add an image to the cloud account's
 policy from the dashboard through the tunnel.

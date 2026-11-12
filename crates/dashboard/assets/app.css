@@ -107,6 +107,9 @@ form.inline label { font-weight: 400; }
 form.stack { display: flex; flex-direction: column; gap: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
 .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; }
 .row > div { display: flex; flex-direction: column; gap: 4px; }
+fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+fieldset[disabled] { opacity: 0.75; }
+legend { font-weight: 600; padding: 0 6px; }
 .busy { display: none; color: var(--dim); }
 .htmx-request .busy, .busy.htmx-request { display: inline; }
 

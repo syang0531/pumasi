@@ -5,7 +5,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -126,6 +126,9 @@ pub(crate) struct Mgmt {
     pub policies: HashMap<String, pumasi_proto::manage::AccountPolicy>,
     /// When jobs with a queue timeout could first run (phase 15).
     pub ready_since: HashMap<JobId, std::time::Instant>,
+    /// What a node said its run's parts took, until the run's report is
+    /// applied (1.4).
+    pub report_timing: HashMap<TaskRef, pumasi_proto::msg::TaskTiming>,
 }
 
 /// Who made an admin call.
@@ -233,6 +236,7 @@ impl State {
             index,
             check,
             priority: self.priority_of(job),
+            since: Instant::now(),
         };
         let pos = if front {
             self.queue.partition_point(|q| q.priority > item.priority)
@@ -248,6 +252,7 @@ impl State {
             return;
         };
         let priority = job.meta.sched.priority;
+        let since = Instant::now();
         let items: Vec<QueueItem> = job
             .tasks
             .iter()
@@ -258,6 +263,7 @@ impl State {
                 index: i as u32,
                 check: false,
                 priority,
+                since,
             })
             .collect();
         let pos = self.queue.partition_point(|q| q.priority >= priority);

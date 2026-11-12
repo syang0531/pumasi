@@ -42,7 +42,7 @@
     },
     "/api/v1/whoami": {
       "get": {
-        "summary": "The ticket's name and role",
+        "summary": "The ticket's name, role and job policy",
         "tags": [
           "cluster"
         ],
@@ -52,7 +52,55 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "description": "`\"Admin\"`, `\"Viewer\"` or `{\"Submitter\": {\"account\": \"...\"}}`"
+                    },
+                    "account": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "policy": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/AccountPolicy"
+                        }
+                      ]
+                    },
+                    "quota": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/AccountQuota"
+                        }
+                      ]
+                    },
+                    "usage": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/AccountUsage"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "role"
+                  ]
                 }
               }
             }
@@ -72,7 +120,8 @@
           "429": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "description": "For a submitter ticket, `account`, `policy`, `quota` and `usage` say what its jobs may ask for and how much is in use; for other roles they are `null`."
       }
     },
     "/api/v1/status": {
@@ -273,6 +322,16 @@
           "jobs"
         ],
         "responses": {
+          "200": {
+            "description": "With `validate`: the job would be accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobCheck"
+                }
+              }
+            }
+          },
           "201": {
             "description": "Submitted",
             "content": {
@@ -304,7 +363,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "Same as `pumasi run`: a job.toml (field `job`, or a file named job.toml) and the files it names (fields `files`, with relative paths as file names). Large shared inputs go through the file store.",
+        "description": "Same as `pumasi run`: a job.toml (field `job`, or a file named job.toml) and the files it names (fields `files`, with relative paths as file names). Large shared inputs go through the file store. With `?validate=1` nothing is submitted: the job goes through the same checks (the ticket's role, the account's policy and quotas, the job's files) and the answer is 200, or the error a real submission would get.",
         "requestBody": {
           "required": true,
           "content": {
@@ -337,7 +396,24 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "validate",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1",
+                "true",
+                "0",
+                "false"
+              ]
+            },
+            "description": "Check the job without submitting it"
+          }
+        ]
       }
     },
     "/api/v1/jobs/{id}": {
@@ -352,7 +428,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "summary": {
+                      "type": "object"
+                    },
+                    "tasks": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Task"
+                      }
+                    }
+                  },
+                  "additionalProperties": true
                 }
               }
             }
@@ -393,7 +481,7 @@
             "description": "Long poll: wait up to this long for the job to finish (`30s`, `2m`; a bare number is seconds; at most 90s)"
           }
         ],
-        "description": "With `?wait=`, answers as soon as the job finishes (succeeded, failed or cancelled) or when the wait runs out, whichever comes first; check `summary.state`. Waits of more than 90s are cut to 90s, under the 100s a Cloudflare Tunnel allows."
+        "description": "With `?wait=`, answers as soon as the job finishes (succeeded, failed or cancelled) or when the wait runs out, whichever comes first; check `summary.state`. Waits of more than 90s are cut to 90s, under the 100s a Cloudflare Tunnel allows. Each task carries `node_name` next to `node`, and how long it waited (`queued_ms`), fetched its inputs (`fetch_ms`), pulled its image (`pull_ms`), ran (`run_ms`) and stored its output (`upload_ms`). `wall_ms` and the receipt cover `run_ms` only."
       }
     },
     "/api/v1/jobs/{id}/cancel": {
@@ -878,6 +966,111 @@
         }
       }
     },
+    "/api/v1/accounts/{name}/policy": {
+      "get": {
+        "summary": "An account's job policy, quota and use",
+        "tags": [
+          "accounts"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountPolicyView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Account name"
+          }
+        ],
+        "description": "Admins and viewers may read any account, a submitter only its own. 404 when the account has no quota, policy or jobs."
+      },
+      "patch": {
+        "summary": "Change an account's job policy or quota",
+        "tags": [
+          "accounts"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountPolicyView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Account name"
+          }
+        ],
+        "description": "Admin only. Changes only the fields in the body and answers the result. A list takes the whole list or `{\"add\": [...], \"remove\": [...]}`, so adding one image needs no read first. Removing the last entry of `images` or `executors` is refused, because an empty list allows everything; send `[]` to mean that. What GET answers can be sent back as it is.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountPolicyPatch"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/ledger": {
       "get": {
         "summary": "Ledger entries, newest first",
@@ -1311,6 +1504,353 @@
             }
           }
         }
+      }
+    },
+    "schemas": {
+      "AccountPolicy": {
+        "type": "object",
+        "properties": {
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Image patterns a job may name (`ghcr.io/lab/*`); empty allows any image"
+          },
+          "require_digest": {
+            "type": "boolean",
+            "description": "Images must be pinned by digest"
+          },
+          "executors": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "wasm",
+                "docker",
+                "microvm"
+              ]
+            },
+            "description": "Executors a job may use; empty allows all"
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "deny"
+            ],
+            "description": "`deny` refuses jobs that ask for network access"
+          },
+          "selector": {
+            "type": "string",
+            "description": "Node selector added to every job (`zone=lab,gpu`); empty for none"
+          },
+          "tolerations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Taints a job may tolerate; `null` allows any, an empty list none"
+          },
+          "max_timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Longest task timeout; `null` for no limit"
+          },
+          "max_gpus_per_task": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Most GPUs one task may ask for; `null` for no limit"
+          }
+        },
+        "required": [
+          "images",
+          "require_digest",
+          "executors",
+          "network",
+          "selector",
+          "tolerations",
+          "max_timeout_ms",
+          "max_gpus_per_task"
+        ]
+      },
+      "AccountQuota": {
+        "type": "object",
+        "description": "`null` means no limit",
+        "properties": {
+          "slots": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Tasks running at once"
+          },
+          "gpus": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "GPUs in use at once"
+          },
+          "cu_per_day": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Spending per day, in thousandths of a CU"
+          },
+          "max_priority": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Highest job priority"
+          },
+          "storage_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Bytes in the file store"
+          }
+        }
+      },
+      "AccountUsage": {
+        "type": "object",
+        "properties": {
+          "running": {
+            "type": "integer",
+            "description": "Tasks running now"
+          },
+          "gpus": {
+            "type": "integer",
+            "description": "GPUs in use now"
+          },
+          "queued": {
+            "type": "integer",
+            "description": "Tasks waiting"
+          },
+          "spent_day": {
+            "type": "integer",
+            "description": "Spent in the last day, in thousandths of a CU"
+          },
+          "storage_bytes": {
+            "type": "integer",
+            "description": "Bytes in the file store"
+          }
+        }
+      },
+      "AccountPolicyView": {
+        "description": "An account's job policy, with its name, quota and current use",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AccountPolicy"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "account": {
+                "type": "string"
+              },
+              "quota": {
+                "$ref": "#/components/schemas/AccountQuota"
+              },
+              "usage": {
+                "$ref": "#/components/schemas/AccountUsage"
+              }
+            },
+            "required": [
+              "account",
+              "quota",
+              "usage"
+            ]
+          }
+        ]
+      },
+      "ListChange": {
+        "description": "A list (replaces the whole list), or what to add to and remove from the current one. Adding an entry that is there and removing one that is not change nothing.",
+        "oneOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "add": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "remove": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "AccountPolicyPatch": {
+        "type": "object",
+        "description": "Only the fields that are given change. `null` lifts a limit. Unknown fields are refused.",
+        "additionalProperties": false,
+        "properties": {
+          "images": {
+            "$ref": "#/components/schemas/ListChange"
+          },
+          "require_digest": {
+            "type": "boolean",
+            "description": "Images must be pinned by digest"
+          },
+          "executors": {
+            "$ref": "#/components/schemas/ListChange"
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "deny"
+            ],
+            "description": "`deny` refuses jobs that ask for network access"
+          },
+          "selector": {
+            "type": "string",
+            "description": "Node selector added to every job (`zone=lab,gpu`); empty for none"
+          },
+          "tolerations": {
+            "description": "`null` allows any taint; otherwise a list or a change to it",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ListChange"
+              }
+            ]
+          },
+          "max_timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Longest task timeout; `null` for no limit"
+          },
+          "max_gpus_per_task": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Most GPUs one task may ask for; `null` for no limit"
+          },
+          "quota": {
+            "$ref": "#/components/schemas/AccountQuota"
+          },
+          "account": {
+            "type": "string",
+            "description": "If given, must be the account in the path"
+          },
+          "usage": {
+            "type": "object",
+            "description": "Ignored, so that what GET answers can be sent back"
+          }
+        }
+      },
+      "JobCheck": {
+        "type": "object",
+        "properties": {
+          "valid": {
+            "type": "boolean",
+            "const": true
+          },
+          "account": {
+            "type": "string",
+            "description": "The account the job would be billed to"
+          },
+          "tasks": {
+            "type": "integer"
+          },
+          "ready_nodes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the nodes that would start one of its tasks right now"
+          },
+          "waiting": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why no task would start right now (jobs it waits for, the account's quota, or each node with its reason); `null` when a node is ready"
+          }
+        },
+        "required": [
+          "valid",
+          "account",
+          "tasks",
+          "ready_nodes"
+        ]
+      },
+      "Task": {
+        "type": "object",
+        "description": "One task of a job. The times are omitted when the control plane is older than 1.4; agents older than 1.4 report no `fetch_ms`, `pull_ms` or `upload_ms` (they read 0).",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "node": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Id of the node the task ran on"
+          },
+          "node_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "That node's name when the task was placed"
+          },
+          "wall_ms": {
+            "type": "integer",
+            "description": "Time the task itself ran, on the node's clock; the same as `run_ms`"
+          },
+          "queued_ms": {
+            "type": "integer",
+            "description": "Time the run that counted waited in the queue for a node (since the job was submitted, its dependencies finished, or the run before it failed)"
+          },
+          "fetch_ms": {
+            "type": "integer",
+            "description": "Time on the node fetching what the task mounts from the cluster's file store (datasets, large inputs, a private image)"
+          },
+          "pull_ms": {
+            "type": "integer",
+            "description": "Time pulling the image; 0 when the node already had it"
+          },
+          "run_ms": {
+            "type": "integer",
+            "description": "Time the task itself ran. This is `wall_ms`, and the only time the receipt bills."
+          },
+          "upload_ms": {
+            "type": "integer",
+            "description": "Time storing the task's output in the file store; 0 when the output went with the result"
+          }
+        },
+        "additionalProperties": true
       }
     }
   }

@@ -541,6 +541,27 @@ Logs go to the journal on Linux and to `~/.pumasi/logs/agent.log` on macOS
 and Windows. `pumasi service uninstall` removes the service; the machine
 stays a member (`pumasi remove-node` revokes it).
 
+The options are kept in `agent.toml` in the agent's home, and the service
+reads them each time it starts. See them and change them without
+reinstalling (and without the join ticket):
+
+```sh
+pumasi service status                 # ... options:  --allow-docker --name den
+sudo pumasi service set -- --allow-webgpu --no-allow-docker --slots 6
+```
+
+`service set` changes only what it names, keeps the rest, checks the
+result the way `agent start` would, and restarts the service. `--NAME
+[VALUE]` adds or replaces an option, `--no-NAME` takes it out, and
+`--dry-run` shows the result without changing anything. `service set
+cluster` and `service set ui` do the same for the other two services
+(`control-plane.toml` and `ui.toml`). A service installed by a release
+before 1.4 keeps its options in the service definition; `service status`
+says so, and the first `service set` moves them to the file. On Windows
+this needs no reinstall and no reboot. After that the service needs
+pumasi 1.4 or later, so roll a machine back to an older release only by
+reinstalling its service with that release.
+
 The control plane and the dashboard (or the remote API) install the same
 way, so the cluster comes back after a reboot of its first machine:
 
@@ -738,7 +759,12 @@ over a quota waits in the queue until the account is back under it.
 ```sh
 pumasi quota alice --slots 8 --gpus 1 --cu-per-day 50 --max-priority 10 --storage 100G
 pumasi quota                                   # every account's limits and usage
+pumasi quota alice --add-images 'node:22-slim' # one more allowed image, the rest kept
 ```
+
+The dashboard's **Accounts** page shows and edits the same quotas and job
+policies, and `PATCH /api/v1/accounts/NAME/policy` changes only the fields
+it is given ([docs/api.md](docs/api.md)).
 
 **Role tickets.** Give people their own tickets instead of the admin one.
 A `submitter` ticket works with one account's jobs, schedules and datasets
@@ -754,7 +780,9 @@ pumasi whoami
 
 A submitter cannot remove nodes, change prices or quotas, read other
 accounts' jobs or mount their datasets, and its jobs run at priority 0
-unless its account's `max_priority` allows more.
+unless its account's `max_priority` allows more. `pumasi whoami` (and
+`GET /api/v1/whoami`) shows a submitter its account's quota and job
+policy, so it can see which images and executors it may use.
 
 **Schedules and dependencies.** A job can run on a cron schedule, in the
 control plane's local time, and skips a run while the previous one is
@@ -910,10 +938,15 @@ part of the binary: no Node, no separate install. The pages:
 - **Jobs**: submit a job (paste a job.toml, attach its files or a
   folder), follow each task's stdout and stderr live, cancel, download one
   output file or all of them as a zip, and the signed receipts (the
-  `pumasi verify-receipts` format).
+  `pumasi verify-receipts` format). Each task shows the node it ran on by
+  name and how long it waited, fetched inputs, pulled its image, ran and
+  stored its output.
 - **Storage**: datasets and their versions, usage against quotas, upload a
   folder as a new version, download one as a zip.
 - **CU**: balances and the ledger; admins grant and pay out.
+- **Accounts**: each account's quota, what it uses now and its job
+  policy (allowed images and executors, network, timeout, GPUs per task,
+  selector, tolerations); admins edit them in a form.
 - **Invites**: join tickets with the install commands, provider invites,
   and access tickets for people.
 - **Prices** and **Events** (with alert rules and webhooks).
@@ -965,7 +998,8 @@ curl -H "Authorization: Bearer $PUMASI_TICKET" -o out.zip "https://pumasi.exampl
 - **Job policies** per account: allowed images (patterns or pinned
   digests), executors, no network, a selector added to every job, allowed
   tolerations, the longest timeout and the most GPUs per task. Anything
-  else is refused with `403` and the reason, whoever submits it. Every
+  else from the account's submitter tickets is refused with `403` and
+  the reason. Every
   job records the ticket that submitted it and the digest of each image
   its tasks ran.
 - **`--api-only`** serves `/api/v1` and `/api/openapi.json` only, with
@@ -980,6 +1014,20 @@ curl -H "Authorization: Bearer $PUMASI_TICKET" -o out.zip "https://pumasi.exampl
   `/api/v1/status` (and `pumasi status`) says how many nodes would take
   the account's work right now, per executor and with GPUs, and why each
   other node would not.
+- **Before submitting**: `GET /api/v1/whoami` carries the submitter's
+  job policy and quota, and `POST /api/v1/jobs?validate=1` runs every
+  check of a submission without creating the job: `200` with the nodes
+  that would start it now, or the `403` or `400` a real submission would
+  get. `capacity` counts only nodes the account's policy can use.
+- **Where the time went**: each task of `GET /api/v1/jobs/ID` has
+  `node_name` next to `node`, and `queued_ms`, `fetch_ms`, `pull_ms` (0
+  when the image was cached), `run_ms` and `upload_ms`. `wall_ms` is
+  `run_ms`, and the receipt bills only that; waiting for a node or for an
+  image pull costs nothing. `pumasi job ID` prints the same.
+- **Account policies over HTTP** (admin ticket): `GET` and `PATCH
+  /api/v1/accounts/NAME/policy`. `PATCH` changes only the fields it is
+  given, and lists take `{"add": [...], "remove": [...]}`, so allowing
+  one more image is one call.
 - Agents re-check Docker every 30 seconds, so a Windows machine whose
   Docker Desktop starts late, or stops, is offered Docker work (or not)
   without a restart.
@@ -1103,7 +1151,8 @@ defends against, including the API exposed to the internet.
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-confidential] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-confidential` confidential jobs in SEV-SNP or TDX microVMs, `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
-| `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- OPTIONS]` | Run the agent (default), the control plane or the dashboard/API as a service that starts at boot (systemd, launchd, Windows service). `status [ROLE]` and `uninstall [ROLE]` too. |
+| `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- OPTIONS]` | Run the agent (default), the control plane or the dashboard/API as a service that starts at boot (systemd, launchd, Windows service). `status [ROLE]` (with the options it runs with) and `uninstall [ROLE]` too. |
+| `pumasi service set [agent\|cluster\|ui] [--dry-run] -- OPTIONS` | Change the options a service runs with and restart it: `--NAME [VALUE]` adds or replaces, `--no-NAME` removes, the rest stay. |
 | `pumasi upgrade latest [--check] [--version TAG] [--wait] [--force]` | Have the control plane download the newest GitHub release (or `TAG`) for every platform in the cluster, check it against its SHA256SUMS, and roll it out; `--check` only shows the newest release and each node's version. |
 | `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
@@ -1132,8 +1181,8 @@ defends against, including the API exposed to the internet.
 | `pumasi trust \| untrust <NODE>` | Let a provider's node run `tier = "trusted"` jobs, or stop it (your own machines always do). |
 | `pumasi cordon \| uncordon \| drain <NODE>` | Stop new tasks going to a node, take it back, or also move its running tasks elsewhere. |
 | `pumasi label <NODE> k=v... \| k-` / `taint <NODE> key[=value]... \| key-` | Node labels for job selectors; taints keep away jobs that do not tolerate them. |
-| `pumasi quota [ACCOUNT --slots N --gpus N --cu-per-day CU --max-priority N --storage SIZE --images P,.. --require-digest yes --executors E,.. --network deny --selector S --tolerations T,.. --max-timeout D --max-gpus-per-task N] [--clear]` | Show every account's limits, job policy and usage, or change one (`none` or `any` lifts a limit). |
-| `pumasi access create NAME --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|NAME` | Tickets with a role for other people; `pumasi whoami` shows the one in use. |
+| `pumasi quota [ACCOUNT --slots N --gpus N --cu-per-day CU --max-priority N --storage SIZE --images P,.. --require-digest yes --executors E,.. --network deny --selector S --tolerations T,.. --max-timeout D --max-gpus-per-task N] [--clear]` | Show every account's limits, job policy and usage, or change one (`none` or `any` lifts a limit). `--add-images`, `--remove-images` (and the same for `executors` and `tolerations`) change one entry of a list. |
+| `pumasi access create NAME --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|NAME` | Tickets with a role for other people; `pumasi whoami` shows the one in use, with a submitter's quota and job policy. |
 | `pumasi schedule add NAME job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm NAME` / `run NAME` | Jobs submitted on a cron schedule. |
 | `pumasi apply -f cluster.toml [--dry-run] [--prune]` | Make labels, taints, cordons, quotas, schedules, alert rules and webhooks match a file; applying twice changes nothing. |
 | `pumasi get nodes\|jobs\|accounts\|schedules\|access [-l SELECTOR] [-o json]` / `describe node\|job\|account\|schedule NAME` | List things, or show one in detail. |
@@ -1408,11 +1457,11 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
-cluster management, the dashboard and monitoring, starting with the open
-issues from real use and then machines that sleep; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
+the open issues from real use, and machines that sleep come next; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1434,8 +1483,8 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 15 | Remote API clients: per-account job policies (images and digests, executors, no network, forced selector, tolerations, longest timeout, GPUs per task), who submitted each job and the image digests it ran, `queue_timeout`, the nodes that can take an account's work now (and why the others cannot), Docker re-checked by running agents, `pumasi ui --api-only` with HTTPS (`--tls-cert`) and failed sign-in limits, a Cloudflare Tunnel guide, `?wait=` long polling, curl examples run in CI, GPU driver capabilities for drawing (`gpu.graphics`, `gpu check --docker-run`) and a Blender example | done |
 | 16 | Confidentiality tiers: `trusted` (owner machines and trusted providers) and `confidential` (SEV-SNP and TDX microVMs): images and inputs sealed on the control plane, remote attestation checked against AMD's and Intel's certificates (recorded reports and forgeries tested in CI), keys released only to a fresh guest with an admin-trusted launch measurement, sealed results, `pumasi confidential` and the dashboard's measurement list | done |
 | 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny, CodeQL and fuzzing in CI, an SSO end-to-end test against Keycloak and OpenLDAP, an internal security review, operations guide, long soak tests on Linux and macOS, then the 1.0 tag. Also: job retention (`--keep-jobs`), admin secret rotation, per-ticket request limits | done (1.0) |
-| 20 | Issues from real use: agent options changed and shown without reinstalling the service (`service set`), account quotas and job policies from the dashboard and a documented API with add/remove, submitters reading their own policy and `?validate=1`, per-task pull, run and upload times, node names in task views | next (1.4) |
-| 21 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue` | planned (1.5) |
+| 20 | Issues from real use: agent options changed and shown without reinstalling the service (`service set`), account quotas and job policies from the dashboard and a documented API with add/remove, submitters reading their own policy and `?validate=1`, per-task pull, run and upload times, node names in task views | done (1.4) |
+| 21 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue` | next (1.5) |
 | 22 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | planned (1.6) |
 | 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | planned (1.7) |
 | 24 | File store on several machines: replicas on owner nodes with repair and scrubbing, writes acknowledged on enough copies, an S3-compatible gateway | planned (1.8) |

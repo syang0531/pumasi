@@ -216,6 +216,53 @@ pub(crate) async fn submit_upload(
     secret: pumasi_proto::Secret,
     up: uploads::Upload,
 ) -> anyhow::Result<JobId> {
+    let (sub, upload) = load_upload(&up).await?;
+    let client = st.backend.client(secret).await?;
+    let id = client
+        .submit(sub, &upload, |m| tracing::debug!("submit: {m}"))
+        .await?;
+    drop(up);
+    Ok(id)
+}
+
+/// Checks an uploaded job as a submission would be checked, without
+/// creating it (`POST /api/v1/jobs?validate=1`): nothing goes to the file
+/// store, only the size of what would.
+pub(crate) async fn check_upload(
+    st: &St,
+    secret: pumasi_proto::Secret,
+    up: uploads::Upload,
+) -> anyhow::Result<pumasi_proto::msg::JobCheck> {
+    let (sub, upload) = load_upload(&up).await?;
+    let upload_bytes = upload
+        .iter()
+        .map(|(_, path)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    let res = st
+        .backend
+        .call(
+            secret,
+            AdminOp::CheckJob {
+                sub: Box::new(sub),
+                upload_bytes,
+            },
+        )
+        .await?;
+    drop(up);
+    match res {
+        AdminResponse::JobCheck(c) => Ok(*c),
+        _ => anyhow::bail!("unexpected response"),
+    }
+}
+
+/// The submission an upload holds, and the input files too large to go
+/// with it (they go through the file store).
+async fn load_upload(
+    up: &uploads::Upload,
+) -> anyhow::Result<(
+    pumasi_proto::job::JobSubmission,
+    Vec<(String, std::path::PathBuf)>,
+)> {
     let mut job_path = up.dir.path().join("job.toml");
     if let Some(text) = up.field("job") {
         tokio::fs::write(&job_path, text).await?;
@@ -252,12 +299,7 @@ pub(crate) async fn submit_upload(
         }
     }
     sub.validate()?;
-    let client = st.backend.client(secret).await?;
-    let id = client
-        .submit(sub, &upload, |m| tracing::debug!("submit: {m}"))
-        .await?;
-    drop(up);
-    Ok(id)
+    Ok((sub, upload))
 }
 
 async fn do_submit(ctx: &Ctx, form: Multipart) -> anyhow::Result<JobId> {
@@ -276,6 +318,31 @@ pub(crate) async fn job_view(ctx: &Ctx, id: JobId) -> anyhow::Result<JobView> {
         AdminResponse::Job(v) => Ok(*v),
         _ => anyhow::bail!("unexpected response"),
     }
+}
+
+/// Where each task ran and how long its parts took (1.4). Empty when the
+/// control plane is older and does not answer: the page then shows the
+/// total only.
+async fn task_details(ctx: &Ctx, id: JobId) -> Vec<pumasi_proto::msg::TaskDetail> {
+    match ctx.call(AdminOp::TaskDetails { id }).await {
+        Ok(AdminResponse::TaskDetails(d)) => d,
+        _ => Vec::new(),
+    }
+}
+
+/// `fetch 1.2 s · pull 40.0 s · upload 3.1 s`: the parts of a run that
+/// are not its billed time, when there were any.
+fn other_times(l: Lang, d: &pumasi_proto::msg::TaskDetail) -> String {
+    [
+        (l.t("fetch", "가져오기"), d.fetch_ms),
+        (l.t("pull", "이미지 풀"), d.pull_ms),
+        (l.t("upload", "업로드"), d.upload_ms),
+    ]
+    .into_iter()
+    .filter(|(_, ms)| *ms > 0)
+    .map(|(what, ms)| format!("{what} {}", fmt::ms(ms)))
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 fn parse_id(s: &str) -> anyhow::Result<JobId> {
@@ -345,6 +412,7 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
     let id = parse_id(id)?;
     let v = job_view(ctx, id).await?;
     let names = node_names(ctx).await;
+    let details = task_details(ctx, id).await;
     let s = &v.summary;
     let terminal = s.state.is_terminal();
     let top = html! {
@@ -363,13 +431,21 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
         .tasks
         .iter()
         .map(|t| {
+            let d = details.iter().find(|d| d.index == t.index);
             html! {
                 tr data-task=(t.index) {
                     td { a href={"/jobs/" (s.id) "/tasks/" (t.index)} { "#" (t.index) } }
                     td { (task_state(l, &t.state, &names)) }
                     td { (t.attempts) @if t.preempted > 0 { " " span class="dim" { "(" (t.preempted) " " (l.t("moved", "이동")) ")" } } }
                     td { @if let Some(n) = &t.node { a href={"/nodes/" (n)} { (name_of(&names, n)) } } }
-                    td { @if t.wall_ms > 0 { (fmt::ms(t.wall_ms)) } }
+                    td class="queued" { @if let Some(d) = d { @if t.node.is_some() { (fmt::ms(d.queued_ms)) } } }
+                    td class="run" {
+                        @if t.wall_ms > 0 { (fmt::ms(t.wall_ms)) }
+                        @if let Some(d) = d {
+                            @let other = other_times(l, d);
+                            @if !other.is_empty() { br; span class="dim" { (other) } }
+                        }
+                    }
                     td { (fmt::cu(t.cost)) }
                     td { (verification(l, &t.verification)) }
                     td class="files" {
@@ -402,7 +478,7 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
         @if has_outputs(&v) {
             p { a class="button" #download-all href={"/jobs/" (s.id) "/outputs.zip"} download { (l.t("Download all outputs (.zip)", "출력 모두 받기 (.zip)")) } }
         }
-        (table(&[l.t("Task", "태스크"), l.t("State", "상태"), l.t("Attempts", "시도"), l.t("Node", "노드"), l.t("Time", "시간"),
+        (table(&[l.t("Task", "태스크"), l.t("State", "상태"), l.t("Attempts", "시도"), l.t("Node", "노드"), l.t("Queued", "대기"), l.t("Run", "실행"),
                  l.t("Cost", "비용"), l.t("Check", "검증"), l.t("Output files", "출력 파일"), ""],
             rows, l.t("No tasks.", "태스크가 없습니다.")))
     };
@@ -637,6 +713,10 @@ async fn render_task(ctx: &Ctx, id: &str, index: u32) -> anyhow::Result<Response
         .ok_or_else(|| anyhow::anyhow!("no such task: {index}"))?
         .clone();
     let names = node_names(ctx).await;
+    let detail = task_details(ctx, id)
+        .await
+        .into_iter()
+        .find(|d| d.index == index);
     let title = format!("{} #{index}", v.summary.name);
     let top = html! {
         div class="page-head" {
@@ -648,7 +728,15 @@ async fn render_task(ctx: &Ctx, id: &str, index: u32) -> anyhow::Result<Response
             dt { (l.t("State", "상태")) } dd { (task_state(l, &t.state, &names)) }
             dt { (l.t("Attempts", "시도")) } dd { (t.attempts) }
             @if let Some(n) = &t.node { dt { (l.t("Node", "노드")) } dd { a href={"/nodes/" (n)} { (name_of(&names, n)) } } }
-            @if t.wall_ms > 0 { dt { (l.t("Time", "시간")) } dd { (fmt::ms(t.wall_ms)) } }
+            @if let Some(d) = &detail {
+                dt { (l.t("Queued", "대기")) } dd data-time="queued" { (fmt::ms(d.queued_ms)) }
+                dt { (l.t("Fetching inputs", "입력 가져오기")) } dd data-time="fetch" { (fmt::ms(d.fetch_ms)) }
+                dt { (l.t("Pulling the image", "이미지 풀")) } dd data-time="pull" { (fmt::ms(d.pull_ms)) }
+                dt { (l.t("Run (billed)", "실행(과금)")) } dd data-time="run" { (fmt::ms(t.wall_ms)) }
+                dt { (l.t("Storing outputs", "출력 저장")) } dd data-time="upload" { (fmt::ms(d.upload_ms)) }
+            } @else if t.wall_ms > 0 {
+                dt { (l.t("Run (billed)", "실행(과금)")) } dd data-time="run" { (fmt::ms(t.wall_ms)) }
+            }
             dt { (l.t("Cost", "비용")) } dd { (fmt::cu(t.cost)) }
             dt { (l.t("Output files", "출력 파일")) } dd class="files" {
                 @if t.output_files.is_empty() && t.stored.is_none() { span class="dim" { "—" } }

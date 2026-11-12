@@ -16,15 +16,15 @@ use pumasi_proto::{
     job::{Executor, FileEntry, MAX_OUTPUT_FILES_BYTES, dir_files, read_files},
     monitor::METRICS_EVERY_SECS,
     msg::{
-        AgentHello, Availability, FromAgent, HelloReply, NodeInfo, Role, TaskAssignment, TaskRef,
-        TaskReport, ToAgent,
+        AgentHello, Availability, FromAgent, HelloReply, NodeInfo, ReportTail, Role,
+        TaskAssignment, TaskRef, TaskReport, TaskTiming, ToAgent,
     },
     net::{NetMode, bind_endpoint_with, dialable_addr, load_or_create_key},
     perf::SignedPerf,
     receipt::{SignedUsage, Usage, output_digest},
     store::{OutputMode, StoredOutput},
     ticket::JoinTicket,
-    wire::{read_msg, write_msg},
+    wire::{read_msg, write_msg, write_msg_tail},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
@@ -166,6 +166,8 @@ pub struct Membership {
 }
 
 type FileCache = Arc<Mutex<HashMap<ModuleHash, Arc<Vec<FileEntry>>>>>;
+/// The timings that follow each run's report, by run, until it is written.
+type ReportTails = Arc<Mutex<HashMap<TaskRef, ReportTail>>>;
 
 pub struct Agent {
     endpoint: Endpoint,
@@ -209,6 +211,9 @@ pub struct Agent {
     /// Confidential runs waiting for the cluster's answer about their
     /// keys (phase 16).
     key_waiters: crate::executor::KeyWaiters,
+    /// What goes after each run's report in its frame (1.4): the writer
+    /// takes it when it writes the report.
+    report_tails: ReportTails,
     _router: Router,
 }
 
@@ -495,6 +500,7 @@ impl Agent {
             webgpu_profile,
             sampler: Arc::new(Mutex::new(sampler)),
             key_waiters: Default::default(),
+            report_tails: Default::default(),
             _router: router,
         })
     }
@@ -788,9 +794,16 @@ impl Agent {
         self.node_store.attach(out_tx.clone(), Some(addr));
 
         // Writer: the only task that touches the send stream.
+        let tails = self.report_tails.clone();
         let writer = tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = write_msg(&mut send, &msg).await {
+                // A report carries its timings after it in the frame. A
+                // control plane older than 1.4 ignores them.
+                let tail = match &msg {
+                    FromAgent::Report { report, .. } => tails.lock().unwrap().remove(&report.task),
+                    _ => None,
+                };
+                if let Err(e) = write_msg_tail(&mut send, &msg, tail.as_ref()).await {
                     debug!("write failed: {e:#}");
                     break;
                 }
@@ -1276,11 +1289,14 @@ impl Agent {
             tx: out_tx.clone(),
             waiters: self.key_waiters.clone(),
         };
+        let tails = self.report_tails.clone();
         debug!(task = %a.task, executor = %a.executor, "starting task");
         tokio::spawn(async move {
             let task = a.task;
+            let mut timing = TaskTiming::default();
             // Mounted datasets and a private image come from the file store
             // first; the run's timeout starts after.
+            let fetch_start = Instant::now();
             let prepared = prepare_io(
                 &node_store,
                 &a,
@@ -1302,6 +1318,11 @@ impl Agent {
                     return;
                 }
             };
+            // Only a task that mounts something waits for the store.
+            if io.staged.is_some() || io.image.is_some() || io.confidential.is_some() {
+                timing.fetch_ms = fetch_start.elapsed().as_millis() as u64;
+            }
+            let pull = io.pull.clone();
             io.gpus = gpus;
             io.webgpu = webgpu;
             io.gpu_capabilities = a.gpu_capabilities.clone();
@@ -1375,10 +1396,16 @@ impl Agent {
             drop(streamer);
             // Output files kept on disk go in the report when they fit, or
             // to the file store.
+            timing.pull_ms = pull.ms();
+            let upload_start = Instant::now();
             let result = match result {
                 Ok(r) => finish_output(r, a.output, &node_store, &cluster_addr).await,
                 Err(e) => Err(e),
             };
+            // Output that went in the report was not uploaded.
+            if matches!(&result, Ok((_, Some(_)))) {
+                timing.upload_ms = upload_start.elapsed().as_millis() as u64;
+            }
             running.lock().unwrap().remove(&task);
             let mut stored: Option<StoredOutput> = None;
             let report = match result {
@@ -1425,10 +1452,15 @@ impl Agent {
                 Err(e) => error_report(task, format!("{e:#}")),
             };
             debug!(task = %task, outcome = %report.outcome, "task finished");
-            let _ = out_tx.send(FromAgent::Report {
+            tails.lock().unwrap().insert(task, ReportTail { timing });
+            let sent = out_tx.send(FromAgent::Report {
                 report: Box::new(report),
                 stored,
             });
+            if sent.is_err() {
+                // The session ended, so nothing will write it.
+                tails.lock().unwrap().remove(&task);
+            }
         });
     }
 }

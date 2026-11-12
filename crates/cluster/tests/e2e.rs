@@ -190,6 +190,13 @@ async fn submit(client: &AdminClient, sub: JobSubmission) -> JobId {
     }
 }
 
+async fn task_details(client: &AdminClient, id: JobId) -> Vec<pumasi_proto::msg::TaskDetail> {
+    match client.call(AdminOp::TaskDetails { id }).await.unwrap() {
+        AdminResponse::TaskDetails(d) => d,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 async fn wait_job(client: &AdminClient, id: JobId, secs: u64) -> JobView {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
@@ -242,6 +249,24 @@ async fn runs_a_sharded_job_across_two_nodes() {
         view.tasks.iter().filter_map(|t| t.node.clone()).collect();
     assert_eq!(nodes.len(), 2, "work should be spread over both nodes");
     assert!(view.total_fuel > 0);
+
+    // Each task says which node ran it by name, and how long it ran
+    // (1.4): the run is the billed time, and WASM has nothing to pull.
+    let details = task_details(&client, id).await;
+    assert_eq!(details.len(), view.tasks.len());
+    let status = cluster.status();
+    for (t, d) in view.tasks.iter().zip(&details) {
+        assert_eq!(t.index, d.index);
+        let node = status
+            .nodes
+            .iter()
+            .find(|n| Some(&n.id) == t.node.as_ref())
+            .unwrap();
+        assert_eq!(d.node_name.as_deref(), Some(node.info.name.as_str()));
+        assert!(["a", "b"].contains(&node.info.name.as_str()));
+        assert_eq!(d.run_ms, t.wall_ms);
+        assert_eq!(d.pull_ms, 0);
+    }
 
     client.close().await;
     a.kill().await;
@@ -1241,11 +1266,26 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         );
     }
 
+    // The times of each task (1.4): the pull is told apart from the
+    // run, and the run is the billed time.
+    for (t, d) in view.tasks.iter().zip(task_details(&client, id).await) {
+        assert_eq!(d.node_name.as_deref(), Some("docker"));
+        assert_eq!(d.run_ms, t.wall_ms);
+        assert!(d.run_ms > 0, "{d:?}");
+    }
+
     // Timeout kills the container; a non-zero exit is reported as such.
     let mut slow = docker_job(&["sleep", "30"], vec![TaskInput::default()]);
     slow.limits.timeout_ms = 1500;
     let id = submit(&client, slow).await;
     let view = wait_job(&client, id, 60).await;
+    // The image is on the node by now: nothing was pulled, and the time
+    // of the run does not count the wait for one.
+    let times = &task_details(&client, id).await[0];
+    assert_eq!(times.pull_ms, 0, "{times:?}");
+    assert_eq!(times.node_name.as_deref(), Some("docker"));
+    assert_eq!(times.run_ms, view.tasks[0].wall_ms);
+    assert!((1000..30_000).contains(&times.run_ms), "{times:?}");
     assert!(
         matches!(
             view.tasks[0].state,

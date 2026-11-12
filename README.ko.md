@@ -268,6 +268,15 @@ pumasi service status
 
 `--ticket`은 첫 시작 때 클러스터에 참가하고, 없으면 이미 참가한 기기여야 합니다. `--` 뒤의 옵션은 `pumasi agent start`로 넘어갑니다. 로그는 Linux는 journal, macOS와 Windows는 `~/.pumasi/logs/agent.log`입니다. `pumasi service uninstall`은 서비스만 지우고 멤버십은 남깁니다(퇴출은 `pumasi remove-node`).
 
+옵션은 에이전트 홈의 `agent.toml`에 저장되고, 서비스가 시작할 때마다 읽습니다. 다시 설치하지 않고(참가 티켓도 없이) 옵션을 보고 바꿀 수 있습니다.
+
+```sh
+pumasi service status                 # ... options:  --allow-docker --name den
+sudo pumasi service set -- --allow-webgpu --no-allow-docker --slots 6
+```
+
+`service set`은 적어 준 옵션만 바꾸고 나머지는 그대로 두며, 결과를 `agent start`와 같은 방식으로 검사한 뒤 서비스를 재시작합니다. `--이름 [값]`은 옵션을 더하거나 바꾸고, `--no-이름`은 뺍니다. `--dry-run`은 바꾸지 않고 결과만 보여 줍니다. `service set cluster`, `service set ui`는 나머지 두 서비스에 같은 일을 합니다(`control-plane.toml`, `ui.toml`). 1.4 이전 릴리스로 설치한 서비스는 옵션이 서비스 정의 안에 있습니다. `service status`가 그렇게 알려 주고, 처음 `service set`을 하면 파일로 옮깁니다. Windows에서도 재설치나 재부팅이 필요 없습니다. 옮긴 뒤에는 서비스가 pumasi 1.4 이상을 필요로 하므로, 기기를 이전 릴리스로 되돌리려면 그 릴리스로 서비스를 다시 설치하세요.
+
 컨트롤 플레인과 대시보드(또는 원격 API)도 같은 방법으로 설치합니다. 그러면 1번 기기를 재부팅해도 클러스터가 다시 뜹니다.
 
 ```sh
@@ -373,7 +382,10 @@ zone = true                      # 라벨이 있기만 하면 (false: 없어야 
 ```sh
 pumasi quota alice --slots 8 --gpus 1 --cu-per-day 50 --max-priority 10 --storage 100G
 pumasi quota                                   # 모든 계정의 한도와 사용량
+pumasi quota alice --add-images 'node:22-slim' # 허용 이미지 하나 추가, 나머지는 그대로
 ```
+
+대시보드의 **계정** 페이지에서도 같은 쿼터와 작업 정책을 보고 고칠 수 있고, `PATCH /api/v1/accounts/이름/policy`는 보낸 필드만 바꿉니다([docs/api.md](docs/api.md)).
 
 **역할 티켓.** 관리자 티켓 대신 사람마다 티켓을 줍니다. `submitter` 티켓은 한 계정의 작업·스케줄·데이터셋만 다루고 그것만 보며, `viewer` 티켓은 읽기만 합니다. 만료 기간을 줄 수 있고 언제든 회수할 수 있으며, 받은 사람은 `pumasi login`으로 저장합니다.
 
@@ -384,7 +396,7 @@ pumasi access revoke "alice laptop"
 pumasi whoami
 ```
 
-submitter는 노드 퇴출, 단가·쿼터 변경, 다른 계정의 작업 보기나 데이터셋 마운트를 할 수 없고, 계정의 `max_priority`가 허용하지 않으면 우선순위 0으로만 제출합니다.
+submitter는 노드 퇴출, 단가·쿼터 변경, 다른 계정의 작업 보기나 데이터셋 마운트를 할 수 없고, 계정의 `max_priority`가 허용하지 않으면 우선순위 0으로만 제출합니다. `pumasi whoami`(와 `GET /api/v1/whoami`)는 submitter에게 자기 계정의 쿼터와 작업 정책을 보여 주므로, 쓸 수 있는 이미지와 실행기를 직접 확인할 수 있습니다.
 
 **스케줄과 의존성.** 작업을 cron 일정(컨트롤 플레인의 현지 시간)으로 돌릴 수 있고, 이전 실행이 아직 끝나지 않았으면 그 회차는 건너뜁니다(`--overlap`이면 겹쳐 실행). `after`는 지정한 작업들이 성공할 때까지 작업을 붙잡아 두고, 하나라도 실패하면 함께 실패시킵니다.
 
@@ -464,6 +476,7 @@ pumasi ui            # 브라우저에서 http://127.0.0.1:7400/login?token=... 
 - **작업**: 작업 제출(job.toml 붙여넣기, 파일이나 폴더 첨부), 태스크별 stdout·stderr 실시간 보기, 취소, 출력 파일 하나 또는 전부를 zip으로 받기, 서명된 영수증(`pumasi verify-receipts` 형식)
 - **저장소**: 데이터셋과 버전, 쿼터 대비 사용량, 폴더를 새 버전으로 올리기, zip으로 받기
 - **CU**: 잔액과 원장. 관리자는 지급·인출
+- **계정**: 계정별 쿼터, 지금 쓰는 양, 작업 정책(허용 이미지와 실행기, 네트워크, 제한 시간, 태스크당 GPU, selector, toleration). 관리자는 폼에서 수정
 - **초대**: 설치 명령이 붙은 참가 티켓, 제공자 초대, 사람에게 주는 액세스 티켓
 - **요금**, **이벤트**(경보 규칙과 웹훅 포함)
 
@@ -499,9 +512,12 @@ curl -H "Authorization: Bearer $PUMASI_TICKET" "https://pumasi.example.com/api/v
 curl -H "Authorization: Bearer $PUMASI_TICKET" -o out.zip "https://pumasi.example.com/api/v1/jobs/$JOB/outputs.zip"
 ```
 
-- **계정별 작업 정책**: 허용 이미지(패턴 또는 고정 다이제스트), 실행기, 네트워크 차단, 모든 작업에 붙는 selector, 허용 toleration, 최대 제한 시간, 태스크당 최대 GPU. 그 밖의 것은 누가 제출하든 이유와 함께 `403`으로 거절합니다. 작업마다 제출한 티켓 이름과 태스크가 실제로 쓴 이미지 다이제스트가 남습니다.
+- **계정별 작업 정책**: 허용 이미지(패턴 또는 고정 다이제스트), 실행기, 네트워크 차단, 모든 작업에 붙는 selector, 허용 toleration, 최대 제한 시간, 태스크당 최대 GPU. 그 밖의 것은 그 계정의 submitter 티켓으로 제출하면 이유와 함께 `403`으로 거절합니다. 작업마다 제출한 티켓 이름과 태스크가 실제로 쓴 이미지 다이제스트가 남습니다.
 - **`--api-only`**는 `/api/v1`와 `/api/openapi.json`만 bearer 티켓으로 제공합니다(화면·쿠키 없음). 한 주소에서 1분에 틀린 티켓이 10번이면 5분간 막습니다(`429`). `--tls-cert`·`--tls-key`로 HTTPS를 직접 제공하고, 루프백이 아닌 주소에서는 `--api-only`가 평문 HTTP를 거부합니다.
 - 작업 조회에 **`?wait=60s`**를 붙이면 끝나는 즉시 답합니다(최대 90초, Cloudflare의 100초 안). job.toml의 **`queue_timeout = "10m"`**은 그 시간 안에 어느 노드도 시작하지 않은 작업을 노드별 이유와 함께 실패시킵니다. `/api/v1/status`(와 `pumasi status`)의 **`capacity`**는 지금 그 계정 작업을 받을 노드 수를 실행기·GPU별로, 못 받는 노드는 이유와 함께 알려 줍니다.
+- **제출 전에 확인**: `GET /api/v1/whoami`에 submitter의 작업 정책과 쿼터가 들어 있고, `POST /api/v1/jobs?validate=1`은 작업을 만들지 않고 제출할 때와 같은 검사를 모두 합니다. 통과하면 `200`과 지금 시작할 수 있는 노드를, 아니면 실제 제출과 같은 `403`이나 `400`을 돌려줍니다. `capacity`는 계정의 정책으로 쓸 수 있는 노드만 셉니다.
+- **시간이 어디에 쓰였는지**: `GET /api/v1/jobs/ID`의 태스크마다 `node` 옆에 `node_name`이 있고, `queued_ms`, `fetch_ms`, `pull_ms`(이미지가 캐시에 있으면 0), `run_ms`, `upload_ms`가 있습니다. `wall_ms`는 `run_ms`와 같고 영수증은 이 시간만 청구합니다. 노드를 기다리거나 이미지를 받는 시간에는 요금이 붙지 않습니다. `pumasi job ID`도 같은 값을 보여 줍니다.
+- **HTTP로 계정 정책 수정**(관리자 티켓): `GET`, `PATCH /api/v1/accounts/이름/policy`. `PATCH`는 보낸 필드만 바꾸고, 목록은 `{"add": [...], "remove": [...]}`를 받으므로 이미지 하나를 허용하는 데 호출 한 번이면 됩니다.
 - 에이전트가 30초마다 Docker를 다시 확인하므로, Docker Desktop이 늦게 켜지거나 꺼지는 Windows 기기도 재시작 없이 Docker 작업을 받거나 멈춥니다.
 
 [docs/api.md](docs/api.md)에 CI가 실제 클러스터에 돌려 보는 curl 예제와 Cloudflare Tunnel 설정, 그 한계(무료 요금제 요청 본문 100 MB)가 있습니다. [`examples/remote-client/pumasi-remote`](examples/remote-client)는 제출·대기·결과 받기를 명령 하나로 하고, 같은 문서에 Claude Code 클라우드 세션(HTTPS 프록시만 있고 티켓은 네트워크 시크릿이 붙여 줌)에서 집 클러스터를 이렇게 쓰는 방법이 있습니다.
@@ -547,7 +563,8 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi invite <계정> [--ttl 7d] [--uses 1] [--allow-docker]` | 다른 사람의 기기를 `계정` 몫으로 버는 제공자로 초대 |
 | `pumasi agent join <티켓> [--allow-docker] [--allow-microvm] [--allow-webgpu] [--no-gpus]` | 클러스터에 참가하고 작업 실행 시작. `--allow-docker`면 Docker 작업, `--allow-microvm`이면 microVM 작업, `--allow-webgpu`면 GPU를 쓰는 wasm 작업도 받음 (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`, 테스트용 `--webgpu-software`). `--no-gpus`가 아니면 GPU도 제공 |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | 이전에 참가한 클러스터에 티켓 없이 재접속 |
-| `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- 옵션]` | 부팅 시 시작하는 서비스로 에이전트(기본), 컨트롤 플레인, 대시보드/API 설치 (systemd, launchd, Windows 서비스). `status [역할]`, `uninstall [역할]`도 있음 |
+| `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- 옵션]` | 부팅 시 시작하는 서비스로 에이전트(기본), 컨트롤 플레인, 대시보드/API 설치 (systemd, launchd, Windows 서비스). `status [역할]`(실행 옵션 표시), `uninstall [역할]`도 있음 |
+| `pumasi service set [agent\|cluster\|ui] [--dry-run] -- 옵션` | 서비스의 실행 옵션을 바꾸고 재시작. `--이름 [값]`은 추가·변경, `--no-이름`은 삭제, 나머지는 그대로 |
 | `pumasi upgrade latest [--check] [--version 태그] [--wait] [--force]` | 컨트롤 플레인이 최신 GitHub 릴리스(또는 `태그`)를 클러스터의 플랫폼별로 받아 SHA256SUMS로 확인하고 배포. `--check`는 최신 릴리스와 노드별 버전만 보여 줌 |
 | `pumasi upgrade rollout 파일... [--wait] [--force]` | 클러스터 키로 서명한 새 에이전트 바이너리를 노드에 배포. `upgrade status`로 노드별 상태, `upgrade cancel`로 중단 |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치. `--gpu-bundle`은 패스스루용 GPU 게스트 커널과 드라이버 추가 |
@@ -572,7 +589,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi cordon \| uncordon \| drain <노드>` | 노드에 새 작업 중단, 재개, 또는 실행 중인 태스크까지 다른 노드로 이동 |
 | `pumasi label <노드> k=v... \| k-` / `taint <노드> key[=value]... \| key-` | selector용 노드 라벨, 허용하지 않는 작업을 막는 테인트 |
 | `pumasi quota [계정 --slots N --gpus N --cu-per-day CU --max-priority N --storage 크기 --images P,.. --require-digest yes --executors E,.. --network deny --selector S --tolerations T,.. --max-timeout D --max-gpus-per-task N] [--clear]` | 모든 계정의 한도·작업 정책·사용량 보기, 또는 한 계정 변경 (`none`이나 `any`는 한도 해제) |
-| `pumasi access create 이름 --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|이름` | 다른 사람에게 줄 역할 티켓. `pumasi whoami`는 지금 쓰는 티켓 표시 |
+| `pumasi access create 이름 --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|이름` | 다른 사람에게 줄 역할 티켓. `pumasi whoami`는 지금 쓰는 티켓과 submitter의 쿼터·작업 정책 표시 |
 | `pumasi schedule add 이름 job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm 이름` / `run 이름` | cron 일정으로 제출하는 작업 |
 | `pumasi apply -f cluster.toml [--dry-run] [--prune]` | 라벨·테인트·cordon·쿼터·스케줄·경보 규칙·웹훅을 파일과 같게 맞춤. 두 번 적용해도 결과 같음 |
 | `pumasi get nodes\|jobs\|accounts\|schedules\|access [-l 셀렉터] [-o json]` / `describe node\|job\|account\|schedule 이름` | 목록 보기, 하나 자세히 보기 |
@@ -689,7 +706,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채우며, 실사용에서 올라온 이슈와 잠드는 기기부터 시작합니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 다음은 잠드는 기기입니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -710,8 +727,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 15 | 원격 API 클라이언트: 계정별 작업 정책(이미지·다이제스트, 실행기, 네트워크 차단, 강제 selector, toleration, 최대 제한 시간, 태스크당 GPU), 작업마다 제출자와 실제 이미지 다이제스트 기록, `queue_timeout`, 지금 그 계정 작업을 받을 노드 수와 못 받는 이유, 실행 중인 에이전트의 Docker 재확인, HTTPS(`--tls-cert`)와 인증 실패 제한이 있는 `pumasi ui --api-only`, Cloudflare Tunnel 안내, `?wait=` 롱폴링, CI에서 실행하는 curl 예제, 그리기용 GPU 드라이버 능력(`gpu.graphics`, `gpu check --docker-run`)과 Blender 예제 | 완료 |
 | 16 | 기밀 등급: `trusted`(내 기기와 신뢰하는 제공자)와 `confidential`(SEV-SNP·TDX microVM). 이미지와 입력을 컨트롤 플레인에서 봉인, AMD·Intel 인증서로 원격 증명 검증, 관리자가 신뢰한 실행 측정값의 새 게스트에만 키 전달, 봉인된 결과, `pumasi confidential` | 완료 |
 | 17 | 자체 구축 1.0 마무리: SSO(OIDC·LDAP, 그룹을 역할 티켓에 매핑), 변조를 탐지하는 감사 로그(해시 체인, JSON·syslog 내보내기), 위협 모델(인터넷에 노출된 API와 터널 시나리오 포함: 티켓 유출, 정책 우회, 요청 폭주), CI에 cargo-audit·cargo-deny·CodeQL·퍼징, Keycloak·OpenLDAP로 SSO 종단 테스트, 내부 보안 점검, 운영 문서, Linux·macOS 장시간 소크 테스트 뒤 1.0 태그. 함께: 작업 보관 기간(`--keep-jobs`), 관리자 시크릿 교체, 티켓별 요청 제한 | 완료(1.0) |
-| 20 | 실사용 이슈: 서비스를 다시 설치하지 않고 에이전트 옵션 바꾸고 보기(`service set`), 대시보드와 문서화된 API로 계정 쿼터·작업 정책 수정(추가·삭제), 제출자가 자기 정책 확인과 `?validate=1`, 태스크별 이미지 받기·실행·업로드 시간, 태스크 표시에 노드 이름 | 다음(1.4) |
-| 21 | 잠드는 기기와 Docker 없는 기기: 태스크 실행 중 잠자기 막기, 잠들기 전에 알려 태스크를 바로 옮기기, 대기 작업이 있으면 Wake-on-LAN으로 깨우기, `executor = "image"`(Docker가 있으면 Docker, 없으면 microVM), Windows 서비스에서 유휴 감지, `--on-pause requeue` | 예정(1.5) |
+| 20 | 실사용 이슈: 서비스를 다시 설치하지 않고 에이전트 옵션 바꾸고 보기(`service set`), 대시보드와 문서화된 API로 계정 쿼터·작업 정책 수정(추가·삭제), 제출자가 자기 정책 확인과 `?validate=1`, 태스크별 이미지 받기·실행·업로드 시간, 태스크 표시에 노드 이름 | 완료(1.4) |
+| 21 | 잠드는 기기와 Docker 없는 기기: 태스크 실행 중 잠자기 막기, 잠들기 전에 알려 태스크를 바로 옮기기, 대기 작업이 있으면 Wake-on-LAN으로 깨우기, `executor = "image"`(Docker가 있으면 Docker, 없으면 microVM), Windows 서비스에서 유휴 감지, `--on-pause requeue` | 다음(1.5) |
 | 22 | 모니터링: microVM 실시간 출력, Windows 온도, Intel·AMD·Apple GPU 지표, 재시작해도 남는 최근 1시간 지표, 노드 간 지연·대역폭, 경보 일시 중지와 라벨별 임계값 | 예정(1.6) |
 | 23 | 대시보드: 재시작해도 유지되는 로그인, 경보·웹훅·요금·스케줄·라벨·노드 가용 정책을 브라우저에서 수정, 카나리 배포, 실시간 차트, 휴대폰 화면 | 예정(1.7) |
 | 24 | 여러 기기에 걸친 파일 저장소: 소유자 노드 복제본과 복구·검사, 충분한 사본에 쓴 뒤 완료 응답, S3 호환 게이트웨이 | 예정(1.8) |

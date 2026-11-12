@@ -378,6 +378,32 @@ pub struct TaskReport {
     pub usage: Option<SignedUsage>,
 }
 
+/// How long the parts of one run took on the node, which only the node
+/// can measure (1.4). It follows a [`FromAgent::Report`] in the same frame
+/// ([`ReportTail`]), so the protocol version stays what it was: an older
+/// control plane ignores the bytes after the message, and an older agent
+/// sends none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTiming {
+    /// Fetching what the task mounts (datasets, large inputs, a private
+    /// image) from the file store before the run. Not part of `wall_ms`.
+    pub fetch_ms: u64,
+    /// Getting the image ready on the node: pulling it from the registry
+    /// (for a microVM also building its disk) or loading a private image.
+    /// 0 when the node already had it. Not part of `wall_ms`.
+    pub pull_ms: u64,
+    /// Pushing the output files to the file store after the run. 0 when
+    /// they went in the report. Not part of `wall_ms`.
+    pub upload_ms: u64,
+}
+
+/// What follows a [`FromAgent::Report`] in its frame (1.4). Fields are
+/// only ever added at the end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportTail {
+    pub timing: TaskTiming,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FromAgent {
     Heartbeat {
@@ -784,6 +810,22 @@ pub enum AdminOp {
         version: Option<String>,
         force: bool,
     },
+    // 1.4 from here.
+    /// Where each task of a job ran, by node name, and how long its parts
+    /// took (the task views of [`AdminOp::Job`] keep their layout, so
+    /// older CLIs still read them).
+    TaskDetails {
+        id: JobId,
+    },
+    /// Checks a job as [`AdminOp::Submit`] would (the ticket's role, the
+    /// account's policy, priorities, datasets, dependencies) without
+    /// creating it, and says which nodes would take it now.
+    /// `upload_bytes` is the size of the input files the submission
+    /// would put in the file store first (they are not sent for a check).
+    CheckJob {
+        sub: Box<JobSubmission>,
+        upload_bytes: u64,
+    },
 }
 
 impl AdminOp {
@@ -920,6 +962,45 @@ pub enum AdminResponse {
     JoinTokens(Vec<JoinTokenView>),
     // 1.3 from here.
     LatestRelease(Box<crate::release::LatestReleaseView>),
+    // 1.4 from here.
+    TaskDetails(Vec<TaskDetail>),
+    JobCheck(Box<JobCheck>),
+}
+
+/// One task of a job: the node it ran on by name, and how long each part
+/// of the run that counted took (1.4). All times are 0 until known.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDetail {
+    pub index: u32,
+    /// The name of the node in the task view's `node`.
+    pub node_name: Option<String>,
+    /// Waiting in the queue before the run was placed on a node (since
+    /// the job was submitted, its dependencies finished, or the run
+    /// before it failed).
+    pub queued_ms: u64,
+    /// See [`TaskTiming`].
+    pub fetch_ms: u64,
+    pub pull_ms: u64,
+    /// The run itself, which is the task's `wall_ms` and what the receipt
+    /// bills: creating the container or VM, copying inputs in, the
+    /// program, and copying outputs out. Waiting, fetching, pulling and
+    /// uploading are not in it.
+    pub run_ms: u64,
+    pub upload_ms: u64,
+}
+
+/// The answer to [`AdminOp::CheckJob`]: the job would be accepted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCheck {
+    /// The account that would pay for it.
+    pub account: String,
+    pub tasks: u32,
+    /// Nodes that would start one of its tasks right now.
+    pub ready_nodes: Vec<String>,
+    /// Why no task would start right now (the job would wait in the
+    /// queue): the jobs it waits for, the account's quota, or each node
+    /// with its reason. `None` when a node is ready.
+    pub waiting: Option<String>,
 }
 
 /// A join ticket or invite that can still be used; its secret is not

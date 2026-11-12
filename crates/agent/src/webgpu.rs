@@ -424,7 +424,8 @@ pub fn bench(adapter: &wgpu::Adapter) -> Result<u32> {
                 timeout: Some(Duration::from_secs(20)),
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(e) = errors.lock().unwrap().take() {
+        let error = errors.lock().unwrap().take();
+        if let Some(e) = error {
             bail!("{e}");
         }
         Ok(start.elapsed())
@@ -623,7 +624,8 @@ impl GpuState {
             });
         }
         let s = self.session.as_mut().expect("opened");
-        if let Some(f) = s.fault.lock().unwrap().clone() {
+        let fault = s.fault.lock().unwrap().clone();
+        if let Some(f) = fault {
             return Err(Stop::Fail(f));
         }
         Ok(s)
@@ -802,11 +804,13 @@ fn read_buffer(
         if mapped.lock().unwrap().is_some() {
             break;
         }
-        if let Some(f) = s.fault.lock().unwrap().clone() {
+        let fault = s.fault.lock().unwrap().clone();
+        if let Some(f) = fault {
             return Err(Stop::Fail(f));
         }
     }
-    match mapped.lock().unwrap().take() {
+    let answer = mapped.lock().unwrap().take();
+    match answer {
         Some(Ok(())) => {}
         Some(Err(e)) => return Err(Stop::Fail(format!("read the buffer: {e}"))),
         None => return Err("read the buffer: no answer".into()),

@@ -480,9 +480,9 @@ impl WasmExecutor {
         io: &TaskIo,
     ) -> RunResult {
         let start = Instant::now();
-        let module = match self.modules.lock().unwrap().get(hash).cloned() {
-            Some(m) => m,
-            None => return RunResult::error("module not loaded", start),
+        let module = self.modules.lock().unwrap().get(hash).cloned();
+        let Some(module) = module else {
+            return RunResult::error("module not loaded", start);
         };
 
         // Scratch space: /input holds the job's files, /output is collected.

@@ -589,6 +589,17 @@ pumasi service status          # every Pumasi service on this machine
   `pumasi-cluster` gets a firewall rule like the agent's.
 - `pumasi service uninstall cluster` (or `ui`) removes one; the cluster's
   data stays.
+- `sudo pumasi service restart` (Windows: an administrator PowerShell,
+  no `sudo`) stops and starts every Pumasi service on the machine, the
+  control plane first; `service restart cluster` (or `ui`, `agent`) does
+  one. Agents and the dashboard find a restarted control plane again by
+  themselves, and it gives the tasks that were running to nodes again.
+  Restarting an agent stops its tasks. The service managers' own commands
+  work too (`systemctl restart pumasi-cluster`, `launchctl kickstart -k
+  system/pumasi.cluster`, `Restart-Service pumasi-cluster`). A service
+  that does not stop when asked to is ended: by systemd after 30 s, by
+  launchd after its 20 s, and on Windows, whose service manager would
+  wait for ever, by itself after 30 s.
 
 On macOS, `curl ... | sudo sh -s -- --ticket ...` installs the agent as a
 LaunchDaemon that runs as root with its state in root's home; the script
@@ -1151,7 +1162,7 @@ defends against, including the API exposed to the internet.
 | `pumasi invite <ACCOUNT> [--ttl 7d] [--uses 1] [--allow-docker]` | Invite someone else's machine as a provider earning for `ACCOUNT`. |
 | `pumasi agent join <TICKET> [--name N] [--slots N] [--allow-docker] [--allow-microvm] [--allow-confidential] [--allow-webgpu] [--no-gpus]` | Join a cluster and start running tasks. `--allow-docker` also accepts docker jobs, `--allow-microvm` microvm jobs (`--vm-backend firecracker\|qemu`, `--vm-dir DIR`), `--allow-confidential` confidential jobs in SEV-SNP or TDX microVMs, `--allow-webgpu` wasm jobs with GPUs (`--webgpu-software` adds a software rasterizer, for tests). GPUs are offered unless `--no-gpus`. |
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
-| `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- OPTIONS]` | Run the agent (default), the control plane or the dashboard/API as a service that starts at boot (systemd, launchd, Windows service). `status [ROLE]` (with the options it runs with) and `uninstall [ROLE]` too. |
+| `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- OPTIONS]` | Run the agent (default), the control plane or the dashboard/API as a service that starts at boot (systemd, launchd, Windows service). `status [ROLE]` (with the options it runs with), `restart [ROLE]` (without a role every service here, the control plane first) and `uninstall [ROLE]` too. |
 | `pumasi service set [agent\|cluster\|ui] [--dry-run] -- OPTIONS` | Change the options a service runs with and restart it: `--NAME [VALUE]` adds or replaces, `--no-NAME` removes, the rest stay. |
 | `pumasi upgrade latest [--check] [--version TAG] [--wait] [--force]` | Have the control plane download the newest GitHub release (or `TAG`) for every platform in the cluster, check it against its SHA256SUMS, and roll it out; `--check` only shows the newest release and each node's version. |
 | `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
@@ -1457,7 +1468,7 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed

@@ -2309,9 +2309,46 @@ fn service_set(
     Ok(0)
 }
 
+/// `pumasi service restart`: one service, or every Pumasi service
+/// installed here.
+fn service_restart(role: Option<service::Role>, scope: service::ScopeArgs) -> Result<i32> {
+    use service::Role;
+    // The control plane first: the dashboard and the agent find it again
+    // by themselves.
+    let roles = match role {
+        Some(r) => vec![r],
+        None => vec![Role::Cluster, Role::Ui, Role::Agent],
+    };
+    let mut found = Vec::new();
+    for r in roles {
+        match service::installed(r, scope)? {
+            Some(installed) => found.push((r, installed.scope)),
+            None if role.is_some() => bail!(
+                "the {0} service is not installed here (`pumasi service install {0}`)",
+                r.as_str()
+            ),
+            None => {}
+        }
+    }
+    if found.is_empty() {
+        println!("no Pumasi service is installed");
+        return Ok(3);
+    }
+    // Before any is stopped.
+    for (r, scope) in &found {
+        service::can_control(*r, *scope)?;
+    }
+    for (r, scope) in found {
+        service::restart(r, scope)?;
+        println!("restarted the {} service", r.as_str());
+    }
+    Ok(0)
+}
+
 fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
     use service::{Role, ServiceCmd};
     match cmd {
+        ServiceCmd::Restart { role, scope } => service_restart(role, scope),
         ServiceCmd::Set {
             role,
             scope,

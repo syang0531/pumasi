@@ -9,7 +9,9 @@
 #   3. restart the control plane's service and check both again,
 #   4. move the API to another port with `pumasi service set ui` (the other
 #      options stay) and read both services' options from `service status`,
-#   5. uninstall both and check nothing is left running, nor their options
+#   5. restart both with `pumasi service restart`; on Windows, also a
+#      control plane that ignores the stop, with `Restart-Service`,
+#   6. uninstall both and check nothing is left running, nor their options
 #      files.
 #
 # Usage: service-cluster.sh BINARY WORK_DIR
@@ -128,6 +130,41 @@ status_has ui "options: *--api-only --listen 127.0.0.1:$PORT --no-open"
 svc set ui --dry-run -- --login-only | tee "$WORK/set.txt"
 grep -q -e "--login-only" "$WORK/set.txt"
 status_has ui "options: *--api-only --listen 127.0.0.1:$PORT --no-open\$"
+
+echo "--- restarting every service with \`service restart\`"
+# The control plane first; the API finds it again by itself.
+svc restart | tee "$WORK/restart.txt"
+grep -q "restarted the cluster service" "$WORK/restart.txt"
+grep -q "restarted the ui service" "$WORK/restart.txt"
+sleep 2
+wait_until "the control plane after \`service restart\`" cluster_up
+wait_until "the API after \`service restart\`" api_up
+
+# The Windows service manager waits for ever for a service to stop, and
+# PowerShell gives up on one that still reads "Running" 2 s after the stop.
+# A control plane that ignores the stop is ended after 30 s, and
+# Restart-Service, which saw "StopPending" all along, starts it again.
+if [ "$OS" = windows ]; then
+  echo "--- restarting a control plane that does not stop"
+  key='HKLM:\SYSTEM\CurrentControlSet\Services\pumasi-cluster'
+  cluster_pid() { svc status cluster | sed -n 's/^pid: *//p' | tr -d '\r'; }
+  powershell -NoProfile -Command "New-ItemProperty -Path '$key' -Name Environment \
+    -PropertyType MultiString -Value 'PUMASI_TEST_STOP_HANGS=1' -Force | Out-Null; \
+    Restart-Service pumasi-cluster"
+  wait_until "the control plane that will not stop" cluster_up
+  hung=$(cluster_pid)
+  powershell -NoProfile -Command "Remove-ItemProperty -Path '$key' -Name Environment; \
+    Restart-Service pumasi-cluster"
+  wait_until "the control plane after it was ended" cluster_up
+  wait_until "the API after the control plane was ended" api_up
+  now=$(cluster_pid)
+  if [ -z "$hung" ] || [ "$hung" = "$now" ]; then
+    echo "the control plane was not started again (pid $hung, now $now)"; dump; exit 1
+  fi
+  if ! grep -q "did not stop within" "$H/logs/cluster.log"; then
+    echo "the control plane stopped by itself: the test's stop did not hang"; dump; exit 1
+  fi
+fi
 
 echo "--- uninstalling"
 svc uninstall ui

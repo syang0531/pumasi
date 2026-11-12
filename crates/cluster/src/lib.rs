@@ -16,6 +16,7 @@ pub mod manage;
 pub mod monitor;
 pub mod names;
 pub mod perf;
+pub mod power;
 mod prometheus;
 pub mod remote;
 pub mod retention;

@@ -11,7 +11,7 @@
 //! | --- | --- | --- |
 //! | macOS | `pmset -g batt` | `HIDIdleTime` of `IOHIDSystem` (`ioreg`), system-wide, so it works for a LaunchDaemon |
 //! | Linux | `/sys/class/power_supply` | the most recent of: terminal access times (`/dev/tty*`, `/dev/pts/*`, as `w` shows) and logind's idle hint for graphical sessions; no sessions at all counts as idle |
-//! | Windows | `GetSystemPowerStatus` | `GetLastInputInfo`, which sees only its own session: a service (session 0) cannot tell |
+//! | Windows | `GetSystemPowerStatus` | `GetLastInputInfo`, which sees only its own session. A service (session 0) starts a small helper (`pumasi idle-helper`) in each signed-in session, which reports that session's last input over a pipe (1.5); with nobody signed in the machine is idle |
 //!
 //! A machine with no battery is on AC power. Idle time that cannot be read
 //! pauses the node, with the reason, rather than guessing.
@@ -218,6 +218,38 @@ impl fmt::Debug for AvailabilityConfig {
             .field("interval", &self.interval)
             .finish()
     }
+}
+
+/// The command (`pumasi idle-helper`) a Windows service starts in each
+/// signed-in session to learn its idle time.
+pub const IDLE_HELPER: &str = "idle-helper";
+
+/// One line of the helper's output: the session's idle time in
+/// milliseconds.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_idle_line(line: &str) -> Option<Duration> {
+    line.trim().parse::<u64>().ok().map(Duration::from_millis)
+}
+
+/// `pumasi idle-helper`: prints this session's idle time in milliseconds
+/// every two seconds, until nobody reads it any more. Started by the
+/// agent service on Windows; of no use elsewhere.
+pub fn idle_helper_main() -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        loop {
+            let idle = windows::own_idle().map_err(anyhow::Error::msg)?;
+            // The service went away: so do we.
+            if writeln!(out, "{}", idle.as_millis()).is_err() || out.flush().is_err() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    #[cfg(not(windows))]
+    bail!("the idle helper is for the Windows agent service; other systems read idle time directly")
 }
 
 /// This machine.
@@ -432,19 +464,26 @@ mod windows {
     }
 
     pub fn idle_time() -> Result<Duration, String> {
-        use windows_sys::Win32::{
-            System::{
-                RemoteDesktop::ProcessIdToSessionId, SystemInformation::GetTickCount,
-                Threading::GetCurrentProcessId,
-            },
-            UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+        use windows_sys::Win32::System::{
+            RemoteDesktop::ProcessIdToSessionId, Threading::GetCurrentProcessId,
         };
         let mut session = 0u32;
         // SAFETY: plain queries about this process.
         if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0 && session == 0
         {
-            return Err("the agent runs as a Windows service, which cannot see the keyboard and mouse; run it in the user's session (`pumasi agent start` at logon) to use --idle-minutes".into());
+            // A service cannot see the keyboard and mouse: helpers in the
+            // signed-in sessions tell it.
+            return helper::service_idle();
         }
+        own_idle()
+    }
+
+    /// Time since the last input in this process's session.
+    pub fn own_idle() -> Result<Duration, String> {
+        use windows_sys::Win32::{
+            System::SystemInformation::GetTickCount,
+            UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+        };
         let mut info = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
             dwTime: 0,
@@ -458,6 +497,262 @@ mod windows {
         }
         let now = unsafe { GetTickCount() };
         Ok(Duration::from_millis(now.wrapping_sub(info.dwTime) as u64))
+    }
+
+    /// Idle time for an agent that runs as a service (1.5).
+    ///
+    /// The service starts `pumasi idle-helper` in every signed-in session
+    /// (as that session's user, without a window) with a pipe for its
+    /// output; the helper prints the session's idle time every two
+    /// seconds. Nothing else can write to that pipe, and the helper gets
+    /// nothing from the service but the pipe.
+    pub mod helper {
+        use std::{
+            collections::HashMap,
+            io::{BufRead, BufReader},
+            os::windows::io::FromRawHandle,
+            sync::{Arc, Mutex},
+            time::{Duration, Instant},
+        };
+
+        use windows_sys::Win32::{
+            Foundation::{
+                CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
+            },
+            Security::SECURITY_ATTRIBUTES,
+            System::{
+                Pipes::CreatePipe,
+                RemoteDesktop::{
+                    WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW, WTSFreeMemory,
+                    WTSQueryUserToken,
+                },
+                Threading::{
+                    CREATE_NO_WINDOW, CreateProcessAsUserW, PROCESS_INFORMATION,
+                    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+                },
+            },
+        };
+
+        /// A report older than this is not believed.
+        const FRESH: Duration = Duration::from_secs(15);
+        /// How long a failed start waits before the next try.
+        const RETRY: Duration = Duration::from_secs(60);
+
+        type Latest = Arc<Mutex<Option<(Instant, Duration)>>>;
+
+        struct Helper {
+            process: HANDLE,
+            latest: Latest,
+        }
+
+        // SAFETY: a process handle may be used from any thread.
+        unsafe impl Send for Helper {}
+
+        impl Helper {
+            fn alive(&self) -> bool {
+                // SAFETY: the handle is ours until `drop`.
+                unsafe { WaitForSingleObject(self.process, 0) != WAIT_OBJECT_0 }
+            }
+        }
+
+        impl Drop for Helper {
+            fn drop(&mut self) {
+                // SAFETY: the handle is ours and closed exactly once.
+                unsafe {
+                    TerminateProcess(self.process, 0);
+                    CloseHandle(self.process);
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct Helpers {
+            by_session: HashMap<u32, Helper>,
+            /// Sessions whose helper did not start: when, and why.
+            failed: HashMap<u32, (Instant, String)>,
+        }
+
+        static HELPERS: Mutex<Option<Helpers>> = Mutex::new(None);
+
+        /// Sessions someone is signed in to and using (the console or a
+        /// remote desktop), not counting the services' session 0.
+        fn active_sessions() -> Result<Vec<u32>, String> {
+            let mut info: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+            let mut count = 0u32;
+            // SAFETY: out-pointers for the list, freed below.
+            if unsafe { WTSEnumerateSessionsW(std::ptr::null_mut(), 0, 1, &mut info, &mut count) }
+                == 0
+            {
+                return Err(format!(
+                    "WTSEnumerateSessions failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: `count` entries at `info`, as the call said.
+            let list = unsafe { std::slice::from_raw_parts(info, count as usize) };
+            let active = list
+                .iter()
+                .filter(|s| s.State == WTSActive && s.SessionId != 0)
+                .map(|s| s.SessionId)
+                .collect();
+            // SAFETY: the list came from WTSEnumerateSessionsW.
+            unsafe { WTSFreeMemory(info.cast()) };
+            Ok(active)
+        }
+
+        /// Starts the helper in `session` as its user, with a pipe as its
+        /// standard output.
+        fn start(session: u32) -> Result<Helper, String> {
+            let exe = std::env::current_exe().map_err(|e| format!("own path: {e}"))?;
+            let os_err = |what: &str| format!("{what}: {}", std::io::Error::last_os_error());
+            let mut token: HANDLE = std::ptr::null_mut();
+            // SAFETY: an out-pointer for the token, closed below.
+            if unsafe { WTSQueryUserToken(session, &mut token) } == 0 {
+                return Err(format!(
+                    "{} (the service must run as LocalSystem)",
+                    os_err("WTSQueryUserToken")
+                ));
+            }
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: std::ptr::null_mut(),
+                bInheritHandle: 1,
+            };
+            let (mut read, mut write): (HANDLE, HANDLE) =
+                (std::ptr::null_mut(), std::ptr::null_mut());
+            // SAFETY: out-pointers for the two ends; only the write end
+            // stays inheritable.
+            if unsafe { CreatePipe(&mut read, &mut write, &sa, 0) } == 0 {
+                let e = os_err("CreatePipe");
+                unsafe { CloseHandle(token) };
+                return Err(e);
+            }
+            unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0) };
+            let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+            let mut command: Vec<u16> =
+                format!("\"{}\" {}\0", exe.display(), super::super::IDLE_HELPER)
+                    .encode_utf16()
+                    .collect();
+            // SAFETY: zeroed is a valid STARTUPINFOW; the fields set are
+            // valid for the call.
+            let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            si.lpDesktop = desktop.as_mut_ptr();
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdOutput = write;
+            let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid token, command line and startup info. The
+            // child inherits the pipe's write end and nothing else of
+            // ours (Rust opens every other handle not inheritable).
+            let ok = unsafe {
+                CreateProcessAsUserW(
+                    token,
+                    std::ptr::null(),
+                    command.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    CREATE_NO_WINDOW,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &si,
+                    &mut pi,
+                )
+            };
+            let failed = (ok == 0).then(|| os_err("CreateProcessAsUser"));
+            // SAFETY: ours, closed once; the child has its own copy of
+            // the write end.
+            unsafe {
+                CloseHandle(write);
+                CloseHandle(token);
+            }
+            if let Some(e) = failed {
+                unsafe { CloseHandle(read) };
+                return Err(e);
+            }
+            unsafe { CloseHandle(pi.hThread) };
+            let latest: Latest = Default::default();
+            let seen = latest.clone();
+            // SAFETY: the read end is ours; the file owns it from here.
+            let pipe = unsafe { std::fs::File::from_raw_handle(read as _) };
+            std::thread::Builder::new()
+                .name("pumasi-idle".into())
+                .spawn(move || {
+                    for line in BufReader::new(pipe).lines() {
+                        let Ok(line) = line else { break };
+                        if let Some(idle) = super::super::parse_idle_line(&line) {
+                            *seen.lock().unwrap() = Some((Instant::now(), idle));
+                        }
+                    }
+                })
+                .map_err(|e| format!("thread: {e}"))?;
+            Ok(Helper {
+                process: pi.hProcess,
+                latest,
+            })
+        }
+
+        /// The shortest idle time of the signed-in sessions, as their
+        /// helpers report it.
+        pub fn service_idle() -> Result<Duration, String> {
+            let sessions = active_sessions()?;
+            let mut guard = HELPERS.lock().unwrap();
+            let helpers = guard.get_or_insert_with(Helpers::default);
+            helpers
+                .by_session
+                .retain(|id, h| sessions.contains(id) && h.alive());
+            helpers.failed.retain(|id, _| sessions.contains(id));
+            if sessions.is_empty() {
+                // Nobody is signed in: nobody is using it.
+                return Ok(Duration::from_secs(u32::MAX as u64));
+            }
+            let mut started = false;
+            for &id in &sessions {
+                if helpers.by_session.contains_key(&id)
+                    || helpers
+                        .failed
+                        .get(&id)
+                        .is_some_and(|(at, _)| at.elapsed() < RETRY)
+                {
+                    continue;
+                }
+                match start(id) {
+                    Ok(h) => {
+                        helpers.failed.remove(&id);
+                        helpers.by_session.insert(id, h);
+                        started = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(session = id, "idle helper did not start: {e}");
+                        helpers.failed.insert(id, (Instant::now(), e));
+                    }
+                }
+            }
+            if started {
+                // Its first line comes at once.
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            let mut idle = Duration::MAX;
+            for &id in &sessions {
+                let report = helpers
+                    .by_session
+                    .get(&id)
+                    .and_then(|h| *h.latest.lock().unwrap())
+                    .filter(|(at, _)| at.elapsed() < FRESH);
+                match report {
+                    Some((at, d)) => idle = idle.min(d + at.elapsed()),
+                    None => {
+                        return Err(match helpers.failed.get(&id) {
+                            Some((_, why)) => {
+                                format!("the idle helper did not start in session {id}: {why}")
+                            }
+                            None => format!("the idle helper in session {id} has not reported"),
+                        });
+                    }
+                }
+            }
+            Ok(idle)
+        }
     }
 }
 
@@ -484,6 +779,14 @@ mod tests {
             battery,
             idle: Ok(Duration::from_secs(idle_secs)),
         }
+    }
+
+    #[test]
+    fn idle_helper_lines() {
+        assert_eq!(parse_idle_line("1500\r"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_idle_line(" 0 "), Some(Duration::ZERO));
+        assert_eq!(parse_idle_line("idle"), None);
+        assert_eq!(parse_idle_line(""), None);
     }
 
     #[test]

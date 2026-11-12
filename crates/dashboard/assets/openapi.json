@@ -127,6 +127,7 @@
     "/api/v1/status": {
       "get": {
         "summary": "Cluster status: nodes and jobs",
+        "description": "Each node carries `power` (1.5; missing when the control plane is older): `asleep_since_unix` while the machine is asleep after saying so, `report` (what its agent does about sleep: `stays_awake`, `sleep_notice`, `wake_on_lan`, `on_pause`, and its LAN network cards in `lan`), `last_wake_unix` and `last_wake_by` for the last magic packet, and `can_wake` (some machine of the cluster is online on its LAN).",
         "tags": [
           "cluster"
         ],
@@ -771,7 +772,7 @@
     },
     "/api/v1/nodes/{node}/{action}": {
       "post": {
-        "summary": "Drain, cordon, uncordon, benchmark, trust or untrust a node (trust: it runs tier = \"trusted\" jobs)",
+        "summary": "Drain, cordon, uncordon, benchmark, wake, trust or untrust a node (trust: it runs tier = \"trusted\" jobs; wake: send the Wake-on-LAN magic packet of an offline node that opted in, 1.5)",
         "tags": [
           "nodes"
         ],
@@ -1848,6 +1849,13 @@
           "upload_ms": {
             "type": "integer",
             "description": "Time storing the task's output in the file store; 0 when the output went with the result"
+          },
+          "ran_as": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The executor the task's latest run used: for an `executor = \"image\"` job, `docker` or `microvm` (1.5). Null before the task is placed; omitted when the control plane is older than 1.5"
           }
         },
         "additionalProperties": true

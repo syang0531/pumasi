@@ -670,7 +670,7 @@ impl State {
             stderr,
             state: t.state.clone(),
             done: done && complete,
-            live: j.meta.executor != Executor::Microvm,
+            live: j.meta.executor != Executor::Microvm && t.ran != Some(Executor::Microvm),
         })
     }
 
@@ -933,7 +933,10 @@ impl State {
     }
 
     /// What should be firing now, by (rule, subject).
-    fn wanted_alerts(&mut self, now: u64) -> BTreeMap<(String, String), (EventLevel, String)> {
+    pub(crate) fn wanted_alerts(
+        &mut self,
+        now: u64,
+    ) -> BTreeMap<(String, String), (EventLevel, String)> {
         let p = self.monitor.policy.clone();
         let mut want = BTreeMap::new();
         let mut put = |rule: &str, subject: &str, level, msg: String| {
@@ -944,6 +947,7 @@ impl State {
             let rt = self.nodes.get(&m.id).filter(|n| n.online);
             if let Some(after) = p.node_offline_secs
                 && rt.is_none()
+                && !self.asleep(&m.id)
                 && !self.node_config(&m.id).is_some_and(|c| c.cordoned)
             {
                 let seen = self

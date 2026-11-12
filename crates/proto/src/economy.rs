@@ -195,7 +195,8 @@ impl CuRates {
     pub fn reference_ns(m: &Metered) -> u128 {
         match m.executor {
             Executor::Wasm => m.fuel_used as u128 * 1_000_000_000 / REFERENCE_FUEL_PER_SEC as u128,
-            Executor::Docker | Executor::Microvm => {
+            // A receipt never names `Image`: a run is Docker or a microVM.
+            Executor::Docker | Executor::Microvm | Executor::Image => {
                 m.wall_ms as u128 * 1_000_000 * billing_score(m.cpu_score) as u128
                     / REFERENCE_SCORE as u128
             }
@@ -242,7 +243,7 @@ impl CuRates {
         // vCPU-thousandths: a WASM task uses one core.
         let cpu = match m.executor {
             Executor::Wasm => 1000,
-            Executor::Docker => m.cpu_millis.unwrap_or(1000) as u128,
+            Executor::Docker | Executor::Image => m.cpu_millis.unwrap_or(1000) as u128,
             Executor::Microvm => vcpus(m.cpu_millis) as u128 * 1000,
         };
         let compute = cpu * t * MICRO_PER_CU as u128 / (1000 * NS_PER_HOUR);

@@ -1786,15 +1786,13 @@ pub mod windows {
     struct Reporter(Mutex<Option<ServiceStatusHandle>>);
 
     impl Reporter {
-        /// False when the service was reported as stopped before.
-        fn report(&self, state: ServiceState, code: i32) -> bool {
+        fn report(&self, state: ServiceState, code: i32) {
             let mut handle = self.0.lock().unwrap();
-            let Some(status) = *handle else { return false };
+            let Some(status) = *handle else { return };
             let _ = status.set_service_status(service_status(state, code));
             if state == ServiceState::Stopped {
                 *handle = None;
             }
-            true
         }
 
         /// Ends the process if the service has not stopped
@@ -1803,14 +1801,18 @@ pub mod windows {
         fn end_if_stop_hangs(self: Arc<Self>, role: Role) {
             std::thread::spawn(move || {
                 std::thread::sleep(STOP_TIMEOUT);
-                if self.report(ServiceState::Stopped, 0) {
-                    tracing::error!(
-                        "{} did not stop within {} s of being asked to; ending the process",
-                        role.as_str(),
-                        STOP_TIMEOUT.as_secs()
-                    );
-                    std::process::exit(0);
-                }
+                // The line first, with the lock held: once "Stopped" is
+                // reported the dispatcher returns on the main thread and
+                // the process may be gone before the line is written.
+                let mut handle = self.0.lock().unwrap();
+                let Some(status) = handle.take() else { return };
+                tracing::error!(
+                    "{} did not stop within {} s of being asked to; ending the process",
+                    role.as_str(),
+                    STOP_TIMEOUT.as_secs()
+                );
+                let _ = status.set_service_status(service_status(ServiceState::Stopped, 0));
+                std::process::exit(0);
             });
         }
     }

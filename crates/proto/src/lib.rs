@@ -16,6 +16,7 @@ pub mod monitor;
 pub mod msg;
 pub mod net;
 pub mod perf;
+pub mod power;
 pub mod receipt;
 pub mod registry;
 pub mod release;
@@ -63,6 +64,19 @@ pub const REMOTE_PROTOCOL: u32 = 13;
 /// attestation to the control plane ([`msg::FromAgent::Attest`],
 /// [`msg::ToAgent::Keys`]).
 pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
+/// What a protocol 14 peer knows beyond protocol 14, counted up by the
+/// releases that add messages without changing the old ones. An agent
+/// says its minor after its hello and the control plane after its welcome
+/// ([`msg::HelloTail`], [`msg::WelcomeTail`], both ignored by a peer that
+/// does not know them), and each side sends a newer message only to a
+/// peer whose minor has it. The protocol version itself stays, so a
+/// cluster upgrades in any order and without `--force`.
+pub const PROTOCOL_MINOR: u32 = 1;
+/// The first minor with sleep and wake (1.5): the agent says when its
+/// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
+/// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
+/// when asked ([`msg::ToAgent::Wake`]).
+pub const POWER_MINOR: u32 = 1;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

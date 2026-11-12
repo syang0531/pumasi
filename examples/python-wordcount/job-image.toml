@@ -1,0 +1,21 @@
+# The same word count as job.toml, on whatever each node has: a container
+# where the agent runs with `--allow-docker`, a microVM where it runs only
+# with `--allow-microvm` (an old Mac, a PC without Docker). `pumasi job ID`
+# shows which one each task used (`as=docker` or `as=microvm`).
+#
+#   pumasi run examples/python-wordcount/job-image.toml
+#   python3 examples/python-wordcount/merge.py pumasi-out/<job id>
+#
+# Tasks that land in a microVM have no network, so keep to what the image
+# brings.
+name = "wordcount-image"
+executor = "image"
+image = "python:3.12-slim"
+command = ["python", "/input/count.py", "{shard}", "{shards}"]
+files = ["count.py", "texts/"]
+shards = 4
+
+[resources]
+memory_mb = 256
+cpus = 1
+timeout = "2m"

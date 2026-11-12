@@ -87,7 +87,9 @@ fn op_name(op: &AdminOp) -> &'static str {
         LatestRelease { check: false } => "read the release check",
         LatestRelease { check: true } => "check for releases",
         UpgradeToLatest { .. } => "roll out upgrades",
-        TaskDetails { .. } => "read jobs",
+        TaskDetails { .. } | TaskExecutors { .. } => "read jobs",
+        NodePower => "read the status",
+        WakeNode { .. } => "wake nodes",
         CheckJob { .. } => "check jobs",
     }
 }
@@ -114,6 +116,8 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             Status
             | Job { .. }
             | TaskDetails { .. }
+            | TaskExecutors { .. }
+            | NodePower
             | TaskFiles { .. }
             | Receipts { .. }
             | Accounts
@@ -188,6 +192,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | TaskFiles { id, .. }
         | Job { id, .. }
         | TaskDetails { id }
+        | TaskExecutors { id }
         | Logs { job: id, .. } => own_job(st, account, id)?,
         RemoveSchedule { name } | RunSchedule { name } => {
             if let Some(other) = st.schedule_account(name) {
@@ -221,9 +226,11 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | TaskFiles { .. }
         | Job { .. }
         | TaskDetails { .. }
+        | TaskExecutors { .. }
         | Logs { .. }) => op,
         op @ (Metrics { .. } | Events { .. } | Alerts) => op,
         op @ (Status
+        | NodePower
         | Accounts
         | GetPolicy
         | GetStoragePolicy

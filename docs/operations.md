@@ -393,6 +393,20 @@ and consider suspending its account's earnings (`pumasi cu`).
 With replicas, the others elect a new leader within seconds. Without:
 restore the latest backup on a new machine at the same address (step 4).
 
+### A node is asleep, or does not wake
+
+`pumasi status` shows a machine that said it was going to sleep as
+`asleep`; its tasks have already moved and no alert fires. `pumasi node
+NODE` shows what its agent does about sleep, its network cards, and when
+the cluster last sent its magic packet. If `pumasi node wake NODE` says
+no machine is on its LAN, another agent (1.5 or newer) or the control
+plane has to be online on the same subnet. If the packet is sent and the
+machine stays asleep (a `node.wake_failed` event after three tries),
+Wake-on-LAN is off in its firmware or OS: the settings are in the
+[README](../README.md#machines-that-sleep). A machine that should never
+sleep while it lends itself needs nothing; one that must be free to
+sleep mid-task takes `pumasi service set -- --allow-sleep`.
+
 ### Something is slow or full
 
 `pumasi status`, `pumasi top`, `pumasi store usage`. A full disk on the

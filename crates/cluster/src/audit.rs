@@ -203,6 +203,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
                     Executor::Wasm => "wasm",
                     Executor::Docker => "docker",
                     Executor::Microvm => "microvm",
+                    Executor::Image => "image",
                 },
                 sub.tier
             );
@@ -312,6 +313,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         SetStoragePolicy(_) => ("storage-prices.set", none(), none()),
         EditNode { node, edit } => ("node.edit", node.clone(), format!("{edit:?}")),
         Drain { node } => ("node.drain", node.clone(), none()),
+        WakeNode { node } => ("node.wake", node.clone(), none()),
         SetQuota { account, quota } => ("quota.set", account.clone(), format!("{quota:?}")),
         CreateAccess {
             name,
@@ -414,6 +416,8 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | TaskFiles { .. }
         | Receipts { .. }
         | TaskDetails { .. }
+        | TaskExecutors { .. }
+        | NodePower
         | CheckJob { .. }
         | Accounts
         | Ledger { .. }

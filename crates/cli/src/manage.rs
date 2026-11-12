@@ -976,7 +976,13 @@ async fn describe_inner(client: &AdminClient, kind: DescribeKind, name: &str) ->
         DescribeKind::Node => {
             let s = status(client).await?;
             let n = find_node(&s.nodes, name)?;
-            print_node(n);
+            print_node(
+                n,
+                crate::node_power(client)
+                    .await
+                    .iter()
+                    .find(|p| p.id == n.id),
+            );
         }
         DescribeKind::Job => {
             let id: JobId = name.parse()?;
@@ -989,7 +995,8 @@ async fn describe_inner(client: &AdminClient, kind: DescribeKind, name: &str) ->
             else {
                 bail!("unexpected response");
             };
-            print_job(&v, &crate::task_details(client, id).await, false);
+            let ran = crate::task_executors(client, &v).await;
+            print_job(&v, &crate::task_details(client, id).await, &ran, false);
         }
         DescribeKind::Account => {
             let list = quotas(client).await?;

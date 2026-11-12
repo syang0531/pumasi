@@ -128,7 +128,7 @@ async fn metrics(client: &AdminClient, node: Option<String>, since: u64) -> Resu
     }
 }
 
-fn local_time(unix: u64, with_date: bool) -> String {
+pub(crate) fn local_time(unix: u64, with_date: bool) -> String {
     use chrono::TimeZone;
     match chrono::Local.timestamp_opt(unix as i64, 0).single() {
         Some(t) if with_date => t.format("%Y-%m-%d %H:%M:%S").to_string(),

@@ -145,8 +145,32 @@ async fn whoami(axum::extract::State(st): S, a: Api) -> Response {
     Json(out).into_response()
 }
 
+/// The cluster's status. Each node also carries `power` (1.5): whether
+/// it is asleep, what its agent does about sleep, and whether the cluster
+/// can wake it. Missing for a control plane older than 1.5.
 async fn status(axum::extract::State(st): S, a: Api) -> Response {
-    simple(st, a, AdminOp::Status).await
+    let status = match call(&st, &a, AdminOp::Status).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let mut v = match serde_json::to_value(&status) {
+        Ok(serde_json::Value::Object(m)) if m.len() == 1 => m.into_iter().next().unwrap().1,
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if let Ok(AdminResponse::NodePower(power)) = call(&st, &a, AdminOp::NodePower).await
+        && let Some(nodes) = v.get_mut("nodes").and_then(|n| n.as_array_mut())
+    {
+        for n in nodes {
+            let id = n.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+            if let Some(p) = power.iter().find(|p| p.id == id)
+                && let Some(n) = n.as_object_mut()
+            {
+                n.insert("power".into(), json!(p));
+            }
+        }
+    }
+    Json(v).into_response()
 }
 
 #[derive(Deserialize)]
@@ -294,6 +318,19 @@ async fn job_json(st: &St, a: &Api, id: JobId, job: &pumasi_proto::msg::JobView)
             t.insert("pull_ms".into(), json!(d.pull_ms));
             t.insert("run_ms".into(), json!(d.run_ms));
             t.insert("upload_ms".into(), json!(d.upload_ms));
+        }
+    }
+    // What each task of an `image` job ran as (1.5): docker or microvm.
+    if let Ok(AdminResponse::TaskExecutors(ran)) = st
+        .backend
+        .call(a.0.secret, AdminOp::TaskExecutors { id })
+        .await
+        && let Some(tasks) = v.get_mut("tasks").and_then(|t| t.as_array_mut())
+    {
+        for (t, e) in tasks.iter_mut().zip(ran) {
+            if let Some(t) = t.as_object_mut() {
+                t.insert("ran_as".into(), json!(e.map(|e| e.to_string())));
+            }
         }
     }
     Json(v).into_response()
@@ -448,6 +485,7 @@ async fn node_action(
         "cordon" => cordon(true),
         "uncordon" => cordon(false),
         "benchmark" => AdminOp::Benchmark { id: node.clone() },
+        "wake" => AdminOp::WakeNode { node: node.clone() },
         "trust" | "untrust" => AdminOp::TrustNode {
             node: node.clone(),
             trusted: action == "trust",
@@ -455,7 +493,7 @@ async fn node_action(
         _ => {
             return error(
                 StatusCode::NOT_FOUND,
-                "actions: drain, cordon, uncordon, benchmark, trust, untrust",
+                "actions: drain, cordon, uncordon, benchmark, wake, trust, untrust",
             );
         }
     };

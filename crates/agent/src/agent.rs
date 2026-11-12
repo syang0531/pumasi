@@ -12,19 +12,19 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, protocol::Router};
 use pumasi_proto::{
-    AGENT_ALPN, BLOBS_ALPN, ModuleHash, PROTOCOL_VERSION, Secret,
+    AGENT_ALPN, BLOBS_ALPN, ModuleHash, POWER_MINOR, PROTOCOL_MINOR, PROTOCOL_VERSION, Secret,
     job::{Executor, FileEntry, MAX_OUTPUT_FILES_BYTES, dir_files, read_files},
     monitor::METRICS_EVERY_SECS,
     msg::{
-        AgentHello, Availability, FromAgent, HelloReply, NodeInfo, ReportTail, Role,
-        TaskAssignment, TaskRef, TaskReport, TaskTiming, ToAgent,
+        AgentHello, Availability, FromAgent, HelloReply, HelloTail, NodeInfo, ReportTail, Role,
+        TaskAssignment, TaskRef, TaskReport, TaskTiming, ToAgent, WelcomeTail,
     },
     net::{NetMode, bind_endpoint_with, dialable_addr, load_or_create_key},
     perf::SignedPerf,
     receipt::{SignedUsage, Usage, output_digest},
     store::{OutputMode, StoredOutput},
     ticket::JoinTicket,
-    wire::{read_msg, write_msg, write_msg_tail},
+    wire::{read_msg, read_msg_tail, write_msg_tail},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
@@ -105,6 +105,10 @@ pub struct AgentConfig {
     /// libraries (`/usr/lib/wsl`, read-only), which Docker Desktop leaves
     /// out of GPU containers. `None`: on Windows hosts.
     pub docker_wsl_libs: Option<bool>,
+    /// The machine's sleep (1.5): staying awake while tasks run, saying
+    /// so before it sleeps, Wake-on-LAN and `--on-pause`. The default
+    /// does none of it.
+    pub power: crate::power::PowerOptions,
 }
 
 /// The Docker executor as it is now: Docker Desktop may start after the
@@ -214,6 +218,8 @@ pub struct Agent {
     /// What goes after each run's report in its frame (1.4): the writer
     /// takes it when it writes the report.
     report_tails: ReportTails,
+    /// The machine's sleep and wake (1.5).
+    power: Arc<crate::power::Power>,
     _router: Router,
 }
 
@@ -230,6 +236,8 @@ enum SessionEnd {
     NotLeader(Option<EndpointAddr>),
     /// Installed a new binary; the process must restart.
     Upgraded(String),
+    /// The machine is going to sleep; the control plane was told.
+    Slept,
 }
 
 /// How an upgrade that did not install ended.
@@ -478,7 +486,9 @@ impl Agent {
             };
             tokio::task::spawn_blocking(move || Sampler::new(&dir, gpus)).await?
         };
+        let power = crate::power::Power::new(config.power.clone());
         Ok(Self {
+            power,
             endpoint,
             key,
             executor,
@@ -670,6 +680,17 @@ impl Agent {
                     bail!("cluster rejected this node: {reason}")
                 }
                 SessionEnd::Upgraded(version) => return Ok(AgentExit::Upgraded { version }),
+                SessionEnd::Slept => {
+                    trial = None;
+                    info!("asleep; reconnecting when the machine wakes");
+                    // The process stops with the machine. Should the sleep
+                    // be called off without a notice, go back anyway.
+                    self.power.wait_awake(Duration::from_secs(20)).await;
+                    backoff = Duration::from_millis(500);
+                    failed_in_row = 0;
+                    hint = Some(target);
+                    continue;
+                }
                 SessionEnd::Lost(e) => {
                     // The handshake succeeded, so the trial (if any) is over.
                     trial = None;
@@ -748,26 +769,39 @@ impl Agent {
             upgrade: self.upgrader.as_ref().map(|u| u.hello()),
             availability: available.borrow_and_update().clone(),
         };
-        if let Err(e) = write_msg(&mut send, &hello).await {
+        // A control plane older than 1.5 ignores what follows the hello.
+        let hello_tail = HelloTail {
+            minor: PROTOCOL_MINOR,
+        };
+        if let Err(e) = write_msg_tail(&mut send, &hello, Some(&hello_tail)).await {
             return SessionEnd::Failed(e);
         }
-        let (cluster_name, heartbeat_ms, role, account) = match read_msg::<_, HelloReply>(&mut recv)
-            .await
-        {
-            Ok(Some(HelloReply::Welcome {
-                cluster_name,
-                heartbeat_ms,
-                role,
-                account,
-            })) => (cluster_name, heartbeat_ms, role, account),
-            Ok(Some(HelloReply::Rejected { reason })) => return SessionEnd::Rejected(reason),
-            Ok(Some(HelloReply::NotLeader { leader, replicas })) => {
-                merge_replicas(candidates, &replicas);
-                return SessionEnd::NotLeader(leader);
-            }
-            Ok(None) => return SessionEnd::Failed(anyhow::anyhow!("cluster closed the stream")),
-            Err(e) => return SessionEnd::Failed(e),
-        };
+        let mut cp_minor = 0;
+        let (cluster_name, heartbeat_ms, role, account) =
+            match read_msg_tail::<_, HelloReply, WelcomeTail>(&mut recv)
+                .await
+                .map(|m| {
+                    m.map(|(reply, tail)| {
+                        cp_minor = tail.map_or(0, |t| t.minor);
+                        reply
+                    })
+                }) {
+                Ok(Some(HelloReply::Welcome {
+                    cluster_name,
+                    heartbeat_ms,
+                    role,
+                    account,
+                })) => (cluster_name, heartbeat_ms, role, account),
+                Ok(Some(HelloReply::Rejected { reason })) => return SessionEnd::Rejected(reason),
+                Ok(Some(HelloReply::NotLeader { leader, replicas })) => {
+                    merge_replicas(candidates, &replicas);
+                    return SessionEnd::NotLeader(leader);
+                }
+                Ok(None) => {
+                    return SessionEnd::Failed(anyhow::anyhow!("cluster closed the stream"));
+                }
+                Err(e) => return SessionEnd::Failed(e),
+            };
         info!(cluster = %cluster_name, node = %self.id().fmt_short(), slots = self.info.slots, %role, %account, "joined cluster");
         if let Some(up) = &self.upgrader {
             up.commit();
@@ -881,6 +915,24 @@ impl Agent {
             .map(|vm| vm.tee_report())
             .unwrap_or_default();
         let _ = out_tx.send(FromAgent::Tee(Box::new(tee)));
+        // How the machine sleeps and wakes, for a control plane that
+        // knows (1.5).
+        let knows_power = cp_minor >= POWER_MINOR;
+        if knows_power {
+            let power = self.power.clone();
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(report) = tokio::task::spawn_blocking(move || power.report()).await {
+                    let _ = out_tx.send(FromAgent::Power(Box::new(report)));
+                }
+            });
+        }
+        let mut asleep = self.power.asleep();
+        // A sleep announced before this session came up is over or under
+        // way: only a new one ends the session.
+        asleep.borrow_and_update();
+        self.power.session(true);
+        let mut slept = false;
         // Docker coming and going, and the GPUs it reaches.
         let docker_changes = {
             let out_tx = out_tx.clone();
@@ -987,10 +1039,24 @@ impl Agent {
         let end = loop {
             let msg = tokio::select! {
                 m = read_msg::<_, ToAgent>(&mut recv) => m,
+                Ok(()) = asleep.changed() => {
+                    if !*asleep.borrow_and_update() {
+                        continue;
+                    }
+                    // Say goodbye: the control plane moves our runs at
+                    // once and closes the connection, which is how we
+                    // know it heard. The OS waits a moment for this.
+                    if knows_power && out_tx.send(FromAgent::Sleeping).is_ok() {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+                    }
+                    slept = true;
+                    break anyhow::anyhow!("the machine is going to sleep");
+                }
                 Ok(()) = installed.changed() => {
                     let Some(version) = installed.borrow_and_update().clone() else {
                         continue;
                     };
+                    self.power.session(false);
                     heartbeat.abort();
                     metrics.abort();
                     availability.abort();
@@ -1184,6 +1250,25 @@ impl Agent {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                Ok(Some(ToAgent::Wake { macs })) => {
+                    // Another node of the cluster sleeps on our LAN.
+                    match self.power.wake_sender() {
+                        Some(sender) => {
+                            tokio::task::spawn_blocking(move || {
+                                let (sent, errors) =
+                                    pumasi_proto::power::wake_all(sender.as_ref(), &macs);
+                                info!(
+                                    packets = sent,
+                                    "sent Wake-on-LAN magic packets for the cluster"
+                                );
+                                for e in errors {
+                                    warn!("magic packet: {e}");
+                                }
+                            });
+                        }
+                        None => debug!("asked to send a magic packet, but this agent sends none"),
+                    }
+                }
                 Ok(Some(ToAgent::Keys { task, reply })) => {
                     let waiter = self.key_waiters.lock().unwrap().remove(&task);
                     if let Some(w) = waiter {
@@ -1207,6 +1292,11 @@ impl Agent {
         }
         writer.abort();
         conn.close(0u32.into(), b"bye");
+        // The OS may go on (to sleep), whether or not anyone heard us.
+        self.power.session(false);
+        if slept {
+            return SessionEnd::Slept;
+        }
         SessionEnd::Lost(end)
     }
 
@@ -1222,6 +1312,8 @@ impl Agent {
     ) {
         let cancel = Arc::new(AtomicBool::new(false));
         running.lock().unwrap().insert(a.task, cancel.clone());
+        // The machine stays awake until this run is reported.
+        let awake = self.power.task();
         let executor = self.executor.clone();
         let docker = self.docker.borrow().exec.clone();
         let microvm = self.microvm.clone();
@@ -1296,6 +1388,7 @@ impl Agent {
         let tails = self.report_tails.clone();
         debug!(task = %a.task, executor = %a.executor, "starting task");
         tokio::spawn(async move {
+            let _awake = awake;
             let task = a.task;
             let mut timing = TaskTiming::default();
             // Mounted datasets and a private image come from the file store
@@ -1396,6 +1489,11 @@ impl Agent {
                     (None, _) => Err(anyhow::anyhow!("microVMs are not enabled on this node")),
                     (_, None) => Err(anyhow::anyhow!("microvm task without an image")),
                 },
+                // The control plane settles an image job on one of the two
+                // before it places a run.
+                Executor::Image => Err(anyhow::anyhow!(
+                    "an image task must be sent as docker or microvm"
+                )),
             };
             drop(streamer);
             // Output files kept on disk go in the report when they fit, or
@@ -1513,7 +1611,7 @@ async fn prepare_io(
                 None => false,
             },
             Executor::Microvm => microvm.as_ref().is_some_and(|vm| vm.has_image(&img.digest)),
-            Executor::Wasm => true,
+            Executor::Wasm | Executor::Image => true,
         };
         let dir = store.scratch("image")?;
         if !loaded {

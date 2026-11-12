@@ -513,7 +513,9 @@ impl State {
             self.nodes
                 .values()
                 .filter(|n| {
-                    n.online && n.perf.protocol >= STORE_PROTOCOL && n.executors.contains(&executor)
+                    n.online
+                        && n.perf.protocol >= STORE_PROTOCOL
+                        && executor.runs_as().iter().any(|e| n.executors.contains(e))
                 })
                 .map(|n| oci_arch_of(&n.info.arch))
                 .collect()

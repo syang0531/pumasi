@@ -118,6 +118,17 @@ shard 0/4: 3 files, 2164 words
 saved 4 output files to pumasi-out/6d916b0dc63f63ea
 ```
 
+A job that should run wherever an image can run sets `executor =
+"image"` (1.5): each task runs in Docker on a node that has Docker and in
+a microVM on a node that has only microVMs (an old Mac, say), with the
+same files and output. `pumasi job ID` shows which one each task used
+(`as=docker` or `as=microvm`), and each is billed at its own rate:
+
+```toml
+image = "python:3.12-slim"
+executor = "image"
+```
+
 ### MicroVM jobs: containers on machines you do not own
 
 A container shares the host's kernel, so Docker jobs are for your own
@@ -350,7 +361,11 @@ From macOS 11, microVMs run on Apple's Virtualization.framework, built
 into macOS: nothing to install, and `pumasi vm setup` only downloads the
 guest kernel and signs a helper copy of the binary (the framework only
 serves signed programs). Docker Desktop and Homebrew's QEMU support only
-recent macOS releases, so old Macs take WASM and microVM jobs.
+recent macOS releases, so old Macs take WASM and microVM jobs. A Mac
+whose macOS is too old for what you need (Catalina has no microVMs, none
+of them has Docker) can run Linux instead:
+[docs/linux-on-old-macs.md](docs/linux-on-old-macs.md) is a step-by-step
+guide for the 2013-2014 models.
 
 ```sh
 curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.sh | sudo sh
@@ -371,13 +386,62 @@ options (also after `--` in `pumasi service install`):
 | `--hours 22:00-07:00` | No new tasks outside these local times (several: `00:00-08:00,12:00-13:00`) |
 | `--max-cpu-percent 50` | Offer half the CPUs: image jobs that need more go elsewhere, slots follow |
 | `--slots N` | Tasks at once (default: one per CPU offered, but at most one per GiB of memory beyond the first two) |
+| `--on-pause requeue` | When the machine pauses, its running tasks move to other nodes at once (default `finish`: they run to the end) |
+| `--allow-sleep` | Do not keep the machine awake while tasks run |
+| `--wake-on-lan` | Let the cluster wake this machine over its LAN when work is waiting |
 
-A paused machine gets no new tasks and finishes the ones it is running;
-`pumasi status` shows it as `paused` with the reason (e.g. "on battery
-power"). Idle time comes from the whole machine on macOS (so a
-LaunchDaemon sees it) and from terminals and desktop sessions on Linux; on
-Windows the agent must run in the user's session to see input (as a
-service it reports that it cannot tell, and stays paused).
+A paused machine gets no new tasks and finishes the ones it is running
+(or hands them back with `--on-pause requeue`, which costs the task no
+attempt); `pumasi status` shows it as `paused` with the reason (e.g. "on
+battery power"). Idle time comes from the whole machine on macOS (so a
+LaunchDaemon sees it) and from terminals and desktop sessions on Linux.
+On Windows, a service cannot see the keyboard and mouse, so the agent
+service starts a small helper (`pumasi idle-helper`, no window) in the
+signed-in user's session and reads the idle time from it; with nobody
+signed in the machine counts as idle. Nothing to set up.
+
+### Machines that sleep
+
+Desktops and laptops go to sleep. From 1.5 the agent deals with it:
+
+- **It keeps the machine awake while a task runs**, and for 30 seconds
+  after the last one (macOS power assertion, Windows power request,
+  `systemd-inhibit` on Linux). Only the idle timer is held back: the
+  lid, the power button and the Sleep menu still work, and the display
+  still turns off. `--allow-sleep` turns this off.
+- **It says goodbye before the machine sleeps.** The control plane moves
+  its tasks to other nodes at once, without waiting for the node timeout
+  and without costing them an attempt, and shows the node as `asleep`
+  instead of `offline`; the `node_offline` alert does not fire for it.
+  When the machine wakes, the agent reconnects by itself.
+- **The cluster wakes it when work is waiting** (Wake-on-LAN), if its
+  agent runs with `--wake-on-lan`. A sleeping node is woken at once for
+  work that no online node can run, and after `--wake-after` (control
+  plane option, default `10m`, `never` to turn it off) for work that is
+  waiting for busy nodes. By hand: `pumasi node wake NODE`, or the
+  **Wake** button on the dashboard's node page.
+
+```sh
+pumasi service set -- --wake-on-lan            # on the machine that may be woken
+pumasi node laptop                             # its network cards and whether the cluster can reach them
+pumasi node wake laptop
+```
+
+The magic packet does not cross routers, so it is sent by machines of the
+cluster that are on the sleeping machine's LAN: the control plane itself
+when it is there, and up to two online agents (1.5 or newer). A cluster
+with a single machine on that LAN cannot wake it. The agent does not
+change the machine's own settings; turn Wake-on-LAN on once:
+
+| Machine | Setting |
+| --- | --- |
+| Mac | System Settings > Energy (laptops: Battery > Options) > **Wake for network access**, or `sudo pmset -a womp 1`. Laptops wake only on power, and reliably only over Ethernet (a Thunderbolt or USB adapter counts). |
+| Windows | Device Manager > the network adapter > **Power Management**: "Allow this device to wake the computer" and "Only allow a magic packet to wake the computer"; **Advanced**: "Wake on Magic Packet" enabled. To wake from shutdown too, turn off Fast Startup (Control Panel > Power Options > Choose what the power buttons do). |
+| Linux | `sudo ethtool -s eth0 wol g`; to keep it, `nmcli connection modify "Wired connection 1" 802-3-ethernet.wake-on-lan magic`. |
+| BIOS / UEFI (PCs) | Enable "Wake on LAN" (also called "Power on by PCI-E" or "Resume by LAN") and disable "ErP" or "Deep sleep", which cut power to the network card. |
+
+Wi-Fi cards rarely wake from a magic packet: `pumasi node NODE` marks
+them, and a wired connection is what works.
 
 ### Other people's machines: invites, compute units and checks
 
@@ -1175,6 +1239,7 @@ defends against, including the API exposed to the internet.
 | `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
 | `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency, GPUs) and recent jobs with their cost in CU. |
 | `pumasi node <NODE> [--rebenchmark]` | One node's benchmark profile, billed score, GPUs, latency and checks; `--rebenchmark` asks it to measure again. |
+| `pumasi node wake <NODE>` | Send the Wake-on-LAN magic packet of an offline node that runs with `--wake-on-lan`, from the machines of the cluster on its LAN. The dashboard's Wake button and `POST /api/v1/nodes/NODE/wake` do the same. |
 | `pumasi node rename <NODE> <NAME>` / `--reset` | Give a node a display name (status, dashboard, events, the `name` label, any NODE argument); it replaces the agent's `--name` until `--reset`. The dashboard's node page and `POST /api/v1/nodes/NODE/rename` do the same. |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | Benchmark this machine the way the agent does and print the profile. |
 | `pumasi job <ID> [--output] [--out DIR]` | Per-task state, node, attempts, time, cost and check result; stdout/stderr with `--output`; downloads output files with `--out`. |
@@ -1468,11 +1533,11 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
-the open issues from real use, and machines that sleep come next; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+the open issues from real use and phase 21 (1.5) handles machines that sleep; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1495,7 +1560,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 16 | Confidentiality tiers: `trusted` (owner machines and trusted providers) and `confidential` (SEV-SNP and TDX microVMs): images and inputs sealed on the control plane, remote attestation checked against AMD's and Intel's certificates (recorded reports and forgeries tested in CI), keys released only to a fresh guest with an admin-trusted launch measurement, sealed results, `pumasi confidential` and the dashboard's measurement list | done |
 | 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny, CodeQL and fuzzing in CI, an SSO end-to-end test against Keycloak and OpenLDAP, an internal security review, operations guide, long soak tests on Linux and macOS, then the 1.0 tag. Also: job retention (`--keep-jobs`), admin secret rotation, per-ticket request limits | done (1.0) |
 | 20 | Issues from real use: agent options changed and shown without reinstalling the service (`service set`), account quotas and job policies from the dashboard and a documented API with add/remove, submitters reading their own policy and `?validate=1`, per-task pull, run and upload times, node names in task views | done (1.4) |
-| 21 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue` | next (1.5) |
+| 21 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue`, a guide for Linux on 2013-2014 Macs | done (1.5) |
 | 22 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | planned (1.6) |
 | 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | planned (1.7) |
 | 24 | File store on several machines: replicas on owner nodes with repair and scrubbing, writes acknowledged on enough copies, an S3-compatible gateway | planned (1.8) |

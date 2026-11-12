@@ -79,7 +79,9 @@ async fn start_cluster(dir: PathBuf) -> Result<Cluster> {
     config.net = NetMode::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
     config.heartbeat = Duration::from_millis(200);
-    config.node_timeout = Duration::from_secs(2);
+    // The default node timeout (10 s): a node that is killed closes its
+    // connection, which the control plane sees at once, and with 2 s a
+    // slow CI runner lost healthy nodes ("node missed heartbeats").
     Cluster::start(config).await
 }
 
@@ -118,6 +120,7 @@ fn agent_config(name: &str, slots: u32, dir: PathBuf) -> AgentConfig {
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        power: Default::default(),
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -351,6 +354,262 @@ async fn a_node_on_battery_takes_no_new_tasks_until_plugged_in() {
 
     client.close().await;
     laptop.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+/// A control plane that cannot bind its address lets go of what it had
+/// opened, so the next start in the same directory works (on Windows the
+/// port of a control plane that just ended can stay taken for a moment).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_cannot_bind_leaves_the_data_directory_free() {
+    init_tracing();
+    let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dir = tempdir("c");
+    let config = || {
+        let mut config = ClusterConfig::new(dir.clone());
+        config.net = NetMode::Local;
+        config.bind = Some(taken.local_addr().unwrap());
+        config
+    };
+    for _ in 0..2 {
+        let err = match Cluster::start(config()).await {
+            Ok(_) => panic!("started on a taken address"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("bind"), "{err}");
+    }
+    let mut free = config();
+    free.bind = Some("127.0.0.1:0".parse().unwrap());
+    let cluster = Cluster::start(free).await.unwrap();
+    cluster.shutdown().await.unwrap();
+}
+
+/// A stand-in network: one card on a LAN no test machine is on, and a
+/// record of the magic packets asked for.
+struct Lan {
+    iface: pumasi_proto::power::LanIface,
+    sent: std::sync::Mutex<Vec<pumasi_proto::power::Mac>>,
+}
+
+impl Lan {
+    fn new(host: u8) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            iface: pumasi_proto::power::LanIface {
+                name: "en0".into(),
+                mac: [0x02, 0, 0, 0, 0, host],
+                addr: [198, 18, 77, host],
+                prefix: 24,
+                wireless: false,
+            },
+            sent: Default::default(),
+        })
+    }
+}
+
+impl pumasi_proto::power::WakeSender for Lan {
+    fn lan(&self) -> Vec<pumasi_proto::power::LanIface> {
+        vec![self.iface.clone()]
+    }
+    fn send(
+        &self,
+        mac: &pumasi_proto::power::Mac,
+        _from: &pumasi_proto::power::LanIface,
+    ) -> Result<()> {
+        self.sent.lock().unwrap().push(*mac);
+        Ok(())
+    }
+}
+
+async fn node_power(client: &AdminClient, id: &str) -> pumasi_proto::power::NodePowerView {
+    match client.call(AdminOp::NodePower).await.unwrap() {
+        AdminResponse::NodePower(v) => v.into_iter().find(|n| n.id == id).unwrap(),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// Release 1.5: a machine that goes to sleep says so first. Its runs move
+/// at once (well before the node timeout), it shows as asleep rather than
+/// lost, another machine on its LAN sends its magic packet, and it comes
+/// back by itself when it wakes. The OS and the network are stand-ins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_that_sleeps_says_goodbye_and_is_woken_over_its_lan() {
+    use pumasi_agent::power::{FakePower, PowerEvent};
+    init_tracing();
+    let mut config = ClusterConfig::new(tempdir("c"));
+    config.name = "test-cluster".into();
+    config.net = NetMode::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.heartbeat = Duration::from_millis(200);
+    // Long, so that only the goodbye can explain a quick requeue.
+    config.node_timeout = Duration::from_secs(60);
+    let cluster = Cluster::start(config).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+
+    let os = std::sync::Arc::new(FakePower::default());
+    let laptop_lan = Lan::new(10);
+    let laptop = Agent::new(AgentConfig {
+        power: pumasi_agent::PowerOptions {
+            backend: Some(os.clone()),
+            wake_on_lan: true,
+            wake: Some(laptop_lan.clone()),
+            linger: Duration::from_millis(200),
+            ..Default::default()
+        },
+        ..agent_config("laptop", 2, tempdir("laptop"))
+    })
+    .await
+    .unwrap();
+    let laptop = spawn_join(laptop, ticket.clone());
+    wait_online(&cluster, 1).await;
+    let laptop_id = node_named(&cluster, "laptop").id;
+    let client = admin(&cluster).await;
+
+    // It reported what it can do; nothing runs, so nothing is held.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let report = loop {
+        if let Some(r) = node_power(&client, &laptop_id).await.report {
+            break r;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no power report");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        report.stays_awake && report.sleep_notice && report.wake_on_lan,
+        "{report:#?}"
+    );
+    assert_eq!(report.lan, vec![laptop_lan.iface.clone()]);
+    assert_eq!(os.held(), 0);
+
+    // While a task runs, the machine is kept awake.
+    let id = submit(
+        &client,
+        submission(vec![vec!["x", "slow"], vec!["y", "slow"]]),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while os.held() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "never kept awake");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The lid closes (the owner's doing: a blocker does not stop that)
+    // while both tasks run, with no other machine in the cluster yet.
+    let slept = std::time::Instant::now();
+    let os2 = os.clone();
+    let announce = tokio::task::spawn_blocking(move || os2.announce(PowerEvent::Sleep));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let p = node_power(&client, &laptop_id).await;
+        if p.asleep_since_unix.is_some() {
+            // Nobody on its LAN to send the packet.
+            assert!(!p.can_wake, "{p:#?}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never asleep: {p:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    announce.await.unwrap();
+    assert!(
+        slept.elapsed() < Duration::from_secs(3),
+        "the OS was held back for {:?}",
+        slept.elapsed()
+    );
+    assert!(!node_named(&cluster, "laptop").online);
+
+    // Another machine on the same LAN joins. Its report follows the join:
+    // the cluster knows only then that it can wake the laptop.
+    let desk_lan = Lan::new(11);
+    let desk = Agent::new(AgentConfig {
+        power: pumasi_agent::PowerOptions {
+            wake: Some(desk_lan.clone()),
+            ..Default::default()
+        },
+        ..agent_config("desk", 2, tempdir("desk"))
+    })
+    .await
+    .unwrap();
+    let desk = spawn_join(desk, ticket);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !node_power(&client, &laptop_id).await.can_wake {
+        assert!(tokio::time::Instant::now() < deadline, "cannot be woken");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let desk_id = node_named(&cluster, "desk").id;
+
+    // The job ends on the other machine, and the move cost no attempt.
+    let view = wait_job(&client, id, 30).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    for t in &view.tasks {
+        assert_eq!(t.node.as_ref(), Some(&desk_id), "{t:#?}");
+        assert_eq!((t.attempts, t.preempted), (2, 1), "{t:#?}");
+    }
+    let AdminResponse::Events(events) = client
+        .call(AdminOp::Events {
+            after: 0,
+            since_unix: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected events");
+    };
+    assert!(
+        events.iter().any(|e| e.kind == "node.asleep"),
+        "{events:#?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind == "node.offline"),
+        "{events:#?}"
+    );
+
+    // Waking it by hand: the desk machine, on the same LAN, sends the packet.
+    let AdminResponse::Applied(lines) = client
+        .call(AdminOp::WakeNode {
+            node: "laptop".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected lines");
+    };
+    assert!(lines.iter().any(|l| l.contains("desk")), "{lines:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while desk_lan.sent.lock().unwrap().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "no magic packet");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(desk_lan.sent.lock().unwrap()[0], laptop_lan.iface.mac);
+    let p = node_power(&client, &laptop_id).await;
+    assert_eq!(p.last_wake_by.as_deref(), Some("desk"), "{p:#?}");
+
+    // It wakes and is back without anyone's help.
+    os.announce(PowerEvent::Wake);
+    wait_online(&cluster, 2).await;
+    assert!(
+        node_power(&client, &laptop_id)
+            .await
+            .asleep_since_unix
+            .is_none()
+    );
+    // An online node is not woken.
+    assert!(
+        client
+            .call(AdminOp::WakeNode {
+                node: "laptop".into()
+            })
+            .await
+            .is_err()
+    );
+
+    client.close().await;
+    laptop.kill().await;
+    desk.kill().await;
     cluster.shutdown().await.unwrap();
 }
 
@@ -635,6 +894,7 @@ async fn provider(name: &str, slots: u32, dir: PathBuf, corrupt: bool) -> Agent 
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        power: Default::default(),
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1158,6 +1418,7 @@ async fn docker_tasks_get_files_and_run_only_on_docker_nodes() {
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        power: Default::default(),
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1349,6 +1610,7 @@ async fn microvm_jobs_run_on_an_invited_provider() {
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        power: Default::default(),
         max_cpu_percent: None,
         availability: None,
         bench: None,
@@ -1509,6 +1771,134 @@ async fn microvm_jobs_run_on_an_invited_provider() {
 /// confidential job's guest attests, the control plane refuses the keys
 /// while no admin trusts the measurement, and releases them once it does.
 /// The run's input and output cross the node only sealed.
+async fn task_executors(client: &AdminClient, id: JobId) -> Vec<Option<Executor>> {
+    match client.call(AdminOp::TaskExecutors { id }).await.unwrap() {
+        AdminResponse::TaskExecutors(e) => e,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// An `executor = "image"` job of two tasks, for whichever executor the
+/// node has.
+fn image_job() -> JobSubmission {
+    let tasks = (0..2)
+        .map(|i| TaskInput {
+            args: vec![format!("arg{i}")],
+            ..Default::default()
+        })
+        .collect();
+    let mut sub = docker_job(&["sh", "-c", "cat shared.txt && echo $0"], tasks);
+    sub.executor = Executor::Image;
+    sub.limits.timeout_ms = 120_000;
+    sub
+}
+
+/// Release 1.5: an image job on a node with Docker runs in a container.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn image_jobs_run_in_docker_where_the_node_has_it() {
+    if !docker_available() {
+        eprintln!("skipping: docker is not available");
+        return;
+    }
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let wasm_only = spawn_join(agent("wasm-only", 4, tempdir("w")).await, ticket.clone());
+    let docker_agent = Agent::new(AgentConfig {
+        docker: Some("docker".into()),
+        ..agent_config("docker", 4, tempdir("d"))
+    })
+    .await
+    .unwrap();
+    let docker_id = docker_agent.id().to_string();
+    let d = spawn_join(docker_agent, ticket);
+    wait_online(&cluster, 2).await;
+    let client = admin(&cluster).await;
+
+    let id = submit(&client, image_job()).await;
+    let view = wait_job(&client, id, 300).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    for (i, t) in view.tasks.iter().enumerate() {
+        assert_eq!(t.node.as_deref(), Some(docker_id.as_str()));
+        assert_eq!(
+            t.stdout.as_deref(),
+            Some(format!("shared+arg{i}\n").as_bytes()),
+            "{t:#?}"
+        );
+    }
+    assert_eq!(
+        task_executors(&client, id).await,
+        vec![Some(Executor::Docker); 2]
+    );
+    // The receipts name the executor that ran, which is what is charged.
+    for r in receipts(&client, id).await {
+        assert_eq!(r.usage.executor, Executor::Docker, "{r:#?}");
+    }
+
+    client.close().await;
+    wasm_only.kill().await;
+    d.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+/// Release 1.5: the same image job on a node without Docker runs in a
+/// microVM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_runs_an_image_job_on_a_node_without_docker() {
+    let Some(vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let wasm_only = spawn_join(agent("wasm-only", 2, tempdir("w")).await, ticket.clone());
+    let vm_agent = Agent::new(AgentConfig {
+        microvm: Some(vm),
+        ..agent_config("vm-only", 2, tempdir("v"))
+    })
+    .await
+    .unwrap();
+    let vm_id = vm_agent.id().to_string();
+    let v = spawn_join(vm_agent, ticket);
+    wait_online(&cluster, 2).await;
+    assert_eq!(
+        node_named(&cluster, "vm-only").executors,
+        vec![Executor::Wasm, Executor::Microvm]
+    );
+    let client = admin(&cluster).await;
+
+    let mut sub = image_job();
+    sub.docker.as_mut().unwrap().image = microvm_image();
+    let id = submit(&client, sub).await;
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    for (i, t) in view.tasks.iter().enumerate() {
+        assert_eq!(t.node.as_deref(), Some(vm_id.as_str()));
+        assert_eq!(
+            t.stdout.as_deref(),
+            Some(format!("shared+arg{i}\n").as_bytes()),
+            "{t:#?}"
+        );
+    }
+    assert_eq!(
+        task_executors(&client, id).await,
+        vec![Some(Executor::Microvm); 2]
+    );
+    for r in receipts(&client, id).await {
+        assert_eq!(r.usage.executor, Executor::Microvm, "{r:#?}");
+    }
+
+    client.close().await;
+    wasm_only.kill().await;
+    v.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn microvm_confidential_jobs_get_keys_only_for_a_trusted_measurement() {
     let Some(mut vm) = microvm_config() else {
@@ -1857,6 +2247,7 @@ async fn upgradable(name: &str, dir: PathBuf, exe: PathBuf, auto: Option<bool>) 
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        power: Default::default(),
         max_cpu_percent: None,
         availability: None,
         bench: None,

@@ -149,6 +149,11 @@ impl std::str::FromStr for Tier {
 ///   No network unless the job asks for one, and then only to the
 ///   internet. Safe to send to other people's machines, so providers that
 ///   opted in with `--allow-microvm` get these tasks.
+/// - `Image`: an OCI image run by whichever of the two the node has (1.5):
+///   Docker where the node offers it, a microVM where it does not (old
+///   Macs, Windows PCs without Docker Desktop). A job, never a run: the
+///   control plane picks `Docker` or `Microvm` for each run it places, and
+///   that is what the node is told and what its receipt names.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -158,12 +163,28 @@ pub enum Executor {
     Wasm,
     Docker,
     Microvm,
+    // 1.5 from here (variants are only ever added at the end: the order is
+    // the stored and sent encoding).
+    Image,
 }
 
 impl Executor {
-    /// Docker and microVM jobs run OCI images and share [`DockerSpec`].
+    /// Docker, microVM and image jobs run OCI images and share
+    /// [`DockerSpec`].
     pub fn runs_images(self) -> bool {
-        matches!(self, Executor::Docker | Executor::Microvm)
+        matches!(self, Executor::Docker | Executor::Microvm | Executor::Image)
+    }
+
+    /// The executors a node can run a job of this kind with, in the order
+    /// the control plane tries them: itself, or for `Image` Docker before
+    /// a microVM (Docker starts faster and can reach GPUs on every OS).
+    pub fn runs_as(self) -> &'static [Executor] {
+        match self {
+            Executor::Wasm => &[Executor::Wasm],
+            Executor::Docker => &[Executor::Docker],
+            Executor::Microvm => &[Executor::Microvm],
+            Executor::Image => &[Executor::Docker, Executor::Microvm],
+        }
     }
 }
 
@@ -173,6 +194,7 @@ impl fmt::Display for Executor {
             Executor::Wasm => "wasm",
             Executor::Docker => "docker",
             Executor::Microvm => "microvm",
+            Executor::Image => "image",
         })
     }
 }
@@ -439,6 +461,21 @@ impl JobSubmission {
         self.gpu_capabilities.contains(&GpuCapability::Graphics)
     }
 
+    /// Settles an `image` job on the one executor it can run with, when
+    /// what it asks for leaves only one: a confidential job runs in a
+    /// microVM, GPU driver capabilities are Docker's. Otherwise it stays
+    /// `image` and each run is placed on whichever its node has.
+    pub fn narrow_executor(&mut self) {
+        if self.executor != Executor::Image {
+            return;
+        }
+        if self.tier == Tier::Confidential {
+            self.executor = Executor::Microvm;
+        } else if !self.gpu_capabilities.is_empty() {
+            self.executor = Executor::Docker;
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.tasks.is_empty(), "job has no tasks");
         ensure!(self.tasks.len() <= 100_000, "too many tasks (max 100000)");
@@ -450,7 +487,7 @@ impl JobSubmission {
                     "module is not a WebAssembly binary"
                 );
             }
-            Executor::Docker | Executor::Microvm => {
+            Executor::Docker | Executor::Microvm | Executor::Image => {
                 let kind = self.executor;
                 let d = self
                     .docker
@@ -469,8 +506,8 @@ impl JobSubmission {
         }
         if self.tier == Tier::Confidential {
             ensure!(
-                self.executor == Executor::Microvm,
-                "confidential jobs run in microVMs: set executor = \"microvm\""
+                matches!(self.executor, Executor::Microvm | Executor::Image),
+                "confidential jobs run in microVMs: set executor = \"microvm\" (or \"image\")"
             );
             ensure!(
                 self.gpu.is_none(),
@@ -552,7 +589,7 @@ impl JobSubmission {
         }
         if !self.gpu_capabilities.is_empty() {
             ensure!(
-                self.executor == Executor::Docker,
+                matches!(self.executor, Executor::Docker | Executor::Image),
                 "GPU capabilities are for docker jobs (a microVM gets the whole GPU)"
             );
             let g = self
@@ -619,7 +656,8 @@ pub struct JobFile {
     #[serde(default)]
     pub command: Vec<String>,
     /// Defaults to `docker` when `image` is set, else `wasm`. Set
-    /// `microvm` to run the image in a VM.
+    /// `microvm` to run the image in a VM, or `image` to run it with
+    /// whichever of the two each node has.
     pub executor: Option<Executor>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -956,7 +994,7 @@ impl JobFile {
                 let m = self.module.as_ref().context("wasm job needs `module`")?;
                 (read(m)?, None)
             }
-            Executor::Docker | Executor::Microvm => {
+            Executor::Docker | Executor::Microvm | Executor::Image => {
                 ensure!(self.module.is_none(), "`module` is only for wasm jobs");
                 let image = self
                     .image
@@ -1188,7 +1226,7 @@ impl JobFile {
             deterministic: match executor {
                 // GPU results are not bit-identical across GPUs.
                 Executor::Wasm => self.deterministic.unwrap_or(!wants_gpu),
-                Executor::Docker | Executor::Microvm => {
+                Executor::Docker | Executor::Microvm | Executor::Image => {
                     ensure!(
                         self.deterministic != Some(true),
                         "deterministic mode is only for wasm jobs"
@@ -1652,6 +1690,10 @@ mod tests {
         let vm = JobFile::load(&root.join("python-wordcount/job-microvm.toml")).unwrap();
         assert_eq!(vm.executor, Executor::Microvm);
         assert_eq!(vm.tasks, sub.tasks);
+        let image = JobFile::load(&root.join("python-wordcount/job-image.toml")).unwrap();
+        assert_eq!(image.executor, Executor::Image);
+        assert_eq!(image.tasks, sub.tasks);
+        image.validate().unwrap();
     }
 
     #[test]

@@ -80,6 +80,7 @@ fn agent_config(name: &str, slots: u32, dir: PathBuf) -> AgentConfig {
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        power: Default::default(),
         max_cpu_percent: None,
         availability: None,
         bench: None,

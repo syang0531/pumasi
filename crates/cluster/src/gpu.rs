@@ -223,7 +223,7 @@ pub(crate) fn pick_gpus(
         Executor::Wasm => webgpu
             .get(id)
             .and_then(|w| req.pick_webgpu(&w.profile.adapters, busy)),
-        Executor::Docker | Executor::Microvm => devices
+        Executor::Docker | Executor::Microvm | Executor::Image => devices
             .get(id)
             .and_then(|d| req.pick(d.gpus(), busy, executor)),
     }

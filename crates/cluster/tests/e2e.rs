@@ -467,28 +467,8 @@ async fn a_machine_that_sleeps_says_goodbye_and_is_woken_over_its_lan() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let desk_lan = Lan::new(11);
-    let desk = Agent::new(AgentConfig {
-        power: pumasi_agent::PowerOptions {
-            wake: Some(desk_lan.clone()),
-            ..Default::default()
-        },
-        ..agent_config("desk", 2, tempdir("desk"))
-    })
-    .await
-    .unwrap();
-    let desk = spawn_join(desk, ticket);
-    wait_online(&cluster, 2).await;
-    let desk_id = node_named(&cluster, "desk").id;
-    // Its report follows the join: the cluster knows only then that it
-    // is on the laptop's LAN.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while node_power(&client, &desk_id).await.report.is_none() {
-        assert!(tokio::time::Instant::now() < deadline, "no power report");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    // The lid closes (the owner's doing: a blocker does not stop that).
+    // The lid closes (the owner's doing: a blocker does not stop that)
+    // while both tasks run, with no other machine in the cluster yet.
     let slept = std::time::Instant::now();
     let os2 = os.clone();
     let announce = tokio::task::spawn_blocking(move || os2.announce(PowerEvent::Sleep));
@@ -496,7 +476,8 @@ async fn a_machine_that_sleeps_says_goodbye_and_is_woken_over_its_lan() {
     loop {
         let p = node_power(&client, &laptop_id).await;
         if p.asleep_since_unix.is_some() {
-            assert!(p.can_wake, "{p:#?}");
+            // Nobody on its LAN to send the packet.
+            assert!(!p.can_wake, "{p:#?}");
             break;
         }
         assert!(
@@ -512,6 +493,26 @@ async fn a_machine_that_sleeps_says_goodbye_and_is_woken_over_its_lan() {
         slept.elapsed()
     );
     assert!(!node_named(&cluster, "laptop").online);
+
+    // Another machine on the same LAN joins. Its report follows the join:
+    // the cluster knows only then that it can wake the laptop.
+    let desk_lan = Lan::new(11);
+    let desk = Agent::new(AgentConfig {
+        power: pumasi_agent::PowerOptions {
+            wake: Some(desk_lan.clone()),
+            ..Default::default()
+        },
+        ..agent_config("desk", 2, tempdir("desk"))
+    })
+    .await
+    .unwrap();
+    let desk = spawn_join(desk, ticket);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !node_power(&client, &laptop_id).await.can_wake {
+        assert!(tokio::time::Instant::now() < deadline, "cannot be woken");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let desk_id = node_named(&cluster, "desk").id;
 
     // The job ends on the other machine, and the move cost no attempt.
     let view = wait_job(&client, id, 30).await;

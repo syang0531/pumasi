@@ -52,10 +52,11 @@ What is in it:
 *Pumasi* (품앗이) is the Korean custom of neighbours taking turns working
 each other's fields.
 
-**Status.** Pumasi is at 1.5 and runs every day on a home cluster of
-Windows PCs (one with an RTX 3080) and a 2014 iMac. It has had an
-internal security review but no outside audit yet ([SECURITY.md](SECURITY.md)),
-and the [roadmap](#roadmap) lists what is not done. Bug reports and
+**Status.** Pumasi is at 1.5 and it is young: so far it has been used on
+one home cluster, of Windows PCs (one with an RTX 3080) and a 2014 iMac,
+since November 2026. It has had an internal security review but no
+outside audit yet ([SECURITY.md](SECURITY.md)), and the
+[roadmap](#roadmap) lists what is not done. Bug reports and
 questions are welcome in the [issues](https://github.com/syang0531/pumasi/issues).
 
 ## Install

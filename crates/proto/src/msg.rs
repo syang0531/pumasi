@@ -348,6 +348,16 @@ pub enum ToAgent {
     Wake {
         macs: Vec<crate::power::Mac>,
     },
+    // Minor 2 (1.6) from here.
+    /// Measure the network to another node now ([`crate::PROBE_ALPN`]):
+    /// round trips, then `bytes` sent. Answered with
+    /// [`FromAgent::Probe`].
+    Probe {
+        /// The node's id, which the answer names.
+        node: String,
+        addr: EndpointAddr,
+        bytes: u32,
+    },
 }
 
 /// How a task ended.
@@ -514,6 +524,9 @@ pub enum FromAgent {
     Sleeping,
     /// How the machine sleeps and wakes, sent after the welcome.
     Power(Box<crate::power::PowerReport>),
+    // Minor 2 (1.6) from here.
+    /// What a [`ToAgent::Probe`] measured.
+    Probe(Box<crate::monitor::ProbeResult>),
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +887,24 @@ pub enum AdminOp {
     TaskExecutors {
         id: JobId,
     },
+    // 1.6 from here.
+    /// Repeat and resolved notices, per-node thresholds and silences (the
+    /// answer of [`AdminOp::Alerts`] keeps its layout, so older CLIs still
+    /// read it).
+    AlertTuning,
+    /// Replaces the repeat and resolved settings and the per-node
+    /// thresholds. Answers like [`AdminOp::AlertTuning`].
+    SetAlertTuning(Box<crate::monitor::AlertTuning>),
+    /// Keeps matching alerts quiet for a while. Answers like
+    /// [`AdminOp::AlertTuning`].
+    Silence(Box<crate::monitor::SilenceSpec>),
+    /// Ends a silence (id or unique prefix). Answers like
+    /// [`AdminOp::AlertTuning`].
+    Unsilence {
+        id: String,
+    },
+    /// What the nodes measured of the network between each other.
+    Net,
 }
 
 impl AdminOp {
@@ -1016,6 +1047,9 @@ pub enum AdminResponse {
     // 1.5 from here.
     NodePower(Vec<crate::power::NodePowerView>),
     TaskExecutors(Vec<Option<Executor>>),
+    // 1.6 from here.
+    AlertTuning(Box<crate::monitor::AlertTuningView>),
+    Net(Box<crate::monitor::NetView>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

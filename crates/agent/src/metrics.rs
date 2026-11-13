@@ -1,7 +1,10 @@
 //! Samples this machine for the cluster's monitoring (phase 11): CPU,
 //! memory, the disk under the data directory, network counters, the
 //! hottest temperature sensor and each GPU's use, memory, temperature and
-//! power.
+//! power. Since 1.6 every GPU vendor reports its use
+//! ([`crate::gpu::usage`]), and Windows its temperatures (WMI on a thread
+//! of its own: ACPI thermal zones, and LibreHardwareMonitor's sensors when
+//! it runs).
 
 use std::path::{Path, PathBuf};
 
@@ -19,11 +22,15 @@ pub struct Sampler {
     disks: Disks,
     networks: Networks,
     /// None on Windows: sysinfo reads sensors there through WMI (COM),
-    /// which crashes when the sampler moves between threads, and the
-    /// sensors usually need administrator rights anyway.
+    /// which crashes when the sampler moves between threads; [`wmi_temps`]
+    /// reads them on a thread of its own instead.
     components: Option<Components>,
+    #[cfg(windows)]
+    wmi: wmi_temps::Temps,
     gpus: Vec<GpuInfo>,
     nvml: Option<crate::gpu::nvml::Sampler>,
+    /// The GPUs NVML does not cover (1.6).
+    usage: crate::gpu::usage::GpuUsage,
     samples: u64,
 }
 
@@ -43,6 +50,9 @@ impl Sampler {
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             components: (!cfg!(windows)).then(Components::new_with_refreshed_list),
+            #[cfg(windows)]
+            wmi: wmi_temps::Temps::start(),
+            usage: crate::gpu::usage::GpuUsage::new(&gpus),
             gpus,
             nvml,
             samples: 0,
@@ -84,6 +94,8 @@ impl Sampler {
             // Sensors that are not there read 0 or nonsense.
             .filter(|t| t.is_finite() && *t > 1.0 && *t < 150.0)
             .fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.max(t))));
+        #[cfg(windows)]
+        let temp_c = temp_c.or_else(|| self.wmi.hottest());
         let load1 = if cfg!(windows) {
             0.0
         } else {
@@ -114,23 +126,135 @@ impl Sampler {
     fn gpu_metrics(&mut self) -> Vec<GpuMetrics> {
         let nvidia = self.nvml.as_mut().map(|n| n.sample()).unwrap_or_default();
         let mut out = Vec::new();
+        let mut rest = Vec::new();
         for g in &self.gpus {
+            if g.driver == "vfio-pci" {
+                // Given to microVMs: the host does not drive it.
+                continue;
+            }
             let m = match g.vendor {
-                GpuVendor::Nvidia => {
-                    nvidia
-                        .iter()
-                        .find(|(pci, _)| *pci == g.pci)
-                        .map(|(_, m)| GpuMetrics {
-                            index: g.index,
-                            ..m.clone()
-                        })
-                }
+                GpuVendor::Nvidia if self.nvml.is_some() => nvidia
+                    .iter()
+                    .find(|(pci, _)| *pci == g.pci)
+                    .map(|(_, m)| GpuMetrics {
+                        index: g.index,
+                        ..m.clone()
+                    }),
                 GpuVendor::Amd if cfg!(target_os = "linux") => amd_sysfs(g),
                 _ => None,
             };
-            out.extend(m);
+            match m {
+                Some(m) => out.push(m),
+                None => rest.push(g),
+            }
         }
+        out.extend(self.usage.sample(&rest));
+        out.sort_by_key(|m| m.index);
         out
+    }
+}
+
+/// Temperatures through WMI on Windows (1.6). COM objects must stay on the
+/// thread that made them, so one thread owns the connections and reads the
+/// sensors every 10 seconds; the sampler takes the latest reading.
+#[cfg(windows)]
+mod wmi_temps {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    use tracing::debug;
+    use wmi::{Variant, WMIConnection};
+
+    #[derive(Clone)]
+    pub struct Temps(Arc<Mutex<Option<(Instant, f32)>>>);
+
+    impl Temps {
+        pub fn start() -> Self {
+            let t = Temps(Arc::new(Mutex::new(None)));
+            let latest = t.0.clone();
+            let spawned = std::thread::Builder::new()
+                .name("pumasi-wmi".into())
+                .spawn(move || {
+                    let acpi = WMIConnection::with_namespace_path("root\\WMI")
+                        .map_err(|e| debug!("WMI root\\WMI: {e}"))
+                        .ok();
+                    let mut lhm = None;
+                    let mut tries = 0u32;
+                    loop {
+                        // LibreHardwareMonitor may start after the agent.
+                        if lhm.is_none() && tries.is_multiple_of(30) {
+                            lhm = WMIConnection::with_namespace_path("root\\LibreHardwareMonitor")
+                                .ok();
+                        }
+                        tries += 1;
+                        let hottest = [
+                            acpi.as_ref().and_then(read_acpi),
+                            lhm.as_ref().and_then(read_lhm),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .filter(|t| t.is_finite() && *t > 1.0 && *t < 150.0)
+                        .fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.max(t))));
+                        *latest.lock().unwrap() = hottest.map(|t| (Instant::now(), t));
+                        if Arc::strong_count(&latest) == 1 {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(10));
+                    }
+                });
+            if let Err(e) = spawned {
+                debug!("no WMI thread: {e}");
+            }
+            t
+        }
+
+        /// The hottest sensor read in the last minute.
+        pub fn hottest(&self) -> Option<f32> {
+            self.0
+                .lock()
+                .unwrap()
+                .filter(|(at, _)| at.elapsed() < Duration::from_secs(60))
+                .map(|(_, t)| t)
+        }
+    }
+
+    fn number(v: &Variant) -> Option<f64> {
+        Some(match v {
+            Variant::R4(f) => *f as f64,
+            Variant::R8(f) => *f,
+            Variant::I4(n) => *n as f64,
+            Variant::UI4(n) => *n as f64,
+            Variant::I8(n) => *n as f64,
+            Variant::UI8(n) => *n as f64,
+            _ => return None,
+        })
+    }
+
+    /// ACPI thermal zones, in tenths of a kelvin (needs administrator
+    /// rights, which the service has).
+    fn read_acpi(c: &WMIConnection) -> Option<f32> {
+        let rows: Vec<HashMap<String, Variant>> = c
+            .raw_query("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")
+            .ok()?;
+        rows.iter()
+            .filter_map(|r| number(r.get("CurrentTemperature")?))
+            .map(|dk| (dk / 10.0 - 273.15) as f32)
+            .fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.max(t))))
+    }
+
+    /// LibreHardwareMonitor's temperature sensors (CPU cores, GPUs,
+    /// drives), while it runs.
+    fn read_lhm(c: &WMIConnection) -> Option<f32> {
+        let rows: Vec<HashMap<String, Variant>> = c
+            .raw_query("SELECT Value FROM Sensor WHERE SensorType = 'Temperature'")
+            .ok()?;
+        rows.iter()
+            .filter_map(|r| number(r.get("Value")?))
+            .map(|t| t as f32)
+            .fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.max(t))))
     }
 }
 

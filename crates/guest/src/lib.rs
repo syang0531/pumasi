@@ -104,6 +104,11 @@ pub struct RunSpec {
     /// Bring up the network card with these settings (`network = true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<GuestNet>,
+    /// Print the task's output on the console as it comes (1.6), in
+    /// [`live_frame`] lines, for the agent to stream while the task runs.
+    /// The result on the output disk still has all of it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live: bool,
 }
 
 /// The guest's network settings: one card (`eth0`), a default route
@@ -171,5 +176,136 @@ impl GuestResult {
             stderr_dropped: 0,
             files_dropped: 0,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live output on the console (1.6)
+// ---------------------------------------------------------------------------
+
+/// Start of a console line that carries task output. The record separator
+/// keeps it apart from anything the kernel or a program prints.
+pub const LIVE_PREFIX: &str = "\u{1e}pumasi-out ";
+/// Output the guest prints live per stream; the rest comes with the
+/// result only. What is streamed is always the start of the output, so
+/// the final output continues it.
+pub const LIVE_MAX_BYTES: u64 = 1 << 20;
+/// Bytes of output in one console line.
+pub const LIVE_CHUNK: usize = 3 * 1024;
+
+/// One console line of live output: stream 1 (stdout) or 2 (stderr), the
+/// offset of `data` in that stream, the data in base64 and a checksum.
+pub fn live_frame(stream: u8, offset: u64, data: &[u8]) -> String {
+    format!(
+        "{LIVE_PREFIX}{stream} {offset} {} {:08x}\n",
+        base64_encode(data),
+        fnv1a(data)
+    )
+}
+
+/// The stream, offset and data of a [`live_frame`] line (without its line
+/// end; a `\r` before it is allowed). `None` for any other line, or a
+/// line that came through damaged.
+pub fn parse_live_frame(line: &str) -> Option<(u8, u64, Vec<u8>)> {
+    let rest = line.trim_end_matches(['\r', '\n']);
+    let rest = &rest[rest.find(LIVE_PREFIX)? + LIVE_PREFIX.len()..];
+    let mut parts = rest.split(' ');
+    let stream: u8 = parts.next()?.parse().ok()?;
+    let offset: u64 = parts.next()?.parse().ok()?;
+    let data = base64_decode(parts.next()?)?;
+    let sum = u32::from_str_radix(parts.next()?, 16).ok()?;
+    (parts.next().is_none() && (1..=2).contains(&stream) && sum == fnv1a(&data))
+        .then_some((stream, offset, data))
+}
+
+fn fnv1a(data: &[u8]) -> u32 {
+    data.iter().fold(0x811c_9dc5u32, |h, b| {
+        (h ^ *b as u32).wrapping_mul(0x0100_0193)
+    })
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.as_bytes();
+    if !s.len().is_multiple_of(4) {
+        return None;
+    }
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    for (i, q) in s.chunks(4).enumerate() {
+        let last = i == s.len() / 4 - 1;
+        let pad = q.iter().rev().take_while(|c| **c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (j, c) in q.iter().enumerate() {
+            let v = if j >= 4 - pad { 0 } else { val(*c)? };
+            n = n << 6 | v;
+        }
+        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&bytes[..3 - pad]);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn frames_round_trip() {
+        for data in [&b""[..], b"a", b"ab", b"abc", b"hello\nworld\r\n\x00\xff"] {
+            let line = live_frame(2, 42, data);
+            assert!(line.ends_with('\n') && !line[..line.len() - 1].contains('\n'));
+            assert_eq!(
+                parse_live_frame(&line.replace('\n', "\r\n")),
+                Some((2, 42, data.to_vec()))
+            );
+        }
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+    }
+
+    #[test]
+    fn damaged_frames_are_refused() {
+        let line = live_frame(1, 0, b"some output");
+        assert!(parse_live_frame("[    1.234] random kernel line").is_none());
+        // A kernel message landed inside the line.
+        let mut bad = line.clone();
+        bad.insert_str(20, "xx");
+        assert!(parse_live_frame(&bad).is_none());
+        let bad = line.replace(" 1 0 ", " 3 0 ");
+        assert!(parse_live_frame(&bad).is_none());
+        // Text before the prefix (a partial kernel line) does not matter.
+        assert!(parse_live_frame(&format!("junk{line}")).is_some());
     }
 }

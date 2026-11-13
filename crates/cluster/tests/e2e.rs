@@ -1903,6 +1903,94 @@ async fn microvm_runs_an_image_job_on_a_node_without_docker() {
     cluster.shutdown().await.unwrap();
 }
 
+/// Release 1.6: a microVM task's output shows while it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_output_shows_while_the_task_runs() {
+    let Some(vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let vm_agent = Agent::new(AgentConfig {
+        microvm: Some(vm),
+        ..agent_config("vm-live", 1, tempdir("v"))
+    })
+    .await
+    .unwrap();
+    let v = spawn_join(vm_agent, ticket);
+    wait_online(&cluster, 1).await;
+    let client = admin(&cluster).await;
+
+    let mut sub = docker_job(
+        &[
+            "sh",
+            "-c",
+            "echo started; echo oops >&2; sleep 8; echo done",
+        ],
+        vec![TaskInput::default()],
+    );
+    sub.executor = Executor::Microvm;
+    sub.docker.as_mut().unwrap().image = microvm_image();
+    sub.limits.timeout_ms = 120_000;
+    let id = submit(&client, sub).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut attempt = 0;
+    let mut seen_running = false;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no output: {out:?} {err:?}"
+        );
+        let AdminResponse::Logs(c) = client
+            .call(AdminOp::Logs {
+                job: id,
+                index: 0,
+                attempt,
+                stdout_from: out.len() as u64,
+                stderr_from: err.len() as u64,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        attempt = c.attempt;
+        out.extend_from_slice(&c.stdout);
+        err.extend_from_slice(&c.stderr);
+        if !seen_running && out.starts_with(b"started\n") {
+            assert!(
+                matches!(c.state, TaskState::Running { .. }),
+                "output only came at the end: {:?}",
+                c.state
+            );
+            assert!(c.live);
+            seen_running = true;
+        }
+        if c.done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(seen_running, "never saw output while running: {out:?}");
+    assert_eq!(out, b"started\ndone\n");
+    assert_eq!(err, b"oops\n");
+    let view = wait_job(&client, id, 60).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    assert_eq!(
+        view.tasks[0].stdout.as_deref(),
+        Some(&b"started\ndone\n"[..])
+    );
+
+    client.close().await;
+    v.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn microvm_confidential_jobs_get_keys_only_for_a_trusted_measurement() {
     let Some(mut vm) = microvm_config() else {

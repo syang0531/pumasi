@@ -10,7 +10,7 @@ use axum::{
 use maud::{Markup, html};
 use pumasi_proto::{
     manage::NodeEdit,
-    monitor::{MetricsView, NodeMetricsView},
+    monitor::{MetricsView, NetView, NodeMetricsView, human_bps, human_rtt},
     msg::{AdminOp, AdminResponse, NodeView},
     power::{NodePowerView, format_mac},
 };
@@ -88,13 +88,68 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
         Ok(AdminResponse::Confidential(v)) => confidential(ctx, &v),
         _ => html! {},
     };
+    let net = match ctx.call(AdminOp::Net).await {
+        Ok(AdminResponse::Net(v)) => net_matrix(l, &v),
+        _ => html! {},
+    };
     Ok(ctx.page(
         l.t("Nodes", "노드"),
         Nav::Nodes,
         html! { div class="page-head" { h1 { (l.t("Nodes", "노드")) } } },
         Some(("5s", live)),
-        html! { (super::upgrade::placeholder(ctx)) (conf) },
+        html! { (super::upgrade::placeholder(ctx)) (net) (conf) },
     ))
+}
+
+/// Round trips between nodes as a matrix (row: from, column: to), with
+/// the bandwidth under each (1.6).
+fn net_matrix(l: Lang, v: &NetView) -> Markup {
+    let nodes: Vec<&String> = v
+        .nodes
+        .iter()
+        .filter(|n| v.links.iter().any(|x| x.from == **n || x.to == **n))
+        .collect();
+    html! {
+        section class="card" id="net" {
+            h2 { (l.t("Network between nodes", "노드 사이 네트워크")) }
+            @if nodes.is_empty() {
+                p class="empty" { (l.t(
+                    "Nothing measured yet. Agents of 1.6 or later measure each other now and then.",
+                    "아직 잰 것이 없습니다. 1.6 이상의 에이전트가 가끔 서로를 잽니다.")) }
+            } @else {
+                p class="dim" { (l.t("Round trip and bandwidth, row to column.", "왕복 시간과 대역폭 (행에서 열로).")) }
+                div class="table-wrap" {
+                    table class="matrix" {
+                        thead { tr { th {} @for n in &nodes { th { (n) } } } }
+                        tbody {
+                            @for a in &nodes {
+                                tr {
+                                    th { (a) }
+                                    @for b in &nodes {
+                                        @if a == b { td class="dim" { "-" } }
+                                        @else {
+                                            @match v.link(a, b) {
+                                                Some(x) if x.error.is_some() => {
+                                                    td class="bad" title=(x.error.clone().unwrap_or_default()) { (l.t("failed", "실패")) }
+                                                }
+                                                Some(x) => {
+                                                    td title=(format!("{} · {}", fmt::ago(l, x.unix), match x.direct { Some(false) => "relay", _ => "direct" })) {
+                                                        (x.rtt_us.map(human_rtt).unwrap_or_default())
+                                                        @if let Some(b) = x.bps { br; span class="dim" { (human_bps(b)) } }
+                                                    }
+                                                }
+                                                None => { td {} }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The confidential tier: which nodes start TEE VMs, and the launch

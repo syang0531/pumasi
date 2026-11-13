@@ -7,14 +7,16 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand};
 use pumasi_cluster::AdminClient;
 use pumasi_proto::{
     job::{JobId, parse_duration_ms},
+    manage::Selector,
     monitor::{
-        AlertPolicy, AlertsView, EventLevel, EventView, FailureRate, LogChunk, MetricsView,
-        NodeMetricsView, WebhookFormat, WebhookSpec, human_duration, parse_opt_percent,
+        AlertOverride, AlertPolicy, AlertTuning, AlertTuningView, AlertsView, EventLevel,
+        EventView, FailureRate, LogChunk, MetricsView, NetView, NodeMetricsView, SilenceSpec,
+        WebhookFormat, WebhookSpec, human_bps, human_duration, human_rtt, parse_opt_percent,
         parse_opt_secs, parse_switch,
     },
     msg::{AdminOp, AdminResponse, TaskState},
@@ -31,10 +33,36 @@ pub enum AlertCmd {
         admin: AdminArgs,
     },
     /// Change alert rules; the ones not given stay as they are. `off`
-    /// turns a rule off.
+    /// turns a rule off. With `--on`, change the offline, disk and
+    /// temperature thresholds of some nodes only.
     Set {
         #[command(flatten)]
         rules: Box<AlertRules>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Keep alerts quiet for a while: no webhook notices for them (they
+    /// still show as firing). Without a rule, every rule; without `--on`,
+    /// every node and the cluster.
+    Silence {
+        /// node_offline, failure_rate, disk, temperature, perf_drop, smart
+        /// or check_mismatch.
+        rule: Option<String>,
+        /// A node name, or a label selector such as `gpu=nvidia`.
+        #[arg(long, value_name = "NODE|SELECTOR")]
+        on: Option<String>,
+        /// How long, e.g. 2h or 3d.
+        #[arg(long = "for", value_name = "DURATION", default_value = "2h")]
+        duration: String,
+        /// Why, for whoever looks later.
+        #[arg(long, default_value = "")]
+        comment: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// End a silence early (its id from `pumasi alert ls`).
+    Unsilence {
+        id: String,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -72,6 +100,18 @@ pub struct AlertRules {
     /// Start from the default rules instead of the current ones.
     #[arg(long)]
     defaults: bool,
+    /// Send a firing alert's notice again this often while it fires,
+    /// e.g. 4h.
+    #[arg(long, value_name = "DURATION|off")]
+    repeat: Option<String>,
+    /// Send a notice when an alert stops firing.
+    #[arg(long, value_name = "on|off")]
+    resolved: Option<String>,
+    /// Set --node-offline, --disk and --temperature for these nodes only:
+    /// a node name, or a label selector such as `os=windows`. `inherit`
+    /// as a value goes back to the cluster's rule.
+    #[arg(long, value_name = "NODE|SELECTOR")]
+    on: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -416,7 +456,9 @@ pub async fn logs(
                 said_waiting = true;
             }
             if matches!(chunk.state, TaskState::Running { .. }) && !chunk.live && !said_not_live {
-                eprintln!("[pumasi] a microVM's output comes when the task finishes");
+                eprintln!(
+                    "[pumasi] the node's agent is older than 1.6: a microVM's output comes when the task finishes"
+                );
                 said_not_live = true;
             }
         }
@@ -525,10 +567,34 @@ pub async fn events(
 // alerts and webhooks
 // ---------------------------------------------------------------------------
 
-fn print_alerts(v: &AlertsView) {
+fn print_alerts(v: &AlertsView, t: Option<&AlertTuningView>) {
     println!("rules:");
     for (rule, text) in v.policy.describe() {
         println!("  {rule:<15} {text}");
+    }
+    if let Some(t) = t {
+        println!(
+            "  {:<15} {}",
+            "repeat",
+            t.tuning
+                .repeat_secs
+                .map_or("off (one notice per alert)".into(), |r| format!(
+                    "every {} while firing",
+                    human_duration(r)
+                ))
+        );
+        println!(
+            "  {:<15} {}",
+            "resolved",
+            if t.tuning.resolved {
+                "a notice when an alert stops firing"
+            } else {
+                "off"
+            }
+        );
+        for o in &t.tuning.overrides {
+            println!("  on {:<12} {}", o.nodes.to_string(), o.describe(false));
+        }
     }
     println!();
     if v.firing.is_empty() {
@@ -536,12 +602,38 @@ fn print_alerts(v: &AlertsView) {
     } else {
         println!("firing:");
         for a in &v.firing {
+            let quiet = t.is_some_and(|t| {
+                t.silenced
+                    .iter()
+                    .any(|(r, s)| *r == a.rule && *s == a.subject)
+            });
             println!(
-                "  {:<15} {:<8} since {}  {}",
+                "  {:<15} {:<8} since {}  {}{}",
                 a.rule,
                 a.level,
                 local_time(a.since_unix, true),
-                a.message
+                a.message,
+                if quiet { " (silenced)" } else { "" }
+            );
+        }
+    }
+    if let Some(t) = t
+        && !t.silences.is_empty()
+    {
+        println!();
+        println!("silences:");
+        for s in &t.silences {
+            println!(
+                "  {}  {:<30} until {}  by {}{}",
+                s.id,
+                s.describe(),
+                local_time(s.until_unix, true),
+                s.by,
+                if s.comment.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", s.comment)
+                }
             );
         }
     }
@@ -582,13 +674,102 @@ async fn alerts(client: &AdminClient) -> Result<AlertsView> {
     }
 }
 
+/// The 1.6 settings (a control plane older than 1.6 does not answer).
+async fn tuning(client: &AdminClient) -> Result<AlertTuningView> {
+    match client
+        .call(AdminOp::AlertTuning)
+        .await
+        .context("repeat notices, per-node thresholds and silences need a 1.6 control plane")?
+    {
+        AdminResponse::AlertTuning(t) => Ok(*t),
+        _ => bail!("unexpected response"),
+    }
+}
+
+/// A node name or a label selector: a bare word that is no selector
+/// syntax names a node.
+fn node_target(s: &str) -> Result<Selector> {
+    let s = s.trim();
+    let sel = if s.contains(['=', ',', '!']) {
+        s.parse::<Selector>()?
+    } else {
+        format!("name={s}").parse::<Selector>()?
+    };
+    sel.validate()?;
+    Ok(sel)
+}
+
+async fn set_tuning(client: &AdminClient, t: AlertTuning) -> Result<AlertTuningView> {
+    match client.call(AdminOp::SetAlertTuning(Box::new(t))).await? {
+        AdminResponse::AlertTuning(t) => Ok(*t),
+        _ => bail!("unexpected response"),
+    }
+}
+
+/// `95`, `95C`, `95°C` or `off`.
+fn parse_celsius(v: &str) -> Result<Option<u16>> {
+    if pumasi_proto::monitor::is_off(v) {
+        return Ok(None);
+    }
+    Ok(Some(
+        v.trim()
+            .trim_end_matches('C')
+            .trim_end_matches('°')
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid temperature {v:?}"))?,
+    ))
+}
+
 pub async fn alert(home: &Path, cmd: AlertCmd) -> Result<i32> {
     match cmd {
         AlertCmd::Ls { admin } => {
             let client = connect_admin(home, &admin).await?;
             let v = alerts(&client).await?;
+            let t = tuning(&client).await.ok();
             client.close().await;
-            print_alerts(&v);
+            print_alerts(&v, t.as_ref());
+        }
+        AlertCmd::Silence {
+            rule,
+            on,
+            duration,
+            comment,
+            admin,
+        } => {
+            let spec = SilenceSpec {
+                rule,
+                nodes: on.as_deref().map(node_target).transpose()?,
+                secs: parse_duration_ms(&duration)? / 1000,
+                comment,
+            };
+            spec.validate()?;
+            let client = connect_admin(home, &admin).await?;
+            let t = match client
+                .call(AdminOp::Silence(Box::new(spec.clone())))
+                .await?
+            {
+                AdminResponse::AlertTuning(t) => *t,
+                _ => bail!("unexpected response"),
+            };
+            let v = alerts(&client).await?;
+            client.close().await;
+            if let Some(s) = t.silences.iter().max_by_key(|s| s.created_unix) {
+                println!(
+                    "silenced {} until {} (id {})",
+                    s.describe(),
+                    local_time(s.until_unix, true),
+                    s.id
+                );
+                println!();
+            }
+            print_alerts(&v, Some(&t));
+        }
+        AlertCmd::Unsilence { id, admin } => {
+            let client = connect_admin(home, &admin).await?;
+            client.call(AdminOp::Unsilence { id: id.clone() }).await?;
+            client.close().await;
+            println!("silence {id} ended");
         }
         AlertCmd::Set { rules, admin } => {
             let AlertRules {
@@ -602,8 +783,83 @@ pub async fn alert(home: &Path, cmd: AlertCmd) -> Result<i32> {
                 smart,
                 check_mismatch,
                 defaults,
+                repeat,
+                resolved,
+                on,
             } = *rules;
             let client = connect_admin(home, &admin).await?;
+            if let Some(target) = on {
+                ensure!(
+                    failure_rate.is_none()
+                        && failure_window.is_none()
+                        && failure_min_runs.is_none()
+                        && perf_drop.is_none()
+                        && smart.is_none()
+                        && check_mismatch.is_none()
+                        && !defaults
+                        && repeat.is_none()
+                        && resolved.is_none(),
+                    "with --on, only --node-offline, --disk and --temperature can be set"
+                );
+                let nodes = node_target(&target)?;
+                let mut t = tuning(&client).await?;
+                let inherit =
+                    |v: &Option<String>| v.as_deref().is_some_and(|v| v.trim() == "inherit");
+                let i = match t.tuning.overrides.iter().position(|o| o.nodes == nodes) {
+                    Some(i) => i,
+                    None => {
+                        t.tuning.overrides.push(AlertOverride {
+                            nodes,
+                            node_offline_secs: None,
+                            disk_percent: None,
+                            temp_c: None,
+                        });
+                        t.tuning.overrides.len() - 1
+                    }
+                };
+                let o = &mut t.tuning.overrides[i];
+                if let Some(v) = &node_offline {
+                    o.node_offline_secs = (!inherit(&node_offline))
+                        .then(|| parse_opt_secs(v))
+                        .transpose()?;
+                }
+                if let Some(v) = &disk {
+                    o.disk_percent = (!inherit(&disk))
+                        .then(|| parse_opt_percent(v))
+                        .transpose()?;
+                }
+                if let Some(v) = &temperature {
+                    o.temp_c = (!inherit(&temperature))
+                        .then(|| parse_celsius(v))
+                        .transpose()?;
+                }
+                t.tuning.overrides.retain(|o| !o.is_empty());
+                let t = set_tuning(&client, t.tuning).await?;
+                let v = alerts(&client).await?;
+                client.close().await;
+                print_alerts(&v, Some(&t));
+                return Ok(0);
+            }
+            if repeat.is_some() || resolved.is_some() {
+                let mut t = tuning(&client).await?;
+                if let Some(v) = repeat {
+                    t.tuning.repeat_secs = parse_opt_secs(&v)?;
+                }
+                if let Some(v) = resolved {
+                    t.tuning.resolved = parse_switch(&v)?;
+                }
+                set_tuning(&client, t.tuning).await?;
+            }
+            let rules_given = node_offline.is_some()
+                || failure_rate.is_some()
+                || failure_window.is_some()
+                || failure_min_runs.is_some()
+                || disk.is_some()
+                || temperature.is_some()
+                || perf_drop.is_some()
+                || smart.is_some()
+                || check_mismatch.is_some()
+                || defaults;
             let mut p = if defaults {
                 AlertPolicy::default()
             } else {
@@ -633,16 +889,7 @@ pub async fn alert(home: &Path, cmd: AlertCmd) -> Result<i32> {
                 p.disk_percent = parse_opt_percent(&v)?;
             }
             if let Some(v) = temperature {
-                p.temp_c = if pumasi_proto::monitor::is_off(&v) {
-                    None
-                } else {
-                    Some(
-                        v.trim()
-                            .trim_end_matches('C')
-                            .trim_end_matches('°')
-                            .parse()?,
-                    )
-                };
+                p.temp_c = parse_celsius(&v)?;
             }
             if let Some(v) = perf_drop {
                 p.perf_drop_percent = parse_opt_percent(&v)?;
@@ -653,15 +900,124 @@ pub async fn alert(home: &Path, cmd: AlertCmd) -> Result<i32> {
             if let Some(v) = check_mismatch {
                 p.check_mismatch = parse_switch(&v)?;
             }
-            let v = match client.call(AdminOp::SetAlertPolicy(Box::new(p))).await? {
-                AdminResponse::Alerts(a) => *a,
-                _ => bail!("unexpected response"),
+            let v = if rules_given {
+                match client.call(AdminOp::SetAlertPolicy(Box::new(p))).await? {
+                    AdminResponse::Alerts(a) => *a,
+                    _ => bail!("unexpected response"),
+                }
+            } else {
+                alerts(&client).await?
             };
+            let t = tuning(&client).await.ok();
             client.close().await;
-            print_alerts(&v);
+            print_alerts(&v, t.as_ref());
         }
     }
     Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// net
+// ---------------------------------------------------------------------------
+
+/// `pumasi net`: round trips between nodes as a matrix (row: from, column:
+/// to), then each pair's bandwidth.
+pub async fn net(home: &Path, admin: &AdminArgs, output: Output) -> Result<i32> {
+    let v = match call(home, admin, AdminOp::Net)
+        .await
+        .context("measuring the network between nodes needs a 1.6 control plane")?
+    {
+        AdminResponse::Net(v) => *v,
+        _ => bail!("unexpected response"),
+    };
+    if let Output::Json = output {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(0);
+    }
+    print!("{}", render_net(&v));
+    Ok(0)
+}
+
+pub fn render_net(v: &NetView) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if v.links.is_empty() {
+        let _ = writeln!(
+            out,
+            "nothing measured yet: agents of 1.6 or later probe each other {}",
+            if v.every_secs == 0 {
+                "never: the control plane was started with --net-probe-every off".to_string()
+            } else {
+                format!(
+                    "one pair every {} (a matrix of {} nodes fills in about {})",
+                    human_duration(v.every_secs),
+                    v.nodes.len(),
+                    human_duration(
+                        v.every_secs
+                            * (v.nodes.len() * v.nodes.len().saturating_sub(1)).max(1) as u64
+                    )
+                )
+            }
+        );
+        return out;
+    }
+    let nodes: Vec<&String> = v
+        .nodes
+        .iter()
+        .filter(|n| v.links.iter().any(|l| l.from == **n || l.to == **n))
+        .collect();
+    let w = nodes
+        .iter()
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 16);
+    let _ = writeln!(out, "round trip (row: from, column: to)");
+    let _ = write!(out, "{:<w$} ", "");
+    for n in &nodes {
+        let _ = write!(out, " {:>10}", truncate(n, 10));
+    }
+    let _ = writeln!(out);
+    for a in &nodes {
+        let _ = write!(out, "{:<w$} ", truncate(a, w));
+        for b in &nodes {
+            let cell = if a == b {
+                "-".to_string()
+            } else {
+                match v.link(a, b) {
+                    Some(l) if l.error.is_some() => "failed".into(),
+                    Some(l) => l.rtt_us.map(human_rtt).unwrap_or_else(|| "?".into()),
+                    None => "".into(),
+                }
+            };
+            let _ = write!(out, " {cell:>10}");
+        }
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{:<16} {:<16} {:>10} {:>12} {:<7} {:<16} ERROR",
+        "FROM", "TO", "RTT", "BANDWIDTH", "PATH", "MEASURED"
+    );
+    for l in &v.links {
+        let _ = writeln!(
+            out,
+            "{:<16} {:<16} {:>10} {:>12} {:<7} {:<16} {}",
+            truncate(&l.from, 16),
+            truncate(&l.to, 16),
+            l.rtt_us.map(human_rtt).unwrap_or_else(|| "-".into()),
+            l.bps.map(human_bps).unwrap_or_else(|| "-".into()),
+            match l.direct {
+                Some(true) => "direct",
+                Some(false) => "relay",
+                None => "-",
+            },
+            local_time(l.unix, true),
+            l.error.as_deref().unwrap_or("")
+        );
+    }
+    out
 }
 
 pub async fn webhook(home: &Path, cmd: WebhookCmd) -> Result<i32> {

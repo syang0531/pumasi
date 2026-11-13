@@ -64,7 +64,7 @@ pub use pumasi_proto::registry::{ContainerConfig, Registry};
 pub use vmm::{Backend, Disk, TeeVm, VmSpec, Vmm};
 
 use crate::{
-    executor::{ConfidentialIo, LocalImage, RunResult, TaskIo},
+    executor::{ConfidentialIo, LiveOutput, LocalImage, RunResult, TaskIo},
     tempdir::TempDir,
 };
 
@@ -371,6 +371,82 @@ const GUEST_DONE: &[&str] = &[
 ];
 /// How long a VMM may keep running after the guest said it was done.
 const AFTER_GUEST_DONE: Duration = Duration::from_secs(3);
+
+/// Follows the guest console for the task's output (1.6): the guest prints
+/// it as [`pumasi_guest::live_frame`] lines, which go to the task's live
+/// output as long as each continues the last. After a lost or damaged line
+/// that stream stops here; the result has all of it.
+struct LiveTail {
+    path: PathBuf,
+    read: u64,
+    partial: Vec<u8>,
+    next: [u64; 2],
+    broken: [bool; 2],
+    live: LiveOutput,
+}
+
+impl LiveTail {
+    fn new(path: PathBuf, live: LiveOutput) -> Self {
+        Self {
+            path,
+            read: 0,
+            partial: Vec::new(),
+            next: [0; 2],
+            broken: [false; 2],
+            live,
+        }
+    }
+
+    /// Reads what the console got since the last call.
+    fn poll(&mut self) {
+        use std::io::{Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.path) else {
+            return;
+        };
+        if f.seek(SeekFrom::Start(self.read)).is_err() {
+            return;
+        }
+        let mut new = Vec::new();
+        if f.read_to_end(&mut new).is_err() || new.is_empty() {
+            return;
+        }
+        self.read += new.len() as u64;
+        self.feed(&new);
+    }
+
+    fn feed(&mut self, new: &[u8]) {
+        self.partial.extend_from_slice(new);
+        let mut start = 0;
+        while let Some(end) = self.partial[start..].iter().position(|b| *b == b'\n') {
+            let line = String::from_utf8_lossy(&self.partial[start..start + end]).into_owned();
+            start += end + 1;
+            let Some((stream, offset, data)) = pumasi_guest::parse_live_frame(&line) else {
+                continue;
+            };
+            let i = (stream - 1) as usize;
+            if self.broken[i] {
+                continue;
+            }
+            if offset != self.next[i] {
+                debug!(
+                    stream,
+                    offset,
+                    expected = self.next[i],
+                    "live microVM output skipped a line; the rest comes with the result"
+                );
+                self.broken[i] = true;
+                continue;
+            }
+            self.next[i] += data.len() as u64;
+            self.live.push(i == 1, &data);
+        }
+        self.partial.drain(..start);
+        // A console line is never this long: whatever it is, drop it.
+        if self.partial.len() > 64 * 1024 {
+            self.partial.clear();
+        }
+    }
+}
 
 /// Whether the serial log says the guest is done, looking at what was
 /// written since `*seen` (bytes already read). Everything new is read, so
@@ -772,6 +848,7 @@ impl MicrovmExecutor {
         let scratch = TempDir::new_in(&self.run_dir, &format!("{}-{}", task.job, task.index))?;
         let dir = scratch.path().to_path_buf();
         let mut run_spec = run_spec(&image.config, spec, input);
+        run_spec.live = io.live.is_some();
         let gateway = match net_vmm {
             Some(_) => {
                 run_spec.network = Some(pumasi_guest::GuestNet {
@@ -869,7 +946,9 @@ impl MicrovmExecutor {
             Some((assets, _)) => &assets.vmm,
             None => net_vmm.unwrap_or(&self.vmm),
         };
-        let end = self.boot_on(vmm, &vm, &dir, Some(deadline), cancel).await?;
+        let end = self
+            .boot_on(vmm, &vm, &dir, Some(deadline), cancel, io.live.as_ref())
+            .await?;
         drop(gateway);
         // Billed time starts at boot: pulling an image is not the job's run.
         let wall_ms = run_start.elapsed().as_millis() as u64;
@@ -1046,7 +1125,9 @@ impl MicrovmExecutor {
         };
         let deadline = run_start + Duration::from_millis(limits.timeout_ms);
         debug!(task = %task, tee = %t.tee, "booting confidential microvm");
-        let end = self.boot_on(vmm, &vm, &dir, Some(deadline), cancel).await;
+        let end = self
+            .boot_on(vmm, &vm, &dir, Some(deadline), cancel, None)
+            .await;
         watcher.abort();
         let end = end?;
         let wall_ms = run_start.elapsed().as_millis() as u64;
@@ -1108,9 +1189,12 @@ impl MicrovmExecutor {
         deadline: Option<Instant>,
         cancel: &AtomicBool,
     ) -> Result<VmEnd> {
-        self.boot_on(&self.vmm, vm, dir, deadline, cancel).await
+        self.boot_on(&self.vmm, vm, dir, deadline, cancel, None)
+            .await
     }
 
+    /// Boots `vm` with `vmm`. With `live`, follows the guest console for
+    /// the task's output ([`LiveTail`]).
     async fn boot_on(
         &self,
         vmm: &Vmm,
@@ -1118,6 +1202,7 @@ impl MicrovmExecutor {
         dir: &Path,
         deadline: Option<Instant>,
         cancel: &AtomicBool,
+        live: Option<&LiveOutput>,
     ) -> Result<VmEnd> {
         let console = std::fs::File::create(dir.join("console.log"))?;
         let mut cmd = vmm.command(vm, dir)?;
@@ -1146,6 +1231,13 @@ impl MicrovmExecutor {
         let mut done_since: Option<Instant> = None;
         let mut ticks = 0u32;
         let mut serial_seen = 0u64;
+        let mut tail = live.map(|l| {
+            let console = match vmm.backend {
+                Backend::Qemu if cfg!(windows) => dir.join(vmm::SERIAL_LOG),
+                _ => dir.join("console.log"),
+            };
+            LiveTail::new(console, l.clone())
+        });
         loop {
             tokio::select! {
                 status = child.wait() => {
@@ -1157,6 +1249,9 @@ impl MicrovmExecutor {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
                     ticks += 1;
+                    if let Some(t) = tail.as_mut().filter(|_| ticks.is_multiple_of(4)) {
+                        t.poll();
+                    }
                     if watch_serial && done_since.is_none() && ticks.is_multiple_of(10) && guest_said_done(&serial, &mut serial_seen) {
                         done_since = Some(Instant::now());
                     }
@@ -1630,6 +1725,31 @@ mod tests {
         assert_eq!(out.stdout, b"hello\n");
         let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["a/x.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn live_output_follows_the_console() {
+        use pumasi_guest::live_frame;
+        let live = LiveOutput::default();
+        let mut t = LiveTail::new(PathBuf::new(), live.clone());
+        let console = format!(
+            "[    0.5] some kernel line\r\npumasi-guest: starting\r\n{}{}",
+            live_frame(1, 0, b"hel").replace('\n', "\r\n"),
+            live_frame(2, 0, b"oops\n"),
+        );
+        let second = live_frame(1, 3, b"lo\n");
+        // A line split across two reads.
+        let (a, b) = second.split_at(10);
+        t.feed(console.as_bytes());
+        t.feed(a.as_bytes());
+        assert_eq!(live.take(), (b"hel".to_vec(), b"oops\n".to_vec()));
+        t.feed(b.as_bytes());
+        assert_eq!(live.take(), (b"lo\n".to_vec(), vec![]));
+        // A lost line: stdout stops being live, stderr goes on.
+        t.feed(live_frame(1, 100, b"later").as_bytes());
+        t.feed(live_frame(1, 6, b"x").as_bytes());
+        t.feed(live_frame(2, 5, b"more").as_bytes());
+        assert_eq!(live.take(), (vec![], b"more".to_vec()));
     }
 
     #[test]

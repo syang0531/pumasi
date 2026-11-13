@@ -362,6 +362,27 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         ),
         RemoveWebhook { name } => ("webhook.remove", name.clone(), none()),
         TestWebhook { name } => ("webhook.test", name.clone(), none()),
+        SetAlertTuning(t) => (
+            "alerts.tune",
+            none(),
+            format!(
+                "repeat {:?}, resolved {}, {} overrides",
+                t.repeat_secs,
+                t.resolved,
+                t.overrides.len()
+            ),
+        ),
+        Silence(s) => (
+            "alerts.silence",
+            s.rule.clone().unwrap_or_default(),
+            format!(
+                "{} for {}s {}",
+                s.nodes.as_ref().map(|n| n.to_string()).unwrap_or_default(),
+                s.secs,
+                s.comment
+            ),
+        ),
+        Unsilence { id } => ("alerts.unsilence", id.clone(), none()),
         HaInvite { ttl_secs } => ("ha.invite", none(), format!("ttl {ttl_secs}s")),
         HaRemove { id } => ("ha.remove", id.clone(), none()),
         // A backup holds every secret: log the first chunk.
@@ -418,6 +439,8 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | TaskDetails { .. }
         | TaskExecutors { .. }
         | NodePower
+        | AlertTuning
+        | Net
         | CheckJob { .. }
         | Accounts
         | Ledger { .. }

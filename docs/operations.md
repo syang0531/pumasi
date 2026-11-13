@@ -311,7 +311,12 @@ gaps).
 - Alerts: `pumasi alert set --defaults` and a webhook (`pumasi webhook add
   ops https://hooks.slack.com/...`).
 - Prometheus and Grafana: `--metrics-addr` and `examples/grafana`.
-- `pumasi top`, `pumasi events -f`.
+- `pumasi top`, `pumasi events -f`, and `pumasi net` for the round trip
+  and bandwidth between nodes.
+- Before you take a machine down on purpose, silence its alerts:
+  `pumasi alert silence --on NODE --for 2h --comment "why"`. A laptop
+  that comes and goes can have the offline rule off for good:
+  `pumasi alert set --on laptop --node-offline off`.
 - Disk: the control plane's database grows with jobs (bounded by
   `--keep-jobs`) and the audit log (kept forever); the file store with
   datasets (bounded by quotas).

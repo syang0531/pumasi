@@ -11,11 +11,13 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use pumasi_proto::{
+    MONITOR_MINOR,
     job::{Executor, JobId, MAX_OUTPUT_BYTES},
     monitor::{
-        AlertPolicy, AlertView, AlertsView, ClusterMetrics, EventLevel, EventView, LOG_CHUNK_BYTES,
-        LogChunk, MetricPoint, MetricsView, NodeMetrics, NodeMetricsView, WebhookFormat,
-        WebhookSpec, WebhookView, escape_label, human_duration, redact_url,
+        AlertPolicy, AlertTuning, AlertTuningView, AlertView, AlertsView, ClusterMetrics,
+        EventLevel, EventView, LOG_CHUNK_BYTES, LogChunk, MetricPoint, MetricsView, NodeMetrics,
+        NodeMetricsView, Silence, SilenceSpec, WebhookFormat, WebhookSpec, WebhookView,
+        escape_label, human_duration, redact_url,
     },
     msg::{JobState, TaskRef, TaskState},
     store::format_size,
@@ -36,12 +38,18 @@ const FLUSH_EVERY: Duration = Duration::from_secs(15);
 /// How often old events and metrics are deleted.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 /// Time series steps and how long each is kept (capped by the retention):
-/// 10 s for an hour (memory only), 1 min for a day, 10 min for the rest.
+/// 10 s for an hour, 1 min for a day, 10 min for the rest. Every tier is
+/// written out (the 10 s one since 1.6, so a restart keeps the last hour).
 const TIERS: [(u64, u64); 3] = [(10, 3600), (60, 86_400), (600, u64::MAX)];
 /// A sample older than this does not count as the node's current state.
 const FRESH_SECS: u64 = 60;
 /// Webhook notices kept for `recent_notices` (tests, debugging).
 const RECENT_NOTICES: usize = 100;
+/// Meta keys of the 1.6 alert settings.
+const ALERT_TUNING_META: &str = "alert_tuning";
+const SILENCES_META: &str = "alert_silences";
+/// Silences kept at most.
+const MAX_SILENCES: usize = 256;
 
 /// One node's metrics: the latest sample and the time series.
 pub(crate) struct NodeSeries {
@@ -136,8 +144,8 @@ impl NodeSeries {
         }
     }
 
-    /// Adds a sample taken at `now`; returns the steps it finished in the
-    /// tiers that are kept on disk.
+    /// Adds a sample taken at `now`; returns the steps it finished, to
+    /// write out.
     fn add(&mut self, now: u64, m: NodeMetrics) -> Vec<(u8, MetricPoint)> {
         if let Some((then, prev)) = &self.latest
             && now > *then
@@ -168,8 +176,10 @@ impl NodeSeries {
             let start = now / tier.step * tier.step;
             if tier.acc.as_ref().is_some_and(|a| a.start != start) {
                 let p = tier.acc.take().expect("checked").point();
-                if i > 0 {
-                    done.push((i as u8, p.clone()));
+                done.push((i as u8, p.clone()));
+                // A step left open at a restart was stored part done.
+                if tier.points.back().is_some_and(|b| b.unix == p.unix) {
+                    tier.points.pop_back();
                 }
                 tier.points.push_back(p);
                 while tier.points.len() > tier.keep {
@@ -197,15 +207,14 @@ impl NodeSeries {
         };
         let tier = &self.tiers[i];
         let from = now.saturating_sub(since_secs);
+        let open = tier.acc.as_ref().map(Acc::point);
         let mut out: Vec<MetricPoint> = tier
             .points
             .iter()
-            .filter(|p| p.unix >= from)
+            .filter(|p| p.unix >= from && open.as_ref().is_none_or(|o| o.unix != p.unix))
             .cloned()
             .collect();
-        if let Some(a) = &tier.acc {
-            out.push(a.point());
-        }
+        out.extend(open);
         (tier.step as u32, out)
     }
 
@@ -245,12 +254,23 @@ pub struct Notice {
     pub message: String,
     pub unix: u64,
     pub since_unix: u64,
+    /// A firing alert's notice sent again (1.6: the repeat setting).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub repeat: bool,
 }
 
 impl Notice {
     /// The text chat webhooks show.
     pub fn text(&self) -> String {
-        if self.status == "resolved" {
+        if self.repeat {
+            format!(
+                "🔁 [{}] still firing after {}: {} ({})",
+                self.cluster,
+                human_duration(self.unix.saturating_sub(self.since_unix)),
+                self.message,
+                self.rule
+            )
+        } else if self.status == "resolved" {
             format!(
                 "✅ [{}] resolved: {} ({})",
                 self.cluster, self.message, self.rule
@@ -312,8 +332,15 @@ pub(crate) struct Monitor {
     /// Queued runs held back by quotas in the last scheduling pass.
     pub quota_blocked: u32,
     pub policy: AlertPolicy,
+    /// Repeat and resolved notices, per-node thresholds (1.6).
+    pub tuning: AlertTuning,
+    /// Silences, ended ones removed every second.
+    silences: Vec<Silence>,
     /// Stateful alerts firing now, by (rule, subject).
     firing: BTreeMap<(String, String), AlertView>,
+    /// When a firing alert's last notice went out; missing while a
+    /// silence has kept it quiet from the start.
+    notified: HashMap<(String, String), u64>,
     webhooks: BTreeMap<String, WebhookState>,
     deliver: Option<mpsc::UnboundedSender<Delivery>>,
     recent: VecDeque<Notice>,
@@ -340,7 +367,10 @@ impl Default for Monitor {
             counters: Counters::default(),
             quota_blocked: 0,
             policy: AlertPolicy::default(),
+            tuning: AlertTuning::default(),
+            silences: Vec::new(),
             firing: BTreeMap::new(),
+            notified: HashMap::new(),
             webhooks: BTreeMap::new(),
             deliver: None,
             recent: VecDeque::new(),
@@ -368,6 +398,12 @@ impl State {
         m.started_unix = now_unix();
         if let Some(p) = self.store.alert_policy()? {
             m.policy = p;
+        }
+        if let Some(t) = self.store.meta_record(ALERT_TUNING_META)? {
+            m.tuning = t;
+        }
+        if let Some(s) = self.store.meta_record::<Vec<Silence>>(SILENCES_META)? {
+            m.silences = s;
         }
         for w in self.store.webhooks()? {
             m.webhooks.insert(
@@ -670,7 +706,14 @@ impl State {
             stderr,
             state: t.state.clone(),
             done: done && complete,
-            live: j.meta.executor != Executor::Microvm && t.ran != Some(Executor::Microvm),
+            // A microVM streams its output from 1.6 agents on.
+            live: match &t.state {
+                _ if j.meta.executor != Executor::Microvm && t.ran != Some(Executor::Microvm) => {
+                    true
+                }
+                TaskState::Running { node } => self.node_minor(node) >= MONITOR_MINOR,
+                _ => false,
+            },
         })
     }
 
@@ -861,6 +904,7 @@ impl State {
             message: format!("test alert from pumasi cluster {}", self.cluster_name),
             unix: now,
             since_unix: now,
+            repeat: false,
         };
         Ok((w.spec.url.clone(), n.body(w.spec.format)))
     }
@@ -916,11 +960,15 @@ impl State {
             message: a.message.clone(),
             unix: now_unix(),
             since_unix: a.since_unix,
+            repeat: false,
         }
     }
 
     /// An alert about something that happened once (no "resolved").
     fn alert_once(&mut self, rule: &str, subject: &str, level: EventLevel, message: &str) {
+        if self.silenced(rule, subject, now_unix()) {
+            return;
+        }
         let a = AlertView {
             rule: rule.into(),
             subject: subject.into(),
@@ -945,7 +993,25 @@ impl State {
         for m in self.members.values() {
             let name = m.info.name.clone();
             let rt = self.nodes.get(&m.id).filter(|n| n.online);
-            if let Some(after) = p.node_offline_secs
+            // Thresholds for this node (1.6), else the cluster's.
+            let o = (!self.monitor.tuning.overrides.is_empty())
+                .then(|| {
+                    self.monitor
+                        .tuning
+                        .override_for(&self.node_labels(&m.id))
+                        .cloned()
+                })
+                .flatten();
+            let node_offline_secs = o
+                .as_ref()
+                .and_then(|o| o.node_offline_secs)
+                .unwrap_or(p.node_offline_secs);
+            let disk_percent = o
+                .as_ref()
+                .and_then(|o| o.disk_percent)
+                .unwrap_or(p.disk_percent);
+            let temp_c = o.as_ref().and_then(|o| o.temp_c).unwrap_or(p.temp_c);
+            if let Some(after) = node_offline_secs
                 && rt.is_none()
                 && !self.asleep(&m.id)
                 && !self.node_config(&m.id).is_some_and(|c| c.cordoned)
@@ -969,7 +1035,7 @@ impl State {
                 }
             }
             let latest = rt.and_then(|_| self.monitor.series.get(&m.id)?.fresh(now));
-            if let (Some(limit), Some(l)) = (p.disk_percent, latest)
+            if let (Some(limit), Some(l)) = (disk_percent, latest)
                 && let Some(pct) = l.disk_percent()
                 && pct >= limit as f32
             {
@@ -984,7 +1050,7 @@ impl State {
                     ),
                 );
             }
-            if let (Some(limit), Some(l)) = (p.temp_c, latest)
+            if let (Some(limit), Some(l)) = (temp_c, latest)
                 && let Some(t) = l.hottest()
                 && t >= limit as f32
             {
@@ -1074,8 +1140,10 @@ impl State {
         want
     }
 
-    /// Fires alerts that should fire and resolves those that should not.
-    fn evaluate_alerts(&mut self, now: u64) {
+    /// Fires alerts that should fire and resolves those that should not;
+    /// sends notices unless a silence covers them, again after the repeat
+    /// time, and when a silence ends on an alert still firing.
+    pub(crate) fn evaluate_alerts(&mut self, now: u64) {
         let want = self.wanted_alerts(now);
         let gone: Vec<(String, String)> = self
             .monitor
@@ -1086,6 +1154,7 @@ impl State {
             .collect();
         for k in gone {
             let a = self.monitor.firing.remove(&k).expect("listed");
+            let told = self.monitor.notified.remove(&k).is_some();
             info!(rule = %a.rule, subject = %a.subject, "alert resolved");
             self.event(
                 EventLevel::Info,
@@ -1094,12 +1163,35 @@ impl State {
                 None,
                 format!("resolved: {}", a.message),
             );
-            let n = self.notice("resolved", &a);
-            self.notify(n);
+            if told && self.monitor.tuning.resolved {
+                let n = self.notice("resolved", &a);
+                self.notify(n);
+            }
         }
+        let repeat = self.monitor.tuning.repeat_secs;
         for ((rule, subject), (level, message)) in want {
             let key = (rule.clone(), subject.clone());
-            if self.monitor.firing.contains_key(&key) {
+            let quiet = self.silenced(&rule, &subject, now);
+            if let Some(a) = self.monitor.firing.get_mut(&key) {
+                // The message follows the measurement (`offline for 5m`).
+                a.message = message;
+                if quiet {
+                    continue;
+                }
+                let again = match self.monitor.notified.get(&key) {
+                    // A silence kept it quiet until now.
+                    None => Some(false),
+                    Some(last) => repeat
+                        .filter(|r| now.saturating_sub(*last) >= *r)
+                        .map(|_| true),
+                };
+                if let Some(is_repeat) = again {
+                    let a = a.clone();
+                    let mut n = self.notice("firing", &a);
+                    n.repeat = is_repeat;
+                    self.notify(n);
+                    self.monitor.notified.insert(key, now);
+                }
                 continue;
             }
             let a = AlertView {
@@ -1109,12 +1201,166 @@ impl State {
                 message,
                 since_unix: now,
             };
-            warn!(rule = %a.rule, subject = %a.subject, "alert firing: {}", a.message);
-            self.event(level, "alert.firing", None, None, a.message.clone());
-            let n = self.notice("firing", &a);
-            self.notify(n);
+            warn!(rule = %a.rule, subject = %a.subject, silenced = quiet, "alert firing: {}", a.message);
+            let text = if quiet {
+                format!("{} (silenced)", a.message)
+            } else {
+                a.message.clone()
+            };
+            self.event(level, "alert.firing", None, None, text);
+            if !quiet {
+                let n = self.notice("firing", &a);
+                self.notify(n);
+                self.monitor.notified.insert(key.clone(), now);
+            }
             self.monitor.firing.insert(key, a);
         }
+    }
+
+    /// Whether a silence keeps this alert quiet now.
+    fn silenced(&self, rule: &str, subject: &str, now: u64) -> bool {
+        let mut labels = None;
+        self.monitor.silences.iter().any(|s| {
+            s.until_unix > now
+                && s.rule.as_deref().is_none_or(|r| r == rule)
+                && match &s.nodes {
+                    None => true,
+                    Some(sel) => {
+                        let l = labels.get_or_insert_with(|| {
+                            self.members
+                                .values()
+                                .find(|m| m.info.name == subject)
+                                .map(|m| self.node_labels(&m.id))
+                        });
+                        l.as_ref().is_some_and(|l| sel.matches(l))
+                    }
+                }
+        })
+    }
+
+    /// Repeat and resolved notices, per-node thresholds and silences.
+    pub fn alert_tuning_view(&self) -> AlertTuningView {
+        let now = now_unix();
+        AlertTuningView {
+            tuning: self.monitor.tuning.clone(),
+            silences: self
+                .monitor
+                .silences
+                .iter()
+                .filter(|s| s.until_unix > now)
+                .cloned()
+                .collect(),
+            silenced: self
+                .monitor
+                .firing
+                .keys()
+                .filter(|(r, s)| self.silenced(r, s, now))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    pub fn set_alert_tuning(&mut self, t: AlertTuning) -> Result<()> {
+        t.validate()?;
+        self.store.put_meta_record(ALERT_TUNING_META, &t)?;
+        info!(?t, "alert tuning set");
+        self.monitor.tuning = t;
+        self.evaluate_alerts(now_unix());
+        Ok(())
+    }
+
+    /// Adds a silence; answers with its id.
+    pub fn add_silence(&mut self, spec: SilenceSpec, by: &str) -> Result<String> {
+        spec.validate()?;
+        let now = now_unix();
+        self.monitor.silences.retain(|s| s.until_unix > now);
+        ensure!(
+            self.monitor.silences.len() < MAX_SILENCES,
+            "too many silences ({MAX_SILENCES}); end some with `pumasi alert unsilence`"
+        );
+        let id = loop {
+            let id = format!("{:08x}", rand::random::<u32>());
+            if !self.monitor.silences.iter().any(|s| s.id == id) {
+                break id;
+            }
+        };
+        let s = Silence {
+            id: id.clone(),
+            rule: spec.rule,
+            nodes: spec.nodes,
+            until_unix: now + spec.secs,
+            comment: spec.comment,
+            by: by.to_string(),
+            created_unix: now,
+        };
+        let mut all = self.monitor.silences.clone();
+        all.push(s.clone());
+        self.store.put_meta_record(SILENCES_META, &all)?;
+        info!(id = %s.id, what = %s.describe(), until = s.until_unix, "alerts silenced");
+        self.event(
+            EventLevel::Info,
+            "alert.silenced",
+            None,
+            None,
+            format!(
+                "{} silenced for {} by {by}{}",
+                s.describe(),
+                human_duration(spec.secs),
+                if s.comment.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", s.comment)
+                }
+            ),
+        );
+        self.monitor.silences = all;
+        Ok(id)
+    }
+
+    /// Ends a silence (id or unique prefix).
+    pub fn remove_silence(&mut self, id: &str) -> Result<()> {
+        let id = id.trim();
+        ensure!(!id.is_empty(), "which silence?");
+        let found: Vec<usize> = self
+            .monitor
+            .silences
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.id.starts_with(id))
+            .map(|(i, _)| i)
+            .collect();
+        let i = match found.as_slice() {
+            [i] => *i,
+            [] => anyhow::bail!("no silence {id:?}"),
+            _ => anyhow::bail!("{id:?} names more than one silence"),
+        };
+        let mut all = self.monitor.silences.clone();
+        let s = all.remove(i);
+        self.store.put_meta_record(SILENCES_META, &all)?;
+        self.monitor.silences = all;
+        self.event(
+            EventLevel::Info,
+            "alert.unsilenced",
+            None,
+            None,
+            format!("silence of {} ended", s.describe()),
+        );
+        self.evaluate_alerts(now_unix());
+        Ok(())
+    }
+
+    /// Drops silences that ended.
+    fn prune_silences(&mut self, now: u64) {
+        if self.monitor.silences.iter().all(|s| s.until_unix > now) {
+            return;
+        }
+        let mut all = self.monitor.silences.clone();
+        all.retain(|s| s.until_unix > now);
+        if let Err(e) = self.store.put_meta_record(SILENCES_META, &all) {
+            warn!("persist silences: {e:#}");
+            return;
+        }
+        self.monitor.silences = all;
     }
 
     // -- housekeeping ---------------------------------------------------------
@@ -1125,6 +1371,7 @@ impl State {
         self.evaluate_alerts(now);
         if self.monitor.last_jobs_check.elapsed() >= Duration::from_secs(1) {
             self.monitor.last_jobs_check = Instant::now();
+            self.prune_silences(now);
             self.check_jobs();
             // Output of runs that ended without a report (node lost,
             // preempted) is no longer live.
@@ -1215,6 +1462,19 @@ impl State {
         }
     }
 
+    /// Queues the steps not finished yet, to write at shutdown: a restart
+    /// keeps the last minutes too. The finished step replaces it later.
+    pub fn keep_open_steps(&mut self) {
+        let m = &mut self.monitor;
+        for (node, s) in &m.series {
+            for (i, t) in s.tiers.iter().enumerate() {
+                if let Some(a) = &t.acc {
+                    m.pending_points.push((node.clone(), i as u8, a.point()));
+                }
+            }
+        }
+    }
+
     /// Writes pending events and finished metric steps to the database.
     pub fn flush_monitor(&mut self) {
         self.monitor.last_flush = Instant::now();
@@ -1226,6 +1486,7 @@ impl State {
         if let Err(e) = self.store.put_points(&points) {
             warn!("persist metrics: {e:#}");
         }
+        self.save_links(false);
     }
 
     // -- Prometheus -----------------------------------------------------------
@@ -1749,6 +2010,7 @@ mod tests {
             message: "node desktop offline for 2m".into(),
             unix: 10,
             since_unix: 5,
+            repeat: false,
         };
         let slack: serde_json::Value = serde_json::from_str(&n.body(WebhookFormat::Slack)).unwrap();
         assert!(

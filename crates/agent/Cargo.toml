@@ -48,6 +48,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Ioctl",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
     "Win32_System_Pipes",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",
@@ -56,6 +57,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# 1.6 monitoring: the display adapters (DXGI) for GPU metrics, and WMI on
+# its own thread for temperatures (ACPI thermal zones, LibreHardwareMonitor).
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi"] }
+wmi = { version = "0.18", default-features = false }
 
 # The Virtualization.framework backend talks to the Objective-C runtime and
 # loads the framework at run time (macOS 10.15 has none).

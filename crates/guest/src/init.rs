@@ -20,10 +20,10 @@ use std::{
 };
 
 use pumasi_guest::{
-    BASE_LABEL, DISK_ROLE_ENTRY, GPU_LABEL, GuestOutcome, GuestResult, INPUT_PREFIX,
-    MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES, MAX_STREAM_BYTES, MODE_PARAM, OUTPUT_MARK,
-    OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL, SPEC_ENTRY,
-    STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY,
+    BASE_LABEL, DISK_ROLE_ENTRY, GPU_LABEL, GuestOutcome, GuestResult, INPUT_PREFIX, LIVE_CHUNK,
+    LIVE_MAX_BYTES, MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES, MAX_STREAM_BYTES, MODE_PARAM,
+    OUTPUT_MARK, OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL,
+    SPEC_ENTRY, STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY, live_frame,
     seal::{
         self, AttestReply, AttestRequest, EVIDENCE_AT, Evidence, Kind, REPLY_AT, SealReader,
         SealWriter, TaskKeys, TeeKind,
@@ -307,6 +307,135 @@ fn waitpid(pid: libc::pid_t) -> io::Result<(libc::pid_t, libc::c_int)> {
         let e = io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EINTR) {
             return Err(e);
+        }
+    }
+}
+
+/// A pipe whose ends close on `execve` (the task's `dup2` copies keep it
+/// open there): (read end, write end).
+fn pipe() -> R<(File, File)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("pipe: {}", io::Error::last_os_error()));
+    }
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+/// Copies the task's output from its pipes to the files at `paths`, and
+/// the first [`LIVE_MAX_BYTES`] of each stream to the console as
+/// [`live_frame`] lines, until the task has ended and every copy of the
+/// pipes is closed. Answers with the task's wait status.
+fn pump(pid: libc::pid_t, pipes: [File; 2], paths: [&Path; 2]) -> R<libc::c_int> {
+    let mut files = [
+        File::create(paths[0]).ctx("create stdout")?,
+        File::create(paths[1]).ctx("create stderr")?,
+    ];
+    for p in &pipes {
+        unsafe {
+            let fd = p.as_raw_fd();
+            libc::fcntl(
+                fd,
+                libc::F_SETFL,
+                libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+            );
+        }
+    }
+    let mut console = io::stderr();
+    let mut open = [true, true];
+    let mut sent = [0u64; 2];
+    let mut streaming = [true, true];
+    let mut status = None;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if status.is_none() {
+            // Reap whatever ended; the task's own status is what counts.
+            // Once it is gone, so is whatever it left running (which also
+            // closes the pipes those processes held).
+            loop {
+                let mut st = 0;
+                let rc = unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG) };
+                if rc <= 0 {
+                    break;
+                }
+                if rc == pid {
+                    status = Some(st);
+                    unsafe { libc::kill(-1, libc::SIGKILL) };
+                    break;
+                }
+            }
+        }
+        if !open[0] && !open[1] {
+            return match status {
+                Some(st) => Ok(st),
+                // The task closed its output and runs on.
+                None => loop {
+                    match waitpid(-1) {
+                        Ok((p, st)) if p == pid => break Ok(st),
+                        Ok(_) => continue,
+                        Err(e) => break Err(format!("wait for the task: {e}")),
+                    }
+                },
+            };
+        }
+        let mut fds: Vec<(usize, libc::pollfd)> = (0..2)
+            .filter(|i| open[*i])
+            .map(|i| {
+                (
+                    i,
+                    libc::pollfd {
+                        fd: pipes[i].as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                )
+            })
+            .collect();
+        let mut raw: Vec<libc::pollfd> = fds.iter().map(|(_, p)| *p).collect();
+        let rc = unsafe { libc::poll(raw.as_mut_ptr(), raw.len() as libc::nfds_t, 100) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("poll the task's output: {e}"));
+        }
+        for (k, (i, _)) in fds.iter_mut().enumerate() {
+            if raw[k].revents == 0 {
+                continue;
+            }
+            let i = *i;
+            loop {
+                match (&pipes[i]).read(&mut buf) {
+                    Ok(0) => {
+                        open[i] = false;
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        let _ = files[i].write_all(data);
+                        if streaming[i] {
+                            let room = (LIVE_MAX_BYTES - sent[i]) as usize;
+                            for chunk in data[..n.min(room)].chunks(LIVE_CHUNK) {
+                                let line = live_frame(i as u8 + 1, sent[i], chunk);
+                                if console.write_all(line.as_bytes()).is_err() {
+                                    streaming[i] = false;
+                                    break;
+                                }
+                                sent[i] += chunk.len() as u64;
+                            }
+                            if sent[i] >= LIVE_MAX_BYTES {
+                                streaming[i] = false;
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        open[i] = false;
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -637,8 +766,19 @@ fn run_in_root(d: &Disks, input: impl Read) -> R<Payload> {
     let stdin = File::open(Path::new(TASK_DIR).join("stdin"))
         .or_else(|_| File::open("/dev/null"))
         .ctx("open stdin")?;
-    let stdout = File::create(&stdout_path).ctx("create stdout")?;
-    let stderr = File::create(&stderr_path).ctx("create stderr")?;
+    // Live output (1.6): the task writes into pipes, and the init copies
+    // what comes to the files and, framed, to the console.
+    let (stdout, stderr, pipes) = if spec.live {
+        let (out_r, out_w) = pipe()?;
+        let (err_r, err_w) = pipe()?;
+        (out_w, err_w, Some((out_r, err_r)))
+    } else {
+        (
+            File::create(&stdout_path).ctx("create stdout")?,
+            File::create(&stderr_path).ctx("create stderr")?,
+            None,
+        )
+    };
     let argv: Vec<CString> = spec.argv.iter().map(cstr).collect();
     let envp: Vec<CString> = env.iter().map(cstr).collect();
 
@@ -658,12 +798,15 @@ fn run_in_root(d: &Disks, input: impl Read) -> R<Payload> {
         );
     }
     drop((stdin, stdout, stderr));
-    let status = loop {
-        match waitpid(-1) {
-            Ok((p, st)) if p == pid => break st,
-            Ok(_) => continue,
-            Err(e) => return Err(format!("wait for the task: {e}")),
-        }
+    let status = match pipes {
+        Some((out_r, err_r)) => pump(pid, [out_r, err_r], [&stdout_path, &stderr_path])?,
+        None => loop {
+            match waitpid(-1) {
+                Ok((p, st)) if p == pid => break st,
+                Ok(_) => continue,
+                Err(e) => return Err(format!("wait for the task: {e}")),
+            }
+        },
     };
     // The command is done; end whatever it left running.
     unsafe { libc::kill(-1, libc::SIGKILL) };

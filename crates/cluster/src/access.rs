@@ -90,6 +90,10 @@ fn op_name(op: &AdminOp) -> &'static str {
         TaskDetails { .. } | TaskExecutors { .. } => "read jobs",
         NodePower => "read the status",
         WakeNode { .. } => "wake nodes",
+        AlertTuning => "read alerts",
+        SetAlertTuning(_) => "change alert rules",
+        Silence(_) | Unsilence { .. } => "silence alerts",
+        Net => "read the network between nodes",
         CheckJob { .. } => "check jobs",
     }
 }
@@ -135,6 +139,8 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | Events { .. }
             | Logs { .. }
             | Alerts
+            | AlertTuning
+            | Net
             | Confidential
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
@@ -228,7 +234,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | TaskDetails { .. }
         | TaskExecutors { .. }
         | Logs { .. }) => op,
-        op @ (Metrics { .. } | Events { .. } | Alerts) => op,
+        op @ (Metrics { .. } | Events { .. } | Alerts | AlertTuning | Net) => op,
         op @ (Status
         | NodePower
         | Accounts

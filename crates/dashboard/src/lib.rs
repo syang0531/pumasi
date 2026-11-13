@@ -50,6 +50,7 @@ use crate::{
     limit::{AuthLimiter, ClientAddr},
 };
 
+pub use limit::TrustedProxy;
 pub use tls::server_config as tls_config;
 
 pub struct UiConfig {
@@ -70,9 +71,13 @@ pub struct UiConfig {
     /// Serve HTTPS with this certificate (from [`tls_config`]).
     pub tls: Option<Arc<rustls::ServerConfig>>,
     /// A header that carries the client's address when the connection
-    /// comes from loopback (a tunnel or reverse proxy on this machine),
-    /// such as `CF-Connecting-IP`; used to rate limit failed sign-ins.
+    /// comes from loopback (a tunnel or reverse proxy on this machine)
+    /// or from one of `trusted_proxies`, such as `CF-Connecting-IP`;
+    /// used to rate limit failed sign-ins.
     pub real_ip_header: Option<String>,
+    /// Reverse proxies on other machines whose `real_ip_header` is
+    /// believed too.
+    pub trusted_proxies: Vec<TrustedProxy>,
     /// The address browsers reach the dashboard at (behind a tunnel or
     /// proxy, its public URL), for the SSO redirect URI
     /// `<public_url>/sso/callback`. Default: the listening address.
@@ -190,7 +195,7 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
         cluster_name: Mutex::new(String::new()),
         upload_limit: config.upload_limit,
         api_only: config.api_only,
-        limiter: AuthLimiter::new(config.real_ip_header),
+        limiter: AuthLimiter::new(config.real_ip_header, config.trusted_proxies),
         tickets: limit::Buckets::new(limit::TICKET_BURST, limit::TICKET_RATE),
         sign_ins: limit::Buckets::new(limit::SIGN_IN_BURST, limit::SIGN_IN_PER_MIN / 60.0),
         waits: limit::Waits::default(),

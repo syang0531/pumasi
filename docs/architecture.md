@@ -1575,8 +1575,10 @@ its name and role; the control plane still checks the secret on every
 call. `limit::AuthLimiter` counts failed sign-ins and wrong bearer
 tickets per client address (10 in a minute block it for 5 minutes, `429`
 with `Retry-After`); the address is the TCP peer, or, for a connection
-from loopback, the header named by `--real-ip-header` (a client that
-reaches the port directly cannot choose its own address). The peer comes
+from loopback or from a `--trusted-proxy` address (1.5.1, for a reverse
+proxy on another machine), the header named by `--real-ip-header` (a
+client that reaches the port directly cannot choose its own address):
+its last address that is not a trusted proxy's. The peer comes
 from `ConnectInfo<ClientAddr>`, which the router is served with, plain
 or TLS.
 

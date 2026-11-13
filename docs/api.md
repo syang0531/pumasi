@@ -92,10 +92,21 @@ no pages, no sign-in link, no cookies, and only
 from one address, that address gets `429 Too Many Requests` for 5
 minutes. Behind a tunnel every connection comes from 127.0.0.1, so
 `--real-ip-header` names the header that carries the client's address
-(trusted only on connections from this machine). For a list such as
+(trusted only on connections from this machine, and from a proxy on
+another machine named with `--trusted-proxy`, below). For a list such as
 `X-Forwarded-For` the last address counts, the one the proxy in front
 added; earlier ones are whatever the client sent. Keep it running as a
 service the same way as the agent (systemd, launchd or Task Scheduler).
+
+What counts towards the 10: a bearer ticket that is not one, is for
+another cluster, or that the control plane refuses (wrong, expired,
+revoked), and on the dashboard a failed sign-in (ticket, LDAP password,
+SSO, a sign-in link that is not valid). A request **without** a ticket
+(a plain `401`, such as a scanner probing paths) does not count, and
+neither does a valid ticket that lacks the role for a call (`403`).
+While an address is blocked, its bearer requests and sign-ins get `429`
+even with a valid ticket; browsers already signed in from it keep
+working.
 
 ### 3. Put it on the internet
 
@@ -167,6 +178,36 @@ pumasi ui --api-only --listen 0.0.0.0:8443 \
 `--api-only` refuses an address other than loopback over plain HTTP
 (tickets would cross the network readable); `--insecure-http` overrides
 that for a TLS proxy elsewhere on a private network.
+
+**A reverse proxy on another machine** of a private network connects
+from its own address, not from 127.0.0.1, so `--real-ip-header` alone is
+not believed and every client counts as the proxy: one client's 10 wrong
+tickets would block everyone behind it (`pumasi ui` warns about this at
+start). Name the proxy with `--trusted-proxy`, by the address this
+machine sees it connect from:
+
+```bash
+pumasi ui --listen 0.0.0.0:7400 --no-open --login-only \
+  --public-url https://pumasi.example.com \
+  --real-ip-header X-Forwarded-For --trusted-proxy 192.168.1.20
+```
+
+`--trusted-proxy` can be given several times and takes networks too
+(`10.8.0.0/24`, `fd00:1::/64`). In `X-Forwarded-For`, addresses of
+trusted proxies are skipped from the end, so a chain of them (a CDN's
+proxy in front of yours, if you list its addresses) still yields the
+client. Whatever can connect from a trusted address picks the address it
+is counted under, so let only the proxy reach the port (a firewall rule
+on this machine), and have the proxy set the header itself instead of
+passing on what the client sent. Caddy does that by default:
+
+```
+pumasi.example.com {
+    reverse_proxy 192.168.1.30:7400
+}
+```
+
+For nginx: `proxy_set_header X-Forwarded-For $remote_addr;`.
 
 ## On the client
 

@@ -6,10 +6,11 @@
 //! is not what keeps them safe; it keeps a guesser from loading the
 //! control plane and the logs.
 //!
-//! The client address is the TCP peer, or, when the peer is loopback and
-//! `--real-ip-header` names a header (such as Cloudflare's
-//! `CF-Connecting-IP`), the address in that header: a tunnel connects
-//! from 127.0.0.1 for everyone.
+//! The client address is the TCP peer, or, when `--real-ip-header` names
+//! a header (such as Cloudflare's `CF-Connecting-IP`) and the peer is
+//! loopback or one of the `--trusted-proxy` addresses, the address in
+//! that header: a tunnel connects from 127.0.0.1 for everyone, and a
+//! reverse proxy on another machine from its own address.
 
 // Rejections are finished responses.
 #![allow(clippy::result_large_err)]
@@ -60,6 +61,65 @@ impl Connected<IncomingStream<'_, crate::tls::TlsListener>> for ClientAddr {
     }
 }
 
+/// A reverse proxy on another machine whose `--real-ip-header` is
+/// believed (`--trusted-proxy`): one address, or a network such as
+/// `192.168.1.0/24`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedProxy {
+    net: IpAddr,
+    prefix: u8,
+}
+
+impl TrustedProxy {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.net, ip.to_canonical()) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let shift = 32 - u32::from(self.prefix);
+                u32::from(net) >> shift == u32::from(ip) >> shift
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let shift = 128 - u32::from(self.prefix);
+                u128::from(net) >> shift == u128::from(ip) >> shift
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::str::FromStr for TrustedProxy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (addr, prefix) = match s.split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (s, None),
+        };
+        let net = addr
+            .trim()
+            .parse::<IpAddr>()
+            .map_err(|_| format!("{s:?} is not an IP address or a network (192.168.1.0/24)"))?
+            .to_canonical();
+        let max = if net.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            None => max,
+            Some(p) => p
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|p| *p <= max)
+                .ok_or_else(|| format!("{s:?}: the prefix length is 1 to {max}"))?,
+        };
+        // Everyone a proxy: any client could then pick the address it is
+        // counted under.
+        if prefix == 0 {
+            return Err(format!(
+                "{s:?} would trust the header from every address; name the proxy's address or network"
+            ));
+        }
+        Ok(Self { net, prefix })
+    }
+}
+
 #[derive(Default)]
 struct Entry {
     window_start: Option<Instant>,
@@ -69,14 +129,16 @@ struct Entry {
 
 pub struct AuthLimiter {
     real_ip_header: Option<String>,
+    trusted_proxies: Vec<TrustedProxy>,
     map: Mutex<HashMap<IpAddr, Entry>>,
     identities: Mutex<HashMap<Secret, (Identity, Instant)>>,
 }
 
 impl AuthLimiter {
-    pub fn new(real_ip_header: Option<String>) -> Self {
+    pub fn new(real_ip_header: Option<String>, trusted_proxies: Vec<TrustedProxy>) -> Self {
         Self {
             real_ip_header: real_ip_header.map(|h| h.to_ascii_lowercase()),
+            trusted_proxies,
             map: Mutex::default(),
             identities: Mutex::default(),
         }
@@ -91,22 +153,44 @@ impl AuthLimiter {
         Some(self.client_ip_of(peer, &parts.headers))
     }
 
+    fn is_proxy(&self, ip: IpAddr) -> bool {
+        self.trusted_proxies.iter().any(|p| p.contains(ip))
+    }
+
     pub fn client_ip_of(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
-        if peer.is_loopback()
-            && let Some(name) = &self.real_ip_header
-            && let Some(ip) = headers
-                .get(name.as_str())
-                .and_then(|v| v.to_str().ok())
-                // The last address: the one the proxy in front of us
-                // added. Earlier ones in `X-Forwarded-For` are whatever
-                // the client sent, so taking the first would let anyone
-                // pick the address they are counted under.
-                .and_then(|v| v.rsplit(',').next())
-                .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        {
-            return ip;
+        // On a dual-stack listener an IPv4 peer is `::ffff:a.b.c.d`.
+        let peer = peer.to_canonical();
+        let Some(name) = &self.real_ip_header else {
+            return peer;
+        };
+        // A client that reaches us directly cannot pick its own address.
+        if !peer.is_loopback() && !self.is_proxy(peer) {
+            return peer;
         }
-        peer
+        // From the end: the last address is the one the proxy in front
+        // of us added. Earlier ones in `X-Forwarded-For` are whatever the
+        // client sent, so taking the first would let anyone pick the
+        // address they are counted under. Behind a chain of proxies, the
+        // addresses of the trusted ones are skipped: what a trusted proxy
+        // wrote before its own entry is its word too. (A proxy may also
+        // add a header line of its own after the client's: the last line
+        // is the nearest.)
+        let mut found = None;
+        let lines = headers.get_all(name.as_str()).iter().rev();
+        'lines: for line in lines {
+            let Ok(line) = line.to_str() else { break };
+            for part in line.rsplit(',') {
+                let Ok(ip) = part.trim().parse::<IpAddr>() else {
+                    break 'lines;
+                };
+                let ip = ip.to_canonical();
+                found = Some(ip);
+                if !self.is_proxy(ip) {
+                    break 'lines;
+                }
+            }
+        }
+        found.unwrap_or(peer)
     }
 
     /// `Err` with a 429 response while `ip` is blocked.
@@ -312,7 +396,7 @@ mod tests {
 
     #[test]
     fn blocks_after_too_many_failures() {
-        let l = AuthLimiter::new(None);
+        let l = AuthLimiter::new(None, Vec::new());
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         let other: IpAddr = "203.0.113.8".parse().unwrap();
         for _ in 0..MAX_FAILURES - 1 {
@@ -367,7 +451,7 @@ mod tests {
 
     #[test]
     fn real_ip_header_only_from_loopback() {
-        let l = AuthLimiter::new(Some("CF-Connecting-IP".into()));
+        let l = AuthLimiter::new(Some("CF-Connecting-IP".into()), Vec::new());
         let mut h = HeaderMap::new();
         h.insert("cf-connecting-ip", "198.51.100.1".parse().unwrap());
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
@@ -378,16 +462,114 @@ mod tests {
         );
         // A client that reaches us directly cannot pick its own address.
         assert_eq!(l.client_ip_of(far, &h), far);
-        let plain = AuthLimiter::new(None);
+        let plain = AuthLimiter::new(None, Vec::new());
         assert_eq!(plain.client_ip_of(lo, &h), lo);
         // Behind a proxy that appends to X-Forwarded-For, only the last
         // address is the proxy's word; the client wrote the rest.
-        let xff = AuthLimiter::new(Some("X-Forwarded-For".into()));
+        let xff = AuthLimiter::new(Some("X-Forwarded-For".into()), Vec::new());
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "10.9.9.9, 203.0.113.7".parse().unwrap());
         assert_eq!(
             xff.client_ip_of(lo, &h),
             "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_parses() {
+        let one: TrustedProxy = "192.168.1.20".parse().unwrap();
+        assert!(one.contains("192.168.1.20".parse().unwrap()));
+        assert!(!one.contains("192.168.1.21".parse().unwrap()));
+        // As a dual-stack listener reports an IPv4 peer.
+        assert!(one.contains("::ffff:192.168.1.20".parse().unwrap()));
+        let net: TrustedProxy = "10.1.0.0/16".parse().unwrap();
+        assert!(net.contains("10.1.255.3".parse().unwrap()));
+        assert!(!net.contains("10.2.0.1".parse().unwrap()));
+        assert!(!net.contains("::1".parse().unwrap()));
+        // Host bits in a network are ignored.
+        let odd: TrustedProxy = "192.168.1.20/24".parse().unwrap();
+        assert!(odd.contains("192.168.1.7".parse().unwrap()));
+        let v6: TrustedProxy = "fd00:1::/32".parse().unwrap();
+        assert!(v6.contains("fd00:1:2::9".parse().unwrap()));
+        assert!(!v6.contains("fd00:2::9".parse().unwrap()));
+        assert!(!v6.contains("10.0.0.1".parse().unwrap()));
+        for bad in [
+            "",
+            "proxy.example.com",
+            "192.168.1.0/33",
+            "fd00::/129",
+            "192.168.1.0/x",
+            "0.0.0.0/0",
+            "::/0",
+        ] {
+            assert!(bad.parse::<TrustedProxy>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn real_ip_header_from_a_trusted_proxy() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let l = AuthLimiter::new(
+            Some("X-Forwarded-For".into()),
+            vec![
+                "192.168.1.20".parse().unwrap(),
+                "10.8.0.0/24".parse().unwrap(),
+            ],
+        );
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        // The proxy on another machine speaks for its clients...
+        assert_eq!(l.client_ip_of(ip("192.168.1.20"), &h), ip("203.0.113.7"));
+        assert_eq!(
+            l.client_ip_of(ip("::ffff:192.168.1.20"), &h),
+            ip("203.0.113.7")
+        );
+        assert_eq!(l.client_ip_of(ip("10.8.0.3"), &h), ip("203.0.113.7"));
+        assert_eq!(l.client_ip_of(ip("127.0.0.1"), &h), ip("203.0.113.7"));
+        // ...its neighbour does not.
+        assert_eq!(l.client_ip_of(ip("192.168.1.21"), &h), ip("192.168.1.21"));
+        // Without the header, or with one that is no address, the peer.
+        assert_eq!(
+            l.client_ip_of(ip("192.168.1.20"), &HeaderMap::new()),
+            ip("192.168.1.20")
+        );
+        let mut junk = HeaderMap::new();
+        junk.insert("x-forwarded-for", "unknown".parse().unwrap());
+        assert_eq!(
+            l.client_ip_of(ip("192.168.1.20"), &junk),
+            ip("192.168.1.20")
+        );
+
+        // Two proxies in a row (a tunnel here behind the proxy elsewhere,
+        // or the other way round): the trusted ones are skipped, and what
+        // the client wrote before them is still not believed.
+        let mut chain = HeaderMap::new();
+        chain.insert(
+            "x-forwarded-for",
+            "198.51.100.99, 203.0.113.7, 192.168.1.20".parse().unwrap(),
+        );
+        assert_eq!(l.client_ip_of(ip("10.8.0.3"), &chain), ip("203.0.113.7"));
+        assert_eq!(l.client_ip_of(ip("127.0.0.1"), &chain), ip("203.0.113.7"));
+        // A request the proxy itself made counts as the proxy.
+        let mut own = HeaderMap::new();
+        own.insert("x-forwarded-for", "192.168.1.20".parse().unwrap());
+        assert_eq!(l.client_ip_of(ip("192.168.1.20"), &own), ip("192.168.1.20"));
+
+        // A proxy that adds a header line of its own after the client's:
+        // the last line counts.
+        let mut lines = HeaderMap::new();
+        lines.append("x-forwarded-for", "198.51.100.99".parse().unwrap());
+        lines.append("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(
+            l.client_ip_of(ip("192.168.1.20"), &lines),
+            ip("203.0.113.7")
+        );
+
+        // Without --real-ip-header a proxy's address is just an address.
+        let plain = AuthLimiter::new(None, vec!["192.168.1.20".parse().unwrap()]);
+        assert_eq!(
+            plain.client_ip_of(ip("192.168.1.20"), &h),
+            ip("192.168.1.20")
         );
     }
 }

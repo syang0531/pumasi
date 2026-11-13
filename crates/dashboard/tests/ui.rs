@@ -237,6 +237,7 @@ async fn dashboard_pages_api_and_guards() {
             api_only: false,
             tls: None,
             real_ip_header: None,
+            trusted_proxies: Vec::new(),
             public_url: None,
         },
     )
@@ -470,6 +471,7 @@ async fn api_only_over_tls_with_rate_limit_and_long_poll() {
             api_only: true,
             tls: Some(tls),
             real_ip_header: Some("CF-Connecting-IP".into()),
+            trusted_proxies: Vec::new(),
             public_url: None,
         },
     )
@@ -786,6 +788,7 @@ async fn dashboard_behind_a_tunnel() {
             api_only: false,
             tls: None,
             real_ip_header: Some("CF-Connecting-IP".into()),
+            trusted_proxies: Vec::new(),
             public_url: Some("https://Pumasi.Example.com/".into()),
         },
     )
@@ -894,6 +897,7 @@ async fn sso_sign_in_and_request_limits() {
             api_only: false,
             tls: None,
             real_ip_header: None,
+            trusted_proxies: Vec::new(),
             public_url: None,
         },
     )
@@ -1054,6 +1058,7 @@ async fn account_policy_validation_and_task_times() {
             api_only: false,
             tls: None,
             real_ip_header: None,
+            trusted_proxies: Vec::new(),
             public_url: None,
         },
     )
@@ -1525,6 +1530,7 @@ async fn a_sleeping_node_shows_as_asleep_and_wakes_from_the_api() {
             api_only: false,
             tls: None,
             real_ip_header: None,
+            trusted_proxies: Vec::new(),
             public_url: None,
         },
     )

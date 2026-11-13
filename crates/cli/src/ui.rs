@@ -53,12 +53,20 @@ pub struct UiArgs {
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
     /// A header with the client's address, trusted only on connections
-    /// from this machine (a tunnel or reverse proxy here), for limiting
-    /// failed sign-ins per client: `CF-Connecting-IP` behind Cloudflare
-    /// Tunnel, `X-Forwarded-For` behind most proxies (its last address
-    /// is used: the one the proxy here added).
+    /// from this machine (a tunnel or reverse proxy here) and from
+    /// `--trusted-proxy` addresses, for limiting failed sign-ins per
+    /// client: `CF-Connecting-IP` behind Cloudflare Tunnel,
+    /// `X-Forwarded-For` behind most proxies (its last address is used:
+    /// the one the proxy added).
     #[arg(long)]
     real_ip_header: Option<String>,
+    /// A reverse proxy on another machine whose `--real-ip-header` is
+    /// trusted too: its address as this machine sees it, or a network
+    /// such as 192.168.1.0/24 (repeatable). Anything that can connect
+    /// from such an address picks the address it is counted under, so
+    /// let only the proxy reach this port.
+    #[arg(long, value_name = "ADDR[/PREFIX]", requires = "real_ip_header")]
+    trusted_proxy: Vec<pumasi_dashboard::TrustedProxy>,
     /// Allow `--api-only` on an address other than loopback without
     /// `--tls-cert` (tickets then cross the network unencrypted; only for
     /// a TLS proxy on another machine of a private network).
@@ -126,6 +134,11 @@ pub async fn run_until(
             "warning: serving on {addr} over plain HTTP; tickets typed into the sign-in page cross the network unencrypted. Put a TLS reverse proxy in front."
         );
     }
+    if !addr.ip().is_loopback() && args.real_ip_header.is_some() && args.trusted_proxy.is_empty() {
+        eprintln!(
+            "warning: --real-ip-header is trusted only on connections from this machine. Behind a reverse proxy on another machine, every client counts as the proxy's address (one client's failed sign-ins block them all) until you name it: --trusted-proxy ADDR"
+        );
+    }
     let ui = pumasi_dashboard::start_on(
         listener,
         UiConfig {
@@ -137,6 +150,7 @@ pub async fn run_until(
             api_only: args.api_only,
             tls,
             real_ip_header: args.real_ip_header.clone(),
+            trusted_proxies: args.trusted_proxy.clone(),
             public_url: args.public_url.clone(),
         },
     )

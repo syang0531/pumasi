@@ -105,8 +105,10 @@ ExecStart=/usr/local/bin/pumasi ui --listen 127.0.0.1:7400 --no-open --login-onl
 Put it on the internet only through Cloudflare Tunnel, a reverse proxy
 with TLS, or `--tls-cert`/`--tls-key` ([api.md](api.md), "Put it on the
 internet"). Behind a proxy, pass `--real-ip-header` so limits apply per
-client and not to the proxy. `pumasi ui --api-only` serves only the JSON
-API for scripts.
+client and not to the proxy; when the proxy runs on another machine, also
+`--trusted-proxy` with its address (the header is otherwise believed only
+on connections from this machine). `pumasi ui --api-only` serves only
+the JSON API for scripts.
 
 ## 2. Sign people in
 

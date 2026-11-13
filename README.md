@@ -27,8 +27,9 @@ A task runs in one of three ways, behind the same job file:
 
 What is in it:
 
-- [Windows](#windows) and [Macs, old Intel ones too](#macs-old-intel-ones-too),
-  as full hosts for all three.
+- [Windows](#windows) as a full host for all three, and
+  [Macs, old Intel ones too](#macs-old-intel-ones-too): a 2013-2014 Mac
+  runs WebAssembly jobs, and microVM jobs from macOS 11.
 - [GPUs](#gpu-jobs): NVIDIA with CUDA in Docker, and
   [any GPU through WebGPU](#webgpu-any-gpu-from-a-wasm-job-experimental)
   (experimental).

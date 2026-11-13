@@ -231,6 +231,9 @@ pub struct Agent {
     _router: Router,
 }
 
+/// Writes settings into an agent's options file.
+pub type SettingsWriter = Arc<dyn Fn(&NodeSettings) -> Result<()> + Send + Sync>;
+
 /// Lets the dashboard change an agent's availability settings (1.7): the
 /// agent's service options file and how to write settings into it. The
 /// CLI sets it for an agent run by `pumasi service run`.
@@ -239,7 +242,7 @@ pub struct SettingsHook {
     pub file: PathBuf,
     /// Merges the settings into the file's options (called on a blocking
     /// thread).
-    pub write: Arc<dyn Fn(&NodeSettings) -> Result<()> + Send + Sync>,
+    pub write: SettingsWriter,
 }
 
 impl std::fmt::Debug for SettingsHook {
@@ -873,10 +876,7 @@ impl Agent {
             join_secret: *join_secret,
             node,
             upgrade: self.upgrader.as_ref().map(|u| u.hello()),
-            availability: effective(
-                &available.borrow_and_update(),
-                &self.restarting.borrow(),
-            ),
+            availability: effective(&available.borrow_and_update(), &self.restarting.borrow()),
         };
         // A control plane older than 1.5 ignores what follows the hello.
         let hello_tail = HelloTail {
@@ -1146,7 +1146,10 @@ impl Agent {
                             }
                         }
                     }
-                    let now = effective(&available.borrow_and_update(), &restarting.borrow_and_update());
+                    let now = effective(
+                        &available.borrow_and_update(),
+                        &restarting.borrow_and_update(),
+                    );
                     if now == last {
                         continue;
                     }

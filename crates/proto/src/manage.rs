@@ -319,7 +319,11 @@ impl Selector {
         let sel: Selector = if s.contains(['=', '!']) {
             s.parse()?
         } else {
-            let names: Vec<&str> = s.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+            let names: Vec<&str> = s
+                .split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .collect();
             format!("name={}", names.join("|")).parse()?
         };
         sel.validate()?;

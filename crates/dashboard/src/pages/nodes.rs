@@ -498,7 +498,10 @@ pub async fn chart_stream(
             }
             s.first = false;
             let m = metrics(&s.ctx, Some(s.node.clone()), s.since).await;
-            let mv = m.nodes.into_iter().find(|x| x.id == s.node || s.node.is_empty());
+            let mv = m
+                .nodes
+                .into_iter()
+                .find(|x| x.id == s.node || s.node.is_empty());
             let key = mv.as_ref().map(|v| (v.latest_unix, v.series.len()));
             if key.is_some() && key == s.last {
                 continue;

@@ -25,7 +25,12 @@ pub struct CanaryArgs {
     #[arg(long, value_name = "NODE|SELECTOR")]
     pub canary: Option<String>,
     /// How long the canaries run the new binary before the rest follow.
-    #[arg(long, value_name = "DURATION", default_value = "30m", requires = "canary")]
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = "30m",
+        requires = "canary"
+    )]
     pub canary_soak: String,
     /// Tasks each canary must finish on the new binary first.
     #[arg(long, value_name = "N", default_value_t = 0, requires = "canary")]
@@ -236,7 +241,11 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
         }
         UpgradeCmd::Promote { nodes, admin } => {
             let client = connect_admin(home, &admin).await?;
-            let resp = client.call(AdminOp::PromoteCanary { nodes: nodes.clone() }).await?;
+            let resp = client
+                .call(AdminOp::PromoteCanary {
+                    nodes: nodes.clone(),
+                })
+                .await?;
             client.close().await;
             let AdminResponse::Canary(view) = resp else {
                 bail!("unexpected response");
@@ -493,7 +502,11 @@ fn print_canary_view(c: &CanaryView) {
         c.spec.nodes,
         pumasi_proto::monitor::human_duration(c.spec.soak_secs),
         c.spec.min_tasks,
-        if c.spec.hold { ", promoted by hand" } else { "" }
+        if c.spec.hold {
+            ", promoted by hand"
+        } else {
+            ""
+        }
     );
     match &c.phase {
         CanaryPhase::Canary => println!(

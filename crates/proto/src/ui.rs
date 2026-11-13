@@ -70,13 +70,13 @@ impl NodeSettings {
             ensure!((1..=1024).contains(&s), "slots must be 1 to 1024");
         }
         if let Some(p) = self.max_cpu_percent {
-            ensure!((1..=100).contains(&p), "the CPU share must be 1 to 100 percent");
+            ensure!(
+                (1..=100).contains(&p),
+                "the CPU share must be 1 to 100 percent"
+            );
         }
         if let Some(m) = self.idle_minutes {
-            ensure!(
-                (1..=24 * 60).contains(&m),
-                "idle minutes must be 1 to 1440"
-            );
+            ensure!((1..=24 * 60).contains(&m), "idle minutes must be 1 to 1440");
         }
         check_hours(&self.hours)?;
         Ok(())
@@ -94,7 +94,10 @@ impl NodeSettings {
             None => out.push(format!("--no-{name}")),
         };
         opt("slots", self.slots.map(|v| v.to_string()));
-        opt("max-cpu-percent", self.max_cpu_percent.map(|v| v.to_string()));
+        opt(
+            "max-cpu-percent",
+            self.max_cpu_percent.map(|v| v.to_string()),
+        );
         opt("idle-minutes", self.idle_minutes.map(|v| v.to_string()));
         let hours = self.hours.trim();
         opt("hours", (!hours.is_empty()).then(|| hours.to_string()));
@@ -137,7 +140,10 @@ pub fn check_hours(s: &str) -> Result<()> {
             .split_once(':')
             .with_context(|| format!("{t:?} is not HH:MM"))?;
         let h: u32 = h.trim().parse().with_context(|| format!("hour in {t:?}"))?;
-        let m: u32 = m.trim().parse().with_context(|| format!("minute in {t:?}"))?;
+        let m: u32 = m
+            .trim()
+            .parse()
+            .with_context(|| format!("minute in {t:?}"))?;
         ensure!(
             m < 60 && (h < 24 || (h == 24 && m == 0)),
             "{t:?} is not a time of day"
@@ -210,7 +216,10 @@ mod tests {
                 "--only-on-ac"
             ]
         );
-        assert_eq!(s.describe(), "2 slots · AC only · idle 10 min · 22:00-07:00");
+        assert_eq!(
+            s.describe(),
+            "2 slots · AC only · idle 10 min · 22:00-07:00"
+        );
         let d = NodeSettings::default();
         assert!(d.changes().contains(&"--no-hours".to_string()));
         assert!(d.changes().contains(&"--no-only-on-ac".to_string()));

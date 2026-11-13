@@ -35,7 +35,7 @@ use crate::{
 
 /// Shared input files above this go through the file store (as with
 /// `pumasi run`).
-const INLINE_INPUT_BYTES: u64 = 16 << 20;
+pub(crate) const INLINE_INPUT_BYTES: u64 = 16 << 20;
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -257,7 +257,7 @@ pub(crate) async fn check_upload(
 
 /// The submission an upload holds, and the input files too large to go
 /// with it (they go through the file store).
-async fn load_upload(
+pub(crate) async fn load_upload(
     up: &uploads::Upload,
 ) -> anyhow::Result<(
     pumasi_proto::job::JobSubmission,

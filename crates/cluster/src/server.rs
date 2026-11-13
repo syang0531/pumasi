@@ -1592,7 +1592,13 @@ fn session_call(
                 Err(anyhow::anyhow!("a session cannot start another session"))
             } else {
                 st.start_session(parent, &label).map(|(secret, view)| {
-                    st.audit(who, "session.start", view.id.clone(), view.label.clone(), true);
+                    st.audit(
+                        who,
+                        "session.start",
+                        view.id.clone(),
+                        view.label.clone(),
+                        true,
+                    );
                     AdminResponse::Session { secret, view }
                 })
             }
@@ -1602,8 +1608,16 @@ fn session_call(
         )),
         AdminOp::RevokeSession { id } => match st.revoke_session(&id, of) {
             Ok(v) => {
-                st.audit(who, "session.revoke", v.id.clone(), format!("{} ({})", v.name, v.label), true);
-                Ok(AdminResponse::Sessions(st.list_sessions(of, current.as_ref())))
+                st.audit(
+                    who,
+                    "session.revoke",
+                    v.id.clone(),
+                    format!("{} ({})", v.name, v.label),
+                    true,
+                );
+                Ok(AdminResponse::Sessions(
+                    st.list_sessions(of, current.as_ref()),
+                ))
             }
             Err(e) => {
                 st.audit(who, "session.revoke", id.clone(), format!("{e:#}"), false);
@@ -1613,7 +1627,13 @@ fn session_call(
         AdminOp::EndSession => match current {
             Some(h) => {
                 st.end_sessions(&[h], "signed out");
-                st.audit(who, "session.end", pumasi_proto::ui::session_id(&h), String::new(), true);
+                st.audit(
+                    who,
+                    "session.end",
+                    pumasi_proto::ui::session_id(&h),
+                    String::new(),
+                    true,
+                );
                 Ok(AdminResponse::Ok)
             }
             None => Err(anyhow::anyhow!("this call was not made with a session")),

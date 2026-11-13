@@ -29,8 +29,8 @@ use anyhow::{Context, Result, bail, ensure};
 use pumasi_proto::{
     SETTINGS_MINOR,
     monitor::EventLevel,
-    msg::{Outcome, ToAgent, UpgradeState},
     monitor::human_duration,
+    msg::{Outcome, ToAgent, UpgradeState},
     release::{CanaryNodeView, CanaryPhase, CanarySpec, CanaryView, Target},
     ui::{NodeSettings, NodeSettingsView, SettingsReport},
 };
@@ -501,11 +501,10 @@ impl State {
         settings.validate()?;
         let id = self.resolve_node(node)?;
         let name = self.node_name(&id);
-        let rt = self
-            .nodes
-            .get(&id)
-            .filter(|n| n.online)
-            .with_context(|| format!("{name} is offline; its settings change when it is online"))?;
+        let rt =
+            self.nodes.get(&id).filter(|n| n.online).with_context(|| {
+                format!("{name} is offline; its settings change when it is online")
+            })?;
         ensure!(
             self.node_minor(&id) >= SETTINGS_MINOR,
             "{name} runs an agent older than 1.7, which cannot change its settings from here; on that machine run `pumasi service set agent -- {}`",

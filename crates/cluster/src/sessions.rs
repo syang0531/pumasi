@@ -102,7 +102,11 @@ impl State {
     }
 
     /// Starts a session for the ticket with secret `parent`.
-    pub(crate) fn start_session(&mut self, parent: Secret, label: &str) -> Result<(Secret, SessionView)> {
+    pub(crate) fn start_session(
+        &mut self,
+        parent: Secret,
+        label: &str,
+    ) -> Result<(Secret, SessionView)> {
         let label: String = label
             .chars()
             .filter(|c| !c.is_control())
@@ -156,14 +160,22 @@ impl State {
 
     /// Sessions, newest use first: all of them (`of: None`, for admins),
     /// or those of the ticket with secret `of`.
-    pub(crate) fn list_sessions(&self, of: Option<&Secret>, current: Option<&[u8; 32]>) -> Vec<SessionView> {
+    pub(crate) fn list_sessions(
+        &self,
+        of: Option<&Secret>,
+        current: Option<&[u8; 32]>,
+    ) -> Vec<SessionView> {
         let mut v: Vec<&SessionRecord> = self
             .ui
             .map
             .values()
             .filter(|r| of.is_none_or(|p| secrets_eq(p, &r.parent)))
             .collect();
-        v.sort_by(|a, b| b.last_used_unix.cmp(&a.last_used_unix).then(a.hash.cmp(&b.hash)));
+        v.sort_by(|a, b| {
+            b.last_used_unix
+                .cmp(&a.last_used_unix)
+                .then(a.hash.cmp(&b.hash))
+        });
         v.into_iter()
             .map(|r| self.session_view(r, current))
             .collect()
@@ -189,7 +201,10 @@ impl State {
                 self.end_sessions(&[*h], "revoked");
                 Ok(view)
             }
-            _ => bail!("{id} is the start of {} session ids; give more of it", found.len()),
+            _ => bail!(
+                "{id} is the start of {} session ids; give more of it",
+                found.len()
+            ),
         }
     }
 
@@ -219,8 +234,7 @@ impl State {
         let mut touched = Vec::new();
         for r in self.ui.map.values() {
             let idle = now.saturating_sub(r.last_used_unix) >= SESSION_IDLE_SECS;
-            let parent_ok =
-                secrets_eq(&r.parent, admin) || self.access_caller(&r.parent).is_some();
+            let parent_ok = secrets_eq(&r.parent, admin) || self.access_caller(&r.parent).is_some();
             if idle || !parent_ok {
                 ended.push(r.hash);
             } else if r.last_used_unix
@@ -233,7 +247,8 @@ impl State {
             self.end_sessions(&ended, "idle, or its ticket is gone");
         }
         if !touched.is_empty() {
-            let recs: Vec<&SessionRecord> = touched.iter().filter_map(|h| self.ui.map.get(h)).collect();
+            let recs: Vec<&SessionRecord> =
+                touched.iter().filter_map(|h| self.ui.map.get(h)).collect();
             match self.store.put_ui_sessions(&recs, &[]) {
                 Ok(()) => {
                     for r in recs {

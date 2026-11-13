@@ -312,9 +312,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
             },
             none(),
         ),
-        SetNodeSettings { node, settings } => {
-            ("node.settings", node.clone(), settings.describe())
-        }
+        SetNodeSettings { node, settings } => ("node.settings", node.clone(), settings.describe()),
         // Sessions log themselves in `server::session_call`.
         StartSession { .. } | RevokeSession { .. } | EndSession => return None,
         RenameNode { node, name } => (

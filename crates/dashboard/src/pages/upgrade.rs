@@ -357,3 +357,36 @@ fn canary(ctx: &Ctx, c: &CanaryView) -> Markup {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn form(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn checked_nodes_become_the_canary() {
+        assert_eq!(canary_from(&form(&[("soak", "30m")])).unwrap(), None);
+        let c = canary_from(&form(&[
+            ("canary", "node-a"),
+            ("canary", "node-b"),
+            ("soak", "1h"),
+            ("tasks", "3"),
+            ("hold", "on"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.nodes, Selector::nodes("node-a,node-b").unwrap());
+        assert_eq!((c.soak_secs, c.min_tasks, c.hold), (3600, 3, true));
+        let c = canary_from(&form(&[("canary", "node-a")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.soak_secs, DEFAULT_CANARY_SOAK_SECS);
+        assert!(canary_from(&form(&[("canary", "node-a"), ("tasks", "many")])).is_err());
+    }
+}

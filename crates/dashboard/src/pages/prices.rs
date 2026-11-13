@@ -207,3 +207,58 @@ pub async fn save(ctx: Ctx, headers: HeaderMap, Form(f): Form<PricesForm>) -> Re
         Err(e) => ctx.fail(e, hx(&headers)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prices_form_sets_rates_and_settlement() {
+        let mut p = Policy::default();
+        let mut s = StoragePolicy::default();
+        let f = PricesForm {
+            memory_gib_hour: "0.3".into(),
+            gpu_tflops_hour: "0.1".into(),
+            gpu_vram_gib_hour: "0.25".into(),
+            storage_gib_month: "0.5".into(),
+            egress_gib: "0".into(),
+            hdd_gib_month: Some("0.2".into()),
+            nvme_gib_month: Some("1".into()),
+            default_quota: Some("10 GiB".into()),
+            ledger: "mutual".into(),
+            credit_limit: Some("50".into()),
+            hold: "2h".into(),
+            verify_rate: "5%".into(),
+            max_strikes: "4".into(),
+        };
+        apply_form(&f, &mut p, &mut s).unwrap();
+        assert_eq!(p.rates.memory_gib_hour, 300_000);
+        assert_eq!(p.rates.egress_gib, 0);
+        assert_eq!(s.nvme_gib_month, 1_000_000);
+        assert_eq!(s.default_quota, Some(10 << 30));
+        assert_eq!(
+            p.ledger,
+            LedgerMode::Mutual {
+                credit_limit: 50_000
+            }
+        );
+        assert_eq!(p.hold_secs, 7200);
+        assert_eq!(p.verify_permille, 50);
+        assert_eq!(p.max_strikes, 4);
+
+        // The page shows what it reads back.
+        let f2 = PricesForm {
+            default_quota: Some(fmt::format_size(10 << 30)),
+            ledger: "prepaid".into(),
+            ..f
+        };
+        apply_form(&f2, &mut p, &mut s).unwrap();
+        assert_eq!(s.default_quota, Some(10 << 30));
+        assert_eq!(p.ledger, LedgerMode::Prepaid);
+        let bad = PricesForm {
+            ledger: "barter".into(),
+            ..f2
+        };
+        assert!(apply_form(&bad, &mut p, &mut s).is_err());
+    }
+}

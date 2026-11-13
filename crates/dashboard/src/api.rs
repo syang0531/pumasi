@@ -878,9 +878,12 @@ mod tests {
             doc["paths"].as_object().unwrap().keys().cloned().collect();
         documented.sort();
         let src = include_str!("api.rs");
+        // `.route("...` on one line, or split over two by rustfmt.
         let mut routed: Vec<String> = src
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix(".route(\""))
+            .split(".route(")
+            .skip(1)
+            .filter_map(|l| l.trim_start().strip_prefix('"'))
+            .filter(|l| l.starts_with('/'))
             .map(|l| format!("/api/v1{}", &l[..l.find('"').unwrap()]))
             .collect();
         routed.push("/api/openapi.json".into());

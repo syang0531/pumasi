@@ -478,3 +478,45 @@ pub async fn remove_webhook(ctx: Ctx, headers: HeaderMap, Path(name): Path<Strin
         Err(e) => ctx.fail(e, hx(&headers)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_alerts_form_becomes_a_policy() {
+        let f = AlertsForm {
+            node_offline: Some("2m".into()),
+            failure_rate: Some("30%".into()),
+            failure_window: Some("1h".into()),
+            failure_min_runs: Some("5".into()),
+            disk: Some("".into()),
+            temperature: Some("85°C".into()),
+            perf_drop: Some("off".into()),
+            smart: Some("on".into()),
+            check_mismatch: None,
+            repeat: Some("4h".into()),
+            resolved: Some("on".into()),
+            tuning: Some("1".into()),
+        };
+        let (p, t) = alerts_from(&f).unwrap();
+        assert_eq!(p.node_offline_secs, Some(120));
+        let fr = p.failure_rate.unwrap();
+        assert_eq!((fr.percent, fr.window_secs, fr.min_runs), (30, 3600, 5));
+        assert_eq!(p.disk_percent, None);
+        assert_eq!(p.temp_c, Some(85));
+        assert_eq!(p.perf_drop_percent, None);
+        assert!(p.smart && !p.check_mismatch);
+        assert_eq!(t, Some((Some(4 * 3600), true)));
+
+        // Without the tuning fields (an older control plane) only the
+        // policy changes; nonsense is refused.
+        let (_, t) = alerts_from(&AlertsForm::default()).unwrap();
+        assert_eq!(t, None);
+        let bad = AlertsForm {
+            disk: Some("lots".into()),
+            ..Default::default()
+        };
+        assert!(alerts_from(&bad).is_err());
+    }
+}

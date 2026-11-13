@@ -261,3 +261,61 @@ pub async fn revoke(ctx: Ctx, headers: HeaderMap, Path(id): Path<String>) -> Res
         Err(e) => ctx.fail(e, hx(&headers)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumasi_proto::monitor::FailureRate;
+
+    #[test]
+    fn the_exported_alerts_read_back_the_same() {
+        for p in [
+            AlertPolicy::default(),
+            AlertPolicy {
+                node_offline_secs: None,
+                failure_rate: None,
+                disk_percent: Some(80),
+                temp_c: None,
+                perf_drop_percent: None,
+                smart: false,
+                check_mismatch: false,
+            },
+            AlertPolicy {
+                node_offline_secs: Some(150),
+                failure_rate: Some(FailureRate {
+                    percent: 30,
+                    window_secs: 7200,
+                    min_runs: 4,
+                }),
+                ..Default::default()
+            },
+        ] {
+            let text = cluster_toml(&[], &p);
+            let spec = apply_spec(&text, true).unwrap();
+            assert_eq!(spec.alerts, Some(p), "{text}");
+            assert!(spec.dry_run && !spec.prune);
+        }
+    }
+
+    #[test]
+    fn files_that_would_read_the_dashboards_machine_are_refused() {
+        let sched = "[schedules.nightly]\ncron = \"@daily\"\njob = \"/etc/passwd\"\n";
+        let e = apply_spec(sched, true).unwrap_err();
+        assert!(format!("{e:#}").contains("Schedules page"), "{e:#}");
+        let env = "[webhooks.chat]\nurl_env = \"HOME\"\n";
+        let e = apply_spec(env, false).unwrap_err();
+        assert!(format!("{e:#}").contains("url_env"), "{e:#}");
+        let ok = "[webhooks.chat]\nurl = \"https://hooks.slack.com/services/x\"\n\n[nodes.\"my pc\"]\nlabels = { room = \"study\" }\ntaints = [\"busy=true\"]\n";
+        let spec = apply_spec(ok, false).unwrap();
+        assert_eq!(spec.webhooks.len(), 1);
+        assert_eq!(spec.nodes[0].node, "my pc");
+        assert!(!spec.dry_run);
+    }
+
+    #[test]
+    fn odd_names_are_quoted() {
+        assert_eq!(key("imac"), "imac");
+        assert_eq!(key("my pc"), "\"my pc\"");
+        assert_eq!(key("a.b"), "\"a.b\"");
+    }
+}

@@ -6,3 +6,6 @@
 *.sh text eol=lf
 *.py text eol=lf
 Dockerfile text eol=lf
+*.wasm binary
+*.png binary
+*.gif binary

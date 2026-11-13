@@ -1,25 +1,64 @@
 # Pumasi
 
-Pool the machines you already own into one private cluster and run batch
-jobs across them: sandboxed WebAssembly modules on every machine, ordinary
-Docker images (Python, any packages, optional network) on the machines you
-allow, or the same images inside microVMs, each task with its own kernel,
-which is safe enough for machines other people lend you. One small Rust
-binary, the same on Linux, macOS and Windows, x86_64 and ARM64.
+[![Release](https://img.shields.io/github/v/release/syang0531/pumasi)](https://github.com/syang0531/pumasi/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+**Turn the computers you already have into one cluster.** Pumasi pools the
+machines you own (the gaming PC, the work laptop, the 2014 iMac in the
+corner) into one private cluster and runs batch jobs across them. It is
+one small Rust binary, the same on Linux, macOS and Windows, x86_64 and
+ARM64. There is no cloud account to open and no port to forward: the
+machines reach each other through NAT.
 
 > [한국어 README](README.ko.md)
 
-Pumasi grows in phases: a private cluster tool that is useful on its own
-(phase 1), then other people's machines joining by invite, with signed
-usage receipts, a prepaid ledger and spot checks of their results
-(phase 2), then a microVM executor that runs container images on those
-machines with VM isolation (phase 3), then release binaries, OS services
-and signed cluster-wide upgrades (phase 4), then Windows as a first-class
-host for all three executors (phase 5), old Intel Macs and availability
-policies (phase 6), then benchmarks and compute units (phase 7, this
-release), and later storage, GPUs, cluster management, monitoring, a
-dashboard and a marketplace. See [docs/architecture.md](docs/architecture.md)
-and the roadmap below.
+![A job spreading over four machines in the Pumasi dashboard](docs/images/dashboard-demo.gif)
+
+*The built-in dashboard while a 24-task job runs on a demo cluster (four
+agents on one Linux machine).*
+
+A task runs in one of three ways, behind the same job file:
+
+- **WebAssembly** modules in a sandbox, on every machine.
+- **Docker** images (Python, any packages, GPUs, optional network) on the
+  machines you allow.
+- **MicroVMs**: the same images, each task in its own VM with its own
+  kernel, which is safe enough for machines other people lend you.
+
+What is in it:
+
+- [Windows](#windows) as a full host for all three, and
+  [Macs, old Intel ones too](#macs-old-intel-ones-too): a 2013-2014 Mac
+  runs WebAssembly jobs, and microVM jobs from macOS 11.
+- [GPUs](#gpu-jobs): NVIDIA with CUDA in Docker, and
+  [any GPU through WebGPU](#webgpu-any-gpu-from-a-wasm-job-experimental)
+  (experimental).
+- Machines that are not servers: they take work
+  [only when idle, on AC power or at night](#when-a-machine-takes-work),
+  and the cluster handles [machines that sleep](#machines-that-sleep)
+  (Wake-on-LAN included).
+- A [web dashboard](#web-dashboard), [monitoring and alerts](#monitoring-and-alerts),
+  a [file store](#the-cluster-file-store) and
+  [k8s-style management](#cluster-management) (labels, quotas, priorities,
+  drain).
+- An [HTTP API](#using-the-cluster-from-anywhere-http-api) to use the
+  cluster from anywhere: CI, a cloud sandbox, your own programs.
+- [Other people's machines](#other-peoples-machines-invites-compute-units-and-checks)
+  by invite, with signed usage receipts and spot checks of their results.
+- [OS services](#run-the-agent-the-control-plane-and-the-dashboard-as-services),
+  [signed cluster-wide upgrades](#upgrading-every-agent-at-once),
+  [control plane replicas](#control-plane-replicas-and-backups), and
+  [SSO and an audit log](#running-it-for-an-organization-sso-audit-log-operations).
+
+*Pumasi* (품앗이) is the Korean custom of neighbours taking turns working
+each other's fields.
+
+**Status.** Pumasi is at 1.5 and it is young: so far it has been used on
+one home cluster, of Windows PCs (one with an RTX 3080) and a 2014 iMac,
+since November 2026. It has had an internal security review but no
+outside audit yet ([SECURITY.md](SECURITY.md)), and the
+[roadmap](#roadmap) lists what is not done. Bug reports and
+questions are welcome in the [issues](https://github.com/syang0531/pumasi/issues).
 
 ## Install
 
@@ -40,43 +79,63 @@ curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.
 irm https://github.com/syang0531/pumasi/releases/latest/download/install.ps1 | iex
 ```
 
-Options: `--version v0.4.0` / `-Version`, `--dir` / `-Dir`, and a join
-ticket to also install the agent as a service (next section):
+Options: `--version v1.5.0` / `-Version`, `--dir` / `-Dir`, and a join
+ticket to also install the agent as a service
+([services](#run-the-agent-the-control-plane-and-the-dashboard-as-services)):
 `curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, or
 `& ([scriptblock]::Create((irm .../install.ps1))) -Ticket pumasijoin...`.
-While the repository is private, set `GITHUB_TOKEN` to a token that can
-read it (the scripts then go through the GitHub API). Or build from source:
-`cargo build --release -p pumasi-cli`.
+Or build from source: `cargo build --release -p pumasi-cli`.
 
-## Quick start
+## Try it in five minutes
+
+One machine is enough to try it; add the others when it works.
 
 ```sh
-# Machine 1: start the control plane. It prints a join command.
+# 1. On one machine: start the control plane. It prints a join command.
 pumasi cluster start --name homelab
 
-# Machines 2..N: paste the join command.
+# 2. On every machine that should take work (the first one too, in
+#    another terminal): paste the join command.
 pumasi agent join pumasijoin...
 
-# Anywhere the admin ticket is available (machine 1 by default):
+# 3. Anywhere the admin ticket is (the first machine by default):
 pumasi status
 ```
 
-Run the sample job (16 shards of a Monte Carlo estimate of pi):
+```
+cluster homelab (851765067d)
+
+NODE         NAME             STATE     ROLE     PLATFORM       VERSION   EXECUTORS    SLOTS  RUNNING  ...
+e993d728f5   attic-server     online    owner    linux/x86_64   1.5.0     wasm             2        0
+67d944c4ec   desk-pc          online    owner    linux/x86_64   1.5.0     wasm             2        0
+4cf0f33834   mini             online    owner    linux/x86_64   1.5.0     wasm             2        0
+8d2920d244   old-laptop       online    owner    linux/x86_64   1.5.0     wasm             2        0
+
+ready for account owner now: wasm 4, docker 0, microvm 0, GPU 0
+```
+
+Run the sample job, 16 shards of a Monte Carlo estimate of pi. Its
+WebAssembly module is in the repository already built, so nothing else
+needs installing:
 
 ```sh
-rustup target add wasm32-wasip1
-cargo build --release --target wasm32-wasip1 --manifest-path examples/montecarlo/Cargo.toml
+git clone --depth 1 https://github.com/syang0531/pumasi && cd pumasi
 pumasi run examples/montecarlo/job.toml --output
 ```
 
 ```
-submitted job 1b6ed8ca8300baee (16 tasks)
-running: 0/16 done, 6 running, 0 failed
+submitted job 5baf22a6d3ea911c (16 tasks)
+running: 0/16 done, 8 running, 0 failed
+running: 8/16 done, 8 running, 0 failed
 succeeded: 16/16 done, 0 running, 0 failed
-job 1b6ed8ca8300baee "estimate-pi": succeeded
+job 5baf22a6d3ea911c "estimate-pi": succeeded
+  executor wasm
+  submitted by cluster admin
+  account owner  cost 0 CU  deterministic
   tasks 16  succeeded 16  failed 0  fuel 6000109645
-  [0] ok node=a57fd372f9 attempts=1 63ms
+  [0] ok node=mini attempts=1 44ms
 0 3926363 5000000
+  [1] ok node=old-laptop attempts=1 42ms
 ...
 ```
 
@@ -84,9 +143,27 @@ Reduce the shard outputs locally with the same module:
 
 ```sh
 pumasi run examples/montecarlo/job.toml -o | grep -E '^[0-9]+ ' \
-  | pumasi exec examples/montecarlo/target/wasm32-wasip1/release/montecarlo.wasm reduce
+  | pumasi exec examples/montecarlo/montecarlo.wasm reduce
 # pi ~= 3.141691 from 80000000 samples in 16 shards
 ```
+
+Then open the dashboard. It is part of the binary and runs on your own
+machine:
+
+```sh
+pumasi ui
+```
+
+![The dashboard's overview page](docs/images/dashboard-overview.png)
+
+From here: run [Python in Docker](#docker-jobs-python-files-and-more),
+keep the cluster running across reboots with
+[services](#run-the-agent-the-control-plane-and-the-dashboard-as-services),
+or add machines on [other networks](#machines-on-other-networks-and-your-own-relay).
+To change the sample, edit `examples/montecarlo/src/main.rs` and build it
+again (the two commands are in its `job.toml`).
+
+## Guide
 
 ### Docker jobs: Python, files and more
 
@@ -1701,6 +1778,19 @@ registries for the images jobs name; GitHub, the Firecracker project and
 the QEMU for Windows builds when `pumasi vm setup` or the install scripts
 download; AMD and Intel attestation services for confidential jobs; and
 webhooks and identity providers the cluster's configuration names.
+
+## Contributing
+
+Reports from real use are the most useful contribution: what machines you
+joined, what you ran, and where it went wrong or felt awkward. Open an
+[issue](https://github.com/syang0531/pumasi/issues/new/choose);
+[CONTRIBUTING.md](CONTRIBUTING.md) covers pull requests, and
+[SECURITY.md](SECURITY.md) how to report a vulnerability privately.
+
+## Sponsor
+
+Pumasi is free and Apache-2.0. If it is useful to you, you can support
+its development through [GitHub Sponsors](https://github.com/sponsors/syang0531).
 
 ## License
 

@@ -1,8 +1,10 @@
 # Estimate pi with 16 independent shards of 5 million samples each.
-# Build the module first:
+# montecarlo.wasm is built from src/ and committed, so the sample runs
+# without a Rust toolchain. After changing src/, build it again:
 #   cargo build --release --target wasm32-wasip1 --manifest-path examples/montecarlo/Cargo.toml
+#   cp examples/montecarlo/target/wasm32-wasip1/release/montecarlo.wasm examples/montecarlo/
 name = "estimate-pi"
-module = "target/wasm32-wasip1/release/montecarlo.wasm"
+module = "montecarlo.wasm"
 shards = 16
 args = ["sample", "{shard}", "5000000"]
 

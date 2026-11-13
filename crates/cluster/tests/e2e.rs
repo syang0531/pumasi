@@ -624,6 +624,10 @@ async fn reschedules_tasks_when_a_node_dies() {
     wait_online(&cluster, 1).await;
 
     let client = admin(&cluster).await;
+    // `b` is built before the job is submitted: on a busy CI runner that
+    // took 3 s, longer than the tasks run (1.5 s), so they finished on `a`
+    // before it died and were never rescheduled.
+    let b = agent("b", 2, tempdir("b")).await;
     // Two slow tasks: both land on `a`, the only node.
     let id = submit(
         &client,
@@ -632,7 +636,7 @@ async fn reschedules_tasks_when_a_node_dies() {
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let b = spawn_join(agent("b", 2, tempdir("b")).await, ticket);
+    let b = spawn_join(b, ticket);
     wait_online(&cluster, 2).await;
     a.kill().await;
 

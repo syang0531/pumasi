@@ -71,6 +71,15 @@ jobs:
             examples/montecarlo/target/wasm32-wasip1/release/montecarlo.wasm sample 1 100000 \
             | tee sample.txt
           grep -q "^1 " sample.txt
+      # The quick start runs the module committed next to the job file, so
+      # nobody needs a Rust toolchain to try Pumasi. It must behave like a
+      # fresh build of src/.
+      - name: Committed sample module matches a fresh build
+        shell: bash
+        run: |
+          cargo run --release -p pumasi-cli -- exec \
+            examples/montecarlo/montecarlo.wasm sample 1 100000 < /dev/null > committed.txt
+          diff sample.txt committed.txt
 
   # WebGPU (phase 14): the same wasm modules on each OS's GPU API (Vulkan
   # with lavapipe on Linux, DX12 on Windows, Metal on macOS), checked

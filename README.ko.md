@@ -1,8 +1,35 @@
 # Pumasi (품앗이)
 
-이미 가진 여러 대의 기기를 하나의 사설 클러스터로 묶어 배치 작업을 나눠 돌립니다. 모든 기기에서 도는 안전한 WebAssembly 작업, 허용한 기기에서 도는 일반 Docker 이미지 작업(Python, 원하는 패키지, 선택적 네트워크), 그리고 같은 이미지를 태스크마다 자기 커널을 가진 microVM 안에서 돌리는 작업(남이 빌려준 기기에도 보낼 수 있을 만큼 격리됨)을 같은 방식으로 실행합니다. Linux, macOS, Windows와 x86_64, ARM64에서 같은 Rust 단일 바이너리 하나로 동작합니다.
+[![Release](https://img.shields.io/github/v/release/syang0531/pumasi)](https://github.com/syang0531/pumasi/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-단계별로 넓혀 갑니다. 1단계는 혼자 써도 쓸모 있는 사설 클러스터 도구, 2단계는 초대한 다른 사람의 기기를 제공자로 받고 서명된 사용 영수증, 선불 원장, 결과 표본 검증을 더한 것, 3단계는 그 기기들에서도 컨테이너 이미지를 VM 격리로 돌리는 microVM 실행기, 4단계는 릴리스 바이너리, OS 서비스 설치, 클러스터 키로 서명한 일괄 업그레이드, 5단계는 세 실행기 모두를 Windows에서 정식 지원하는 것, 6단계는 구형 Intel Mac과 가용 정책, 7단계는 성능 벤치마크와 컴퓨팅 유닛(CU), 8단계는 클러스터 파일 저장소, 9단계는 GPU, 10단계는 클러스터 관리, 11단계(이번 릴리스)는 모니터링과 경보입니다. 이후 대시보드와 고가용성을 거쳐 마켓으로 넓힙니다. 구조는 [docs/architecture.md](docs/architecture.md)에 있습니다.
+**이미 가진 컴퓨터들을 하나의 클러스터로 묶습니다.** 게임용 PC, 업무용 노트북, 구석에 있는 2014년 iMac을 하나의 사설 클러스터로 묶어 배치 작업을 나눠 돌립니다. Linux, macOS, Windows와 x86_64, ARM64에서 같은 Rust 단일 바이너리 하나로 동작합니다. 클라우드 계정도 포트 포워딩도 필요 없습니다. 기기들은 NAT 뒤에서도 서로 연결됩니다.
+
+> [English README](README.md)
+
+![대시보드에서 작업이 네 기기로 퍼지는 모습](docs/images/dashboard-demo.gif)
+
+*태스크 24개짜리 작업이 도는 동안의 내장 대시보드입니다(Linux 한 대에 에이전트 넷을 띄운 데모 클러스터).*
+
+태스크는 같은 작업 명세로 세 가지 방식 중 하나로 실행됩니다.
+
+- **WebAssembly** 모듈: 샌드박스 안에서, 모든 기기에서 돕니다.
+- **Docker** 이미지: Python, 원하는 패키지, GPU, 선택적 네트워크를 쓰며 허용한 기기에서 돕니다.
+- **microVM**: 같은 이미지를 태스크마다 자기 커널을 가진 VM 안에서 돌립니다. 남이 빌려준 기기에도 보낼 수 있을 만큼 격리됩니다.
+
+들어 있는 것:
+
+- [Windows](#windows)와 [Mac, 구형 Intel Mac까지](#mac-구형-intel-mac까지) 세 실행 방식을 모두 지원합니다.
+- [GPU](#gpu-작업): Docker에서 NVIDIA와 CUDA, 그리고 [WebGPU로 어떤 GPU든](#webgpu-wasm-작업에서-어떤-gpu든-실험)(실험).
+- 서버가 아닌 기기: [쉬고 있을 때, 전원에 꽂혀 있을 때, 밤에만](#기기가-일을-받는-때-가용-정책) 일을 받게 할 수 있고, [잠드는 기기](#잠드는-기기)도 다룹니다(Wake-on-LAN 포함).
+- [웹 대시보드](#웹-대시보드), [모니터링과 경보](#모니터링과-경보), [파일 저장소](#클러스터-파일-저장소), [k8s 방식의 클러스터 관리](#클러스터-관리)(레이블, 쿼터, 우선순위, 드레인).
+- [HTTP API](#어디서든-클러스터-쓰기-http-api): CI, 클라우드 샌드박스, 내 프로그램 등 어디서든 클러스터를 씁니다.
+- [다른 사람의 기기](#다른-사람의-기기-초대-컴퓨팅-유닛-검증): 초대로 받고, 서명된 사용 영수증과 결과 표본 검증을 붙입니다.
+- [OS 서비스](#에이전트컨트롤-플레인대시보드를-서비스로-실행), [서명된 일괄 업그레이드](#모든-에이전트를-한-번에-업그레이드), [컨트롤 플레인 복제본](#컨트롤-플레인-복제본과-백업), [SSO와 감사 로그](#조직에서-운영하기-sso-감사-로그-운영-문서).
+
+품앗이는 이웃끼리 서로 일을 거들어 주며 품을 갚는 우리 풍습입니다.
+
+**상태.** 지금 1.5이고, Windows PC 여러 대(한 대는 RTX 3080)와 2014년 iMac으로 이뤄진 집 클러스터에서 매일 돌고 있습니다. 내부 보안 점검은 마쳤지만 외부 감사는 아직 받지 않았습니다([SECURITY.md](SECURITY.md)). 아직 안 된 것은 [로드맵](#로드맵)에 적어 두었습니다. 버그 제보와 질문은 [이슈](https://github.com/syang0531/pumasi/issues)로 주세요.
 
 ## 설치
 
@@ -18,28 +45,77 @@ curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.
 irm https://github.com/syang0531/pumasi/releases/latest/download/install.ps1 | iex
 ```
 
-옵션: `--version v0.4.0` / `-Version`, `--dir` / `-Dir`. 참가 티켓을 주면 에이전트를 서비스로도 설치합니다: `curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, 또는 `& ([scriptblock]::Create((irm .../install.ps1))) -Ticket pumasijoin...`. 저장소가 비공개인 동안에는 읽기 권한이 있는 토큰을 `GITHUB_TOKEN`에 넣으면 GitHub API로 받습니다. 소스에서 빌드하려면 `cargo build --release -p pumasi-cli`.
+옵션: `--version v1.5.0` / `-Version`, `--dir` / `-Dir`. 참가 티켓을 주면 에이전트를 [서비스](#에이전트컨트롤-플레인대시보드를-서비스로-실행)로도 설치합니다: `curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, 또는 `& ([scriptblock]::Create((irm .../install.ps1))) -Ticket pumasijoin...`. 소스에서 빌드하려면 `cargo build --release -p pumasi-cli`.
 
-## 빠른 시작
+## 5분 만에 써 보기
+
+한 대로도 써 볼 수 있습니다. 잘 되면 다른 기기를 더하세요.
 
 ```sh
-# 1번 기기: 컨트롤 플레인 시작. 참가 명령이 출력됩니다.
+# 1. 한 기기에서: 컨트롤 플레인 시작. 참가 명령이 출력됩니다.
 pumasi cluster start --name homelab
 
-# 2~N번 기기: 출력된 참가 명령을 붙여 넣습니다.
+# 2. 일을 받을 기기마다(첫 기기도 다른 터미널에서): 출력된 참가 명령을 붙여 넣습니다.
 pumasi agent join pumasijoin...
 
-# 관리자 티켓이 있는 곳(기본은 1번 기기)에서:
+# 3. 관리자 티켓이 있는 곳(기본은 첫 기기)에서:
 pumasi status
 ```
 
-샘플 작업(몬테카를로로 원주율 추정, 16개 샤드):
+```
+cluster homelab (851765067d)
+
+NODE         NAME             STATE     ROLE     PLATFORM       VERSION   EXECUTORS    SLOTS  RUNNING  ...
+e993d728f5   attic-server     online    owner    linux/x86_64   1.5.0     wasm             2        0
+67d944c4ec   desk-pc          online    owner    linux/x86_64   1.5.0     wasm             2        0
+4cf0f33834   mini             online    owner    linux/x86_64   1.5.0     wasm             2        0
+8d2920d244   old-laptop       online    owner    linux/x86_64   1.5.0     wasm             2        0
+
+ready for account owner now: wasm 4, docker 0, microvm 0, GPU 0
+```
+
+샘플 작업(몬테카를로로 원주율 추정, 16개 샤드)을 돌립니다. WebAssembly 모듈이 빌드된 채로 저장소에 들어 있어서 따로 설치할 것이 없습니다.
 
 ```sh
-rustup target add wasm32-wasip1
-cargo build --release --target wasm32-wasip1 --manifest-path examples/montecarlo/Cargo.toml
+git clone --depth 1 https://github.com/syang0531/pumasi && cd pumasi
 pumasi run examples/montecarlo/job.toml --output
 ```
+
+```
+submitted job 5baf22a6d3ea911c (16 tasks)
+running: 0/16 done, 8 running, 0 failed
+running: 8/16 done, 8 running, 0 failed
+succeeded: 16/16 done, 0 running, 0 failed
+job 5baf22a6d3ea911c "estimate-pi": succeeded
+  executor wasm
+  submitted by cluster admin
+  account owner  cost 0 CU  deterministic
+  tasks 16  succeeded 16  failed 0  fuel 6000109645
+  [0] ok node=mini attempts=1 44ms
+0 3926363 5000000
+  [1] ok node=old-laptop attempts=1 42ms
+...
+```
+
+샤드 출력은 같은 모듈로 내 컴퓨터에서 합칩니다.
+
+```sh
+pumasi run examples/montecarlo/job.toml -o | grep -E '^[0-9]+ ' \
+  | pumasi exec examples/montecarlo/montecarlo.wasm reduce
+# pi ~= 3.141691 from 80000000 samples in 16 shards
+```
+
+이제 대시보드를 엽니다. 바이너리에 들어 있고 내 컴퓨터에서 돕니다.
+
+```sh
+pumasi ui
+```
+
+![대시보드 개요 화면](docs/images/dashboard-overview.png)
+
+다음으로 [Docker에서 Python](#docker-작업-python-파일-그-밖의-무엇이든)을 돌리거나, 재부팅해도 클러스터가 유지되도록 [서비스](#에이전트컨트롤-플레인대시보드를-서비스로-실행)로 설치하거나, [다른 네트워크](#다른-네트워크의-기기와-자체-릴레이)의 기기를 더해 보세요. 샘플을 바꾸려면 `examples/montecarlo/src/main.rs`를 고치고 다시 빌드합니다(명령 두 줄이 그 폴더의 `job.toml`에 있습니다).
+
+## 안내서
 
 ### Docker 작업: Python, 파일, 그 밖의 무엇이든
 
@@ -786,6 +862,14 @@ Windows 릴리스 바이너리에 서명을 붙이는 중입니다([docs/signing
 - 승인자: [syang0531](https://github.com/syang0531)
 
 개인정보: Pumasi에는 원격 측정(telemetry)이 없습니다. 이 프로그램은 사용자나 설치·운영하는 사람이 요청하지 않는 한 다른 네트워크 시스템에 어떤 정보도 보내지 않습니다. 운영자가 설정한 것은 다른 시스템과 통신합니다: 클러스터의 기기들, 다른 네트워크의 기기를 잇는 릴레이 서버(기본은 n0의 공개 iroh 릴레이이며 암호화된 트래픽만 봄, `--relay`로 직접 운영하는 릴레이 지정), 작업이 지정한 이미지의 컨테이너 레지스트리, `pumasi vm setup`과 설치 스크립트가 받는 GitHub·Firecracker·Windows용 QEMU 배포처, 기밀 작업의 AMD·Intel 증명 서비스, 클러스터 설정에 적은 웹훅과 ID 공급자.
+
+## 기여
+
+실제로 써 본 이야기가 가장 큰 도움이 됩니다. 어떤 기기를 묶었고, 무엇을 돌렸고, 어디서 막히거나 불편했는지 [이슈](https://github.com/syang0531/pumasi/issues/new/choose)로 알려 주세요. 한국어로 쓰셔도 됩니다. 풀 리퀘스트는 [CONTRIBUTING.md](CONTRIBUTING.md), 보안 취약점을 비공개로 알리는 방법은 [SECURITY.md](SECURITY.md)에 있습니다.
+
+## 후원
+
+Pumasi는 무료이고 Apache-2.0입니다. 쓸모가 있었다면 [GitHub Sponsors](https://github.com/sponsors/syang0531)로 개발을 후원할 수 있습니다.
 
 ## 라이선스
 

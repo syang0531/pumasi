@@ -390,6 +390,10 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
                 }
                 ticks += 1;
                 inner.state().tick(inner.config.node_timeout);
+                if ticks.is_multiple_of(10) {
+                    let admin = inner.admin_secret();
+                    inner.state().tick_sessions(&admin);
+                }
                 // Keep the advertised address fresh (relay may change).
                 let fresh = inner.endpoint.addr();
                 if !fresh.addrs.is_empty() {
@@ -773,6 +777,7 @@ impl Cluster {
                 st.keep_open_steps();
                 st.flush_monitor();
                 st.save_links(true);
+                st.save_sessions();
             }
             if let Some(ha) = self.shared.ha() {
                 // Give the last writes a moment to commit.
@@ -1305,6 +1310,11 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     st.on_heartbeat(&node_id, generation);
                     st.on_probe(&node_id, generation, *r);
                 }
+                Ok(Some(FromAgent::Settings { report, error })) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_settings(&node_id, generation, *report, error);
+                }
                 Ok(Some(FromAgent::Tee(r))) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
@@ -1479,12 +1489,32 @@ impl ProtocolHandler for AdminHandler {
 /// Runs one ticket-holding admin call: checks the ticket and its role,
 /// runs the call, filters the reply, and writes the audit log.
 async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str) -> AdminResponse {
-    let caller = if secrets_eq(secret, &inner.admin_secret()) {
-        Some(Caller::Admin {
-            name: "cluster admin".into(),
-        })
-    } else {
-        inner.state().access_caller(secret)
+    let admin = inner.admin_secret();
+    let by_ticket = |st: &crate::state::State, secret: &Secret| {
+        if secrets_eq(secret, &admin) {
+            Some(Caller::Admin {
+                name: "cluster admin".into(),
+            })
+        } else {
+            st.access_caller(secret)
+        }
+    };
+    // A dashboard session (1.7) acts as the ticket it signed in with.
+    let (caller, session) = {
+        let mut st = inner.state();
+        match by_ticket(&st, secret) {
+            Some(c) => (Some(c), None),
+            None => match st.find_session(secret) {
+                Some(found) => match by_ticket(&st, &found.parent) {
+                    Some(c) => (Some(c), Some(found)),
+                    None => {
+                        st.end_sessions(&[found.hash], "its ticket is gone");
+                        (None, None)
+                    }
+                },
+                None => (None, None),
+            },
+        }
     };
     let Some(caller) = caller else {
         return AdminResponse::Error(
@@ -1492,6 +1522,15 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
         );
     };
     let who = crate::audit::Actor::caller(&caller, peer);
+    if matches!(
+        op,
+        AdminOp::StartSession { .. }
+            | AdminOp::Sessions
+            | AdminOp::RevokeSession { .. }
+            | AdminOp::EndSession
+    ) {
+        return session_call(inner, secret, &caller, session, op, &who);
+    }
     let admitted = {
         let st = inner.state();
         let refused = crate::audit::refused_action(&op);
@@ -1531,6 +1570,57 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
         }
     };
     access::scope(&caller, resp)
+}
+
+/// The session calls (1.7): any ticket starts sessions for itself and
+/// sees and ends its own; an admin sees and ends every one.
+fn session_call(
+    inner: &Arc<Inner>,
+    secret: &Secret,
+    caller: &Caller,
+    session: Option<crate::sessions::Found>,
+    op: AdminOp,
+    who: &crate::audit::Actor,
+) -> AdminResponse {
+    let parent = session.as_ref().map_or(*secret, |s| s.parent);
+    let current = session.as_ref().map(|s| s.hash);
+    let of = (!matches!(caller, Caller::Admin { .. })).then_some(&parent);
+    let mut st = inner.state();
+    let res: Result<AdminResponse> = match op {
+        AdminOp::StartSession { label } => {
+            if session.is_some() {
+                Err(anyhow::anyhow!("a session cannot start another session"))
+            } else {
+                st.start_session(parent, &label).map(|(secret, view)| {
+                    st.audit(who, "session.start", view.id.clone(), view.label.clone(), true);
+                    AdminResponse::Session { secret, view }
+                })
+            }
+        }
+        AdminOp::Sessions => Ok(AdminResponse::Sessions(
+            st.list_sessions(of, current.as_ref()),
+        )),
+        AdminOp::RevokeSession { id } => match st.revoke_session(&id, of) {
+            Ok(v) => {
+                st.audit(who, "session.revoke", v.id.clone(), format!("{} ({})", v.name, v.label), true);
+                Ok(AdminResponse::Sessions(st.list_sessions(of, current.as_ref())))
+            }
+            Err(e) => {
+                st.audit(who, "session.revoke", id.clone(), format!("{e:#}"), false);
+                Err(e)
+            }
+        },
+        AdminOp::EndSession => match current {
+            Some(h) => {
+                st.end_sessions(&[h], "signed out");
+                st.audit(who, "session.end", pumasi_proto::ui::session_id(&h), String::new(), true);
+                Ok(AdminResponse::Ok)
+            }
+            None => Err(anyhow::anyhow!("this call was not made with a session")),
+        },
+        _ => Err(anyhow::anyhow!("not a session call")),
+    };
+    res.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))
 }
 
 /// Sign-in calls (phase 17), which need no ticket: the control plane
@@ -1761,38 +1851,80 @@ async fn handle_release_admin(
             }
             Ok(view(inner))
         }
-        AdminOp::UpgradeToLatest { version, force } => {
-            let res = (|| {
-                let tag = version
-                    .as_deref()
-                    .map(crate::latest::check_tag)
-                    .transpose()?;
-                let mut l = inner.latest.lock().unwrap();
-                if let pumasi_proto::release::FetchState::Running { version, .. } = &l.fetch {
-                    anyhow::bail!("already downloading {version}; wait for it to finish");
-                }
-                l.fetch = pumasi_proto::release::FetchState::Running {
-                    version: tag.clone().unwrap_or_else(|| "latest".into()),
-                    step: "looking up the release".into(),
-                    started_unix: crate::state::now_unix(),
-                };
-                Ok(tag)
-            })();
-            match res {
-                Ok(tag) => {
-                    tokio::spawn(upgrade_to_latest(inner.shared.clone(), tag, force));
-                    Ok(view(inner))
-                }
+        AdminOp::SetNodeSettings { node, settings } => {
+            set_node_settings(inner, &node, *settings).await
+        }
+        AdminOp::CanaryUpgradeToLatest {
+            version,
+            force,
+            canary,
+        } => {
+            // A selector that picks no node fails now, not after the
+            // download.
+            let checked = inner.state().new_canary((*canary).clone(), Vec::new());
+            match checked {
+                Ok(_) => start_latest(inner, version, force, Some(*canary)).map(|_| view(inner)),
                 Err(e) => Err(e),
             }
+        }
+        AdminOp::UpgradeToLatest { version, force } => {
+            start_latest(inner, version, force, None).map(|_| view(inner))
         }
         other => return Err(other),
     })
 }
 
+/// Starts downloading a published release in the background.
+fn start_latest(
+    inner: &Arc<Inner>,
+    version: Option<String>,
+    force: bool,
+    canary: Option<pumasi_proto::release::CanarySpec>,
+) -> Result<()> {
+    let tag = version
+        .as_deref()
+        .map(crate::latest::check_tag)
+        .transpose()?;
+    {
+        let mut l = inner.latest.lock().unwrap();
+        if let pumasi_proto::release::FetchState::Running { version, .. } = &l.fetch {
+            anyhow::bail!("already downloading {version}; wait for it to finish");
+        }
+        l.fetch = pumasi_proto::release::FetchState::Running {
+            version: tag.clone().unwrap_or_else(|| "latest".into()),
+            step: "looking up the release".into(),
+            started_unix: crate::state::now_unix(),
+        };
+    }
+    tokio::spawn(upgrade_to_latest(inner.shared.clone(), tag, force, canary));
+    Ok(())
+}
+
+/// Sends a node new settings and waits for its agent's answer.
+async fn set_node_settings(
+    inner: &Arc<Inner>,
+    node: &str,
+    settings: pumasi_proto::ui::NodeSettings,
+) -> Result<AdminResponse> {
+    let (id, reply) = inner.state().request_settings(node, settings)?;
+    match tokio::time::timeout(Duration::from_secs(20), reply).await {
+        Ok(Ok(Ok(_))) => Ok(AdminResponse::NodeSettings(Box::new(
+            inner.state().node_settings(&id)?,
+        ))),
+        Ok(Ok(Err(e))) => anyhow::bail!("the node did not change its settings: {e}"),
+        Ok(Err(_)) => anyhow::bail!("the node went offline before it answered"),
+        Err(_) => anyhow::bail!("the node did not answer within 20 seconds"),
+    }
+}
+
 /// Downloads a published release and starts its rollout, recording how
 /// far it got in `shared.latest`.
-async fn upgrade_to_latest(shared: Arc<Shared>, tag: Option<String>, force: bool) {
+async fn upgrade_to_latest(
+    shared: Arc<Shared>,
+    tag: Option<String>,
+    force: bool,
+    canary: Option<pumasi_proto::release::CanarySpec>,
+) {
     use pumasi_proto::release::{FetchState, Target, is_older, same_version};
     let source = shared.config.release_source.clone();
     let started = crate::state::now_unix();
@@ -1872,7 +2004,9 @@ async fn upgrade_to_latest(shared: Arc<Shared>, tag: Option<String>, force: bool
         }
         {
             let mut st = inner.state();
-            st.start_rollout(files, force, |f| shared.releases.has(&f.sha256, f.size))?;
+            st.start_rollout_with(files, force, canary, |f| {
+                shared.releases.has(&f.sha256, f.size)
+            })?;
             shared.releases.prune(&st.rollout_hashes());
             st.event(
                 pumasi_proto::monitor::EventLevel::Info,
@@ -2228,6 +2362,30 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             Ok(AdminResponse::Rollout(view))
         }
         AdminOp::RolloutStatus => Ok(AdminResponse::Rollout(inner.state().rollout_view())),
+        AdminOp::CanaryRollout {
+            files,
+            force,
+            canary,
+        } => {
+            let mut st = inner.state();
+            let view = st.start_rollout_with(files, force, Some(*canary), |f| {
+                inner.releases.has(&f.sha256, f.size)
+            })?;
+            inner.releases.prune(&st.rollout_hashes());
+            Ok(AdminResponse::Rollout(view))
+        }
+        AdminOp::Canary => Ok(AdminResponse::Canary(
+            inner.state().canary_view().map(Box::new),
+        )),
+        AdminOp::PromoteCanary { nodes } => Ok(AdminResponse::Canary(
+            inner
+                .state()
+                .promote_canary(&nodes, caller.name())?
+                .map(Box::new),
+        )),
+        AdminOp::NodeSettings { node } => Ok(AdminResponse::NodeSettings(Box::new(
+            inner.state().node_settings(&node)?,
+        ))),
         AdminOp::CancelRollout => {
             inner.state().cancel_rollout()?;
             Ok(AdminResponse::Ok)

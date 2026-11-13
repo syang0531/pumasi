@@ -476,6 +476,11 @@ pub struct State {
     pub(crate) power: crate::power::PowerState,
     /// The network between nodes (1.6).
     pub(crate) net: crate::net::NetState,
+    /// Dashboard sessions (1.7).
+    pub(crate) ui: crate::sessions::SessionState,
+    /// Canary rollouts and node settings (1.7).
+    pub(crate) canary: Option<crate::canary::CanaryRecord>,
+    pub(crate) settings: crate::canary::SettingsState,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -557,6 +562,9 @@ impl State {
             names: Default::default(),
             power: Default::default(),
             net: Default::default(),
+            ui: Default::default(),
+            canary: None,
+            settings: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -659,6 +667,8 @@ impl State {
         })?;
         state.load_monitor(Duration::from_secs(7 * 86_400))?;
         state.load_net()?;
+        state.load_sessions()?;
+        state.canary = state.load_canary()?;
         state.load_conf(snap.measurements, snap.trusted_nodes);
         state.load_audit()?;
         state.load_sso()?;
@@ -854,6 +864,7 @@ impl State {
     pub fn remove_node(&mut self, id: &str) -> Result<()> {
         let id = self.resolve_node(id)?;
         let id = id.as_str();
+        self.forget_settings(id);
         let name = self.node_name(id);
         self.event(
             EventLevel::Info,
@@ -1035,6 +1046,8 @@ impl State {
         node.online = false;
         node.tx = None;
         self.files.caches.remove(id);
+        // A settings change waiting for its answer gets "went offline".
+        self.settings.drop_waiters(id);
         node.perf.challenge = None;
         node.gpu = GpuRuntime::default();
         if let Some(kill) = node.kill.take() {
@@ -1473,6 +1486,7 @@ impl State {
         } else {
             self.set_stored(r.job, r.index, stored);
             self.note_run(node_id, r, &report.outcome);
+            self.canary_note_run(node_id, &report.outcome);
             // No part of a run took longer than the run was out.
             if let Some(t) = timing
                 && let Some(task) = self

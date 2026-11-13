@@ -59,10 +59,10 @@ async fn render(st: &St, l: Lang, error: Option<&str>, status: StatusCode) -> Re
 }
 
 /// Starts a session for an access ticket the control plane just made.
-async fn session_from(st: &St, ticket: &str) -> anyhow::Result<String> {
+async fn session_from(st: &St, ticket: &str, label: &str) -> anyhow::Result<String> {
     let t = auth::parse_ticket(st, ticket)?;
     let ident = auth::identify(st, t.secret).await?;
-    Ok(st.sessions.create(ident))
+    Ok(auth::start_session(st, ident, label).await)
 }
 
 /// Sends the browser to the OpenID Connect provider.
@@ -148,7 +148,9 @@ pub async fn sso_callback(
             .call([0; 32], AdminOp::SsoFinish { state, code })
             .await?
         {
-            AdminResponse::AccessTicket { ticket, .. } => session_from(&st, &ticket).await,
+            AdminResponse::AccessTicket { ticket, .. } => {
+                session_from(&st, &ticket, &auth::label(&headers, ip)).await
+            }
             _ => anyhow::bail!("unexpected response"),
         }
     }
@@ -219,7 +221,9 @@ pub async fn ldap(
             )
             .await?
         {
-            AdminResponse::AccessTicket { ticket, .. } => session_from(&st, &ticket).await,
+            AdminResponse::AccessTicket { ticket, .. } => {
+                session_from(&st, &ticket, &auth::label(&headers, ip)).await
+            }
             _ => anyhow::bail!("unexpected response"),
         }
     }
@@ -284,7 +288,10 @@ pub async fn page(
             .await;
         }
         return match auth::identify(&st, st.backend.own_secret()).await {
-            Ok(ident) => signed_in(&st, &st.sessions.create(ident)),
+            Ok(ident) => {
+                let id = auth::start_session(&st, ident, &auth::label(&headers, ip)).await;
+                signed_in(&st, &id)
+            }
             Err(e) => render(&st, l, Some(&format!("{e:#}")), StatusCode::BAD_GATEWAY).await,
         };
     }
@@ -317,7 +324,10 @@ pub async fn submit(
     }
     .await;
     match res {
-        Ok(ident) => signed_in(&st, &st.sessions.create(ident)),
+        Ok(ident) => {
+            let id = auth::start_session(&st, ident, &auth::label(&headers, ip)).await;
+            signed_in(&st, &id)
+        }
         Err(e) => {
             let msg = format!("{e:#}");
             let status = crate::pages::status_for(&msg);
@@ -338,7 +348,7 @@ pub async fn logout(State(st): State<St>, headers: HeaderMap) -> Response {
     // Logging out needs no CSRF token: the worst a forged one does is
     // sign someone out.
     if let Some(id) = auth::cookie(&headers, SESSION_COOKIE) {
-        st.sessions.remove(&id);
+        auth::end_session(&st, &id).await;
     }
     (
         [

@@ -67,6 +67,9 @@ pub enum AgentExit {
     Upgraded { version: String },
     /// The new binary did not work; the previous one was put back.
     RolledBack { reason: String },
+    /// New settings from the cluster are written to the service's
+    /// options file (1.7); restart to run with them.
+    Reconfigured,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

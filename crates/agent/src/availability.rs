@@ -141,6 +141,11 @@ pub fn parse_hours(s: &str) -> Result<Vec<HourRange>> {
 
 struct HourList<'a>(&'a [HourRange]);
 
+/// Hours as `--hours` takes them: `22:00-07:00,12:00-13:00`.
+pub fn hours_text(hours: &[HourRange]) -> String {
+    HourList(hours).to_string()
+}
+
 impl fmt::Display for HourList<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, h) in self.0.iter().enumerate() {

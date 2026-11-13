@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, protocol::Router};
 use pumasi_proto::{
     AGENT_ALPN, BLOBS_ALPN, ModuleHash, POWER_MINOR, PROBE_ALPN, PROTOCOL_MINOR, PROTOCOL_VERSION,
-    Secret,
+    SETTINGS_MINOR, Secret,
     job::{Executor, FileEntry, MAX_OUTPUT_FILES_BYTES, dir_files, read_files},
     monitor::METRICS_EVERY_SECS,
     msg::{
@@ -25,6 +25,7 @@ use pumasi_proto::{
     receipt::{SignedUsage, Usage, output_digest},
     store::{OutputMode, StoredOutput},
     ticket::JoinTicket,
+    ui::{NodeSettings, SettingsReport},
     wire::{read_msg, read_msg_tail, write_msg_tail},
 };
 use serde::{Deserialize, Serialize};
@@ -221,7 +222,32 @@ pub struct Agent {
     report_tails: ReportTails,
     /// The machine's sleep and wake (1.5).
     power: Arc<crate::power::Power>,
+    /// Where new settings from the dashboard go (1.7); `None` for an
+    /// agent started by hand.
+    settings_hook: Option<SettingsHook>,
+    /// New settings are written: what they are, until the agent restarts
+    /// with them once idle (it takes no new tasks meanwhile).
+    restarting: watch::Sender<Option<NodeSettings>>,
     _router: Router,
+}
+
+/// Lets the dashboard change an agent's availability settings (1.7): the
+/// agent's service options file and how to write settings into it. The
+/// CLI sets it for an agent run by `pumasi service run`.
+#[derive(Clone)]
+pub struct SettingsHook {
+    pub file: PathBuf,
+    /// Merges the settings into the file's options (called on a blocking
+    /// thread).
+    pub write: Arc<dyn Fn(&NodeSettings) -> Result<()> + Send + Sync>,
+}
+
+impl std::fmt::Debug for SettingsHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsHook")
+            .field("file", &self.file)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a session ended.
@@ -239,6 +265,8 @@ enum SessionEnd {
     Upgraded(String),
     /// The machine is going to sleep; the control plane was told.
     Slept,
+    /// New settings are written and no task runs: restart with them.
+    Reconfigured,
 }
 
 /// How an upgrade that did not install ended.
@@ -513,8 +541,80 @@ impl Agent {
             sampler: Arc::new(Mutex::new(sampler)),
             key_waiters: Default::default(),
             report_tails: Default::default(),
+            settings_hook: None,
+            restarting: watch::channel(None).0,
             _router: router,
         })
+    }
+
+    /// Lets the dashboard change this agent's settings through `hook`
+    /// (1.7).
+    pub fn with_settings_hook(mut self, hook: SettingsHook) -> Self {
+        self.settings_hook = Some(hook);
+        self
+    }
+
+    /// The availability settings this agent runs with, as options.
+    pub fn settings(&self) -> NodeSettings {
+        let policy = self.config.availability.as_ref().map(|a| &a.policy);
+        NodeSettings {
+            slots: self.config.slots,
+            max_cpu_percent: self.config.max_cpu_percent,
+            only_on_ac: policy.is_some_and(|p| p.only_on_ac),
+            idle_minutes: policy
+                .and_then(|p| p.idle_for)
+                .map(|d| d.as_secs().div_ceil(60)),
+            hours: policy
+                .map(|p| crate::availability::hours_text(&p.hours))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn settings_report(&self) -> SettingsReport {
+        let restarting = self.restarting.borrow().clone();
+        SettingsReport {
+            settings: restarting.clone().unwrap_or_else(|| self.settings()),
+            file: self
+                .settings_hook
+                .as_ref()
+                .map(|h| h.file.display().to_string()),
+            restarting: restarting.is_some(),
+        }
+    }
+
+    /// Applies settings from the dashboard: writes them to the options
+    /// file and restarts once idle. Answers with the report and why
+    /// nothing changed, if it did not.
+    async fn change_settings(&self, new: NodeSettings) -> (SettingsReport, Option<String>) {
+        let Some(hook) = self.settings_hook.clone() else {
+            return (
+                self.settings_report(),
+                Some(
+                    "this agent was started by hand with its options on the command line, so it cannot keep new ones"
+                        .into(),
+                ),
+            );
+        };
+        if let Err(e) = new.validate() {
+            return (self.settings_report(), Some(format!("{e:#}")));
+        }
+        let pending = self.restarting.borrow().clone();
+        if pending.is_none() && new == self.settings() {
+            return (self.settings_report(), None);
+        }
+        let s = new.clone();
+        let written = tokio::task::spawn_blocking(move || (hook.write)(&s))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .and_then(|r| r);
+        match written {
+            Ok(()) => {
+                info!(settings = %new.describe(), "new settings written; restarting with them once idle");
+                self.restarting.send_replace(Some(new));
+                (self.settings_report(), None)
+            }
+            Err(e) => (self.settings_report(), Some(format!("{e:#}"))),
+        }
     }
 
     /// The signed device profile (GPUs, microVM networking).
@@ -649,6 +749,9 @@ impl Agent {
             if let Some(version) = version {
                 return Ok(AgentExit::Upgraded { version });
             }
+            if self.restarting.borrow().is_some() {
+                return Ok(AgentExit::Reconfigured);
+            }
             let (target, count) = {
                 let c = candidates.lock().unwrap();
                 let t = hint.take().unwrap_or_else(|| c[next % c.len()].clone());
@@ -682,6 +785,7 @@ impl Agent {
                     bail!("cluster rejected this node: {reason}")
                 }
                 SessionEnd::Upgraded(version) => return Ok(AgentExit::Upgraded { version }),
+                SessionEnd::Reconfigured => return Ok(AgentExit::Reconfigured),
                 SessionEnd::Slept => {
                     trial = None;
                     info!("asleep; reconnecting when the machine wakes");
@@ -769,7 +873,10 @@ impl Agent {
             join_secret: *join_secret,
             node,
             upgrade: self.upgrader.as_ref().map(|u| u.hello()),
-            availability: available.borrow_and_update().clone(),
+            availability: effective(
+                &available.borrow_and_update(),
+                &self.restarting.borrow(),
+            ),
         };
         // A control plane older than 1.5 ignores what follows the hello.
         let hello_tail = HelloTail {
@@ -1016,17 +1123,49 @@ impl Agent {
 
         // Availability changes, as they happen (the hello carried the
         // state at connect time).
+        // A settings change waiting to restart pauses the node (1.7).
         let availability = {
             let out_tx = out_tx.clone();
+            let mut restarting = self.restarting.subscribe();
+            let mut last = effective(&available.borrow(), &restarting.borrow_and_update());
             tokio::spawn(async move {
-                while available.changed().await.is_ok() {
-                    let now = available.borrow_and_update().clone();
+                // Without an availability policy nothing ever sends on
+                // `available`.
+                let mut policy = true;
+                loop {
+                    tokio::select! {
+                        r = available.changed(), if policy => {
+                            if r.is_err() {
+                                policy = false;
+                                continue;
+                            }
+                        }
+                        r = restarting.changed() => {
+                            if r.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    let now = effective(&available.borrow_and_update(), &restarting.borrow_and_update());
+                    if now == last {
+                        continue;
+                    }
+                    last = now.clone();
                     if out_tx.send(FromAgent::Availability(now)).is_err() {
                         break;
                     }
                 }
             })
         };
+        // The settings, for a control plane that edits them (1.7).
+        let knows_settings = cp_minor >= SETTINGS_MINOR;
+        if knows_settings {
+            let _ = out_tx.send(FromAgent::Settings {
+                report: Box::new(self.settings_report()),
+                error: None,
+            });
+        }
+        let mut restart_check = tokio::time::interval(Duration::from_millis(500));
 
         // An upgrade in progress reports a failure here; a success shows
         // in `installed`.
@@ -1068,6 +1207,23 @@ impl Agent {
                     writer.abort();
                     conn.close(0u32.into(), b"upgrading");
                     return SessionEnd::Upgraded(version);
+                }
+                _ = restart_check.tick(), if self.restarting.borrow().is_some() => {
+                    if !running.lock().unwrap().is_empty() {
+                        continue;
+                    }
+                    // The settings answer goes out first.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    self.power.session(false);
+                    heartbeat.abort();
+                    metrics.abort();
+                    availability.abort();
+                    if let Some(b) = &benchmarks {
+                        b.abort();
+                    }
+                    writer.abort();
+                    conn.close(0u32.into(), b"restarting with new settings");
+                    return SessionEnd::Reconfigured;
                 }
                 Some((sha, end)) = up_rx.recv() => {
                     upgrading = false;
@@ -1160,6 +1316,18 @@ impl Agent {
                         }
                         let _ = up_tx.send((sha, end));
                     });
+                }
+                Ok(Some(ToAgent::Settings(new))) => {
+                    let (report, error) = self.change_settings(*new).await;
+                    if let Some(e) = &error {
+                        warn!("settings from the cluster not applied: {e}");
+                    }
+                    if knows_settings {
+                        let _ = out_tx.send(FromAgent::Settings {
+                            report: Box::new(report),
+                            error,
+                        });
+                    }
                 }
                 Ok(Some(ToAgent::Assign(mut a))) => {
                     // Cache shared files and compile modules here, in message
@@ -1720,6 +1888,17 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// What the node tells the control plane: paused while new settings
+/// wait for the restart, else what its policy says.
+fn effective(policy: &Availability, restarting: &Option<NodeSettings>) -> Availability {
+    match restarting {
+        Some(_) => Availability::Paused {
+            reason: "restarting with new settings once its tasks end".into(),
+        },
+        None => policy.clone(),
+    }
 }
 
 fn log_availability(a: &Availability) {

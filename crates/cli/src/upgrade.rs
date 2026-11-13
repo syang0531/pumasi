@@ -9,12 +9,47 @@ use pumasi_proto::{
     PROTOCOL_VERSION,
     msg::{AdminOp, AdminResponse, RELEASE_CHUNK, RolloutView, UpgradeState},
     release::{
-        FetchState, LatestReleaseView, ReleaseFile, detect_target, hex, is_older, read_build_info,
-        sha256,
+        CanaryPhase, CanaryView, FetchState, LatestReleaseView, ReleaseFile, detect_target, hex,
+        is_older, read_build_info, sha256,
     },
 };
 
 use crate::{AdminArgs, connect_admin, short, truncate, utc};
+
+/// Canaries (1.7): nodes that take the release first.
+#[derive(clap::Args, Clone, Default)]
+pub struct CanaryArgs {
+    /// Upgrade these nodes first (a name, names separated by commas, or a
+    /// label selector such as `os=windows`); the others follow once these
+    /// run the new binary and have worked cleanly for --canary-soak.
+    #[arg(long, value_name = "NODE|SELECTOR")]
+    pub canary: Option<String>,
+    /// How long the canaries run the new binary before the rest follow.
+    #[arg(long, value_name = "DURATION", default_value = "30m", requires = "canary")]
+    pub canary_soak: String,
+    /// Tasks each canary must finish on the new binary first.
+    #[arg(long, value_name = "N", default_value_t = 0, requires = "canary")]
+    pub canary_tasks: u32,
+    /// Wait for `pumasi upgrade promote` instead of going on by itself.
+    #[arg(long, requires = "canary")]
+    pub canary_hold: bool,
+}
+
+impl CanaryArgs {
+    pub fn spec(&self) -> Result<Option<pumasi_proto::release::CanarySpec>> {
+        let Some(nodes) = &self.canary else {
+            return Ok(None);
+        };
+        let spec = pumasi_proto::release::CanarySpec {
+            nodes: pumasi_proto::manage::Selector::nodes(nodes)?,
+            soak_secs: pumasi_proto::job::parse_duration_ms(&self.canary_soak)? / 1000,
+            min_tasks: self.canary_tasks,
+            hold: self.canary_hold,
+        };
+        spec.validate()?;
+        Ok(Some(spec))
+    }
+}
 
 #[derive(Subcommand)]
 pub enum UpgradeCmd {
@@ -38,6 +73,8 @@ pub enum UpgradeCmd {
         /// Give up waiting after this long, e.g. 10m.
         #[arg(long, default_value = "15m")]
         timeout: String,
+        #[command(flatten)]
+        canary: CanaryArgs,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -67,10 +104,21 @@ pub enum UpgradeCmd {
         #[arg(long, default_value = "30m")]
         timeout: String,
         #[command(flatten)]
+        canary: CanaryArgs,
+        #[command(flatten)]
         admin: AdminArgs,
     },
     /// Show the current rollout and where each node stands.
     Status {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Let the rest of the cluster have a canary rollout's release now
+    /// (or, with NODE, only these nodes as well).
+    Promote {
+        /// Nodes to add to the canaries (names or id prefixes); none: every
+        /// node.
+        nodes: Vec<String>,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -88,8 +136,10 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
             force,
             wait,
             timeout,
+            canary,
             admin,
         } => {
+            let canary = canary.spec()?;
             let mut prepared = Vec::new();
             let mut targets = HashSet::new();
             for path in &files {
@@ -136,12 +186,19 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
                 eprintln!(" done");
             }
             let files = prepared.into_iter().map(|(_, f, _)| f).collect();
-            let AdminResponse::Rollout(view) =
-                client.call(AdminOp::Rollout { files, force }).await?
-            else {
+            let op = match canary {
+                Some(c) => AdminOp::CanaryRollout {
+                    files,
+                    force,
+                    canary: Box::new(c),
+                },
+                None => AdminOp::Rollout { files, force },
+            };
+            let AdminResponse::Rollout(view) = client.call(op).await? else {
                 bail!("unexpected response");
             };
             print_rollout(&view);
+            print_canary(&client).await;
             if !wait {
                 client.close().await;
                 return Ok(0);
@@ -157,11 +214,13 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
             force,
             wait,
             timeout,
+            canary,
             admin,
         } => {
             let timeout = Duration::from_millis(pumasi_proto::job::parse_duration_ms(&timeout)?);
+            let canary = canary.spec()?;
             let client = connect_admin(home, &admin).await?;
-            let code = latest(&client, version, check, force, wait, timeout).await;
+            let code = latest(&client, version, check, force, canary, wait, timeout).await;
             client.close().await;
             code
         }
@@ -170,8 +229,27 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
             let AdminResponse::Rollout(view) = client.call(AdminOp::RolloutStatus).await? else {
                 bail!("unexpected response");
             };
-            client.close().await;
             print_rollout(&view);
+            print_canary(&client).await;
+            client.close().await;
+            Ok(0)
+        }
+        UpgradeCmd::Promote { nodes, admin } => {
+            let client = connect_admin(home, &admin).await?;
+            let resp = client.call(AdminOp::PromoteCanary { nodes: nodes.clone() }).await?;
+            client.close().await;
+            let AdminResponse::Canary(view) = resp else {
+                bail!("unexpected response");
+            };
+            if nodes.is_empty() {
+                println!("promoted: every node gets the release now");
+            } else {
+                println!("{} join the canaries", nodes.join(", "));
+            }
+            if let Some(v) = view {
+                println!();
+                print_canary_view(&v);
+            }
             Ok(0)
         }
         UpgradeCmd::Cancel { admin } => {
@@ -191,11 +269,13 @@ async fn latest_view(client: &AdminClient, check: bool) -> Result<LatestReleaseV
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn latest(
     client: &AdminClient,
     version: Option<String>,
     check: bool,
     force: bool,
+    canary: Option<pumasi_proto::release::CanarySpec>,
     wait: bool,
     timeout: Duration,
 ) -> Result<i32> {
@@ -236,9 +316,15 @@ async fn latest(
         return Ok(0);
     }
     let deadline = tokio::time::Instant::now() + timeout;
-    let started = client
-        .call(AdminOp::UpgradeToLatest { version, force })
-        .await?;
+    let op = match canary {
+        Some(c) => AdminOp::CanaryUpgradeToLatest {
+            version,
+            force,
+            canary: Box::new(c),
+        },
+        None => AdminOp::UpgradeToLatest { version, force },
+    };
+    let started = client.call(op).await?;
     let AdminResponse::LatestRelease(_) = started else {
         bail!("unexpected response");
     };
@@ -274,6 +360,7 @@ async fn latest(
         bail!("unexpected response");
     };
     print_rollout(&view);
+    print_canary(client).await;
     if !wait {
         return Ok(0);
     }
@@ -319,6 +406,15 @@ async fn wait_rollout(client: &AdminClient, timeout: Duration) -> Result<i32> {
         let AdminResponse::Rollout(view) = client.call(AdminOp::RolloutStatus).await? else {
             bail!("unexpected response");
         };
+        // A canary that halted moves no further by itself.
+        if let Ok(AdminResponse::Canary(Some(c))) = client.call(AdminOp::Canary).await
+            && let CanaryPhase::Halted { reason } = &c.phase
+        {
+            print_rollout(&view);
+            println!();
+            print_canary_view(&c);
+            bail!("the rollout halted at the canaries: {reason}");
+        }
         let pending = view.nodes.iter().filter(|n| !settled(&n.state)).count();
         let line = format!("{pending} node(s) still upgrading");
         if line != last {
@@ -379,5 +475,51 @@ fn print_rollout(view: &RolloutView) {
     }
     if view.nodes.is_empty() {
         println!("(no nodes)");
+    }
+}
+
+/// The current rollout's canary, if it has one (nothing against a control
+/// plane before 1.7).
+async fn print_canary(client: &AdminClient) {
+    if let Ok(AdminResponse::Canary(Some(c))) = client.call(AdminOp::Canary).await {
+        println!();
+        print_canary_view(&c);
+    }
+}
+
+fn print_canary_view(c: &CanaryView) {
+    println!(
+        "canary: {} (soak {}, {} task(s) each{})",
+        c.spec.nodes,
+        pumasi_proto::monitor::human_duration(c.spec.soak_secs),
+        c.spec.min_tasks,
+        if c.spec.hold { ", promoted by hand" } else { "" }
+    );
+    match &c.phase {
+        CanaryPhase::Canary => println!(
+            "  waiting for {}",
+            c.waiting_for.as_deref().unwrap_or("the canaries")
+        ),
+        CanaryPhase::Promoted { unix, by } => {
+            println!("  promoted {} UTC ({by}): every node gets it", utc(*unix))
+        }
+        CanaryPhase::Halted { reason } => println!(
+            "  HALTED: {reason}\n  (`pumasi upgrade promote` goes on anyway, `pumasi upgrade cancel` stops)"
+        ),
+    }
+    for n in &c.canaries {
+        println!(
+            "  {:<16} {} · {} ok, {} failed",
+            truncate(&n.name, 16),
+            match n.upgraded_unix {
+                Some(t) => format!("upgraded {} UTC", utc(t)),
+                None => "not upgraded yet".into(),
+            },
+            n.tasks_ok,
+            n.tasks_failed
+        );
+    }
+    if !c.held.is_empty() {
+        println!("  held back: {}", c.held.join(", "));
     }
 }

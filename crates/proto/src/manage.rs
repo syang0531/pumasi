@@ -309,6 +309,24 @@ impl FromStr for Selector {
     }
 }
 
+impl Selector {
+    /// Nodes as people name them (1.7): a node name, names separated by
+    /// commas (`imac,gaming-pc`), or a label selector (`os=windows`), as
+    /// `--canary`, `alert silence --on` and the dashboard take them.
+    pub fn nodes(text: &str) -> Result<Selector> {
+        let s = text.trim();
+        ensure!(!s.is_empty(), "which nodes?");
+        let sel: Selector = if s.contains(['=', '!']) {
+            s.parse()?
+        } else {
+            let names: Vec<&str> = s.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+            format!("name={}", names.join("|")).parse()?
+        };
+        sel.validate()?;
+        Ok(sel)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Nodes
 // ---------------------------------------------------------------------------

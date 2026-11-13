@@ -1,6 +1,7 @@
 //! Pumasi cluster control plane: membership, job queue, scheduler.
 
 mod access;
+pub mod canary;
 pub mod attest;
 pub mod audit;
 pub mod backup;
@@ -23,6 +24,7 @@ pub mod remote;
 pub mod retention;
 pub mod rollout;
 pub mod server;
+pub mod sessions;
 pub mod sso;
 pub mod state;
 pub mod store;

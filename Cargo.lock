@@ -4643,6 +4643,7 @@ version = "1.6.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "crc32fast",
  "data-encoding",
  "iroh",

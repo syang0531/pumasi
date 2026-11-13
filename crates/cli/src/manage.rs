@@ -53,6 +53,15 @@ pub enum AccessCmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// List the dashboard's signed-in sessions (every one with an admin
+    /// ticket, else your ticket's), or end one with --revoke.
+    Sessions {
+        /// A session id (or a unique prefix) to end.
+        #[arg(long, value_name = "ID")]
+        revoke: Option<String>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -638,6 +647,37 @@ pub async fn access(home: &Path, cmd: AccessCmd) -> Result<i32> {
             };
             for v in gone {
                 eprintln!("revoked {} ticket \"{}\" ({})", v.role, v.name, v.id);
+            }
+            Ok(0)
+        }
+        AccessCmd::Sessions { revoke, admin } => {
+            let op = match &revoke {
+                Some(id) => AdminOp::RevokeSession { id: id.clone() },
+                None => AdminOp::Sessions,
+            };
+            let AdminResponse::Sessions(list) = call(home, &admin, op).await? else {
+                bail!("unexpected response");
+            };
+            if let Some(id) = revoke {
+                eprintln!("ended session {id}");
+            }
+            println!(
+                "{:<18} {:<20} {:<12} {:<20} {:<20} BROWSER",
+                "ID", "TICKET", "ROLE", "SIGNED IN (UTC)", "LAST USED (UTC)"
+            );
+            for v in &list {
+                println!(
+                    "{:<18} {:<20} {:<12} {:<20} {:<20} {}",
+                    v.id,
+                    truncate(&v.name, 20),
+                    truncate(&v.role.to_string(), 12),
+                    utc(v.created_unix),
+                    utc(v.last_used_unix),
+                    v.label
+                );
+            }
+            if list.is_empty() {
+                println!("(nobody is signed in to the dashboard)");
             }
             Ok(0)
         }

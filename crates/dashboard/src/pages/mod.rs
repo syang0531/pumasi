@@ -38,6 +38,8 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
         .route("/", get(overview::page))
         .route("/nodes", get(nodes::list))
         .route("/nodes/{node}", get(nodes::detail))
+        .route("/nodes/{node}/charts", get(nodes::chart_stream))
+        .route("/nodes/{node}/settings", post(nodes::settings))
         .route("/nodes/{node}/{action}", post(nodes::action))
         .route("/jobs", get(jobs::list).post(jobs::submit).layer(uploads))
         .route("/jobs/new", get(jobs::new))

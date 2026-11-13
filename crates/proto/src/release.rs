@@ -285,6 +285,77 @@ impl fmt::Display for FetchState {
     }
 }
 
+/// How long canaries run before the rest of the cluster gets a release,
+/// unless `--canary-soak` says otherwise.
+pub const DEFAULT_CANARY_SOAK_SECS: u64 = 30 * 60;
+
+/// A canary rollout (1.7): the nodes `nodes` selects install the release
+/// first; the others wait until every canary runs it and has, for
+/// `soak_secs` since, stayed connected and finished `min_tasks` tasks
+/// without a failure of its own. A canary that fails to upgrade, drops
+/// out or fails a task halts the rollout at the canaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanarySpec {
+    pub nodes: crate::manage::Selector,
+    pub soak_secs: u64,
+    /// Tasks each canary finishes cleanly on the new binary before the
+    /// rest follow.
+    pub min_tasks: u32,
+    /// Wait for `pumasi upgrade promote` instead of following by itself.
+    pub hold: bool,
+}
+
+impl CanarySpec {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(!self.nodes.is_empty(), "which nodes are the canaries?");
+        self.nodes.validate()?;
+        ensure!(
+            self.soak_secs <= 7 * 24 * 3600,
+            "a canary soaks for a week at most"
+        );
+        ensure!(self.min_tasks <= 10_000, "at most 10000 tasks per canary");
+        Ok(())
+    }
+}
+
+/// Where a canary rollout stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CanaryPhase {
+    /// The canaries are upgrading or soaking; the rest wait.
+    Canary,
+    /// The canaries passed (or an admin promoted them): every node gets
+    /// the release.
+    Promoted { unix: u64, by: String },
+    /// A canary failed; only an admin's promote or cancel moves on.
+    Halted { reason: String },
+}
+
+/// One canary node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryNodeView {
+    pub id: String,
+    pub name: String,
+    /// When it came back with the new binary.
+    pub upgraded_unix: Option<u64>,
+    /// Tasks finished on the new binary: cleanly, and with a failure of
+    /// the node's own (an error, not the program's exit code).
+    pub tasks_ok: u32,
+    pub tasks_failed: u32,
+}
+
+/// The canary of the current rollout ([`crate::msg::AdminOp::Canary`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryView {
+    pub spec: CanarySpec,
+    pub started_unix: u64,
+    pub phase: CanaryPhase,
+    pub canaries: Vec<CanaryNodeView>,
+    /// Nodes that wait for the canaries, by name.
+    pub held: Vec<String>,
+    /// While in [`CanaryPhase::Canary`]: what it still waits for.
+    pub waiting_for: Option<String>,
+}
+
 /// Version and protocol read from a binary's [`crate::BUILD_INFO`] marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildInfo {

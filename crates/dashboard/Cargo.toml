@@ -17,6 +17,7 @@ tracing.workspace = true
 iroh.workspace = true
 rand.workspace = true
 data-encoding.workspace = true
+blake3.workspace = true
 n0-future.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 # The web server and its HTML templates, compiled into the binary.

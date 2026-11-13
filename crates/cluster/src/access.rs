@@ -95,6 +95,13 @@ fn op_name(op: &AdminOp) -> &'static str {
         Silence(_) | Unsilence { .. } => "silence alerts",
         Net => "read the network between nodes",
         CheckJob { .. } => "check jobs",
+        StartSession { .. } | Sessions | RevokeSession { .. } | EndSession => "manage sessions",
+        NodeSettings { .. } => "read node settings",
+        SetNodeSettings { .. } => "change nodes",
+        CanaryRollout { .. } | CanaryUpgradeToLatest { .. } | PromoteCanary { .. } => {
+            "roll out upgrades"
+        }
+        Canary => "read the rollout",
     }
 }
 
@@ -142,6 +149,8 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | AlertTuning
             | Net
             | Confidential
+            | Canary
+            | NodeSettings { .. }
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -245,6 +254,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | Schedules
         | WhoAmI
         | Confidential
+        | Canary
         | StoreList { .. }
         | StoreUpload { .. }) => op,
         Ledger {

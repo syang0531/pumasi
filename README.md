@@ -53,7 +53,7 @@ What is in it:
 *Pumasi* (품앗이) is the Korean custom of neighbours taking turns working
 each other's fields.
 
-**Status.** Pumasi is at 1.5 and it is young: so far it has been used on
+**Status.** Pumasi is at 1.6 and it is young: so far it has been used on
 one home cluster, of Windows PCs (one with an RTX 3080) and a 2014 iMac,
 since November 2026. It has had an internal security review but no
 outside audit yet ([SECURITY.md](SECURITY.md)), and the
@@ -79,7 +79,7 @@ curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.
 irm https://github.com/syang0531/pumasi/releases/latest/download/install.ps1 | iex
 ```
 
-Options: `--version v1.5.0` / `-Version`, `--dir` / `-Dir`, and a join
+Options: `--version v1.6.0` / `-Version`, `--dir` / `-Dir`, and a join
 ticket to also install the agent as a service
 ([services](#run-the-agent-the-control-plane-and-the-dashboard-as-services)):
 `curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, or
@@ -106,10 +106,10 @@ pumasi status
 cluster homelab (851765067d)
 
 NODE         NAME             STATE     ROLE     PLATFORM       VERSION   EXECUTORS    SLOTS  RUNNING  ...
-e993d728f5   attic-server     online    owner    linux/x86_64   1.5.0     wasm             2        0
-67d944c4ec   desk-pc          online    owner    linux/x86_64   1.5.0     wasm             2        0
-4cf0f33834   mini             online    owner    linux/x86_64   1.5.0     wasm             2        0
-8d2920d244   old-laptop       online    owner    linux/x86_64   1.5.0     wasm             2        0
+e993d728f5   attic-server     online    owner    linux/x86_64   1.6.0     wasm             2        0
+67d944c4ec   desk-pc          online    owner    linux/x86_64   1.6.0     wasm             2        0
+4cf0f33834   mini             online    owner    linux/x86_64   1.6.0     wasm             2        0
+8d2920d244   old-laptop       online    owner    linux/x86_64   1.6.0     wasm             2        0
 
 ready for account owner now: wasm 4, docker 0, microvm 0, GPU 0
 ```
@@ -970,9 +970,16 @@ schedule nightly-wordcount: created (0 3 * * *)
 
 Every agent reports its CPU, memory, the disk under its data directory,
 network traffic, the hottest temperature sensor and each GPU's use, VRAM,
-temperature and power every 5 seconds. The control plane keeps them for 7
-days (`--metrics-retention`): 10-second steps for the last hour, 1-minute
-steps for a day, 10-minute steps after that.
+temperature and power every 5 seconds. GPUs of every vendor report use and
+memory: NVIDIA through NVML, AMD and Intel through sysfs and DRM fdinfo on
+Linux, Apple and AMD GPUs in Macs through IOAccelerator statistics, and any
+GPU on Windows through the GPU Engine performance counters. Windows nodes
+read temperatures through WMI (ACPI thermal zones, and
+[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)'s
+sensors while it runs, which most desktop boards need). The control plane
+keeps them for 7 days (`--metrics-retention`): 10-second steps for the last
+hour, 1-minute steps for a day, 10-minute steps after that, all of them
+kept across a restart.
 
 ```sh
 pumasi top                     # every node, the queue and firing alerts, live
@@ -991,8 +998,25 @@ laptop           online     1/4   24%   1.0    9.8 GiB/16.0 GiB   41%  12.0 KiB/
 old-mac          offline    0/2
 ```
 
-Output of WASM and Docker tasks reaches `pumasi logs -f` within a fraction
-of a second; microVM tasks show theirs when they finish.
+Task output reaches `pumasi logs -f` within a second, microVM tasks
+included (from 1.6 agents; older ones show a microVM task's output when it
+finishes).
+
+**The network between nodes.** Agents measure each other now and then
+(five round trips and a 1 MiB transfer over the same iroh connections,
+one pair every 20 seconds, at most 16 MiB a minute into any agent).
+`pumasi net` shows the matrix, the dashboard's node list too, and a node
+that fetches from the file store tries the closest other node's cache
+first. `pumasi cluster start --net-probe-every 1m` (or `off`) changes the
+pace.
+
+```
+round trip (row: from, column: to)
+                  desktop     laptop    old-mac
+desktop                 -     1.2 ms     3.4 ms
+laptop             1.1 ms          -     3.9 ms
+old-mac            3.3 ms     4.0 ms          -
+```
 
 **Prometheus and Grafana.** `pumasi cluster start --metrics-addr
 127.0.0.1:9464` serves `/metrics` in the Prometheus text format: node
@@ -1009,13 +1033,23 @@ full, a sensor at 90 °C, a benchmark 25% slower than the node's last one, a
 drive failing SMART and a check run disagreeing with a provider. Change the
 thresholds or turn rules off, and send alerts to Slack, Mattermost, Discord
 or any URL that takes JSON; each alert is sent when it starts and when it
-clears.
+clears. The offline, disk and temperature thresholds can differ per node or
+label, a firing alert can be sent again every few hours, and a silence
+keeps alerts quiet while you work on a machine (they still show as firing).
 
 ```sh
 pumasi alert set --node-offline 2m --disk 85% --temperature off
+pumasi alert set --on laptop --node-offline off       # the laptop comes and goes
+pumasi alert set --on gpu=nvidia --temperature 85     # per label
+pumasi alert set --repeat 4h --resolved off
+pumasi alert silence node_offline --on old-mac --for 3h --comment "new disk"
+pumasi alert unsilence 3f2a                            # ends it early (id from alert ls)
 pumasi webhook add ops https://hooks.slack.com/services/...   # sends a test alert
 pumasi alert ls
 ```
+
+The dashboard's Events page shows all of it, and admins can add and end
+silences there and send a test notice to a webhook.
 
 Both can also live in `cluster.toml` (`[alerts]` and `[webhooks.NAME]`,
 with `url_env` to keep the URL out of the file).
@@ -1343,7 +1377,9 @@ defends against, including the API exposed to the internet.
 | `pumasi metrics [NODE] [--since 1h] [-o json]` | The latest metrics of every node, or one node's history. |
 | `pumasi logs <JOB> [-t TASK] [-f]` | A task's stdout and stderr; `-f` follows it while it runs. |
 | `pumasi events [-f] [--since 1h] [-n 50] [-o json]` | Cluster events: nodes, jobs, checks, preemptions, alerts. |
-| `pumasi alert ls` / `alert set [--node-offline 1m] [--failure-rate 50%] [--disk 90%] [--temperature 90] [--perf-drop 25%] [--smart on] [--check-mismatch on] [--defaults]` | Alert rules and what fires now; `off` turns a rule off. |
+| `pumasi alert ls` / `alert set [--node-offline 1m] [--failure-rate 50%] [--disk 90%] [--temperature 90] [--perf-drop 25%] [--smart on] [--check-mismatch on] [--repeat 4h] [--resolved on] [--on NODE\|SELECTOR] [--defaults]` | Alert rules and what fires now; `off` turns a rule off, `--on` sets offline, disk and temperature thresholds for some nodes (`inherit` drops them). |
+| `pumasi alert silence [RULE] [--on NODE\|SELECTOR] [--for 2h] [--comment TEXT]` / `alert unsilence ID` | Keep alerts quiet for a while, or stop doing so. |
+| `pumasi net [-o json]` | Round trip and bandwidth between nodes, as last measured. |
 | `pumasi webhook add NAME URL [--format slack\|discord\|json]` / `ls` / `rm NAME` / `test NAME` | Where alerts go. |
 | `pumasi ha status [-o json]` / `ha invite [--ttl 1h]` / `ha remove ID` | Control plane replicas: who leads and how far each has the log, a ticket for one more replica, take one out. |
 | `pumasi cluster replica <TICKET> [--net public\|local] [--bind ADDR]` | Run this machine as a control plane replica (restart it later with `pumasi cluster start`). |
@@ -1610,11 +1646,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
-the open issues from real use and phase 21 (1.5) handles machines that sleep; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+the open issues from real use, phase 21 (1.5) handles machines that sleep
+and phase 22 (1.6) fills in monitoring; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1638,7 +1675,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 17 | Self-hosting 1.0: SSO (OIDC and LDAP, groups mapped to role tickets), tamper-evident audit log (hash chain, JSON and syslog export), threat model (including the API and tunnel exposed to the internet: leaked tickets, policy bypasses, request floods), cargo-audit, cargo-deny, CodeQL and fuzzing in CI, an SSO end-to-end test against Keycloak and OpenLDAP, an internal security review, operations guide, long soak tests on Linux and macOS, then the 1.0 tag. Also: job retention (`--keep-jobs`), admin secret rotation, per-ticket request limits | done (1.0) |
 | 20 | Issues from real use: agent options changed and shown without reinstalling the service (`service set`), account quotas and job policies from the dashboard and a documented API with add/remove, submitters reading their own policy and `?validate=1`, per-task pull, run and upload times, node names in task views | done (1.4) |
 | 21 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue`, a guide for Linux on 2013-2014 Macs | done (1.5) |
-| 22 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | planned (1.6) |
+| 22 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | done (1.6) |
 | 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | planned (1.7) |
 | 24 | File store on several machines: replicas on owner nodes with repair and scrubbing, writes acknowledged on enough copies, an S3-compatible gateway | planned (1.8) |
 | 25 | Scheduling: gangs, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption and drain, schedule time zones | planned (1.9) |
@@ -1659,8 +1696,7 @@ compute shaders only (no textures or samplers, one bind group, no f16), a
 runaway shader is stopped by the GPU driver's watchdog rather than the
 job's timeout, and there is no GPU challenge over WebGPU yet. Accounts
 exist only inside one cluster (SSO signs people in, but there is no SCIM
-or SAML, and nobody is removed until their session ends or is revoked), CU are not connected to real payments, node-to-node latency and bandwidth are not measured yet
-(only each node's round trip to the control plane), the file store lives
+or SAML, and nobody is removed until their session ends or is revoked), CU are not connected to real payments, the file store lives
 only on the control plane (no replicas on owner nodes yet, no S3-compatible
 gateway). GPUs are checked on real hardware by hand, not in CI (hosted
 runners have none); VFIO passthrough is experimental and NVIDIA-only
@@ -1673,10 +1709,11 @@ Virtualization.framework guests are checked on real machines only: CI
 runners have WHPX only nested, where it breaks QEMU's disks and the agent
 falls back to emulation, and hosted Mac runners cannot virtualize at all.
 macOS 10.15 and 11 themselves have no CI runners either.
-MicroVM task output reaches `pumasi logs` only when the task ends (the
-guest writes it to its output disk), Intel and Apple GPUs report no
-metrics, Windows nodes report no temperature, and the 10-second metric steps of the last hour are not kept
-across a control plane restart. The dashboard shows prices and alert rules
+Live microVM output stops after the first MiB of each stream (the rest
+comes when the task ends), Intel and Apple GPUs report use and memory but
+no temperature or power, and Windows desktops without
+LibreHardwareMonitor often have no temperature to report (few boards fill
+in the ACPI thermal zones). The dashboard shows prices and alert rules
 but does not change them (the CLI and `apply` do), and keeps its sign-ins
 in memory (restarting `pumasi ui` signs everyone out). The remote API has
 no built-in tunnel or certificate renewal (Cloudflare Tunnel, a reverse

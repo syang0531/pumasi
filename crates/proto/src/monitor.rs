@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     job::{JobId, parse_duration_ms},
+    manage::{LabelSet, Selector},
     msg::TaskState,
 };
 
@@ -189,8 +190,9 @@ pub struct LogChunk {
     pub state: TaskState,
     /// The task finished: nothing more will come.
     pub done: bool,
-    /// The output is streamed while the task runs (WASM and Docker; a
-    /// microVM's output comes when it finishes).
+    /// The output is streamed while the task runs (WASM and Docker, and
+    /// microVMs on 1.6 agents; an older agent's microVM output comes when
+    /// it finishes).
     pub live: bool,
 }
 
@@ -577,6 +579,274 @@ pub struct AlertsView {
     pub policy: AlertPolicy,
     pub firing: Vec<AlertView>,
     pub webhooks: Vec<WebhookView>,
+}
+
+// ---------------------------------------------------------------------------
+// Alert tuning, silences (1.6)
+// ---------------------------------------------------------------------------
+
+/// The alert rules, by the names `pumasi alert` and notices use.
+pub const ALERT_RULES: &[&str] = &[
+    "node_offline",
+    "failure_rate",
+    "disk",
+    "temperature",
+    "perf_drop",
+    "smart",
+    "check_mismatch",
+];
+
+/// Other thresholds for the nodes a selector picks (1.6). `None` keeps
+/// the cluster's rule; `Some(None)` turns the rule off for these nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertOverride {
+    /// The nodes it is for: `name=imac`, `gpu=nvidia`, `os=windows`.
+    pub nodes: Selector,
+    pub node_offline_secs: Option<Option<u64>>,
+    pub disk_percent: Option<Option<u8>>,
+    pub temp_c: Option<Option<u16>>,
+}
+
+impl AlertOverride {
+    /// Whether it changes nothing (and can go).
+    pub fn is_empty(&self) -> bool {
+        self.node_offline_secs.is_none() && self.disk_percent.is_none() && self.temp_c.is_none()
+    }
+
+    /// `disk 95%, temperature off`.
+    pub fn describe(&self, ko: bool) -> String {
+        let off = if ko { "꺼짐" } else { "off" };
+        let mut parts = Vec::new();
+        if let Some(v) = self.node_offline_secs {
+            parts.push(format!(
+                "node_offline {}",
+                v.map_or(off.to_string(), human_duration)
+            ));
+        }
+        if let Some(v) = self.disk_percent {
+            parts.push(format!(
+                "disk {}",
+                v.map_or(off.to_string(), |p| format!("{p}%"))
+            ));
+        }
+        if let Some(v) = self.temp_c {
+            parts.push(format!(
+                "temperature {}",
+                v.map_or(off.to_string(), |t| format!("{t} °C"))
+            ));
+        }
+        parts.join(", ")
+    }
+}
+
+/// How alerts are sent beyond [`AlertPolicy`], and per-node thresholds
+/// (1.6). Kept apart from the policy so that older CLIs keep reading it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertTuning {
+    /// Send a firing alert's notice again this often while it fires
+    /// (`None`: once).
+    pub repeat_secs: Option<u64>,
+    /// Send a notice when an alert stops firing.
+    pub resolved: bool,
+    /// Thresholds for some nodes. A node takes the first override whose
+    /// selector names it (`name=...`), else the first that matches its
+    /// labels, else the cluster's rules.
+    pub overrides: Vec<AlertOverride>,
+}
+
+impl Default for AlertTuning {
+    fn default() -> Self {
+        Self {
+            repeat_secs: None,
+            resolved: true,
+            overrides: Vec::new(),
+        }
+    }
+}
+
+impl AlertTuning {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(r) = self.repeat_secs {
+            ensure!(r >= 60, "alerts repeat at most every minute");
+        }
+        ensure!(self.overrides.len() <= 64, "at most 64 alert overrides");
+        for o in &self.overrides {
+            o.nodes.validate()?;
+            ensure!(!o.nodes.is_empty(), "an alert override needs a selector");
+            if let Some(Some(p)) = o.disk_percent {
+                ensure!((1..=100).contains(&p), "disk must be 1% to 100%");
+            }
+        }
+        Ok(())
+    }
+
+    /// The override for a node with these labels.
+    pub fn override_for(&self, labels: &LabelSet) -> Option<&AlertOverride> {
+        let by_name = |o: &&AlertOverride| o.nodes.0.iter().any(|t| t.key == "name");
+        self.overrides
+            .iter()
+            .filter(by_name)
+            .find(|o| o.nodes.matches(labels))
+            .or_else(|| {
+                self.overrides
+                    .iter()
+                    .filter(|o| !by_name(o))
+                    .find(|o| o.nodes.matches(labels))
+            })
+    }
+}
+
+/// Firing alerts that send no notices until `until_unix` (1.6). They still
+/// show as firing and in the events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Silence {
+    /// Eight hex digits.
+    pub id: String,
+    /// One rule ([`ALERT_RULES`]), or every rule.
+    pub rule: Option<String>,
+    /// The nodes it covers, or every subject (the cluster and the control
+    /// plane included).
+    pub nodes: Option<Selector>,
+    pub until_unix: u64,
+    pub comment: String,
+    /// Who made it (the ticket's name).
+    pub by: String,
+    pub created_unix: u64,
+}
+
+/// What `pumasi alert silence` asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SilenceSpec {
+    pub rule: Option<String>,
+    pub nodes: Option<Selector>,
+    /// From now.
+    pub secs: u64,
+    pub comment: String,
+}
+
+impl SilenceSpec {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(r) = &self.rule {
+            ensure!(
+                ALERT_RULES.contains(&r.as_str()),
+                "unknown alert rule {r:?} ({})",
+                ALERT_RULES.join(", ")
+            );
+        }
+        if let Some(s) = &self.nodes {
+            s.validate()?;
+        }
+        ensure!(self.secs >= 60, "a silence lasts at least a minute");
+        ensure!(self.secs <= 90 * 86_400, "a silence lasts at most 90 days");
+        ensure!(self.comment.len() <= 500, "the comment is too long");
+        Ok(())
+    }
+}
+
+impl Silence {
+    /// `disk on name=imac`, `every alert`.
+    pub fn describe(&self) -> String {
+        let rule = self.rule.as_deref().unwrap_or("every alert");
+        match &self.nodes {
+            Some(s) => format!("{rule} on {s}"),
+            None => rule.to_string(),
+        }
+    }
+}
+
+/// Repeat and resolved notices, per-node thresholds and silences (1.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertTuningView {
+    pub tuning: AlertTuning,
+    /// Silences that have not ended.
+    pub silences: Vec<Silence>,
+    /// Firing alerts a silence keeps quiet now, as (rule, subject).
+    pub silenced: Vec<(String, String)>,
+}
+
+// ---------------------------------------------------------------------------
+// Network between nodes (1.6)
+// ---------------------------------------------------------------------------
+
+/// Bytes an agent sends to another in one probe, to measure the bandwidth.
+pub const PROBE_BYTES: u32 = 1 << 20;
+/// Most bytes an agent takes in one probe from another.
+pub const PROBE_MAX_BYTES: u32 = 4 << 20;
+/// Round trips in one probe (the fastest counts).
+pub const PROBE_PINGS: u32 = 5;
+
+/// What one agent measured to another (1.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeResult {
+    /// The node probed (its id).
+    pub node: String,
+    /// The fastest round trip, in microseconds.
+    pub rtt_us: Option<u32>,
+    /// Bytes sent and how long they took to arrive, in microseconds.
+    pub bytes: u64,
+    pub micros: u64,
+    /// Whether the path is direct (not through a relay).
+    pub direct: Option<bool>,
+    pub error: Option<String>,
+}
+
+impl ProbeResult {
+    /// Bytes per second, when the transfer worked.
+    pub fn bps(&self) -> Option<u64> {
+        (self.error.is_none() && self.bytes > 0 && self.micros > 0)
+            .then(|| self.bytes.saturating_mul(1_000_000) / self.micros)
+    }
+}
+
+/// The last probe from one node to another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkView {
+    /// Node names.
+    pub from: String,
+    pub to: String,
+    pub rtt_us: Option<u32>,
+    pub bps: Option<u64>,
+    pub direct: Option<bool>,
+    pub unix: u64,
+    pub error: Option<String>,
+}
+
+/// `pumasi net`: what the nodes measured between each other.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetView {
+    /// Every node's name, sorted.
+    pub nodes: Vec<String>,
+    pub links: Vec<LinkView>,
+    /// How often the control plane asks for a probe (0: never).
+    pub every_secs: u64,
+}
+
+impl NetView {
+    /// The link from one node to another, by name.
+    pub fn link(&self, from: &str, to: &str) -> Option<&LinkView> {
+        self.links.iter().find(|l| l.from == from && l.to == to)
+    }
+}
+
+/// `1.2 ms`, `250 µs`, `85 ms`.
+pub fn human_rtt(us: u32) -> String {
+    match us {
+        u if u < 1000 => format!("{u} µs"),
+        u if u < 10_000 => format!("{:.1} ms", u as f64 / 1000.0),
+        u => format!("{} ms", u / 1000),
+    }
+}
+
+/// `940 Mbit/s`, `12 Mbit/s`, `1.2 Gbit/s`.
+pub fn human_bps(bps: u64) -> String {
+    let bits = bps as f64 * 8.0;
+    if bits >= 1e9 {
+        format!("{:.1} Gbit/s", bits / 1e9)
+    } else if bits >= 1e6 {
+        format!("{:.0} Mbit/s", bits / 1e6)
+    } else {
+        format!("{:.0} kbit/s", bits / 1e3)
+    }
 }
 
 // ---------------------------------------------------------------------------

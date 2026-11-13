@@ -103,6 +103,9 @@ pub struct ClusterConfig {
     /// Wake a sleeping node (Wake-on-LAN) for work that has waited this
     /// long for a busy node. `None`: only for work no online node can run.
     pub wake_after: Option<Duration>,
+    /// Ask an agent to measure the network to another this often (1.6;
+    /// `None`: never).
+    pub probe_every: Option<Duration>,
 }
 
 impl ClusterConfig {
@@ -126,6 +129,7 @@ impl ClusterConfig {
             insecure_test_tee: false,
             release_source: pumasi_proto::release::DEFAULT_RELEASE_SOURCE.into(),
             wake_after: Some(Duration::from_secs(600)),
+            probe_every: Some(crate::net::DEFAULT_PROBE_EVERY),
         }
     }
 }
@@ -306,6 +310,7 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
     );
     state.set_metrics_retention(config.metrics_retention);
     state.power.wake_after = config.wake_after;
+    state.set_probe_every(config.probe_every);
     if config.insecure_test_tee {
         warn!(
             "--insecure-test-tee: confidential tasks may run without a TEE; nothing they hold is protected"
@@ -763,7 +768,12 @@ impl Cluster {
             }
             // Pending metrics and events (with replicas, only if this is
             // still the leader: Raft takes them while it runs).
-            inner.state().flush_monitor();
+            {
+                let mut st = inner.state();
+                st.keep_open_steps();
+                st.flush_monitor();
+                st.save_links(true);
+            }
             if let Some(ha) = self.shared.ha() {
                 // Give the last writes a moment to commit.
                 let _ = tokio::time::timeout(Duration::from_secs(2), ha.raft.ensure_linearizable())
@@ -1289,6 +1299,11 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                 }
                 Ok(Some(FromAgent::Sleeping)) => {
                     inner.state().on_sleeping(&node_id, generation);
+                }
+                Ok(Some(FromAgent::Probe(r))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_probe(&node_id, generation, *r);
                 }
                 Ok(Some(FromAgent::Tee(r))) => {
                     let mut st = inner.state();
@@ -2333,6 +2348,25 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             inner.state().remove_webhook(&name)?;
             Ok(AdminResponse::Ok)
         }
+        AdminOp::AlertTuning => Ok(AdminResponse::AlertTuning(Box::new(
+            inner.state().alert_tuning_view(),
+        ))),
+        AdminOp::SetAlertTuning(t) => {
+            let mut st = inner.state();
+            st.set_alert_tuning(*t)?;
+            Ok(AdminResponse::AlertTuning(Box::new(st.alert_tuning_view())))
+        }
+        AdminOp::Silence(spec) => {
+            let mut st = inner.state();
+            st.add_silence(*spec, caller.name())?;
+            Ok(AdminResponse::AlertTuning(Box::new(st.alert_tuning_view())))
+        }
+        AdminOp::Unsilence { id } => {
+            let mut st = inner.state();
+            st.remove_silence(&id)?;
+            Ok(AdminResponse::AlertTuning(Box::new(st.alert_tuning_view())))
+        }
+        AdminOp::Net => Ok(AdminResponse::Net(Box::new(inner.state().net_view()))),
         AdminOp::Audit { after, limit } => Ok(AdminResponse::Audit(
             inner.state().audit_entries(after, limit)?,
         )),

@@ -5,14 +5,16 @@
 //! - AMD (Linux): sysfs and the KFD topology; FP32 is estimated from the
 //!   SIMD count and clock. Docker jobs get `/dev/kfd` and the GPU's render
 //!   node.
-//! - Intel and Apple GPUs are listed for information only: no executor
-//!   can use them yet (the WebGPU executor of a later phase will).
+//! - Intel and Apple GPUs are listed for information only (and for their
+//!   metrics, [`usage`]): only the WebGPU executor uses them. On Windows
+//!   DXGI lists the GPUs NVML does not (1.6).
 //! - Any GPU bound to `vfio-pci` on Linux, with a clean IOMMU group, can
 //!   be passed through to microVMs ([`vfio`]).
 
 pub mod cuda;
 pub mod docker_check;
 pub mod nvml;
+pub mod usage;
 pub mod vfio;
 
 use std::{collections::HashSet, path::Path, time::Duration};
@@ -64,6 +66,12 @@ pub fn detect(env: &GpuEnv, notes: &mut Vec<String>) -> Vec<GpuInfo> {
         }
     } else if cfg!(target_os = "macos") {
         gpus.extend(macos_gpus());
+    }
+    // Intel and AMD GPUs on Windows (1.6), for their metrics and WebGPU.
+    #[cfg(windows)]
+    {
+        let have_nvidia = !gpus.is_empty();
+        gpus.extend(usage::windows::list(have_nvidia));
     }
     for (i, g) in gpus.iter_mut().enumerate() {
         g.index = i as u32;

@@ -1397,6 +1397,16 @@ impl Store {
         self.put_meta(ALERT_POLICY_META, &enc(p))
     }
 
+    /// A record kept under a meta key (1.6: alert tuning, silences, the
+    /// network links), in postcard.
+    pub fn meta_record<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        self.get_meta(key)?.map(|b| dec(&b)).transpose()
+    }
+
+    pub fn put_meta_record<T: Serialize>(&self, key: &str, v: &T) -> Result<()> {
+        self.put_meta(key, &enc(v))
+    }
+
     pub fn webhooks(&self) -> Result<Vec<WebhookSpec>> {
         let tx = self.read()?;
         let mut out = Vec::new();

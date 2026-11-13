@@ -495,6 +495,42 @@ curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/up
 {"source":"https://github.com/syang0531/pumasi/releases","latest":"v1.3.0","checked_unix":1762851000,"check_error":null,"control_plane":"1.2.3","fetch":{"Running":{"version":"v1.3.0","step":"downloading pumasi-windows-x86_64.exe (31/72 MiB)","started_unix":1762851004}}}
 ```
 
+### Alerts and the network (1.6)
+
+`GET /api/v1/alerts` has the rules, what fires, the webhooks, and (1.6)
+`tuning` (repeat and resolved notices, per-node thresholds), the
+`silences` that have not ended and which firing alerts they keep quiet
+(`silenced`). With an admin ticket, keep an alert quiet for a while
+(`rule` and `on` are optional: every rule, every node), end it early by
+its id, or send a webhook a test notice:
+
+```sh
+curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" \
+  -H 'Content-Type: application/json' \
+  -d '{"rule": "node_offline", "on": "node-a", "for": "2h", "comment": "new disk"}' \
+  "$PUMASI_URL/api/v1/alerts/silences"
+```
+<!-- ci: id=$(curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/alerts" | jq -r '.silences[] | select(.comment == "new disk") | .id') -->
+<!-- ci: curl -fsS -X DELETE -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/alerts/silences/$id" -->
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/alerts" | jq -e '.silences == []' -->
+
+`DELETE /api/v1/alerts/silences/ID` ends one (a unique prefix of the id
+is enough), and `POST /api/v1/webhooks/NAME/test` sends a test notice.
+
+`GET /api/v1/net` (any ticket) has the network between nodes as last
+measured: for each direction the fastest of five round trips in
+microseconds, the bandwidth of a 1 MiB transfer in bytes a second,
+whether the path was direct or through a relay, and when:
+
+```sh
+curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/net"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/net" | jq -e '.nodes == ["node-a"] and .every_secs == 20' -->
+
+```json
+{"nodes":["desktop","laptop"],"links":[{"from":"desktop","to":"laptop","rtt_us":1180,"bps":48210000,"direct":true,"unix":1794607297,"error":null}],"every_secs":20}
+```
+
 Every route, with its parameters, is in `$PUMASI_URL/api/openapi.json`
 (OpenAPI 3.1), which code generators and tools such as Postman read.
 

@@ -12,7 +12,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, protocol::Router};
 use pumasi_proto::{
-    AGENT_ALPN, BLOBS_ALPN, ModuleHash, POWER_MINOR, PROTOCOL_MINOR, PROTOCOL_VERSION, Secret,
+    AGENT_ALPN, BLOBS_ALPN, ModuleHash, POWER_MINOR, PROBE_ALPN, PROTOCOL_MINOR, PROTOCOL_VERSION,
+    Secret,
     job::{Executor, FileEntry, MAX_OUTPUT_FILES_BYTES, dir_files, read_files},
     monitor::METRICS_EVERY_SECS,
     msg::{
@@ -271,7 +272,7 @@ impl Agent {
             key.clone(),
             config.net,
             &config.relays,
-            vec![BLOBS_ALPN.to_vec()],
+            vec![BLOBS_ALPN.to_vec(), PROBE_ALPN.to_vec()],
             config.bind,
         )
         .await?;
@@ -283,6 +284,7 @@ impl Agent {
         .await?;
         let router = Router::builder(endpoint.clone())
             .accept(BLOBS_ALPN, node_store.protocol())
+            .accept(PROBE_ALPN, crate::probe::ProbeServer::default())
             .spawn();
         let executor = WasmExecutor::new()?;
         let mut info = node_info(&config);
@@ -1268,6 +1270,16 @@ impl Agent {
                         }
                         None => debug!("asked to send a magic packet, but this agent sends none"),
                     }
+                }
+                Ok(Some(ToAgent::Probe { node, addr, bytes })) => {
+                    // The control plane asks one probe at a time.
+                    let endpoint = self.endpoint.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let r = crate::probe::probe(&endpoint, node, addr, bytes).await;
+                        debug!(to = %r.node, rtt_us = ?r.rtt_us, bps = ?r.bps(), error = ?r.error, "network probe");
+                        let _ = out_tx.send(FromAgent::Probe(Box::new(r)));
+                    });
                 }
                 Ok(Some(ToAgent::Keys { task, reply })) => {
                     let waiter = self.key_waiters.lock().unwrap().remove(&task);

@@ -1118,12 +1118,14 @@ measure CPU, so the sampler lives as long as the agent.
 
 The control plane (`cluster/src/monitor.rs`) keeps per node the latest
 sample, the network rates derived from consecutive counters, and three
-tiers of averaged points: 10 s steps for the last hour (memory only),
+tiers of averaged points: 10 s steps for the last hour,
 1 min steps for 24 hours and 10 min steps for the retention period
 (`--metrics-retention`, 7 days by default), each capped by the retention.
 A point averages its samples, except temperature, which keeps the
-maximum. Finished 1 min and 10 min points are written to the `metrics`
-table keyed by (node, tier, step start) every 15 s and pruned hourly.
+maximum. Finished points of every tier are written to the `metrics`
+table keyed by (node, tier, step start) every 15 s and pruned hourly; at
+shutdown the unfinished steps are written too, and a finished step
+replaces its part-done row (1.6: before, the 10 s tier was memory only).
 `AdminOp::Metrics { node, since_secs }` returns `MetricsView`: every node's
 latest sample, and with a node the finest tier that covers `since_secs`
 (`step_secs` says which), plus `ClusterMetrics` (queued runs per priority,
@@ -1157,8 +1159,8 @@ checked) and keeps it until the run's report arrives; then the stored
 output takes over. `AdminOp::Logs { job, index, attempt, stdout_from,
 stderr_from }` returns a `LogChunk` with the bytes from those offsets (at
 most 1 MiB each), the task state, `done` and `live` (false when the output
-comes only at the end, as for microVM runs, whose guest writes it to the
-output disk). `pumasi logs -f` polls every 200 ms, so output reaches the
+comes only at the end, as for microVM runs on agents older than 1.6; see
+[live microVM output](#live-microvm-output)). `pumasi logs -f` polls every 200 ms, so output reaches the
 terminal within about 0.4 s plus one round trip.
 
 ### Alerts and webhooks
@@ -2133,6 +2135,120 @@ Not covered: Wake-on-LAN over Wi-Fi or across subnets, waking a machine
 the cluster never saw go to sleep without a person asking, and stopping
 a lid-close sleep.
 
+## Phase 22: monitoring everywhere (1.6)
+
+Release 1.6 fills the monitoring gaps the home cluster ran into: microVM
+output that only came at the end, GPUs other than NVIDIA and AMD on
+Linux without metrics, Windows without temperatures, a 10 s tier lost on
+every restart, no idea of the network between nodes, and alerts that
+could only be on or off for the whole cluster.
+
+### Live microVM output
+
+Firecracker has no virtio console, so the guest uses the console every
+backend already has (the serial port, or `hvc0` under vz). With
+`RunSpec::live` the guest init gives the task pipes instead of the output
+files, and its `pump` loop (100 ms `poll`) copies what comes to the files
+as before and also writes the first `LIVE_MAX_BYTES` (1 MiB) of each
+stream to the console as lines of at most 3 KiB of data:
+
+    \x1epumasi-out <stream> <offset> <base64> <fnv1a-32 hex>
+
+The agent's `LiveTail` reads the console log every 200 ms while the task
+runs (`console.log`, or QEMU's `serial.log` on Windows), skips everything
+that is not a frame (kernel messages, the guest's own log), checks the
+checksum and pushes the bytes into the same `LiveOutput` that Docker and
+WASM runs use. The offsets keep the live copy a prefix of the real
+output: a frame that does not start where the last one ended (a line the
+console lost or mangled) stops that stream's live copy, and the rest
+comes with the result as before. The result itself still comes from the
+output disk, so the console is never trusted for more than a preview.
+The control plane reports `LogChunk::live` for microVM runs on agents of
+minor 2 or later.
+
+### GPU and temperature metrics
+
+`agent/src/gpu/usage.rs` measures what NVML does not. On Linux, DRM
+fdinfo: every DRM driver (i915, xe, amdgpu, nouveau, ...) prints engine
+time per client in `/proc/PID/fdinfo`; the sampler sums the clients of
+each device (`drm-pdev`) and reports the busiest engine between two
+samples: busy nanoseconds over wall time and engine instances (i915,
+amdgpu), or busy cycles over total cycles (xe), with resident memory. It sees only processes the
+agent may read, so an agent running as an ordinary user misses other
+users' work. AMD keeps the sysfs path (`gpu_busy_percent`, VRAM) where
+it exists. On macOS, the `PerformanceStatistics` dictionary of each
+`IOAccelerator` in the I/O registry (`Device Utilization %` or `GPU
+Activity(%)`, `vramUsedBytes` or `In use system memory`), matched to the
+listed GPUs by vendor in order, through IOKit and CoreFoundation
+directly. On Windows, the PDH
+counters `\GPU Engine(*)\Utilization Percentage` (each engine summed
+over processes, the busiest engine counts) and `\GPU Adapter Memory(*)\Dedicated
+Usage`, whose instance names carry the adapter LUID; DXGI maps LUIDs to
+adapters, and adapters NVML does not list (not the software adapter)
+are listed as GPUs, so an Intel or AMD GPU on Windows shows up at all. WebGPU uses the
+same devices, so its adapters report through these paths.
+
+Windows temperatures come from WMI on a thread of its own
+(`pumasi-wmi`, COM initialized once there, read every 10 s):
+`MSAcpi_ThermalZoneTemperature` in `root\WMI` and, when
+LibreHardwareMonitor runs with its WMI provider, its `Sensor` class in
+`root\LibreHardwareMonitor` (CPU and GPU temperatures). sysinfo's own
+WMI reads are not safe across threads, which is why Windows had none.
+
+### The network between nodes
+
+Agents of minor 2 accept `pumasi/probe/0` (`agent/src/probe.rs`). The
+prober opens one stream, sends a header (round trips, bytes), times five
+8-byte echoes (the fastest counts), then writes the bytes and times until
+the other side answers with the count. The server takes one probe at a
+time, 4 MiB at most per probe and 16 MiB a minute in all, and a whole
+probe has 25 s.
+
+The control plane (`cluster/src/net.rs`) asks for one probe at a time
+(`ToAgent::Probe { node, addr, bytes }`, `addr` from the file store
+report) every `--net-probe-every` (20 s): the pair of online, awake
+minor-2 agents measured longest ago, never-measured pairs first. With
+five nodes that measures each of the 20 directions every 7 minutes for
+under 60 KB/s across the cluster. A probe without an answer in 30 s is
+recorded as failed. The last result per direction is kept in memory,
+written to `meta.net_links` every minute and at shutdown, and returned
+by `AdminOp::Net` (`pumasi net`, `GET /api/v1/net`, the node list in the
+dashboard). `datasets::peers_for` orders the caches a node fetches from
+by what they hold, then by the round trip between the two nodes (either
+direction), unmeasured last.
+
+### Alerts
+
+`AlertTuning` (in `meta.alert_tuning`, `AdminOp::SetAlertTuning`) adds
+`repeat_secs` (send a firing alert's notice again this often, at least a
+minute), `resolved` (whether a cleared alert sends a notice; on by
+default) and up to 64 overrides: a selector and its own node-offline,
+disk and temperature thresholds (`Some(None)` turns the rule off for
+those nodes). Overrides that name nodes (`name=`) win over label ones;
+otherwise the first match counts. Silences (`meta.alert_silences`, at
+most 256) have a rule or every rule, a selector or every subject, an
+end, a comment and who made them; an alert they cover still fires and
+is recorded (`alert.firing ... (silenced)`), but sends no notice until
+the silence ends, when its notice goes out if it still fires. A resolved
+notice is sent only for alerts whose firing notice went out. Ended
+silences are pruned every second. `alert.silenced` and
+`alert.unsilenced` are events, and the audit log has `alerts.tune`,
+`alerts.silence` and `alerts.unsilence`.
+
+### Compatibility
+
+Protocol stays 14 and storage layout stays 7; the minor goes to 2
+(`MONITOR_MINOR`). `ToAgent::Probe` goes only to minor-2 agents, and an
+older agent's microVM runs keep `live: false`. A 1.6 agent with a 1.5
+control plane streams nothing extra (the run spec says whether to) and
+is never asked to probe. `AlertPolicy`, `AlertsView` and `ApplySpec` are
+unchanged, because an older CLI or dashboard could not decode a longer
+`AlertsView` it does not expect at the end of a response it builds
+(postcard is not self-describing): the new data comes through
+`AdminOp::AlertTuning`, `SetAlertTuning`, `Silence`, `Unsilence` and
+`Net`, appended to the enum. For the same reason overrides and silences
+are not in `cluster.toml` yet.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -2217,6 +2333,12 @@ and task index, last in `tables!`): the queue wait and the node's fetch,
 pull and upload times of the run that counted. They are deleted with
 their job.
 
+Phase 22 (1.6) keeps layout 7 and adds no table: the meta keys
+`alert_tuning`, `alert_silences` and `net_links` (postcard records), and
+rows of the 10 s tier in `metrics`, which an older control plane loads
+and prunes like the other tiers (1.5 already read every tier back, it
+only never wrote the first).
+
 `PROTOCOL_VERSION` is 14 (phase 16, above): protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
@@ -2269,12 +2391,13 @@ remotely; install a current binary on them once.
   quotas, quotas count tasks rather than CPU or memory, preemption stops a
   task instead of letting it checkpoint, and schedules use the control
   plane's time zone only.
-- Monitoring: microVM output is not streamed while the task runs; Intel
-  and Apple GPUs report no metrics; Windows nodes report no temperature
-  (sysinfo reads it through WMI, which is not safe across threads); the 10 s tier is lost on a control
-  plane restart; alert rules are cluster-wide (no per-node or per-label
-  thresholds, no silences or repeat notices); node-to-node latency is not
-  measured.
+- Monitoring: live microVM output covers the first MiB of each stream;
+  Intel and Apple GPUs report use and memory but no temperature or power;
+  DRM fdinfo sees only processes the agent may read; Windows desktops
+  without LibreHardwareMonitor often have no temperature (few boards fill
+  in ACPI thermal zones); per-node thresholds and silences are not in
+  `cluster.toml`; the network is measured between agents, not to the
+  control plane's file store.
 - Dashboard: prices, alert rules, webhooks, schedules and rollouts are
   shown (or left to the CLI) but not edited in the browser (account
   quotas and job policies are, since 1.4);
@@ -2285,7 +2408,7 @@ remotely; install a current binary on them once.
   subgroups, one adapter per task, no GPU challenge over WebGPU (so an
   untrusted node's adapter is billed at 1 TFLOPS at most), shaders that
   never end are stopped by the driver's watchdog rather than the job's
-  timeout, no GPU metrics for adapters that are not listed GPUs, and core
+  timeout, and core
   modules only (no `wasi:webgpu` components until Wasmtime runs them).
 - Confidential tier: no NVIDIA confidential computing (no GPUs in
   confidential jobs), no network, x86-64 only, no encrypted scratch disk,

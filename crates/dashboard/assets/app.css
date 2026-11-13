@@ -130,6 +130,9 @@ legend { font-weight: 600; padding: 0 6px; }
 
 /* Tables */
 .table-wrap { overflow-x: auto; }
+.matrix th, .matrix td { white-space: nowrap; }
+.matrix td { text-align: right; }
+.matrix td.bad { color: var(--bad); }
 #live > .table-wrap, main > .table-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin-bottom: 16px; }
 table { width: 100%; border-collapse: collapse; }
 th { text-align: left; font-weight: 600; color: var(--dim); font-size: 12px; border-bottom: 1px solid var(--line); padding: 6px 8px; white-space: nowrap; }

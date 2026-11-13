@@ -1,6 +1,7 @@
 //! End-to-end tests of monitoring (phase 11) over real iroh connections:
 //! node metrics, the Prometheus endpoint, live task output, events, and a
-//! node going offline reaching a webhook.
+//! node going offline reaching a webhook; and (1.6) probes between
+//! agents, silences, and metrics kept over a restart.
 
 use std::{
     net::SocketAddr,
@@ -13,7 +14,7 @@ use pumasi_agent::{Agent, AgentConfig, AgentExit};
 use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
     job::{Executor, JobSubmission, Limits, TaskInput, Tier},
-    monitor::{AlertPolicy, LogChunk, WebhookFormat, WebhookSpec, lint_exposition},
+    monitor::{AlertPolicy, LogChunk, SilenceSpec, WebhookFormat, WebhookSpec, lint_exposition},
     msg::{AdminOp, AdminResponse, JobState, TaskState},
     net::NetMode,
     ticket::JoinTicket,
@@ -73,6 +74,14 @@ fn init_tracing() {
 }
 
 async fn start_cluster(dir: PathBuf, metrics_token: Option<&str>) -> Result<Cluster> {
+    start_cluster_probing(dir, metrics_token, None).await
+}
+
+async fn start_cluster_probing(
+    dir: PathBuf,
+    metrics_token: Option<&str>,
+    probe_every: Option<Duration>,
+) -> Result<Cluster> {
     let mut config = ClusterConfig::new(dir);
     config.name = "test-cluster".into();
     config.net = NetMode::Local;
@@ -81,6 +90,7 @@ async fn start_cluster(dir: PathBuf, metrics_token: Option<&str>) -> Result<Clus
     config.node_timeout = Duration::from_secs(2);
     config.metrics_addr = Some("127.0.0.1:0".parse().unwrap());
     config.metrics_token = metrics_token.map(String::from);
+    config.probe_every = probe_every;
     Cluster::start(config).await
 }
 
@@ -495,6 +505,128 @@ async fn node_going_offline_reaches_the_webhook() {
     assert_eq!(v.webhooks[0].sent, 2, "the test and the alert");
     assert!(v.webhooks[0].target.ends_with("/…"), "URL path hidden");
 
+    client.close().await;
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probes_silences_and_metrics_over_a_restart() {
+    init_tracing();
+    let dir = tempdir("cp-net");
+    let cluster = start_cluster_probing(dir.clone(), None, Some(Duration::from_millis(300)))
+        .await
+        .unwrap();
+    let ticket = || {
+        cluster
+            .create_join_ticket(Duration::from_secs(60), None)
+            .unwrap()
+    };
+    let a = spawn_agent("net-a", ticket()).await;
+    let b = spawn_agent("net-b", ticket()).await;
+    wait_online(&cluster, 2).await;
+    let client = admin(&cluster).await;
+
+    // Both directions get measured, directly on the loopback.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let net = loop {
+        let AdminResponse::Net(v) = client.call(AdminOp::Net).await.unwrap() else {
+            panic!()
+        };
+        let ok = |f, t| {
+            v.link(f, t)
+                .is_some_and(|l| l.error.is_none() && l.bps.is_some())
+        };
+        if ok("net-a", "net-b") && ok("net-b", "net-a") {
+            break v;
+        }
+        assert!(Instant::now() < deadline, "no probes: {v:#?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let l = net.link("net-a", "net-b").unwrap();
+    eprintln!("probe a→b: {l:?}");
+    assert!(l.rtt_us.is_some());
+    assert_eq!(l.direct, Some(true));
+    assert_eq!(net.nodes, ["net-a", "net-b"]);
+
+    // A silence keeps b's offline alert out of the notices.
+    client
+        .call(AdminOp::SetAlertPolicy(Box::new(AlertPolicy {
+            node_offline_secs: Some(0),
+            disk_percent: None,
+            temp_c: None,
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+    let AdminResponse::AlertTuning(v) = client
+        .call(AdminOp::Silence(Box::new(SilenceSpec {
+            rule: Some("node_offline".into()),
+            nodes: Some("name=net-b".parse().unwrap()),
+            secs: 3600,
+            comment: "maintenance".into(),
+        })))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(v.silences.len(), 1);
+    b.kill().await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let AdminResponse::AlertTuning(v) = client.call(AdminOp::AlertTuning).await.unwrap() else {
+            panic!()
+        };
+        if v.silenced == [("node_offline".to_string(), "net-b".to_string())] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "b not silenced: {v:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The first samples, at 10 s steps, are still there after a restart.
+    let samples = |c: AdminClient| async move {
+        let AdminResponse::Metrics(m) = c
+            .call(AdminOp::Metrics {
+                node: Some("net-a".into()),
+                since_secs: 3600,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        c.close().await;
+        m.nodes[0].series.len()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let before = loop {
+        let n = samples(admin(&cluster).await).await;
+        if n > 0 {
+            break n;
+        }
+        assert!(Instant::now() < deadline, "no samples");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    client.close().await;
+    a.kill().await;
+    cluster.shutdown().await.unwrap();
+
+    let cluster = start_cluster(dir, None).await.unwrap();
+    let client = admin(&cluster).await;
+    let after = samples(admin(&cluster).await).await;
+    assert!(
+        after >= before,
+        "{after} samples after the restart, {before} before"
+    );
+    let AdminResponse::Net(v) = client.call(AdminOp::Net).await.unwrap() else {
+        panic!()
+    };
+    assert!(v.link("net-a", "net-b").is_some(), "links kept: {v:?}");
+    let AdminResponse::AlertTuning(v) = client.call(AdminOp::AlertTuning).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(v.silences.len(), 1, "silences kept");
     client.close().await;
     cluster.shutdown().await.unwrap();
 }

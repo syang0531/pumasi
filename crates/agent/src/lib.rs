@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod microvm;
 pub mod platform;
 pub mod power;
+pub mod probe;
 pub mod store;
 pub mod tempdir;
 pub mod upgrade;

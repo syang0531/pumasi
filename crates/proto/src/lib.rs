@@ -37,6 +37,9 @@ pub const BLOBS_ALPN: &[u8] = iroh_blobs::ALPN;
 /// ALPN between control plane replicas: Raft and replicas joining
 /// (phase 13).
 pub const RAFT_ALPN: &[u8] = b"pumasi/raft/0";
+/// ALPN between agents for network probes (1.6): round trips and a short
+/// transfer, see [`monitor::PROBE_BYTES`].
+pub const PROBE_ALPN: &[u8] = b"pumasi/probe/0";
 /// The first agent protocol with the file store.
 pub const STORE_PROTOCOL: u32 = 8;
 /// The first agent protocol with devices: GPUs, GPU challenges and microVM
@@ -71,12 +74,18 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 1;
+pub const PROTOCOL_MINOR: u32 = 2;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
 /// when asked ([`msg::ToAgent::Wake`]).
 pub const POWER_MINOR: u32 = 1;
+/// The first minor with the 1.6 monitoring: a microVM's output streams
+/// while it runs (the agent's guest prints it on the VM console), and the
+/// agent measures the network to other nodes when asked
+/// ([`msg::ToAgent::Probe`], [`msg::FromAgent::Probe`]) and answers other
+/// agents' probes on [`PROBE_ALPN`].
+pub const MONITOR_MINOR: u32 = 2;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

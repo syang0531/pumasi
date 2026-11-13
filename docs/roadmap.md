@@ -20,7 +20,7 @@ on real machines.
 | --- | --- | --- | --- |
 | 20 | 1.4 | Issues from real use: account policies and agent options without a terminal, task timings and names | done |
 | 21 | 1.5 | Machines that sleep and machines without Docker | done |
-| 22 | 1.6 | Monitoring: live microVM output, every GPU and temperature, node-to-node network | planned |
+| 22 | 1.6 | Monitoring: live microVM output, every GPU and temperature, node-to-node network | done |
 | 23 | 1.7 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | planned |
 | 24 | 1.8 | File store on several machines and an S3-compatible gateway | planned |
 | 25 | 1.9 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | planned |
@@ -133,6 +133,16 @@ iMac; a Windows agent service with `--idle-minutes 5` pauses while someone
 types.
 
 ## 22. Monitoring: live microVM output, every GPU and temperature, node-to-node network (1.6)
+
+Done in 1.6.0 ([release notes](releases/v1.6.0.md)). What differs from
+the plan below: the guest streams its output over the console it already
+has (Firecracker has no virtio console), as framed lines with an offset
+and a checksum, and only the first MiB of each stream is live; per-node
+thresholds and silences are set with the CLI, the API and the dashboard,
+not in `cluster.toml` (`apply` keeps the cluster-wide rules), and the
+dashboard edits silences but not yet the rules themselves (phase 23).
+WebGPU adapters are the same GPUs, so they report through the vendor
+paths ([details](architecture.md#phase-22-monitoring-everywhere-16)).
 
 - **Live microVM output.** The guest streams stdout and stderr over a
   virtio console while the task runs (Firecracker, QEMU, WHPX and vz), so

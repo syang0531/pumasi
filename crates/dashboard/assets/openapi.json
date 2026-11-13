@@ -127,7 +127,7 @@
     "/api/v1/status": {
       "get": {
         "summary": "Cluster status: nodes and jobs",
-        "description": "Each node carries `power` (1.5; missing when the control plane is older): `asleep_since_unix` while the machine is asleep after saying so, `report` (what its agent does about sleep: `stays_awake`, `sleep_notice`, `wake_on_lan`, `on_pause`, and its LAN network cards in `lan`), `last_wake_unix` and `last_wake_by` for the last magic packet, and `can_wake` (some machine of the cluster is online on its LAN).",
+        "description": "Submitters see only their account's jobs. Each node carries `power` (1.5; missing when the control plane is older): `asleep_since_unix` while the machine is asleep after saying so, `report` (what its agent does about sleep: `stays_awake`, `sleep_notice`, `wake_on_lan`, `on_pause`, and its LAN network cards in `lan`), `last_wake_unix` and `last_wake_by` for the last magic packet, and `can_wake` (some machine of the cluster is online on its LAN).",
         "tags": [
           "cluster"
         ],
@@ -157,8 +157,7 @@
           "429": {
             "$ref": "#/components/responses/Error"
           }
-        },
-        "description": "Submitters see only their account's jobs."
+        }
       }
     },
     "/api/v1/metrics": {
@@ -284,6 +283,197 @@
     "/api/v1/alerts": {
       "get": {
         "summary": "Alert rules, firing alerts and webhooks",
+        "tags": [
+          "monitoring"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Since 1.6 also `tuning` (`repeat_secs`: send a firing alert's notice again this often, `resolved`: send a notice when it stops, `overrides`: other `node_offline_secs`, `disk_percent` and `temp_c` for the nodes a selector picks), `silences` (rule, nodes, `until_unix`, comment, who) and `silenced` (firing alerts a silence keeps quiet, as [rule, subject]). They are missing when the control plane is older."
+      }
+    },
+    "/api/v1/alerts/silences": {
+      "post": {
+        "summary": "Silence alerts for a while: no webhook notices for them (1.6, admin)",
+        "tags": [
+          "monitoring"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "rule": {
+                    "type": "string",
+                    "description": "node_offline, failure_rate, disk, temperature, perf_drop, smart or check_mismatch; missing: every rule"
+                  },
+                  "on": {
+                    "type": "string",
+                    "description": "A node name or a label selector (`os=windows`); missing: every node and the cluster"
+                  },
+                  "for": {
+                    "type": "string",
+                    "description": "How long, e.g. `2h` (default), at most 90 days"
+                  },
+                  "comment": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The alert tuning, silences included",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/alerts/silences/{id}": {
+      "delete": {
+        "summary": "End a silence (id or unique prefix; 1.6, admin)",
+        "tags": [
+          "monitoring"
+        ],
+        "responses": {
+          "200": {
+            "description": "The alert tuning",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The silence's id"
+          }
+        ]
+      }
+    },
+    "/api/v1/webhooks/{name}/test": {
+      "post": {
+        "summary": "Send a test alert to a webhook now and wait for its answer (1.6, admin)",
+        "tags": [
+          "monitoring"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The webhook's name"
+          }
+        ]
+      }
+    },
+    "/api/v1/net": {
+      "get": {
+        "summary": "Round trips and bandwidth the nodes measured between each other (1.6)",
+        "description": "`nodes` (names), `links` (`from`, `to`, `rtt_us`, `bps` in bytes per second, `direct`, `unix`, `error`) and `every_secs` (how often the control plane asks for a probe, 0: never).",
         "tags": [
           "monitoring"
         ],

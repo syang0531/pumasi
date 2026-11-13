@@ -67,6 +67,9 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
         .route("/access/{action}", post(access::action))
         .route("/prices", get(prices::page))
         .route("/events", get(events::page))
+        .route("/events/silences", post(events::silence))
+        .route("/events/silences/{id}/end", post(events::unsilence))
+        .route("/events/webhooks/{name}/test", post(events::test_webhook))
         .route("/upgrade", get(upgrade::panel).post(upgrade::start))
 }
 

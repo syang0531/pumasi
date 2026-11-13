@@ -12,7 +12,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use pumasi_proto::manage::AccessRole;
 use pumasi_proto::{
@@ -42,6 +42,10 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
         .route("/metrics", get(metrics))
         .route("/events", get(events))
         .route("/alerts", get(alerts))
+        .route("/alerts/silences", post(silence))
+        .route("/alerts/silences/{id}", delete(unsilence))
+        .route("/webhooks/{name}/test", post(test_webhook))
+        .route("/net", get(net))
         .route("/jobs", post(submit).layer(uploads))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -214,8 +218,52 @@ async fn events(axum::extract::State(st): S, a: Api, Query(q): Query<EventsQuery
     .await
 }
 
+/// The alerts view, with the 1.6 tuning merged in when the control
+/// plane has it.
 async fn alerts(axum::extract::State(st): S, a: Api) -> Response {
-    simple(st, a, AdminOp::Alerts).await
+    let mut v = match call(&st, &a, AdminOp::Alerts).await {
+        Ok(AdminResponse::Alerts(v)) => match serde_json::to_value(&*v) {
+            Ok(v) => v,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        },
+        Ok(r) => return payload(r),
+        Err(r) => return r,
+    };
+    if let Ok(AdminResponse::AlertTuning(t)) = call(&st, &a, AdminOp::AlertTuning).await
+        && let (Some(obj), Ok(serde_json::Value::Object(extra))) =
+            (v.as_object_mut(), serde_json::to_value(&*t))
+    {
+        obj.extend(extra);
+    }
+    Json(v).into_response()
+}
+
+#[derive(Deserialize)]
+struct SilenceBody {
+    rule: Option<String>,
+    on: Option<String>,
+    #[serde(rename = "for")]
+    duration: Option<String>,
+    comment: Option<String>,
+}
+
+async fn silence(axum::extract::State(st): S, a: Api, Json(b): Json<SilenceBody>) -> Response {
+    match pages::events::silence_spec(b.rule, b.on, b.duration, b.comment) {
+        Ok(spec) => simple(st, a, AdminOp::Silence(Box::new(spec))).await,
+        Err(e) => error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
+}
+
+async fn unsilence(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -> Response {
+    simple(st, a, AdminOp::Unsilence { id }).await
+}
+
+async fn test_webhook(axum::extract::State(st): S, a: Api, Path(name): Path<String>) -> Response {
+    simple(st, a, AdminOp::TestWebhook { name }).await
+}
+
+async fn net(axum::extract::State(st): S, a: Api) -> Response {
+    simple(st, a, AdminOp::Net).await
 }
 
 /// The longest `?wait=` (phase 15): under the 100 seconds Cloudflare

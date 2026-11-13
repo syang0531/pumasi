@@ -231,28 +231,34 @@ pub fn oci_arch_of(arch: &str) -> String {
 }
 
 /// Nodes (other than `node`) that have any of these collections cached,
-/// best first. Only connected nodes have a cache entry.
+/// best first: those with more of them, then the closest (`rtt`, the
+/// measured round trip to a node, 1.6), then those never measured. Only
+/// connected nodes have a cache entry.
 pub(crate) fn peers_for(
     caches: &HashMap<String, NodeCache>,
     node: &str,
     roots: &[BlobHash],
+    rtt: impl Fn(&str) -> Option<u32>,
 ) -> Vec<EndpointAddr> {
     if roots.is_empty() {
         return vec![];
     }
-    let mut found: Vec<(usize, &EndpointAddr)> = caches
+    let mut found: Vec<(usize, u32, &EndpointAddr)> = caches
         .iter()
         .filter(|(id, _)| id.as_str() != node)
-        .filter_map(|(_, c)| {
+        .filter_map(|(id, c)| {
             let have = roots.iter().filter(|r| c.roots.contains(*r)).count();
-            c.addr.as_ref().filter(|_| have > 0).map(|a| (have, a))
+            c.addr
+                .as_ref()
+                .filter(|_| have > 0)
+                .map(|a| (have, rtt(id).unwrap_or(u32::MAX), a))
         })
         .collect();
-    found.sort_by_key(|(have, _)| std::cmp::Reverse(*have));
+    found.sort_by_key(|(have, rtt, _)| (std::cmp::Reverse(*have), *rtt));
     found
         .into_iter()
         .take(MAX_PEERS)
-        .map(|(_, a)| a.clone())
+        .map(|(_, _, a)| a.clone())
         .collect()
 }
 

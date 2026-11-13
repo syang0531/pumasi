@@ -446,6 +446,14 @@ enum Cmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// The network between nodes: round trips and bandwidth the agents
+    /// measured to each other (1.6 agents, one pair now and then).
+    Net {
+        #[arg(short = 'o', long, value_enum, default_value = "table")]
+        output: manage::Output,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
     /// Open the web dashboard: a web server on this machine that talks to
     /// the cluster with your ticket, so the control plane opens no port.
     /// Nodes, jobs (submit, live output, downloads), storage, CU, invites,
@@ -866,6 +874,11 @@ struct MetricsArgs {
     /// nodes only for work that no online node can run at all.
     #[arg(long, default_value = "10m", value_name = "DURATION|never")]
     wake_after: String,
+    /// Ask one agent to measure the network to another this often (a few
+    /// round trips and 1 MiB), for `pumasi net` and to pick the closest
+    /// file store cache; `off` never asks.
+    #[arg(long, default_value = "20s", value_name = "DURATION|off")]
+    net_probe_every: String,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1365,6 +1378,7 @@ async fn run(cli: Cli) -> Result<i32> {
             output,
             admin,
         } => monitor::events(&home, &admin, since.as_deref(), limit, follow, output).await,
+        Cmd::Net { output, admin } => monitor::net(&home, &admin, output).await,
         Cmd::Ui(args) => ui::run(&home, args).await,
         Cmd::Alert(cmd) => monitor::alert(&home, cmd).await,
         Cmd::Webhook(cmd) => monitor::webhook(&home, cmd).await,
@@ -1799,6 +1813,13 @@ async fn cluster_start(
         d => Some(Duration::from_millis(
             parse_duration_ms(d).context("--wake-after")?,
         )),
+    };
+    config.probe_every = if pumasi_proto::monitor::is_off(&metrics.net_probe_every) {
+        None
+    } else {
+        Some(Duration::from_millis(
+            parse_duration_ms(&metrics.net_probe_every).context("--net-probe-every")?,
+        ))
     };
     config.disk_class = match storage_class {
         Some(StorageClassArg::Hdd) => DiskClass::Hdd,

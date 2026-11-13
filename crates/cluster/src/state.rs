@@ -474,6 +474,8 @@ pub struct State {
     pub(crate) names: std::collections::BTreeMap<String, crate::names::NameOverride>,
     /// Nodes' sleep and wake state (1.5).
     pub(crate) power: crate::power::PowerState,
+    /// The network between nodes (1.6).
+    pub(crate) net: crate::net::NetState,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -554,6 +556,7 @@ impl State {
             sso: Default::default(),
             names: Default::default(),
             power: Default::default(),
+            net: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -655,6 +658,7 @@ impl State {
             account_policies: snap.account_policies,
         })?;
         state.load_monitor(Duration::from_secs(7 * 86_400))?;
+        state.load_net()?;
         state.load_conf(snap.measurements, snap.trusted_nodes);
         state.load_audit()?;
         state.load_sso()?;
@@ -1144,6 +1148,7 @@ impl State {
         self.tick_queue_timeouts();
         self.tick_files();
         self.tick_wake();
+        self.tick_net();
         self.expire_upgrades();
         self.expire_challenges();
         self.expire_gpu_challenges();
@@ -2232,7 +2237,9 @@ impl State {
         });
         let mut roots: Vec<BlobHash> = mounts.iter().map(|m| m.root).collect();
         roots.extend(image.as_ref().map(|i| i.root));
-        let peers = crate::datasets::peers_for(&self.files.caches, node_id, &roots);
+        let peers = crate::datasets::peers_for(&self.files.caches, node_id, &roots, |p| {
+            self.net.rtt_between(node_id, p)
+        });
         let output = if !speaks_store {
             OutputMode::Inline
         } else if job.meta.ext.output_dataset.is_some() {
@@ -2292,7 +2299,9 @@ impl State {
                 mounts: vec![],
                 image: None,
                 output: OutputMode::Store,
-                peers: crate::datasets::peers_for(&self.files.caches, node_id, &roots),
+                peers: crate::datasets::peers_for(&self.files.caches, node_id, &roots, |p| {
+                    self.net.rtt_between(node_id, p)
+                }),
                 confidential: Some(c),
                 ..assignment
             };
@@ -3782,6 +3791,155 @@ mod tests {
 
     fn events_of(st: &State) -> Vec<String> {
         st.events(0, 0, 1000).into_iter().map(|e| e.kind).collect()
+    }
+
+    #[test]
+    fn silences_overrides_and_repeat_notices() {
+        use pumasi_proto::monitor::{AlertOverride, AlertPolicy, AlertTuning, SilenceSpec};
+        let mut st = state();
+        st.set_alert_policy(AlertPolicy {
+            node_offline_secs: Some(0),
+            failure_rate: None,
+            disk_percent: None,
+            temp_c: None,
+            ..Default::default()
+        })
+        .unwrap();
+        let (a, _ra) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let (b, _rb) = join(&mut st, "b", vec![Executor::Wasm], None);
+        let (c, _rc) = join(&mut st, "c", vec![Executor::Wasm], None);
+        // b may go away; a is being moved.
+        st.set_alert_tuning(AlertTuning {
+            repeat_secs: Some(3600),
+            resolved: false,
+            overrides: vec![AlertOverride {
+                nodes: "name=b".parse().unwrap(),
+                node_offline_secs: Some(None),
+                disk_percent: None,
+                temp_c: None,
+            }],
+        })
+        .unwrap();
+        let id = st
+            .add_silence(
+                SilenceSpec {
+                    rule: Some("node_offline".into()),
+                    nodes: Some("name=a".parse().unwrap()),
+                    secs: 4 * 3600,
+                    comment: "moving it".into(),
+                },
+                "admin",
+            )
+            .unwrap();
+        assert!(
+            st.add_silence(
+                SilenceSpec {
+                    rule: Some("nonsense".into()),
+                    nodes: None,
+                    secs: 3600,
+                    comment: String::new(),
+                },
+                "admin"
+            )
+            .is_err()
+        );
+        for n in [&a, &b, &c] {
+            let g = st.nodes[n].generation;
+            st.on_disconnect(n, g);
+        }
+        st.tick_monitor();
+        let mut subjects: Vec<String> = st
+            .alerts_view()
+            .firing
+            .into_iter()
+            .map(|f| f.subject)
+            .collect();
+        subjects.sort();
+        assert_eq!(subjects, ["a", "c"], "b has the rule off");
+        let notices = st.recent_notices();
+        assert_eq!(notices.len(), 1, "a is silenced: {notices:?}");
+        assert_eq!(notices[0].subject, "c");
+        let v = st.alert_tuning_view();
+        assert_eq!(v.silenced, [("node_offline".to_string(), "a".to_string())]);
+        assert_eq!(v.silences[0].by, "admin");
+
+        // Still firing an hour later: c's notice again.
+        st.evaluate_alerts(now_unix() + 3600);
+        let n = st.recent_notices();
+        assert_eq!(n.len(), 2);
+        assert!(n[1].repeat && n[1].subject == "c", "{n:?}");
+        assert!(n[1].text().contains("still firing"));
+        st.evaluate_alerts(now_unix() + 3700);
+        assert_eq!(st.recent_notices().len(), 2, "not before the next hour");
+
+        // The silence ends: a's notice goes out now.
+        st.remove_silence(&id[..4]).unwrap();
+        let n = st.recent_notices();
+        assert_eq!(n.len(), 3);
+        assert!(n[2].subject == "a" && !n[2].repeat && n[2].status == "firing");
+        assert!(st.alert_tuning_view().silences.is_empty());
+
+        // Back online: no resolved notice with `resolved` off.
+        let (tx, _rx2) = mpsc::unbounded_channel();
+        let (kill, _) = oneshot::channel();
+        st.on_connect(
+            &c,
+            pumasi_proto::PROTOCOL_VERSION,
+            info("c", vec![Executor::Wasm]),
+            None,
+            Availability::Available,
+            tx,
+            kill,
+        );
+        st.tick_monitor();
+        assert_eq!(st.recent_notices().len(), 3);
+        let kinds = events_of(&st);
+        for k in ["alert.silenced", "alert.unsilenced", "alert.resolved"] {
+            assert!(kinds.contains(&k.to_string()), "{k} in {kinds:?}");
+        }
+        // Thresholds that make no sense are refused.
+        assert!(
+            st.set_alert_tuning(AlertTuning {
+                repeat_secs: Some(5),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_closest_cache_comes_first() {
+        use crate::datasets::{NodeCache, peers_for};
+        let root = [7u8; 32];
+        let addr = |b: u8| iroh::EndpointAddr::new(SecretKey::from_bytes(&[b; 32]).public());
+        let mut caches = HashMap::new();
+        for (id, b) in [("far", 1u8), ("near", 2), ("unknown", 3)] {
+            caches.insert(
+                id.to_string(),
+                NodeCache {
+                    addr: Some(addr(b)),
+                    roots: [root].into_iter().collect(),
+                },
+            );
+        }
+        let mut net = crate::net::NetState::default();
+        net.links.insert(
+            ("me".into(), "far".into()),
+            crate::net::Link {
+                rtt_us: Some(40_000),
+                ..Default::default()
+            },
+        );
+        // Measured the other way round.
+        net.links.insert(
+            ("near".into(), "me".into()),
+            crate::net::Link {
+                rtt_us: Some(300),
+                ..Default::default()
+            },
+        );
+        let peers = peers_for(&caches, "me", &[root], |p| net.rtt_between("me", p));
+        assert_eq!(peers, vec![addr(2), addr(1), addr(3)]);
     }
 
     #[test]

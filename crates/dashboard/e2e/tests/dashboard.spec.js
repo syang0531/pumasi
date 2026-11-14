@@ -288,6 +288,22 @@ test("upload a dataset and download it as a zip", async ({ page }) => {
   expect(zipEntry(fs.readFileSync(await zip.path()), "hello.txt")?.toString()).toBe("안녕 pumasi\n");
 });
 
+test("make an S3 key, see it listed, revoke it", async ({ page }) => {
+  await signIn(page);
+  await page.goto(`${state().base}/storage`);
+  await expect(page.locator("#replication")).toContainText("storage=SIZE");
+  await page.locator("#s3-label").fill("e2e key");
+  await page.getByRole("button", { name: "Create a key" }).click();
+  await expect(page.locator("#s3-new-secret")).toBeVisible();
+  const id = (await page.locator("#s3-new-id").textContent()).trim();
+  expect(id).toMatch(/^PUMA[A-Z2-7]{16}$/);
+  const row = page.locator(`tr[data-s3-key="${id}"]`);
+  await expect(row).toContainText("e2e key");
+  page.once("dialog", (d) => d.accept());
+  await row.getByRole("button", { name: "Revoke" }).click();
+  await expect(row).toHaveCount(0);
+});
+
 test("the other pages load", async ({ page }) => {
   await signIn(page);
   for (const [path, heading] of [

@@ -3435,6 +3435,12 @@ mod tests {
                 answer[0] ^= 1;
             }
             let generation = st.nodes[&bob_id].generation;
+            // The test solved it on its CPU (slowly in a debug build on a
+            // busy runner); the GPU's time is what is measured, so the
+            // answer counts as coming at once.
+            if let Some(p) = st.nodes.get_mut(&bob_id).unwrap().gpu.pending.as_mut() {
+                p.sent = std::time::Instant::now();
+            }
             st.on_gpu_result(&bob_id, generation, challenge.nonce, answer);
             let view = st.status();
             let node = view.nodes.iter().find(|n| n.id == bob_id).unwrap();
@@ -3607,6 +3613,12 @@ mod tests {
                 pumasi_proto::gpu::solve_cpu(challenge.seed, challenge.target, challenge.solutions);
             if !honest {
                 answer[0] ^= 1;
+            }
+            // The test solved it on its CPU (slowly in a debug build on a
+            // busy runner); the GPU's time is what is measured, so the
+            // answer counts as coming at once.
+            if let Some(p) = st.nodes.get_mut(&bob_id).unwrap().gpu.pending.as_mut() {
+                p.sent = std::time::Instant::now();
             }
             st.on_gpu_result(&bob_id, generation, challenge.nonce, answer);
             let view = st.status();

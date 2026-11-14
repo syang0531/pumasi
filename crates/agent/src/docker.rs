@@ -72,6 +72,12 @@ impl DockerExecutor {
         &self.bin
     }
 
+    /// A command running the CLI (with the Pumasi WSL distro's daemon and
+    /// certificate when it is that one).
+    fn cmd(&self) -> Command {
+        crate::wsl_docker::docker_command(&self.bin)
+    }
+
     /// Limits containers of jobs without a CPU limit to `cpus` (the node's
     /// CPU cap; jobs with a limit are placed only within it).
     pub fn with_cpu_cap(mut self, cpus: Option<u32>) -> Self {
@@ -90,9 +96,14 @@ impl DockerExecutor {
     /// Checks that the Docker CLI works, the daemon answers, and it runs
     /// Linux containers.
     pub async fn detect(bin: &str, label: &str) -> Result<Self> {
+        // `pumasi docker setup` (1.11): the Pumasi WSL distro's Docker,
+        // when the machine has it and no other CLI is named.
+        let managed = crate::wsl_docker::installed().filter(|i| i.serves(bin));
         // A Windows service may start before Docker Desktop's directory is
         // on its PATH; look in the default install location too.
-        let resolved = if bin == "docker" && cfg!(windows) {
+        let resolved = if let Some(i) = &managed {
+            Some(i.layout.docker_exe().display().to_string())
+        } else if bin == "docker" && cfg!(windows) {
             crate::microvm::vmm::find_program(
                 "docker",
                 None,
@@ -105,7 +116,7 @@ impl DockerExecutor {
         let bin = resolved.as_deref().unwrap_or(bin);
         let out = tokio::time::timeout(
             Duration::from_secs(15),
-            Command::new(bin)
+            crate::wsl_docker::docker_command(bin)
                 .args(["version", "--format", "{{.Server.Version}} {{.Server.Os}}"])
                 .stdin(Stdio::null())
                 .output(),
@@ -115,8 +126,13 @@ impl DockerExecutor {
         .with_context(|| format!("could not run `{bin}`; is Docker installed?"))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let hint = if cfg!(windows) {
-                " (is Docker Desktop running? It must be started once in the signed-in session, and the agent's account must be in the docker-users group)"
+            let hint = if managed.is_some() {
+                // The task keeps dockerd running; start it should it have
+                // stopped (Task Scheduler ignores this while it runs).
+                crate::wsl_docker::kick();
+                " (the Pumasi WSL Docker: its scheduled task was started, which takes a minute; `pumasi docker status` shows how it goes)"
+            } else if cfg!(windows) {
+                " (is Docker Desktop running? It must be started once in the signed-in session, and the agent's account must be in the docker-users group; or set up Docker without Docker Desktop with `pumasi docker setup`)"
             } else {
                 " (is the Docker daemon running?)"
             };
@@ -150,7 +166,7 @@ impl DockerExecutor {
     pub async fn alive(&self) -> Result<()> {
         let out = tokio::time::timeout(
             Duration::from_secs(15),
-            Command::new(&self.bin)
+            self.cmd()
                 .args(["version", "--format", "{{.Server.Os}}"])
                 .stdin(Stdio::null())
                 .output(),
@@ -208,10 +224,7 @@ impl DockerExecutor {
     async fn cli(&self, args: &[&str]) -> Result<std::process::Output> {
         let out = tokio::time::timeout(
             CLI_TIMEOUT,
-            Command::new(&self.bin)
-                .args(args)
-                .stdin(Stdio::null())
-                .output(),
+            self.cmd().args(args).stdin(Stdio::null()).output(),
         )
         .await
         .with_context(|| format!("`docker {}` timed out", args.first().unwrap_or(&"")))??;
@@ -260,7 +273,8 @@ impl DockerExecutor {
 
     async fn pull(&self, image: &str, cancel: &AtomicBool) -> Result<()> {
         info!(%image, "pulling image");
-        let mut child = Command::new(&self.bin)
+        let mut child = self
+            .cmd()
             .args(["pull", "--quiet", image])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -313,7 +327,8 @@ impl DockerExecutor {
                 .context("read the image manifest")?,
         )
         .context("bad image manifest")?;
-        let mut child = Command::new(&self.bin)
+        let mut child = self
+            .cmd()
             .args(["load", "--quiet"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -511,7 +526,8 @@ impl DockerExecutor {
             self.copy_checkpoint_in(&name, &c.dir).await?;
         }
 
-        let mut child = Command::new(&self.bin)
+        let mut child = self
+            .cmd()
             .args(["start", "--attach", "--interactive", &name])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -637,7 +653,8 @@ impl DockerExecutor {
                 .sum::<u64>();
         // Plenty for a slow disk: 10 MiB/s on top of the usual timeout.
         let timeout = CLI_TIMEOUT + Duration::from_secs(bytes / (10 << 20));
-        let mut child = Command::new(&self.bin)
+        let mut child = self
+            .cmd()
             .args(["cp", "-", &format!("{name}:/")])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -675,7 +692,8 @@ impl DockerExecutor {
         let files = pumasi_proto::job::dir_files(dir)?;
         let bytes: u64 = files.iter().map(|(_, _, n)| n).sum();
         let timeout = CLI_TIMEOUT + Duration::from_secs(bytes / (10 << 20));
-        let mut child = Command::new(&self.bin)
+        let mut child = self
+            .cmd()
             .args(["cp", "-", &format!("{name}:/")])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -709,7 +727,8 @@ impl DockerExecutor {
     /// Replaces `dir` with the container's `/checkpoint` (`docker cp
     /// name:/checkpoint -`), up to the file store's output limit.
     async fn copy_checkpoint_out(&self, name: &str, dir: &std::path::Path) -> Result<()> {
-        let mut child = Command::new(&self.bin)
+        let mut child = self
+            .cmd()
             .args([
                 "cp",
                 &format!("{name}:{}", pumasi_proto::sched::CHECKPOINT_DIR),
@@ -746,7 +765,8 @@ impl DockerExecutor {
     /// Extracts `/output` into `dir` (`docker cp name:/output -`), up to
     /// the file store's output limit.
     async fn copy_out_dir(&self, name: &str, dir: &std::path::Path, stderr: &mut Vec<u8>) {
-        let child = Command::new(&self.bin)
+        let child = self
+            .cmd()
             .args(["cp", &format!("{name}:/output"), "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -785,7 +805,8 @@ impl DockerExecutor {
     /// Reads `/output` as a tar stream (`docker cp name:/output -`) and
     /// keeps its regular files within the output cap.
     async fn copy_out(&self, name: &str, stderr: &mut Vec<u8>) -> Vec<FileEntry> {
-        let child = Command::new(&self.bin)
+        let child = self
+            .cmd()
             .args(["cp", &format!("{name}:/output"), "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1236,7 +1257,7 @@ struct ContainerGuard {
 
 impl Drop for ContainerGuard {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(&self.bin)
+        let _ = crate::wsl_docker::docker_std_command(&self.bin)
             .args(["rm", "-f", &self.name])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -25,7 +25,7 @@ on real machines.
 | 24 | 1.8 | File store on several machines and an S3-compatible gateway | done |
 | 25 | 1.9 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | done |
 | 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | done |
-| 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | planned |
+| 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | done |
 | 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | planned |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
 | 19 | | Buying CU with won through the hub (Toss Payments) | on hold |
@@ -286,6 +286,14 @@ the iMac; two half-GPU jobs share the RTX 3080; AMD Docker jobs only where
 the owner has an AMD Linux machine.
 
 ## 27. Windows: Docker without Docker Desktop, ARM64 microVMs (1.11)
+
+Done in 1.11.0 ([release notes](releases/v1.11.0.md)). The distro is
+started at boot by a scheduled task that logs a hidden account on (WSL
+does not run as the agent service's LocalSystem), and the agent starts
+that task again when Docker stops answering. HCS was not adopted: the
+cost is a second guest kernel and disk format, and CI cannot time it
+against WHPX, so `scripts/windows/boot-times.ps1` measures it on real PCs
+first. Signing still waits for SignPath Foundation.
 
 - **Docker for machines nobody signs into:** `pumasi docker setup`
   installs dockerd in a small WSL distro that Pumasi manages, started by

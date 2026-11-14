@@ -178,7 +178,7 @@ or QEMU on Windows, and the guest init (release binaries embed it). Backends:
 | Backend | Where | Notes |
 | --- | --- | --- |
 | Firecracker | Linux with `/dev/kvm` | default when installed; `--no-api --config-file`, its own seccomp filters |
-| QEMU | Linux, macOS, Windows | `-M microvm,pic=off,pit=off` on x86_64 (the guest kernel never programs the legacy 8259, so a PIT tick would arrive as vector 0; HVF keeps the PIT to calibrate the TSC), `-M virt` on ARM64; KVM, HVF or WHPX when available, else TCG (slow; adds `tsc_early_khz` so boot never stalls calibrating the TSC) |
+| QEMU | Linux, macOS, Windows | `-M microvm,pic=off,pit=off` on x86_64 (the guest kernel never programs the legacy 8259, so a PIT tick would arrive as vector 0; HVF keeps the PIT to calibrate the TSC), `-M virt` on ARM64 (`gic-version=3` on Windows, a virtio console `hvc0`: the pinned Arm kernels have no PL011 driver); KVM, HVF or WHPX when available, else TCG (slow; adds `tsc_early_khz` so boot never stalls calibrating the TSC) |
 | vz | macOS 11+ | Apple's Virtualization.framework in a signed helper process; the default on macOS (phase 6, below) |
 
 Nothing crosses the VM boundary except virtio block devices, which the
@@ -2725,6 +2725,149 @@ GPUs need nothing new from the agent. `JobSubmission::gpu_ext` is
 `#[serde(skip)]` and travels in new admin ops (`SubmitExt`,
 `CheckJobExt`) that a client sends only when it is set; schedules refuse
 it for now.
+
+## Phase 27: Windows (1.11)
+
+Release 1.11 runs Docker on Windows machines nobody signs into, without
+Docker Desktop, and microVMs on Windows on Arm. The code is
+`agent/src/wsl_docker/` (`mod.rs` the parts every platform builds and
+tests, `windows.rs` the Windows calls, `tls.rs` the certificates) and
+`agent/src/microvm/{vmm,setup}.rs`.
+
+### Docker in a WSL distro Pumasi manages
+
+Docker Desktop starts with a signed-in user, so a Windows provider nobody
+is logged into had no Docker. WSL 2 runs Linux without Docker Desktop,
+but not as LocalSystem, the agent service's account (`wsl.exe` refuses
+it, and distros belong to one user). `pumasi docker setup` (an
+administrator terminal) therefore makes:
+
+- a local account, `pumasi-wsl`: a standard user whose password is random,
+  never expires and is kept only by Task Scheduler (setup forgets it; a
+  new run sets a new one), hidden from the sign-in screen
+  (`SpecialAccounts\UserList`), with "Log on as a batch job"
+  (`SeBatchLogonRight`, which a task that logs on with a stored password
+  needs; `remove` takes it back before deleting the account);
+- `%ProgramData%\Pumasi\wsl-docker`, with the `Pumasi` parent owned by
+  Administrators so no user who created it first can swap what is inside.
+  SYSTEM and Administrators have full control; `pumasi-wsl` may read, and
+  change only `distro\` (the distro's `ext4.vhdx`) and `logs\`;
+  `tls\client\` (the agent's key) is SYSTEM's and the Administrators'
+  alone. Downloads are pinned with SHA-256 like `pumasi vm setup`'s:
+  Ubuntu Base 24.04.5 (30 MB, amd64 or arm64) and Docker's static Windows
+  CLI (there is no Arm build; Windows on Arm runs it emulated). `bin\`
+  holds that CLI and a copy of `pumasi.exe` (the account may not read the
+  one in an administrator's profile);
+- a CA, a server certificate for `127.0.0.1`/`localhost` and a client
+  certificate (ECDSA P-256, rcgen), made once (`--new-certificates` makes
+  new ones);
+- a scheduled task, `\Pumasi\WSL Docker`: a boot trigger, password logon as
+  `pumasi-wsl` (so no one needs to be signed in), no time limit, no
+  battery or idle conditions, one instance. It runs `pumasi
+  __wsl-docker-run --dir DIR`.
+
+`__wsl-docker-run`, as `pumasi-wsl`, writes the account's `.wslconfig`
+(loopback forwarding on, WSLg off), imports `pumasi-docker` from the
+Ubuntu Base tarball when `wsl --list` lacks it, and compares a marker in
+the distro (`/etc/pumasi/provisioned`: the setup version, a hash of the
+server certificate, and whether WSL lends the distro the Windows NVIDIA
+driver's `libcuda.so.1`) with what it should be. When they differ it pipes
+a script to `sh -s` as root: `apt-get install docker.io iptables ...`,
+with a GPU the NVIDIA Container Toolkit from NVIDIA's apt repository and
+`nvidia-ctk runtime configure --runtime=docker`, the TLS files,
+`/etc/wsl.conf` (no automount of Windows drives, no interop, no systemd)
+and the start script; the marker is written last, so a failed run is
+tried again, and the distro is terminated so `wsl.conf` applies. Then it
+runs the start script, which picks the iptables backend the kernel
+supports, mounts cgroup2 if WSL has not, and `exec`s `dockerd
+--host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2376
+--tlsverify ...`. The `wsl.exe` it waits on sits in a Job Object, so ending
+the task ends the distro. When dockerd ends it starts it again after a
+pause (5 s, doubling to 2 minutes, reset after 10 minutes of running);
+everything goes to `logs\wsl-docker.log` (cut at 8 MiB).
+
+WSL forwards loopback listeners of the VM to the Windows loopback, so
+`tcp://127.0.0.1:2376` reaches dockerd from SYSTEM's agent; any local user
+could connect too, and the TLS client check is what keeps them out
+(`tls: certificate required`). A container that broke out to the distro's
+root would find no Windows drive and no way to start Windows programs.
+
+The agent: `DockerExecutor::detect("docker")` on Windows uses
+`bin\docker.exe` when the setup is there (`wsl_docker::installed()`), and
+every Docker CLI the agent and `pumasi gpu check` start goes through
+`wsl_docker::docker_command`, which adds `DOCKER_HOST`,
+`DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH` for that CLI. A named
+`--docker-bin` (Docker Desktop's CLI, Podman) is run as before. When the
+daemon does not answer, the agent runs `schtasks /Run` on the task (at
+most every two minutes; Task Scheduler ignores it while the task runs),
+and the background Docker check picks it up once it answers. GPU Docker
+jobs work as with Docker Desktop: `--gpus device=UUID`, and graphics
+tasks get `/usr/lib/wsl` read-only, which exists in every WSL 2 distro.
+
+Without WSL, setup still makes everything above, then runs `wsl --install
+--no-distribution` and asks for a restart; the boot trigger then sets the
+distro up with nobody signed in. `pumasi docker remove` ends and deletes
+the task, removes the account's profile (which holds the distro's
+registration), the account and the directory, waiting for the VM to let
+go of the disk.
+
+CI (`wsl-docker`): setup on a hosted Windows runner checks the account,
+the task, the downloads and the client key's ACL, starts the task, and
+needs the task's log line written as `pumasi-wsl`. Where WSL 2 starts a
+distro (it needs nested virtualization), the cluster's Docker end-to-end
+test then runs an agent's Docker jobs on it; elsewhere a notice says how
+far it went. The provisioning script and the start script were also run
+in an Ubuntu Base chroot on Linux: Docker installed, dockerd answered the
+CLI with the client certificate, and refused it without one.
+
+### MicroVMs on Windows on Arm
+
+`pumasi vm setup` on Windows aarch64 installs QEMU 11.1's native Arm
+build (`qemu-arm-setup-20260811.exe`, from the same builder as the x64
+one). QEMU 11 has WHPX on Arm, with Hyper-V's GICv3 as the only interrupt
+controller, so the machine is `virt,gic-version=3` and the accelerator
+plain `whpx` (no `kernel-irqchip=off`, which is the x86 workaround), then
+`tcg`. The CPU stays `max`, which is the host CPU under WHPX and still
+works when QEMU falls back. The Arm guest kernels have no PL011 driver
+for `virt`'s UART, so Arm QEMU VMs (on Linux too, where the console was
+silent) get a virtio console (`virtio-serial-device` + `virtconsole`,
+`console=hvc0`) into the same `serial.log` the agent watches on Windows.
+The probe VM that already guarded x86 WHPX runs on Arm too, and now also
+fails when QEMU printed `falling back to tcg` (Windows before 24H2 has a
+pre-release Arm hypervisor API QEMU does not use), so the agent reports
+TCG instead of calling it accelerated. CI builds the Arm binary on x64
+Windows, as releases are built, and runs a microVM on a `windows-11-arm`
+runner (guest init from a new `ubuntu-24.04-arm` job).
+
+### HCS, measured and not adopted
+
+The research doc left Hyper-V's compute service as a faster but larger
+backend. Adopting it means more than an API: HCS boots a Linux kernel
+directly (`LinuxKernelDirect`), but its devices are VMBus ones, so the
+guest needs a second kernel with Hyper-V drivers (`hv_vmbus`,
+`hv_storvsc`, `hv_netvsc`, `hv_sock`) and its disks VHD(X) instead of the
+raw ext4 images every other backend shares, and the guest init a VMBus
+console and network path. The rule from the roadmap is to adopt it only
+if it is clearly faster. CI cannot measure that: on hosted runners WHPX
+is nested and the probe VM sends QEMU to TCG. `scripts/windows/boot-times.ps1`
+measures it on a real PC: the median of five cold WSL 2 starts (an HCS VM
+booting Linux, which is what an HCS backend would cost at least) against
+five `pumasi vm run busybox -- true` with WHPX (disks, boot, run, exit).
+HCS is worth a backend only if its number is well under half of QEMU's;
+until a run on the home cluster's PCs shows that, QEMU with WHPX stays
+the Windows backend.
+
+### Code signing
+
+The signing workflow is unchanged (`docs/signing.md`); Windows binaries
+are signed once SignPath Foundation approves the project.
+
+### Compatibility
+
+No protocol, store or job-file change. `pumasi docker` is new; agents
+on machines without the setup, and every other platform, behave as in
+1.10. Linux Arm QEMU VMs change their console from `ttyAMA0` (which the
+pinned kernels never had) to `hvc0`.
 
 ## Persistence
 

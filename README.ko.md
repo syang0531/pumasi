@@ -119,7 +119,7 @@ pumasi ui
 
 ### Docker 작업: Python, 파일, 그 밖의 무엇이든
 
-컨테이너를 돌려도 되는 기기의 에이전트를 `--allow-docker`로 시작합니다(그 기기에 Docker가 설치되어 있어야 합니다. Windows는 WSL 2 백엔드에 Linux 컨테이너 모드인 Docker Desktop).
+컨테이너를 돌려도 되는 기기의 에이전트를 `--allow-docker`로 시작합니다(그 기기에 Docker가 설치되어 있어야 합니다. Windows는 `pumasi docker setup`, 또는 WSL 2 백엔드에 Linux 컨테이너 모드인 Docker Desktop).
 
 ```sh
 pumasi agent join pumasijoin... --allow-docker
@@ -209,7 +209,7 @@ gpu = { vendor = "intel" }            # 선택: nvidia, amd, intel, apple, any
 
 ### Windows
 
-Windows 10·11(x86_64)에서 모두 동작합니다. WASM은 그대로, Docker는 Docker Desktop으로, microVM은 Windows 하이퍼바이저 플랫폼(WHPX)을 쓰는 QEMU로 돌립니다. 관리자 PowerShell에서:
+Windows 10·11의 x86_64와 Arm에서 모두 동작합니다. WASM은 그대로, Docker는 Pumasi가 관리하는 WSL 배포판(또는 Docker Desktop)으로, microVM은 Windows 하이퍼바이저 플랫폼(WHPX)을 쓰는 QEMU로 돌립니다. 관리자 PowerShell에서:
 
 ```powershell
 # 한 번만: QEMU가 쓰는 하이퍼바이저 API를 켜고 재부팅
@@ -217,11 +217,16 @@ Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
 
 pumasi vm setup        # 게스트 커널과 버전 고정 QEMU (~\.pumasi\vm\qemu에 설치)
 pumasi vm status       # "whpx usable"이면 하드웨어 가속 microVM
+pumasi docker setup    # Docker Desktop 없이 WSL에서 부팅 때부터 도는 Docker (1.11)
 pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
 ```
 
+**Docker Desktop 없는 Docker (1.11).** `pumasi docker setup`은 숨겨진 로컬 계정(`pumasi-wsl`)이 소유한 작은 WSL 2 배포판 `pumasi-docker`에 Docker(Ubuntu의 `docker.io`)를 설치하고, 부팅 때(아무도 로그인하기 전) 그것을 시작해 `dockerd`를 계속 띄워 두는 예약 작업을 등록합니다. Windows에 NVIDIA 드라이버가 있으면 NVIDIA Container Toolkit도 넣어 GPU Docker 작업도 됩니다(WSL의 CUDA 지원). 데몬은 `127.0.0.1:2376`에서 상호 TLS로만 받고(클라이언트 인증서는 SYSTEM과 관리자만 읽음), 배포판에는 Windows 드라이브가 보이지 않고 Windows 프로그램도 실행할 수 없으며, 파일은 모두 `C:\ProgramData\Pumasi\wsl-docker`에 있습니다. `--allow-docker` 에이전트는 이것이 설치되어 있으면 이것을 씁니다. 그런 기기에서 Docker Desktop을 계속 쓰려면 에이전트에 `--docker-bin "C:\Program Files\Docker\Docker\resources\bin\docker.exe"`를 줍니다. `pumasi docker status`는 작업 상태, Docker 응답 여부, 로그 끝부분을 보여 주고, `pumasi docker remove`는 모두 지웁니다. WSL이 없으면 `setup`이 설치하고(`wsl --install --no-distribution`), 재부팅하면 예약 작업이 알아서 Docker를 설치합니다.
+
+**Windows on Arm (1.11).** `pumasi vm setup`이 QEMU의 Arm 네이티브 빌드를 설치하고, microVM은 Windows 11 24H2부터 WHPX로(QEMU 11), 그 전에는 소프트웨어 에뮬레이션으로 돕니다. 에이전트가 프로브 VM 하나를 띄워 보고 어느 쪽인지 알려 줍니다.
+
 - WHPX가 없으면(기능이 꺼졌거나 펌웨어에서 가상화가 꺼짐) microVM은 QEMU 소프트웨어 에뮬레이션으로 돕니다. 결과는 같고 몇 배 느립니다. 비교하려면 `PUMASI_QEMU_ACCEL=tcg`로 강제할 수 있습니다. WHPX가 있어도 클라우드 VM처럼 중첩된 환경에서는 VM 디스크가 깨지는데, 에이전트가 시작할 때 작은 프로브 VM을 띄워 보고 그러면 자동으로 에뮬레이션으로 돌리며 로그에 남깁니다.
-- Docker 작업에는 WSL 2 백엔드, Linux 컨테이너 모드로 실행 중인 Docker Desktop이 필요합니다. Docker Desktop은 로그인한 사용자와 함께 시작하므로, 아무도 로그인하지 않은 기기는 WASM과 microVM 작업만 받습니다(Docker Desktop 로그인 시 시작과 자동 로그인을 켜면 해결).
+- Docker Desktop을 쓴다면 WSL 2 백엔드, Linux 컨테이너 모드로 실행 중이어야 합니다. Docker Desktop은 로그인한 사용자와 함께 시작하므로, 그런 기기에 아무도 로그인하지 않았으면 WASM과 microVM 작업만 받습니다. `pumasi docker setup`에는 이 제한이 없습니다.
 - `pumasi service install`은 사설·도메인 네트워크에서 에이전트가 UDP를 받도록 방화벽 규칙을 추가해, 릴레이 대신 직접 연결되게 합니다. `service uninstall`이 규칙을 지웁니다. Windows가 공용(Public)으로 분류한 네트워크에서는 릴레이로 연결되며, 넓히려면 `netsh advfirewall firewall set rule name="Pumasi agent (UDP in)" new profile=any`.
 - 에이전트가 띄운 VM과 Docker CLI는 Windows Job Object에 묶여, 에이전트가 비정상 종료해도 함께 끝납니다.
 - 1.2.1까지의 `install.ps1`은 `pumasi.exe`를 SYSTEM, Administrators, 설치한 계정만 쓸 수 있게 남겨서, 다른 계정에서 실행하면 "액세스가 거부되었습니다"가 났습니다(서비스는 정상). 더 새 릴리스의 `install.ps1`을 다시 실행하거나 관리자 PowerShell에서 `icacls "C:\Program Files\Pumasi\pumasi.exe" /reset`을 실행하세요.
@@ -722,6 +727,7 @@ pumasi audit export --syslog tcp://siem.acme.local:601 --state audit.state --fol
 | `pumasi upgrade rollout 파일... [--wait] [--force]` | 클러스터 키로 서명한 새 에이전트 바이너리를 노드에 배포. `upgrade status`로 노드별 상태, `upgrade cancel`로 중단 |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | 게스트 커널, Firecracker(Linux) 또는 QEMU(Windows, 관리자), 게스트 init을 `~/.pumasi/vm`에 설치. `--gpu-bundle`은 패스스루용 GPU 게스트 커널과 드라이버 추가 |
 | `pumasi vm status` | microVM 준비 상태와 사용할 VM 모니터 표시 |
+| `pumasi docker setup [--port 2376] [--no-wait] [--new-certificates]` / `docker status` / `docker remove` | Windows 관리자: Pumasi가 관리하는 WSL 2 배포판의 Docker. 부팅 때 아무도 로그인하기 전에 예약 작업이 띄우고(Docker Desktop 불필요) `--allow-docker` 에이전트가 씀. `status`는 작업·데몬·로그, `remove`는 모두 삭제 |
 | `pumasi vm run 이미지 [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- 명령...]` | 에이전트와 똑같이 이 기기의 microVM에서 이미지 실행 (`/output`은 `pumasi-out/vm`에 저장) |
 | `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image 이미지] [--wsl-libs auto\|yes\|no]]` / `gpu webgpu [--software]` | 이 기기의 GPU와 벤치마크. `check`는 GPU마다 Docker·microVM에서 쓸 수 있는지 보고 클러스터 GPU 검증을 로컬로 돌려 봄. `--docker-run`은 컨테이너를 띄워 Docker에서 CUDA·OptiX·그리기(EGL, OpenGL, Vulkan)가 되는지 확인해 에이전트용으로 저장(`gpu.graphics`). `webgpu`는 wasm 작업이 쓸 수 있는 WebGPU 어댑터 목록 |
 | `pumasi store put 이름 경로... [--account A]` / `get 이름[@버전] \| --job ID [-o DIR]` / `ls [이름]` / `rm 이름[@버전]` / `usage` / `quota 계정 크기\|none` | 클러스터 파일 저장소: 버전 있는 데이터셋, 작업 출력, 이어받기, 쿼터 |
@@ -864,7 +870,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md). 1.5.1은 `--trusted-proxy`를 더해, 다른 기기의 리버스 프록시 뒤에서 모든 클라이언트가 로그인 실패 제한 하나를 같이 쓰던 문제를 고쳤습니다: [노트](docs/releases/v1.5.1.md). 1.6.0은 실행 중인 microVM 태스크의 출력을 바로 보여 주고, 모든 GPU와 Windows 온도를 보고하고, 노드 사이 네트워크를 재고, 경보 일시 중지·반복 알림·노드별 기준을 더했습니다: [노트](docs/releases/v1.6.0.md). 1.7.0은 대시보드 로그인을 재시작 뒤에도 유지하고, 경보 규칙·웹훅·요금·예약 작업·`cluster.toml`·노드 작업 조건을 브라우저에서 고치며, 카나리 롤아웃·실시간 차트·휴대폰 화면을 더했습니다: [노트](docs/releases/v1.7.0.md). 1.8.0은 파일 저장소를 여러 기기에 두고 S3 게이트웨이를 더했습니다: [노트](docs/releases/v1.8.0.md). 1.9.0은 갱 스케줄링, 분산·어피니티, CPU·메모리 쿼터, 체크포인트, 스케줄 시간대를 더했습니다: [노트](docs/releases/v1.9.0.md). 1.10.0은 폭주하는 WebGPU 셰이더를 작업 제한 시간에 멈추고, WebGPU 어댑터와 AMD GPU를 GPU 검증으로 재며, 태스크가 GPU를 나눠 쓰게 합니다(`gpus = 0.5`, MIG 슬라이스): [노트](docs/releases/v1.10.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를, 22단계(1.6)에서 모니터링을, 23단계(1.7)에서 대시보드를, 24단계(1.8)에서 파일 저장소를, 25단계(1.9)에서 스케줄링을, 26단계(1.10)에서 GPU를 다뤘습니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md). 1.5.1은 `--trusted-proxy`를 더해, 다른 기기의 리버스 프록시 뒤에서 모든 클라이언트가 로그인 실패 제한 하나를 같이 쓰던 문제를 고쳤습니다: [노트](docs/releases/v1.5.1.md). 1.6.0은 실행 중인 microVM 태스크의 출력을 바로 보여 주고, 모든 GPU와 Windows 온도를 보고하고, 노드 사이 네트워크를 재고, 경보 일시 중지·반복 알림·노드별 기준을 더했습니다: [노트](docs/releases/v1.6.0.md). 1.7.0은 대시보드 로그인을 재시작 뒤에도 유지하고, 경보 규칙·웹훅·요금·예약 작업·`cluster.toml`·노드 작업 조건을 브라우저에서 고치며, 카나리 롤아웃·실시간 차트·휴대폰 화면을 더했습니다: [노트](docs/releases/v1.7.0.md). 1.8.0은 파일 저장소를 여러 기기에 두고 S3 게이트웨이를 더했습니다: [노트](docs/releases/v1.8.0.md). 1.9.0은 갱 스케줄링, 분산·어피니티, CPU·메모리 쿼터, 체크포인트, 스케줄 시간대를 더했습니다: [노트](docs/releases/v1.9.0.md). 1.10.0은 폭주하는 WebGPU 셰이더를 작업 제한 시간에 멈추고, WebGPU 어댑터와 AMD GPU를 GPU 검증으로 재며, 태스크가 GPU를 나눠 쓰게 합니다(`gpus = 0.5`, MIG 슬라이스): [노트](docs/releases/v1.10.0.md). 1.11.0은 Windows에서 Docker Desktop 없이 부팅 때부터 Docker를 돌리고(`pumasi docker setup`), Windows on Arm에서 microVM을 돌립니다: [노트](docs/releases/v1.11.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를, 22단계(1.6)에서 모니터링을, 23단계(1.7)에서 대시보드를, 24단계(1.8)에서 파일 저장소를, 25단계(1.9)에서 스케줄링을, 26단계(1.10)에서 GPU를, 27단계(1.11)에서 Windows를 다뤘습니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -892,7 +898,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 24 | 여러 기기에 걸친 파일 저장소: 소유자 노드 복제본과 복구·검사, 충분한 사본에 쓴 뒤 완료 응답, S3 호환 게이트웨이 | 완료(1.8) |
 | 25 | 스케줄링: 갱 스케줄링, 분산, 어피니티·안티어피니티, CPU·메모리 쿼터, 라벨별 쿼터, 선점·drain·일시 중지·잠자기 뒤에도 이어지는 체크포인트(Docker·WASM), 스케줄 시간대 | 완료(1.9) |
 | 26 | GPU: 작업 제한 시간에 멈추는 WebGPU 셰이더(워커 프로세스), WebGPU용 GPU 챌린지, `shader-f16`과 subgroups, AMD 등 CUDA 없는 GPU의 WebGPU 벤치마크와 검증, ROCm Docker 작업, GPU 나눠 쓰기(`gpus = 0.5`), GPU로 쓰는 MIG 슬라이스 | 완료(1.10) |
-| 27 | Windows: Pumasi가 관리하는 WSL 배포판의 Docker(Docker Desktop·로그인 불필요), ARM64 microVM, 확실히 빠르면 HCS 백엔드 | 예정(1.11) |
+| 27 | Windows: Pumasi가 관리하는 WSL 배포판의 Docker(`pumasi docker setup`: Docker Desktop·로그인 불필요, NVIDIA GPU), ARM64 microVM(QEMU 11, WHPX 또는 TCG), HCS 백엔드는 채택하지 않음(실제 PC에서 잴 스크립트) | 완료(1.11) |
 | 28 | 운영: 공유·피어별 요청 제한, 서명된 체크포인트 뒤 감사 로그 정리, SCIM, HTTPS 프록시 뒤의 CLI, 팔로워 읽기 | 예정(1.12) |
 | 18 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 보류 |
 | 19 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 보류 |

@@ -5,7 +5,7 @@ members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "cr
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "1.10.0"
+version = "1.11.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/syang0531/pumasi"
@@ -68,6 +68,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1"
+# The TLS certificates of the WSL Docker daemon (1.11).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 # WebGPU executor (phase 14): compute shaders on Vulkan, Metal, DX12 or GL.
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "dx12", "gles", "wgsl"] }
 pollster = "0.4"

@@ -207,9 +207,7 @@ impl Assets {
 
     /// Whether QEMU gets a hardware accelerator here.
     pub fn qemu_accelerated(&self) -> bool {
-        self.kvm
-            || cfg!(target_os = "macos")
-            || (cfg!(target_arch = "x86_64") && matches!(self.whpx, Some(Ok(()))))
+        self.kvm || cfg!(target_os = "macos") || matches!(self.whpx, Some(Ok(())))
     }
 
     /// The VMM to use, or why there is none. `dir` is the VM directory,
@@ -248,7 +246,7 @@ impl Assets {
                 backend: Backend::Qemu,
                 bin: bin.clone(),
                 accelerated,
-                tsc_khz: (cfg!(windows) && accelerated)
+                tsc_khz: (cfg!(windows) && cfg!(target_arch = "x86_64") && accelerated)
                     .then(|| crate::platform::measure_tsc_khz(Duration::from_millis(50)))
                     .flatten(),
             }
@@ -702,6 +700,13 @@ impl MicrovmExecutor {
             out.files.len() == 1 && out.files[0] == file,
             "the copy came back different"
         );
+        // QEMU tries the accelerators in order: WHPX it cannot use (on Arm,
+        // Windows builds before 24H2's final hypervisor API) leaves the VM
+        // in TCG, which works but is no reason to call it accelerated.
+        let vmm_log = std::fs::read_to_string(dir.join("console.log")).unwrap_or_default();
+        if let Some(line) = fell_back_to_tcg(&vmm_log) {
+            bail!("QEMU could not use the hypervisor: {line}");
+        }
         Ok(())
     }
 
@@ -1600,6 +1605,22 @@ pub(crate) fn create_sparse(path: &Path, len: u64) -> Result<std::fs::File> {
     Ok(f)
 }
 
+/// The line where QEMU said it fell back to TCG, with the reason before it.
+fn fell_back_to_tcg(vmm_log: &str) -> Option<String> {
+    let lines: Vec<&str> = vmm_log.lines().map(str::trim).collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("falling back to tcg"))?;
+    Some(
+        lines[at.saturating_sub(1)..=at]
+            .iter()
+            .filter(|l| !l.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 fn console_tail(dir: &Path) -> String {
     // The VMM's own output, then the guest console when QEMU writes that
     // to a file (Windows).
@@ -1619,6 +1640,18 @@ fn console_tail(dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qemu_falling_back_to_tcg() {
+        let log = "qemu-system-aarch64: -accel whpx: WHPX: No accelerator found, hr=80070057\nqemu-system-aarch64: falling back to tcg\n";
+        assert_eq!(
+            fell_back_to_tcg(log).as_deref(),
+            Some(
+                "qemu-system-aarch64: -accel whpx: WHPX: No accelerator found, hr=80070057 qemu-system-aarch64: falling back to tcg"
+            )
+        );
+        assert_eq!(fell_back_to_tcg("Linux version 6.1\n"), None);
+    }
     use pumasi_guest::{
         DISK_ROLE_ENTRY, GuestResult, RESULT_ENTRY, SPEC_ENTRY, STDIN_ENTRY, STDOUT_ENTRY,
     };

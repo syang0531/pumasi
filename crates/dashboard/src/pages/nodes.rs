@@ -551,9 +551,10 @@ fn availability(ctx: &Ctx, n: &NodeView, v: Option<&pumasi_proto::ui::NodeSettin
                 }
             }
             @if editable {
-                form class="settings" hx-post={"/nodes/" (n.id) "/settings"} hx-target="#flash"
+                form #node-settings class="stack settings" hx-post={"/nodes/" (n.id) "/settings"} hx-target="#flash"
                     hx-confirm=(l.t("Change this node's settings? Its agent restarts with them once its running tasks end.",
                                     "이 노드의 설정을 바꿀까요? 에이전트가 실행 중인 태스크를 마친 뒤 새 설정으로 재시작합니다.")) {
+                    div class="grid2" {
                     label { (l.t("Slots", "슬롯")) " "
                         input type="number" name="slots" min="1" max="1024" placeholder=(l.t("default", "기본"))
                             value=[s.slots]; }
@@ -565,6 +566,7 @@ fn availability(ctx: &Ctx, n: &NodeView, v: Option<&pumasi_proto::ui::NodeSettin
                     label { (l.t("Idle minutes", "유휴 시간(분)")) " "
                         input type="number" name="idle_minutes" min="1" max="1440" placeholder=(l.t("off", "끔"))
                             value=[s.idle_minutes]; }
+                    }
                     label class="check" {
                         input type="checkbox" name="only_on_ac" value="on" checked[s.only_on_ac];
                         " " (l.t("Only on AC power", "전원 연결 시에만"))

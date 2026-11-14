@@ -56,7 +56,7 @@ module.exports = async () => {
     120_000,
   );
   const urlFile = path.join(work, "ui.url");
-  start("ui", ["--home", home("cluster"), "ui", "--no-open", "--listen", "127.0.0.1:0", "--url-file", urlFile]);
+  const ui = start("ui", ["--home", home("cluster"), "ui", "--no-open", "--listen", "127.0.0.1:0", "--url-file", urlFile]);
   const url = await waitFor("the dashboard", () => fs.existsSync(urlFile) && fs.readFileSync(urlFile, "utf8").trim());
   const fixtures = path.join(work, "job");
   fs.mkdirSync(fixtures);
@@ -66,5 +66,9 @@ module.exports = async () => {
     base: new URL(url).origin,
     adminTicket: fs.readFileSync(adminTicketFile, "utf8").trim(),
     module: path.join(fixtures, "ticker.wasm"),
+    // For tests that restart the dashboard or add a node (1.7).
+    uiPid: ui.pid,
+    clusterHome: home("cluster"),
+    join,
   });
 };

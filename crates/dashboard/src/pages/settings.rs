@@ -150,7 +150,11 @@ pub fn cluster_toml(nodes: &[NodeView], p: &AlertPolicy) -> String {
             .iter()
             .map(|(k, v)| format!("{} = {}", key(k), q(v)))
             .collect();
-        let _ = writeln!(out, "labels = {{ {} }}", labels.join(", "));
+        if labels.is_empty() {
+            out.push_str("labels = {}\n");
+        } else {
+            let _ = writeln!(out, "labels = {{ {} }}", labels.join(", "));
+        }
         let taints: Vec<String> = c.taints.iter().map(|t| q(&t.to_string())).collect();
         let _ = writeln!(out, "taints = [{}]", taints.join(", "));
         let _ = writeln!(out, "cordoned = {}\n", c.cordoned);

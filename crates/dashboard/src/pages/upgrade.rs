@@ -210,13 +210,16 @@ fn markup(ctx: &Ctx, v: &LatestReleaseView, r: &RolloutView, c: Option<&CanaryVi
         .is_some_and(|t| is_older(&v.control_plane, t));
     let running = matches!(v.fetch, FetchState::Running { .. });
     // Reload while something moves, so the state below stays current.
-    let trigger = if busy(v, r) || c.is_some_and(|c| c.phase == CanaryPhase::Canary) {
+    // A halted canary moves only when an admin acts: no reload that would
+    // clear the nodes checked below.
+    let halted = c.is_some_and(|c| matches!(c.phase, CanaryPhase::Halted { .. }));
+    let trigger = if !halted && (busy(v, r) || c.is_some_and(|c| c.phase == CanaryPhase::Canary)) {
         "every 3s, upgrade-changed from:body"
     } else {
         "every 600s, upgrade-changed from:body"
     };
     html! {
-        section #upgrade hx-get="/upgrade" hx-trigger=(trigger) hx-swap="outerHTML" {
+        section #upgrade hx-get="/upgrade" hx-trigger=(trigger) hx-swap="outerHTML" hx-disinherit="*" {
             h2 { (l.t("Upgrade", "업그레이드")) }
             dl class="facts" {
                 dt { (l.t("Newest release", "최신 릴리스")) }

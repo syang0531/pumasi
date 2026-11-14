@@ -1221,8 +1221,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     #[test]
     fn webgpu_timeout_stops_a_shader_that_never_ends() {
         let Some(gpu) = test_gpu() else { return };
+        // Long enough for a slow runner to start the worker and open the
+        // device, so the shader is running when the timeout comes.
         let limits = Limits {
-            timeout_ms: 3_000,
+            timeout_ms: 10_000,
             ..Default::default()
         };
         let start = Instant::now();
@@ -1234,9 +1236,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             "stderr: {}",
             String::from_utf8_lossy(&r.stderr)
         );
-        assert!(took < Duration::from_secs(15), "took {took:?}");
+        assert!(took < Duration::from_secs(30), "took {took:?}");
         let err = String::from_utf8_lossy(&r.stderr);
         assert!(err.contains("stopped at the task's end"), "{err}");
+        assert!(err.contains(": 1 dispatches"), "the shader ran: {err}");
         // The GPU is still good for the next task.
         let r = run_gpu(&gpu_wat(TRIPLE_WGSL, 1024), Some(gpu), Limits::default());
         assert_eq!(

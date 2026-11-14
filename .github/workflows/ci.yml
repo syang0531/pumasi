@@ -160,7 +160,7 @@ jobs:
           mods=examples/webgpu/target/wasm32-wasip1/release
           start=$(date +%s)
           set +e
-          "$bin" exec --gpu --webgpu-software --timeout 5s --out out "$mods/forever.wasm" > forever.txt 2>&1
+          "$bin" exec --gpu --webgpu-software --timeout 10s --out out "$mods/forever.wasm" > forever.txt 2>&1
           code=$?
           set -e
           took=$(( $(date +%s) - start ))

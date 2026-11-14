@@ -108,7 +108,9 @@ impl GpuState {
     /// What the task did on the GPU, for its stderr; `None` when it did
     /// not use it.
     pub fn summary(&self) -> Option<String> {
-        if self.info.is_empty() {
+        // A worker killed while it was still opening the device counts as
+        // used too.
+        if self.info.is_empty() && !self.killed {
             return None;
         }
         let name = self

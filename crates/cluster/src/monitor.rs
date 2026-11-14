@@ -1023,10 +1023,14 @@ impl State {
                 && !self.asleep(&m.id)
                 && !self.node_config(&m.id).is_some_and(|c| c.cordoned)
             {
+                // A node that has just joined has no entry in `nodes` until
+                // it says hello a moment later: count from its join, not
+                // from the control plane's start.
                 let seen = self
                     .nodes
                     .get(&m.id)
                     .map_or(0, |n| n.last_seen_unix)
+                    .max(m.joined_unix)
                     .max(self.monitor.started_unix);
                 let gone = now.saturating_sub(seen);
                 if gone >= after {

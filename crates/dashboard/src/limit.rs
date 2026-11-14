@@ -132,6 +132,11 @@ pub struct AuthLimiter {
     trusted_proxies: Vec<TrustedProxy>,
     map: Mutex<HashMap<IpAddr, Entry>>,
     identities: Mutex<HashMap<Secret, (Identity, Instant)>>,
+    /// Addresses the control plane says are blocked: failures every
+    /// dashboard of the cluster counted (1.12).
+    shared_blocked: Mutex<HashMap<IpAddr, Instant>>,
+    /// Where failures go to be counted by the control plane.
+    reporter: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<IpAddr>>,
 }
 
 impl AuthLimiter {
@@ -141,7 +146,27 @@ impl AuthLimiter {
             trusted_proxies,
             map: Mutex::default(),
             identities: Mutex::default(),
+            shared_blocked: Mutex::default(),
+            reporter: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Sends failures to the control plane from now on.
+    pub fn report_to(&self, tx: tokio::sync::mpsc::UnboundedSender<IpAddr>) {
+        let _ = self.reporter.set(tx);
+    }
+
+    /// Replaces the copy of the control plane's blocked addresses.
+    pub fn set_shared_blocked(&self, blocked: &[(String, u64)]) {
+        let now = Instant::now();
+        let map: HashMap<IpAddr, Instant> = blocked
+            .iter()
+            .filter_map(|(ip, ms)| {
+                let ip: IpAddr = ip.parse().ok()?;
+                Some((ip.to_canonical(), now + Duration::from_millis(*ms)))
+            })
+            .collect();
+        *self.shared_blocked.lock().unwrap() = map;
     }
 
     /// The client's address for counting failures.
@@ -197,8 +222,14 @@ impl AuthLimiter {
     pub fn check(&self, ip: Option<IpAddr>) -> Result<(), Response> {
         let Some(ip) = ip else { return Ok(()) };
         let now = Instant::now();
-        let map = self.map.lock().unwrap();
-        match map.get(&ip).and_then(|e| e.blocked_until) {
+        let local = self
+            .map
+            .lock()
+            .unwrap()
+            .get(&ip)
+            .and_then(|e| e.blocked_until);
+        let shared = self.shared_blocked.lock().unwrap().get(&ip).copied();
+        match local.into_iter().chain(shared).max() {
             Some(until) if until > now => Err(too_many(until - now)),
             _ => Ok(()),
         }
@@ -207,6 +238,9 @@ impl AuthLimiter {
     /// Counts a failed sign-in or bearer ticket from `ip`.
     pub fn failed(&self, ip: Option<IpAddr>) {
         let Some(ip) = ip else { return };
+        if let Some(tx) = self.reporter.get() {
+            let _ = tx.send(ip.to_canonical());
+        }
         let now = Instant::now();
         let mut map = self.map.lock().unwrap();
         if map.len() >= MAX_TRACKED && !map.contains_key(&ip) {
@@ -261,62 +295,92 @@ impl AuthLimiter {
     }
 }
 
-/// Requests one ticket may make in a burst (phase 17)...
-pub const TICKET_BURST: f64 = 120.0;
-/// ...and per second after it. A dashboard page with live regions makes
-/// well under one a second; a script that loops faster than this is
-/// slowed down rather than allowed to load the control plane.
-pub const TICKET_RATE: f64 = 20.0;
+/// Requests one ticket may make in a burst and per second after it
+/// (phase 17). A dashboard page with live regions makes well under one a
+/// second; a script that loops faster than this is slowed down rather
+/// than allowed to load the control plane. Since 1.12 the control plane
+/// keeps the buckets for every dashboard ([`SharedLimits`]).
+pub use pumasi_proto::limit::{SIGN_IN_BURST, SIGN_IN_PER_MIN, TICKET_BURST, TICKET_RATE};
 /// `?wait=` long polls one ticket may hold open at once.
 pub const MAX_WAITS: u32 = 8;
-/// Sign-ins one client address may start in a burst, and per minute.
-pub const SIGN_IN_BURST: f64 = 10.0;
-pub const SIGN_IN_PER_MIN: f64 = 10.0;
 
-/// Token buckets, one per key (a ticket's secret, a client address).
-pub struct Buckets<K> {
-    burst: f64,
-    per_sec: f64,
-    map: Mutex<HashMap<K, (f64, Instant)>>,
+/// The control plane's side of the limits (1.12): every `pumasi ui` of a
+/// cluster takes tokens from the same buckets there. A dashboard whose
+/// ticket is not an admin's, or whose control plane is older, keeps
+/// counting on its own (the local buckets), as before.
+pub struct SharedLimits {
+    /// Shared counting is off until this time (a refusal turns it off for
+    /// good, a failed call for a minute).
+    off_until: Mutex<Option<Instant>>,
+    /// Tokens taken from the control plane and not spent yet, per ticket.
+    leases: Mutex<HashMap<String, u32>>,
 }
 
-impl<K: std::hash::Hash + Eq + Clone> Buckets<K> {
-    pub fn new(burst: f64, per_sec: f64) -> Self {
+/// What a shared take came to.
+pub enum Shared {
+    Allowed,
+    Wait(Duration),
+    /// Not shared now: count locally.
+    Local,
+}
+
+impl Default for SharedLimits {
+    fn default() -> Self {
         Self {
-            burst,
-            per_sec,
-            map: Mutex::default(),
+            off_until: Mutex::new(None),
+            leases: Mutex::default(),
+        }
+    }
+}
+
+impl SharedLimits {
+    pub fn on(&self) -> bool {
+        self.off_until
+            .lock()
+            .unwrap()
+            .is_none_or(|u| Instant::now() >= u)
+    }
+
+    /// Stops sharing for a while (`None`: for good).
+    pub fn pause(&self, why: &str, for_: Option<Duration>) {
+        let mut off = self.off_until.lock().unwrap();
+        let was_on = off.is_none_or(|u| Instant::now() >= u);
+        let until = match for_ {
+            Some(d) => Instant::now() + d,
+            // Far enough to be never for a running dashboard.
+            None => Instant::now() + Duration::from_secs(100 * 365 * 86_400),
+        };
+        *off = Some(until);
+        if was_on {
+            tracing::warn!("request limits are counted by this dashboard alone: {why}");
         }
     }
 
-    /// Takes one token, or says how long until there is one.
-    pub fn take(&self, key: &K) -> Result<(), Duration> {
-        self.take_at(key, Instant::now())
+    /// Spends a leased token of `key`, if there is one.
+    pub fn spend_lease(&self, key: &str) -> bool {
+        let mut l = self.leases.lock().unwrap();
+        match l.get_mut(key) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        }
     }
 
-    fn take_at(&self, key: &K, now: Instant) -> Result<(), Duration> {
-        let mut map = self.map.lock().unwrap();
-        if map.len() >= MAX_TRACKED && !map.contains_key(key) {
-            // Full buckets are the same as none.
-            let (burst, rate) = (self.burst, self.per_sec);
-            map.retain(|_, (t, at)| *t + now.duration_since(*at).as_secs_f64() * rate < burst);
-            if map.len() >= MAX_TRACKED
-                && let Some(k) = map.keys().next().cloned()
-            {
-                map.remove(&k);
+    pub fn add_lease(&self, key: String, n: u32) {
+        let mut l = self.leases.lock().unwrap();
+        if l.len() >= MAX_TRACKED && !l.contains_key(&key) {
+            l.retain(|_, n| *n > 0);
+            if l.len() >= MAX_TRACKED {
+                l.clear();
             }
         }
-        let (tokens, at) = map.entry(key.clone()).or_insert((self.burst, now));
-        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * self.per_sec).min(self.burst);
-        *at = now;
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
-            Ok(())
-        } else {
-            Err(Duration::from_secs_f64((1.0 - *tokens) / self.per_sec))
-        }
+        *l.entry(key).or_default() += n;
     }
 }
+
+pub use pumasi_proto::limit::Buckets;
 
 /// `429` for a ticket that is going too fast.
 pub fn slow_down(wait: Duration, msg: &str) -> Response {

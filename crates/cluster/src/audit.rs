@@ -6,7 +6,7 @@
 
 use anyhow::{Result, ensure};
 use pumasi_proto::{
-    audit::{AuditEntry, AuditHead, GENESIS},
+    audit::{AuditCheckpoint, AuditEntry, AuditHead, GENESIS, rfc3339},
     job::Executor,
     msg::{AdminOp, OWNER_ACCOUNT},
     store::StoreTarget,
@@ -18,14 +18,28 @@ use crate::{
     state::{State, now_unix},
 };
 
+/// Ends a walk over the audit log early.
+#[derive(Debug)]
+struct StopWalk;
+
+impl std::fmt::Display for StopWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stop")
+    }
+}
+
+impl std::error::Error for StopWalk {}
+
 /// Longest detail kept in an entry.
 const MAX_DETAIL: usize = 1024;
 
 /// Where the chain stands.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct AuditTip {
     pub next_seq: u64,
     pub head: [u8; 32],
+    /// Where a pruned log starts (1.12).
+    pub checkpoint: Option<AuditCheckpoint>,
 }
 
 impl Default for AuditTip {
@@ -33,7 +47,15 @@ impl Default for AuditTip {
         Self {
             next_seq: 1,
             head: GENESIS,
+            checkpoint: None,
         }
+    }
+}
+
+impl AuditTip {
+    /// The last pruned entry (0: none).
+    pub fn floor(&self) -> u64 {
+        self.checkpoint.as_ref().map_or(0, |c| c.seq)
     }
 }
 
@@ -86,12 +108,22 @@ fn clip(mut s: String) -> String {
 impl State {
     /// Picks up the chain where the database leaves it.
     pub(crate) fn load_audit(&mut self) -> Result<()> {
+        let checkpoint = self.store.audit_checkpoint()?;
         self.audit_tip = match self.store.last_audit()? {
-            Some(e) => AuditTip {
+            Some(e) if checkpoint.as_ref().is_none_or(|c| e.seq > c.seq) => AuditTip {
                 next_seq: e.seq + 1,
                 head: e.hash,
+                checkpoint,
             },
-            None => AuditTip::default(),
+            // Everything up to the checkpoint is gone (or about to be).
+            _ => match checkpoint {
+                Some(c) => AuditTip {
+                    next_seq: c.seq + 1,
+                    head: c.hash,
+                    checkpoint: Some(c),
+                },
+                None => AuditTip::default(),
+            },
         };
         Ok(())
     }
@@ -122,24 +154,57 @@ impl State {
         .seal(self.audit_tip.head);
         match self.store.put_audit(&e) {
             Ok(()) => {
-                self.audit_tip = AuditTip {
-                    next_seq: e.seq + 1,
-                    head: e.hash,
-                };
+                self.audit_tip.next_seq = e.seq + 1;
+                self.audit_tip.head = e.hash;
             }
             Err(err) => warn!("could not write audit entry {}: {err:#}", e.line()),
         }
     }
 
     pub fn audit_entries(&self, after: u64, limit: u32) -> Result<Vec<AuditEntry>> {
-        self.store.audit(after, limit.clamp(1, 10_000) as usize)
+        self.store.audit(
+            after,
+            limit.clamp(1, 10_000) as usize,
+            self.audit_tip.floor(),
+        )
     }
 
-    /// Checks the whole chain from the first entry and signs its head.
+    /// Up to `limit` entries from `from` on.
+    pub fn audit_from(&self, from: u64, limit: u32) -> Result<Vec<AuditEntry>> {
+        // `after` counts from the entry before; `after: 0` would mean the
+        // newest, so the floor (at least 0) keeps it a range.
+        let floor = self.audit_tip.floor();
+        let after = from.saturating_sub(1).max(floor);
+        if after == 0 {
+            let mut out = Vec::new();
+            self.store
+                .each_audit_limited(0, limit.clamp(1, 10_000) as usize, &mut out)?;
+            return Ok(out);
+        }
+        self.store
+            .audit(after, limit.clamp(1, 10_000) as usize, floor)
+    }
+
+    pub fn audit_checkpoint(&self) -> Option<AuditCheckpoint> {
+        self.audit_tip.checkpoint.clone()
+    }
+
+    /// Checks the whole chain from the first entry (after a prune, from
+    /// its checkpoint, whose signature is checked too) and signs its head.
     pub fn audit_verify(&self) -> Result<AuditHead> {
-        let mut prev = GENESIS;
-        let mut next = 1u64;
-        self.store.each_audit(|e| {
+        let (mut prev, mut next) = match &self.audit_tip.checkpoint {
+            Some(c) => {
+                c.verify()?;
+                ensure!(
+                    c.cluster == self.key.public().to_string(),
+                    "the audit checkpoint is signed by another key"
+                );
+                (c.hash, c.seq + 1)
+            }
+            None => (GENESIS, 1u64),
+        };
+        let start = next;
+        self.store.each_audit(start - 1, |e| {
             pumasi_proto::audit::verify_chain(prev, next, std::slice::from_ref(&e))?;
             prev = e.hash;
             next += 1;
@@ -159,12 +224,121 @@ impl State {
             .to_vec();
         Ok(AuditHead {
             cluster: self.key.public().to_string(),
-            entries: seq,
+            entries: next - start,
             seq,
             hash: prev,
             unix,
             signature,
         })
+    }
+
+    /// Prunes the audit log up to and including entry `through` (1.12):
+    /// checks the whole chain, signs a checkpoint at `through` (whose hash
+    /// must be `expect`, when given), removes the entries and logs the
+    /// prune as the next entry. Returns the checkpoint and how many
+    /// entries went.
+    pub fn audit_prune(
+        &mut self,
+        through: u64,
+        expect: Option<[u8; 32]>,
+        who: &Actor,
+    ) -> Result<(AuditCheckpoint, u64)> {
+        let floor = self.audit_tip.floor();
+        let last = self.audit_tip.next_seq - 1;
+        ensure!(through > floor, "entries up to #{floor} are already pruned");
+        ensure!(
+            through <= last,
+            "the audit log ends at #{last}; there is no #{through}"
+        );
+        // Prove the chain is intact before throwing any of it away: a
+        // checkpoint vouches for everything before it.
+        self.audit_verify()
+            .map_err(|e| anyhow::anyhow!("not pruning a log that does not verify: {e:#}"))?;
+        let entry = self
+            .store
+            .audit_entry(through)?
+            .ok_or_else(|| anyhow::anyhow!("audit entry #{through} is missing"))?;
+        if let Some(h) = expect {
+            ensure!(
+                entry.hash == h,
+                "audit entry #{through} does not have the hash given (the entries saved are not the ones in the log)"
+            );
+        }
+        let unix = now_unix();
+        let signature = self
+            .key
+            .sign(&AuditCheckpoint::signed_bytes(
+                through,
+                &entry.hash,
+                entry.unix,
+                floor,
+                unix,
+            ))
+            .to_bytes()
+            .to_vec();
+        let cp = AuditCheckpoint {
+            cluster: self.key.public().to_string(),
+            seq: through,
+            hash: entry.hash,
+            entry_unix: entry.unix,
+            previous_seq: floor,
+            unix,
+            signature,
+        };
+        let removed = self.store.prune_audit(&cp)?;
+        self.audit_tip.checkpoint = Some(cp.clone());
+        self.audit(
+            who,
+            "audit.prune",
+            format!("#{} to #{through}", floor + 1),
+            format!(
+                "{removed} entries, up to {} UTC; checkpoint hash {}",
+                rfc3339(entry.unix),
+                data_encoding::HEXLOWER.encode(&entry.hash)
+            ),
+            true,
+        );
+        warn!(
+            "audit log pruned: entries #{} to #{through} removed behind a signed checkpoint",
+            floor + 1
+        );
+        Ok((cp, removed))
+    }
+
+    /// Prunes entries older than `keep` (`pumasi cluster start
+    /// --keep-audit`), keeping the newest one at least. Zero keeps all.
+    pub fn audit_prune_older(&mut self, keep: std::time::Duration, now: u64) -> Option<u64> {
+        if keep.is_zero() {
+            return None;
+        }
+        let cutoff = now.saturating_sub(keep.as_secs());
+        let floor = self.audit_tip.floor();
+        // The newest entry before the cutoff, never the head itself.
+        let mut through = None;
+        let last = self.audit_tip.next_seq.saturating_sub(1);
+        let res = self.store.each_audit(floor, |e| {
+            if e.unix < cutoff && e.seq < last {
+                through = Some(e.seq);
+                Ok(())
+            } else {
+                // Entries are in time order: stop at the first newer one.
+                anyhow::bail!(StopWalk)
+            }
+        });
+        if let Err(e) = res
+            && !e.is::<StopWalk>()
+        {
+            warn!("could not read the audit log to prune it: {e:#}");
+            return None;
+        }
+        let through = through?;
+        match self.audit_prune(through, None, &Actor::system()) {
+            Ok((_, n)) => Some(n),
+            Err(e) => {
+                warn!("could not prune the audit log: {e:#}");
+                None
+            }
+        }
     }
 }
 
@@ -547,7 +721,20 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | AuditVerify
         | SsoGet
         | Resources
-        | Placement { .. } => return None,
+        | Placement { .. }
+        | AuditCheckpoint
+        | AuditFrom { .. }
+        | ScimView => return None,
+        // Unwrapped before anything looks at it.
+        FollowerRead(inner) => return describe(inner),
+        // Logged by the prune itself, with what went.
+        AuditPrune { .. } => return None,
+        // Counting requests is not a change to the cluster.
+        Limit(_) => return None,
+        // SCIM changes log themselves, one entry per person or group.
+        Scim(_) => return None,
+        ScimTokenCreate { label } => ("scim.token.create", label.clone(), none()),
+        ScimTokenRevoke { id } => ("scim.token.revoke", id.clone(), none()),
         SetResources { account, quota } => ("resources.set", account.clone(), quota.describe()),
         // Joined into the plain calls before they get here.
         SubmitPlaced { .. }
@@ -572,7 +759,17 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
 pub fn refused_action(op: &AdminOp) -> String {
     match describe(op) {
         Some((a, _, _)) => a.to_string(),
-        None if matches!(op, AdminOp::Audit { .. } | AdminOp::AuditVerify) => "audit.read".into(),
+        None if matches!(
+            op,
+            AdminOp::Audit { .. }
+                | AdminOp::AuditVerify
+                | AdminOp::AuditCheckpoint
+                | AdminOp::AuditFrom { .. }
+        ) =>
+        {
+            "audit.read".into()
+        }
+        None if matches!(op, AdminOp::AuditPrune { .. }) => "audit.prune".into(),
         None if matches!(op, AdminOp::SsoGet) => "sso.read".into(),
         None => format!("call.{}", variant_name(op)),
     }

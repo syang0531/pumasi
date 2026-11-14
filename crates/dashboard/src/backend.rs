@@ -71,4 +71,9 @@ impl Backend {
     pub async fn call(&self, secret: Secret, op: AdminOp) -> Result<AdminResponse> {
         self.client(secret).await?.call(op).await
     }
+
+    /// A read a follower may answer ([`AdminClient::read`]).
+    pub async fn read(&self, secret: Secret, op: AdminOp) -> Result<AdminResponse> {
+        self.client(secret).await?.read(op).await
+    }
 }

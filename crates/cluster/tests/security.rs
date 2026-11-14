@@ -54,6 +54,9 @@ async fn start_cluster(dir: PathBuf) -> Result<Cluster> {
     config.name = "security".into();
     config.net = NetMode::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
+    // These tests sign many people in from one client; the per-peer
+    // limit has its own test (limits_sign_in_calls_per_peer).
+    config.sign_in_per_min = 1000.0;
     Cluster::start(config).await
 }
 
@@ -847,6 +850,45 @@ async fn start_ldap() -> SocketAddr {
         }
     });
     addr
+}
+
+/// Sign-in calls without a ticket are limited per peer (1.12); the admin
+/// (a dashboard signing people in) is not, and `SsoInfo` is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limits_sign_in_calls_per_peer() -> Result<()> {
+    init_tracing();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut config = ClusterConfig::new(tempdir("limits"));
+    config.name = "limits".into();
+    config.net = NetMode::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let cluster = Cluster::start(config).await?;
+    let admin = AdminClient::connect(&cluster.admin_ticket(), NetMode::Local).await?;
+    let anon = AdminClient::connect(&anonymous(&cluster.admin_ticket()), NetMode::Local).await?;
+    let login = || AdminOp::LdapLogin {
+        user: "alice".into(),
+        password: Hidden("guess".into()),
+    };
+    for _ in 0..10 {
+        let e = err(&anon, login()).await;
+        assert!(e.contains("no LDAP"), "{e}");
+    }
+    let e = err(&anon, login()).await;
+    assert!(e.contains("too many sign-in attempts"), "{e}");
+    assert!(matches!(
+        call(&anon, AdminOp::SsoInfo).await,
+        AdminResponse::SsoInfo(_)
+    ));
+    for _ in 0..15 {
+        let e = err(&admin, login()).await;
+        assert!(e.contains("no LDAP"), "{e}");
+    }
+    // Another peer has its own budget.
+    let other = AdminClient::connect(&anonymous(&cluster.admin_ticket()), NetMode::Local).await?;
+    let e = err(&other, login()).await;
+    assert!(e.contains("no LDAP"), "{e}");
+    cluster.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

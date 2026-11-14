@@ -48,3 +48,26 @@ impl HaView {
             .count()
     }
 }
+
+/// What a leader hands its followers every couple of seconds so they can
+/// answer reads themselves (1.12): the status, the newest events and the
+/// latest metrics, as an admin sees them. A follower answers a
+/// [`crate::msg::AdminOp::FollowerRead`] from this while it is fresh, and
+/// sends the caller to the leader otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadCache {
+    /// When the leader made it (UNIX milliseconds).
+    pub at_unix_ms: u64,
+    pub status: crate::msg::ClusterStatus,
+    /// The newest events, oldest first.
+    pub events: Vec<crate::monitor::EventView>,
+    /// Whether older events exist than the first one here.
+    pub events_cut: bool,
+    /// The latest readings of every node (`since_secs` 0).
+    pub metrics: crate::monitor::MetricsView,
+}
+
+/// Events a [`ReadCache`] carries at most.
+pub const READ_CACHE_EVENTS: usize = 500;
+/// A follower answers from a cache at most this old (milliseconds).
+pub const READ_CACHE_FRESH_MS: u64 = 6_000;

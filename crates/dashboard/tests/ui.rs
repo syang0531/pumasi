@@ -1661,3 +1661,193 @@ async fn a_sleeping_node_shows_as_asleep_and_wakes_from_the_api() {
     laptop_task.abort();
     desk_task.abort();
 }
+
+/// An `--api-only` dashboard over plain HTTP on loopback, believing
+/// `CF-Connecting-IP` like one behind a tunnel.
+async fn api_dashboard(ticket: pumasi_proto::ticket::AdminTicket) -> pumasi_dashboard::Ui {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    pumasi_dashboard::start_on(
+        listener,
+        UiConfig {
+            ticket,
+            net: NetMode::Local,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            login_only: false,
+            upload_limit: 64 << 20,
+            api_only: true,
+            tls: None,
+            real_ip_header: Some("CF-Connecting-IP".into()),
+            trusted_proxies: Vec::new(),
+            public_url: Some("https://ui.example.com".into()),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// 1.12: two dashboards in front of one cluster count failed sign-ins and
+/// each ticket's requests together (the control plane keeps the counts),
+/// and SCIM reaches the control plane through either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_dashboards_share_limits_and_scim() {
+    let (cluster, agent_task) = start_cluster().await;
+    let admin = cluster.admin_ticket();
+    let a = api_dashboard(admin.clone()).await;
+    let b = api_dashboard(admin.clone()).await;
+    let auth = ("Authorization", format!("Bearer {admin}"));
+
+    // SCIM: a token from the control plane, a user made through one
+    // dashboard and read through the other.
+    let client = pumasi_cluster::AdminClient::connect(&admin, NetMode::Local)
+        .await
+        .unwrap();
+    let pumasi_proto::msg::AdminResponse::ScimToken { token, .. } = client
+        .call(pumasi_proto::msg::AdminOp::ScimTokenCreate {
+            label: "Okta".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("no token");
+    };
+    let scim_auth = ("Authorization", format!("Bearer {token}"));
+    let body = serde_json::json!({
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+        "userName": "carol@example.com",
+        "active": true,
+        "emails": [{"value": "carol@example.com", "primary": true}],
+    })
+    .to_string();
+    let r = request(
+        a.addr(),
+        "POST",
+        "/scim/v2/Users",
+        &[
+            scim_auth.clone(),
+            ("Content-Type", "application/scim+json".into()),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    assert!(r.header("content-type").unwrap().contains("scim+json"));
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        r.json()["meta"]["location"],
+        format!("https://ui.example.com/scim/v2/Users/{id}")
+    );
+    let r = request(
+        b.addr(),
+        "GET",
+        "/scim/v2/Users?filter=userName%20eq%20%22carol%40example.com%22",
+        std::slice::from_ref(&scim_auth),
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["totalResults"], 1);
+    let r = request(
+        b.addr(),
+        "DELETE",
+        &format!("/scim/v2/Users/{id}"),
+        std::slice::from_ref(&scim_auth),
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 204, "{}", r.text());
+    // A wrong SCIM token: 401, counted like a failed sign-in.
+    let r = request(
+        a.addr(),
+        "GET",
+        "/scim/v2/Users",
+        &[
+            ("Authorization", "Bearer pumasi-scim-wrong".into()),
+            ("CF-Connecting-IP", "198.51.100.50".into()),
+        ],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 401, "{}", r.text());
+    assert_eq!(r.json()["status"], "401");
+
+    // Failed sign-ins from one address, half through each dashboard: the
+    // tenth blocks it on both.
+    let guesser = ("CF-Connecting-IP", "198.51.100.9".to_string());
+    for i in 0..10 {
+        let ui = if i % 2 == 0 { &a } else { &b };
+        let r = request(
+            ui.addr(),
+            "GET",
+            "/api/v1/status",
+            &[guesser.clone(), ("Authorization", "Bearer nope".into())],
+            b"",
+        )
+        .await;
+        assert_eq!(r.status, 401, "attempt {i}: {}", r.text());
+    }
+    for (name, ui) in [("a", &a), ("b", &b)] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = request(
+                ui.addr(),
+                "GET",
+                "/api/v1/whoami",
+                &[guesser.clone(), auth.clone()],
+                b"",
+            )
+            .await;
+            if r.status == 429 {
+                break;
+            }
+            assert_eq!(r.status, 200, "{}", r.text());
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "dashboard {name} never saw the shared block"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+    // Other addresses carry on.
+    let r = request(
+        a.addr(),
+        "GET",
+        "/api/v1/whoami",
+        &[("CF-Connecting-IP", "198.51.100.10".into()), auth.clone()],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    // One ticket's requests through both: the shared bucket runs out
+    // well before two separate ones would (2 x 120 plus refills).
+    let mut n = 0;
+    let limited = loop {
+        let ui = if n % 2 == 0 { &a } else { &b };
+        let r = request(
+            ui.addr(),
+            "GET",
+            "/api/v1/whoami",
+            &[("CF-Connecting-IP", "198.51.100.11".into()), auth.clone()],
+            b"",
+        )
+        .await;
+        n += 1;
+        if r.status == 429 {
+            break n;
+        }
+        assert_eq!(r.status, 200, "{}", r.text());
+        if n > 400 {
+            panic!("no limit after {n} requests");
+        }
+    };
+    assert!(
+        limited < 200,
+        "the limit came after {limited} requests: the dashboards counted alone"
+    );
+
+    client.close().await;
+    a.stop();
+    b.stop();
+    agent_task.abort();
+    let _ = cluster.shutdown().await;
+}

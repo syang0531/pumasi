@@ -211,6 +211,16 @@ impl State {
         peer: &str,
     ) -> Result<AccessRecord> {
         let action = format!("{method}.login");
+        // Turned off in the identity provider (SCIM, 1.12).
+        if let Some(why) = self.scim_refuses(who) {
+            let actor = Actor {
+                name: who.name.clone(),
+                role: "anonymous".into(),
+                peer: peer.into(),
+            };
+            self.audit(&actor, &action, &who.name, why.clone(), false);
+            bail!("{why}");
+        }
         let Some(role) = role_for(&self.sso.config.maps, who) else {
             let actor = Actor {
                 name: who.name.clone(),

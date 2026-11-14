@@ -26,7 +26,7 @@ on real machines.
 | 25 | 1.9 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | done |
 | 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | done |
 | 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | done |
-| 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | planned |
+| 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | done |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
 | 19 | | Buying CU with won through the hub (Toss Payments) | on hold |
 
@@ -312,6 +312,17 @@ without Docker Desktop runs Docker and GPU jobs as a service after a
 reboot, before anyone signs in.
 
 ## 28. Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy (1.12)
+
+Done in 1.12.0 ([release notes](releases/v1.12.0.md),
+[details](architecture.md#phase-28-operations-112)). Shared limits apply
+to dashboards run with the admin ticket and live in the leader's memory
+(a failover resets them). Keycloak has no SCIM client of its own, so CI
+sends the requests Entra ID and Okta send, and the Keycloak end-to-end
+test plays the directory with curl for a user signed in through
+Keycloak. Followers answer the dashboard's status, events and current
+metrics for admins and viewers; the API and the CLI still read from the
+leader. Proxy settings apply to agents and control planes too
+(`PUMASI_PROXY=off` opts out).
 
 - Per-peer limits on unauthenticated sign-in calls at the control plane,
   and request limits and failed sign-in counts shared by every `pumasi ui`

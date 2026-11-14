@@ -2,7 +2,8 @@
 # SSO end-to-end test against real identity software instead of the mock
 # providers in crates/cluster/tests/security.rs: Keycloak for OpenID
 # Connect (browser flow with PKCE, device flow, group claims) and OpenLDAP
-# for LDAP (service bind, user bind, group lookup), both in Docker.
+# for LDAP (service bind, user bind, group lookup), both in Docker, and
+# SCIM provisioning (1.12) in the shapes Entra ID and Okta send.
 #
 #   scripts/sso-e2e.sh [--bin target/release/pumasi] [--keep]
 #
@@ -22,7 +23,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --bin) bin=$2; shift 2 ;;
     --keep) keep=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown option $1"; exit 2 ;;
   esac
 done
@@ -263,5 +264,46 @@ for who in alice bob carol dave erin; do
 done
 "$bin" audit verify >/dev/null || fail "pumasi audit verify failed"
 ok "audit: every sign-in and refusal is logged, and the chain verifies"
+
+# --- SCIM provisioning (1.12) ---------------------------------------------
+# Keycloak has no SCIM client of its own, so this plays the directory: the
+# requests have the shape Entra ID and Okta send. Alice is signed in to the
+# dashboard (alice.jar) and from a terminal (alice-cli); deactivating her
+# must end both, and keep her out until she is active again.
+scim_token=$("$bin" sso scim token keycloak-sync 2>/dev/null)
+case $scim_token in pumasi-scim-*) ;; *) fail "pumasi sso scim token printed '${scim_token}'" ;; esac
+scim() {
+  local method=$1 path=$2 body=${3:-}
+  curl -sS -o "$work/scim.json" -w '%{http_code}' -X "$method" \
+    -H "Authorization: Bearer $scim_token" -H 'Content-Type: application/scim+json' \
+    ${body:+--data "$body"} "$ui/scim/v2$path"
+}
+status=$(scim POST /Users '{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"alice@example.com","externalId":"kc-alice","active":true,"emails":[{"value":"alice@example.com","type":"work","primary":true}]}')
+[ "$status" = 201 ] || fail "SCIM POST /Users gave HTTP $status: $(cat "$work/scim.json")"
+alice_id=$(jq -r .id "$work/scim.json")
+status=$(scim GET '/Users?filter=userName%20eq%20%22alice%40example.com%22')
+[ "$status" = 200 ] && [ "$(jq -r .totalResults "$work/scim.json")" = 1 ] ||
+  fail "SCIM filter on userName: HTTP $status $(cat "$work/scim.json")"
+status=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer pumasi-scim-wrong' "$ui/scim/v2/Users")
+[ "$status" = 401 ] || fail "a wrong SCIM token got HTTP $status, not 401"
+ok "SCIM: the directory provisions alice, and a wrong token is refused"
+
+signed_in "$work/alice.jar" || fail "alice lost her dashboard session before SCIM deactivated her"
+status=$(scim PATCH "/Users/$alice_id" '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"Replace","path":"active","value":"False"}]}')
+[ "$status" = 200 ] || fail "SCIM PATCH active=false gave HTTP $status: $(cat "$work/scim.json")"
+signed_in "$work/alice.jar" && fail "alice's dashboard session survived SCIM deactivation"
+"$bin" --home "$work/alice-cli" status >/dev/null 2>&1 &&
+  fail "alice's terminal session survived SCIM deactivation"
+status=$(browser_flow alice alice-pass "$work/alice2.jar")
+[ "$status" = 200 ] && fail "alice signed in again while SCIM says she is inactive"
+ok "SCIM: deactivating alice ends her sessions and refuses her sign-in"
+
+status=$(scim PATCH "/Users/$alice_id" '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"replace","value":{"active":true}}]}')
+[ "$status" = 200 ] || fail "SCIM PATCH active=true gave HTTP $status"
+[ "$(browser_flow alice alice-pass "$work/alice3.jar")" = 200 ] || fail "alice cannot sign in after SCIM reactivated her"
+signed_in "$work/alice3.jar" || fail "alice has no session after reactivation"
+"$bin" audit ls --json --limit 500 | grep -q 'scim.user' || fail "the audit log has no scim.user entries"
+"$bin" audit verify >/dev/null || fail "pumasi audit verify failed after SCIM"
+ok "SCIM: reactivated alice signs in again, and the audit log records it all"
 
 echo "sso e2e passed ($passed checks)"

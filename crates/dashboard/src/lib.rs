@@ -24,6 +24,7 @@ mod i18n;
 mod limit;
 mod pages;
 mod s3;
+mod scim;
 mod tls;
 mod uploads;
 mod zip;
@@ -103,6 +104,8 @@ pub(crate) struct AppState {
     sign_ins: limit::Buckets<std::net::IpAddr>,
     /// Open `?wait=` long polls per ticket.
     waits: limit::Waits,
+    /// The counts kept by the control plane for every dashboard (1.12).
+    shared: limit::SharedLimits,
     /// Where the provider sends browsers back to.
     public_url: String,
     /// The S3 gateway's state (1.8).
@@ -202,9 +205,13 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
         tickets: limit::Buckets::new(limit::TICKET_BURST, limit::TICKET_RATE),
         sign_ins: limit::Buckets::new(limit::SIGN_IN_BURST, limit::SIGN_IN_PER_MIN / 60.0),
         waits: limit::Waits::default(),
+        shared: limit::SharedLimits::default(),
         public_url,
         s3: s3::Gateway::default(),
     });
+    let (fail_tx, fail_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.limiter.report_to(fail_tx);
+    tokio::spawn(shared_limits(Arc::downgrade(&state), fail_rx));
     let app = router(state).into_make_service_with_connect_info::<ClientAddr>();
     let https = config.tls.is_some();
     let task = match config.tls {
@@ -220,6 +227,95 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
         https,
         task,
     })
+}
+
+impl AppState {
+    /// Takes tokens from a bucket on the control plane (1.12).
+    pub(crate) async fn shared_take(
+        &self,
+        bucket: pumasi_proto::limit::Bucket,
+        key: String,
+        want: u32,
+    ) -> limit::Shared {
+        use pumasi_proto::limit::{LimitOp, LimitReply};
+        if !self.shared.on() {
+            return limit::Shared::Local;
+        }
+        let op = pumasi_proto::msg::AdminOp::Limit(Box::new(LimitOp::Take {
+            bucket,
+            key: key.clone(),
+            want,
+        }));
+        match self.backend.call(self.backend.own_secret(), op).await {
+            Ok(pumasi_proto::msg::AdminResponse::Limit(r)) => match *r {
+                LimitReply::Taken { got, .. } if got > 0 => {
+                    if got > 1 {
+                        self.shared.add_lease(key, got - 1);
+                    }
+                    limit::Shared::Allowed
+                }
+                LimitReply::Taken { wait_ms, .. } => {
+                    limit::Shared::Wait(std::time::Duration::from_millis(wait_ms.max(1)))
+                }
+                LimitReply::Blocked(_) => limit::Shared::Local,
+            },
+            Ok(pumasi_proto::msg::AdminResponse::Error(e))
+                if e.contains("cannot share request limits")
+                    || e.contains("unexpected admin call") =>
+            {
+                self.shared.pause(
+                    "the dashboard's ticket is not an admin ticket, or the control plane is older than 1.12",
+                    None,
+                );
+                limit::Shared::Local
+            }
+            Ok(_) | Err(_) => {
+                // An older control plane drops the call it cannot read;
+                // a busy one may be away for a moment. Ask again later.
+                self.shared.pause(
+                    "the control plane did not answer the limit call",
+                    Some(std::time::Duration::from_secs(60)),
+                );
+                limit::Shared::Local
+            }
+        }
+    }
+}
+
+/// Sends failed sign-ins to the control plane and keeps the copy of the
+/// addresses it blocked fresh (every few seconds), for as long as the
+/// dashboard runs.
+async fn shared_limits(
+    state: std::sync::Weak<AppState>,
+    mut failures: tokio::sync::mpsc::UnboundedReceiver<std::net::IpAddr>,
+) {
+    use pumasi_proto::{
+        limit::{LimitOp, LimitReply},
+        msg::{AdminOp, AdminResponse},
+    };
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let op = tokio::select! {
+            ip = failures.recv() => match ip {
+                Some(ip) => LimitOp::Failed { ip: ip.to_string() },
+                None => return,
+            },
+            _ = tick.tick() => LimitOp::Blocked,
+        };
+        let Some(st) = state.upgrade() else { return };
+        if !st.shared.on() {
+            continue;
+        }
+        if let Ok(AdminResponse::Limit(r)) = st
+            .backend
+            .call(st.backend.own_secret(), AdminOp::Limit(Box::new(op)))
+            .await
+            && let LimitReply::Blocked(b) = *r
+        {
+            st.limiter.set_shared_blocked(&b);
+        }
+    }
 }
 
 /// The Host headers browsers send for `public_url` (`https://name[:port]/...`):
@@ -261,6 +357,9 @@ fn router(state: St) -> Router {
         .nest("/api/v1", api::routes(uploads))
         .route("/api/openapi.json", get(api::openapi))
         .route("/healthz", get(|| async { "ok" }))
+        // SCIM (1.12) carries its own token, also with `--api-only`.
+        .route("/scim/v2", axum::routing::any(scim::handle))
+        .route("/scim/v2/{*path}", axum::routing::any(scim::handle))
         // The S3 gateway (1.8) signs its own requests, also with `--api-only`.
         .merge(s3::routes());
     let app = if state.api_only {

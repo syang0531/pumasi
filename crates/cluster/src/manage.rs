@@ -66,7 +66,7 @@ impl AccessRecord {
         }
     }
 
-    fn live(&self, now: u64) -> bool {
+    pub(crate) fn live(&self, now: u64) -> bool {
         self.expires_unix.is_none_or(|e| e > now)
     }
 }

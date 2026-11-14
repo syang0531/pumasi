@@ -59,11 +59,157 @@ pub async fn bind_endpoint_with(
         )));
     }
     builder = builder.secret_key(secret_key).alpns(alpns);
+    if mode == NetMode::Public {
+        let via = ProxySettings::from_env()?;
+        if let Some(url) = &via.proxy {
+            tracing::debug!(proxy = %redact(url), "reaching relays through a proxy");
+            builder = builder.proxy_url(url.clone());
+        }
+        if let Some(tls) = via.ca_tls_config() {
+            builder = builder.ca_tls_config(tls);
+        }
+    }
     if let Some(addr) = bind_addr {
         builder = builder.bind_addr(addr).context("invalid bind address")?;
     }
     let endpoint = builder.bind().await.context("bind endpoint")?;
     Ok(endpoint)
+}
+
+/// The environment variable naming the proxy for relay connections, before
+/// the usual `HTTPS_PROXY` and friends; `off` (or `none`, or empty) goes
+/// direct even when those are set.
+pub const PROXY_ENV: &str = "PUMASI_PROXY";
+/// A PEM file of extra CA certificates trusted for relays and HTTPS
+/// proxies (a proxy that opens TLS signs with its own CA).
+pub const CA_FILE_ENV: &str = "PUMASI_CA_FILE";
+
+/// How relay connections leave this machine (1.12): through an HTTP(S)
+/// proxy with `CONNECT`, for clients such as cloud sandboxes that have no
+/// other way out, and with extra trusted CAs for a proxy that re-signs
+/// TLS. Only relay traffic (HTTPS) goes through the proxy; peers are then
+/// reached through the relay, since a proxy carries no UDP.
+#[derive(Debug, Clone, Default)]
+pub struct ProxySettings {
+    pub proxy: Option<url::Url>,
+    /// Certificates from [`CA_FILE_ENV`].
+    pub extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// Also trust the system store (and `SSL_CERT_FILE`): on with a
+    /// proxy, whose CA is usually installed there.
+    pub system_roots: bool,
+}
+
+impl ProxySettings {
+    /// Reads [`PROXY_ENV`], then `HTTPS_PROXY`, `https_proxy`,
+    /// `HTTP_PROXY`, `http_proxy` and `ALL_PROXY`, and [`CA_FILE_ENV`].
+    pub fn from_env() -> Result<Self> {
+        Self::from_vars(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let pick = |names: &[&'static str]| -> Option<(&'static str, String)> {
+            names
+                .iter()
+                .find_map(|n| get(n).map(|v| (*n, v.trim().to_string())))
+        };
+        let proxy = match pick(&[PROXY_ENV]) {
+            Some((_, v)) if v.is_empty() || v == "off" || v == "none" => None,
+            Some((n, v)) => Some(parse_proxy(n, &v)?),
+            None => match pick(&[
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]) {
+                Some((_, v)) if v.is_empty() => None,
+                // Set for other programs: one we cannot use is skipped
+                // with a warning rather than stopping this one.
+                Some((n, v)) => match parse_proxy(n, &v) {
+                    Ok(u) => Some(u),
+                    Err(e) => {
+                        tracing::warn!("{e:#}; reaching relays directly");
+                        None
+                    }
+                },
+                None => None,
+            },
+        };
+        let mut extra_roots = Vec::new();
+        if let Some(path) = get(CA_FILE_ENV).filter(|p| !p.trim().is_empty()) {
+            extra_roots = load_pem_certs(Path::new(path.trim()))
+                .with_context(|| format!("{CA_FILE_ENV}={path}"))?;
+        }
+        Ok(Self {
+            system_roots: proxy.is_some(),
+            proxy,
+            extra_roots,
+        })
+    }
+
+    /// The CAs relays and proxies are checked against, when anything is
+    /// added to the bundled web roots.
+    pub fn ca_tls_config(&self) -> Option<iroh::tls::CaTlsConfig> {
+        if self.extra_roots.is_empty() && !self.system_roots {
+            return None;
+        }
+        let mut roots = self.extra_roots.clone();
+        if self.system_roots {
+            roots.extend(rustls_native_certs::load_native_certs().certs);
+        }
+        Some(iroh::tls::CaTlsConfig::embedded().with_extra_roots(roots))
+    }
+}
+
+/// `http://[user:pass@]host:port` or `https://...` (iroh's relay client
+/// speaks `CONNECT` to either); a bare `host:port` is taken as `http://`.
+fn parse_proxy(var: &str, value: &str) -> Result<url::Url> {
+    let with_scheme = if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    };
+    let scheme = with_scheme
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        scheme == "http" || scheme == "https",
+        "{var}: only http:// and https:// proxies are supported (with CONNECT), not {scheme}://"
+    );
+    let url = url::Url::parse(&with_scheme)
+        .map_err(|e| anyhow::anyhow!("{var}: not a proxy URL: {e}"))?;
+    anyhow::ensure!(
+        url.host_str().is_some(),
+        "{var}: the proxy URL names no host"
+    );
+    Ok(url)
+}
+
+/// A proxy URL without its password, for logs.
+pub fn redact(url: &url::Url) -> String {
+    let mut u = url.clone();
+    if !u.username().is_empty() || u.password().is_some() {
+        let _ = u.set_username("***");
+        let _ = u.set_password(None);
+    }
+    u.to_string()
+}
+
+/// Every certificate in a PEM file.
+pub fn load_pem_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    let certs = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("{} is not a PEM certificate file", path.display()))?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "{} holds no PEM certificates",
+        path.display()
+    );
+    Ok(certs)
 }
 
 /// The relays in `addrs` that are not n0's public ones: those of a cluster
@@ -162,5 +308,87 @@ mod relay_tests {
         ];
         assert_eq!(custom_relays(&addrs), vec![own]);
         assert!(custom_relays(&addrs[..1]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    #[test]
+    fn proxy_from_the_usual_variables() {
+        let p = ProxySettings::from_vars(vars(&[])).unwrap();
+        assert!(p.proxy.is_none() && p.ca_tls_config().is_none());
+
+        let p = ProxySettings::from_vars(vars(&[("https_proxy", "http://10.0.0.1:3128")])).unwrap();
+        assert_eq!(p.proxy.unwrap().as_str(), "http://10.0.0.1:3128/");
+        assert!(p.system_roots);
+
+        // HTTPS_PROXY before HTTP_PROXY; a bare host:port is http://.
+        let p = ProxySettings::from_vars(vars(&[
+            ("HTTP_PROXY", "http://wrong:1"),
+            ("HTTPS_PROXY", "proxy.corp:8080"),
+        ]))
+        .unwrap();
+        assert_eq!(p.proxy.unwrap().as_str(), "http://proxy.corp:8080/");
+
+        // PUMASI_PROXY wins, and `off` goes direct.
+        let p = ProxySettings::from_vars(vars(&[
+            ("HTTPS_PROXY", "http://a:1"),
+            (PROXY_ENV, "https://user:pw@b:2"),
+        ]))
+        .unwrap();
+        let url = p.proxy.unwrap();
+        assert_eq!(url.username(), "user");
+        assert_eq!(redact(&url), "https://***@b:2/");
+        let p =
+            ProxySettings::from_vars(vars(&[("HTTPS_PROXY", "http://a:1"), (PROXY_ENV, "off")]))
+                .unwrap();
+        assert!(p.proxy.is_none());
+    }
+
+    #[test]
+    fn socks_is_refused_only_when_asked_for() {
+        // Someone else's ALL_PROXY: skipped.
+        let p =
+            ProxySettings::from_vars(vars(&[("ALL_PROXY", "socks5://127.0.0.1:1080")])).unwrap();
+        assert!(p.proxy.is_none());
+        // Ours: an error.
+        let e = ProxySettings::from_vars(vars(&[(PROXY_ENV, "socks5://127.0.0.1:1080")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("only http:// and https://"), "{e}");
+    }
+
+    #[test]
+    fn extra_ca_file() {
+        let dir = std::env::temp_dir().join(format!("pumasi-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "not a certificate\n").unwrap();
+        let e =
+            ProxySettings::from_vars(vars(&[(CA_FILE_ENV, empty.to_str().unwrap())])).unwrap_err();
+        assert!(format!("{e:#}").contains("no PEM certificates"), "{e:#}");
+        // A real certificate (DER bytes need not parse as X.509 for PEM).
+        let pem = dir.join("ca.pem");
+        std::fs::write(
+            &pem,
+            "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ0E=\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let p = ProxySettings::from_vars(vars(&[(CA_FILE_ENV, pem.to_str().unwrap())])).unwrap();
+        assert_eq!(p.extra_roots.len(), 1);
+        assert!(!p.system_roots && p.ca_tls_config().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

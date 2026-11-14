@@ -208,6 +208,19 @@ impl State {
         }
     }
 
+    /// The sessions started with any of these tickets.
+    pub(crate) fn sessions_of_parents(
+        &self,
+        parents: &std::collections::BTreeSet<Secret>,
+    ) -> Vec<[u8; 32]> {
+        self.ui
+            .map
+            .values()
+            .filter(|r| parents.contains(&r.parent))
+            .map(|r| r.hash)
+            .collect()
+    }
+
     pub(crate) fn end_sessions(&mut self, hashes: &[[u8; 32]], why: &str) {
         let mut gone = Vec::new();
         for h in hashes {

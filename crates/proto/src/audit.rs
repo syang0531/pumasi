@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 /// The `prev` of the first entry.
@@ -179,6 +179,123 @@ impl AuditHead {
         )
         .map_err(|_| anyhow::anyhow!("audit head signature does not verify"))
     }
+}
+
+/// Where a pruned log now starts (1.12): the last entry removed, signed by
+/// the cluster key after the control plane checked the whole chain up to
+/// it. The entry after it carries `hash` as its `prev`, so the remaining
+/// log still verifies from here, and a head saved before the prune can
+/// still be checked against the entries removed (if they were kept, as
+/// `pumasi audit prune --save` does) and this checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditCheckpoint {
+    /// The cluster key (its iroh endpoint id), which signed.
+    pub cluster: String,
+    /// The last entry removed: the log now starts at `seq + 1`.
+    pub seq: u64,
+    /// That entry's hash.
+    #[serde(with = "hex32")]
+    pub hash: [u8; 32],
+    /// That entry's time.
+    pub entry_unix: u64,
+    /// The checkpoint this one replaced (0 when the log was whole), so
+    /// a chain of checkpoints shows every prune.
+    pub previous_seq: u64,
+    /// When the control plane pruned.
+    pub unix: u64,
+    /// Ed25519 over [`AuditCheckpoint::signed_bytes`].
+    #[serde(with = "hex_vec")]
+    pub signature: Vec<u8>,
+}
+
+impl AuditCheckpoint {
+    pub fn signed_bytes(
+        seq: u64,
+        hash: &[u8; 32],
+        entry_unix: u64,
+        previous_seq: u64,
+        unix: u64,
+    ) -> Vec<u8> {
+        let mut b = b"pumasi/audit-checkpoint/v1\0".to_vec();
+        b.extend_from_slice(&seq.to_le_bytes());
+        b.extend_from_slice(hash);
+        b.extend_from_slice(&entry_unix.to_le_bytes());
+        b.extend_from_slice(&previous_seq.to_le_bytes());
+        b.extend_from_slice(&unix.to_le_bytes());
+        b
+    }
+
+    /// Checks the signature against the cluster key it names.
+    pub fn verify(&self) -> Result<()> {
+        let key: iroh::PublicKey = self
+            .cluster
+            .parse()
+            .map_err(|e| anyhow::anyhow!("bad cluster key in audit checkpoint: {e}"))?;
+        let Ok(sig) = <[u8; 64]>::try_from(self.signature.as_slice()) else {
+            bail!("audit checkpoint signature has the wrong length");
+        };
+        key.verify(
+            &Self::signed_bytes(
+                self.seq,
+                &self.hash,
+                self.entry_unix,
+                self.previous_seq,
+                self.unix,
+            ),
+            &iroh::Signature::from_bytes(&sig),
+        )
+        .map_err(|_| anyhow::anyhow!("audit checkpoint signature does not verify"))
+    }
+
+    /// One line for people.
+    pub fn line(&self) -> String {
+        format!(
+            "entries up to #{} ({} UTC) were pruned on {} UTC; the log starts at #{}, after hash {}",
+            self.seq,
+            rfc3339(self.entry_unix),
+            rfc3339(self.unix),
+            self.seq + 1,
+            &data_encoding::HEXLOWER.encode(&self.hash)[..16],
+        )
+    }
+}
+
+/// Checks a head saved before a prune against the entries that were
+/// removed (as `pumasi audit prune --save` wrote them, oldest first, from
+/// any point on) and the checkpoint: the saved entries must follow each
+/// other, reach the checkpoint's entry with its hash, and hold the saved
+/// head's entry with the saved hash.
+pub fn verify_pruned_head(
+    head: &AuditHead,
+    saved: &[AuditEntry],
+    checkpoint: &AuditCheckpoint,
+) -> Result<()> {
+    ensure!(
+        head.seq <= checkpoint.seq,
+        "the saved head #{} is after the checkpoint #{}: check it against the log",
+        head.seq,
+        checkpoint.seq
+    );
+    let Some(first) = saved.first() else {
+        bail!("no saved entries to check the head against");
+    };
+    let last = verify_chain(first.prev, first.seq, saved)?;
+    let end = saved.last().map_or(0, |e| e.seq);
+    ensure!(
+        end == checkpoint.seq && last == checkpoint.hash,
+        "the saved entries end at #{end}, not at the checkpoint's #{} with its hash",
+        checkpoint.seq
+    );
+    let e = saved
+        .iter()
+        .find(|e| e.seq == head.seq)
+        .with_context(|| format!("the saved entries do not include #{}", head.seq))?;
+    ensure!(
+        e.hash == head.hash,
+        "entry #{} in the saved entries does not have the saved head's hash: the log was rewritten",
+        head.seq
+    );
+    Ok(())
 }
 
 /// UTC time as RFC 3339 (`2026-11-06T06:38:27Z`).

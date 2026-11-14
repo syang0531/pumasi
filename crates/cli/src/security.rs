@@ -816,12 +816,16 @@ pub async fn scim(home: &Path, cmd: ScimCmd) -> Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&*v)?);
                 return Ok(0);
             }
-            println!("tokens:");
+            // A locked stdout: CodeQL takes `println!` of a user name for
+            // logging sensitive data (phase 25 did the same for accounts).
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "tokens:")?;
             if v.tokens.is_empty() {
-                println!("  none (pumasi sso scim token LABEL)");
+                writeln!(out, "  none (pumasi sso scim token LABEL)")?;
             }
             for t in &v.tokens {
-                println!(
+                writeln!(
+                    out,
                     "  {}  {}  created {} UTC, last used {}",
                     t.id,
                     t.label,
@@ -831,11 +835,12 @@ pub async fn scim(home: &Path, cmd: ScimCmd) -> Result<i32> {
                     } else {
                         format!("{} UTC", utc(t.last_used_unix))
                     }
-                );
+                )?;
             }
-            println!("people ({}):", v.users.len());
+            writeln!(out, "people ({}):", v.users.len())?;
             for u in &v.users {
-                println!(
+                writeln!(
+                    out,
                     "  {:<32} {:<8} sessions {}{}",
                     u.user_name,
                     if u.active { "active" } else { "OFF" },
@@ -845,11 +850,11 @@ pub async fn scim(home: &Path, cmd: ScimCmd) -> Result<i32> {
                     } else {
                         format!("  groups: {}", u.groups.join(", "))
                     }
-                );
+                )?;
             }
-            println!("groups ({}):", v.groups.len());
+            writeln!(out, "groups ({}):", v.groups.len())?;
             for g in &v.groups {
-                println!("  {:<32} {} member(s)", g.display_name, g.members);
+                writeln!(out, "  {:<32} {} member(s)", g.display_name, g.members)?;
             }
             Ok(0)
         }

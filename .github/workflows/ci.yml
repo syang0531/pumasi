@@ -170,8 +170,13 @@ jobs:
           grep -qi "timeout\|timed out" forever.txt
           grep -q "stopped at the task's end" forever.txt
           test "$took" -lt 60
-          # The adapter still works after the kill.
-          "$bin" exec --gpu --webgpu-software --memory-mb 512 --out out "$mods/matmul.wasm" 128 | grep -q ": ok$"
+          # A software rasterizer runs in the killed worker, so the adapter
+          # is free again at once. (A virtual GPU, such as Apple's
+          # paravirtual one on macOS runners, may keep running the shader on
+          # the host until its own watchdog; real GPUs are checked by hand.)
+          if grep -q ", software)" forever.txt; then
+            "$bin" exec --gpu --webgpu-software --memory-mb 512 --timeout 60s --out out "$mods/matmul.wasm" 128 | grep -q ": ok$"
+          fi
       - uses: actions/upload-artifact@v4
         if: env.HAS_GPU == 'true'
         with:

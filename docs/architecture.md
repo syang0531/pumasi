@@ -2642,7 +2642,11 @@ agent waits for each answer with the task's deadline and cancellation in
 view; when either comes, it kills the worker (taking the device and any
 shader still running with it), and the call fails as a timeout or
 cancellation, with "the GPU work was stopped at the task's end" in the
-task's GPU summary. Dispatches are bounded pieces of work: at most 16
+task's GPU summary. The task always ends then; whether the GPU drops the
+running shader at once is the driver's business (a software rasterizer
+stops with the process; Apple's paravirtual GPU in macOS VMs keeps it
+running on the host until the host's watchdog, which CI showed).
+Dispatches are bounded pieces of work: at most 16
 wait on the queue at once (`MAX_IN_FLIGHT`), so a stop never waits behind
 a long backlog. Windows starts the worker without a console window. A
 worker that dies fails the task's later GPU calls with the tail of its

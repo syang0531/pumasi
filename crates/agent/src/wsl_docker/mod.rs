@@ -455,8 +455,10 @@ pub fn wsl_text(bytes: &[u8]) -> String {
             || bytes.iter().skip(1).step_by(2).take(8).all(|&b| b == 0));
     let text = if utf16 {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
             .collect();
         String::from_utf16_lossy(&units)
     } else {

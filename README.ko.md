@@ -29,7 +29,7 @@
 
 품앗이는 이웃끼리 서로 일을 거들어 주며 품을 갚는 우리 풍습입니다.
 
-**상태.** 지금 1.6이고 아직 젊은 프로젝트입니다. 지금까지는 Windows PC 여러 대(한 대는 RTX 3080)와 2014년 iMac으로 이뤄진 집 클러스터 한 곳에서 2026년 11월부터 쓰고 있습니다. 내부 보안 점검은 마쳤지만 외부 감사는 아직 받지 않았습니다([SECURITY.md](SECURITY.md)). 아직 안 된 것은 [로드맵](#로드맵)에 적어 두었습니다. 버그 제보와 질문은 [이슈](https://github.com/syang0531/pumasi/issues)로 주세요.
+**상태.** 지금 1.7이고 아직 젊은 프로젝트입니다. 지금까지는 Windows PC 여러 대(한 대는 RTX 3080)와 2014년 iMac으로 이뤄진 집 클러스터 한 곳에서 2026년 11월부터 쓰고 있습니다. 내부 보안 점검은 마쳤지만 외부 감사는 아직 받지 않았습니다([SECURITY.md](SECURITY.md)). 아직 안 된 것은 [로드맵](#로드맵)에 적어 두었습니다. 버그 제보와 질문은 [이슈](https://github.com/syang0531/pumasi/issues)로 주세요.
 
 ## 설치
 
@@ -45,7 +45,7 @@ curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.
 irm https://github.com/syang0531/pumasi/releases/latest/download/install.ps1 | iex
 ```
 
-옵션: `--version v1.6.0` / `-Version`, `--dir` / `-Dir`. 참가 티켓을 주면 에이전트를 [서비스](#에이전트컨트롤-플레인대시보드를-서비스로-실행)로도 설치합니다: `curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, 또는 `& ([scriptblock]::Create((irm .../install.ps1))) -Ticket pumasijoin...`. 소스에서 빌드하려면 `cargo build --release -p pumasi-cli`.
+옵션: `--version v1.7.0` / `-Version`, `--dir` / `-Dir`. 참가 티켓을 주면 에이전트를 [서비스](#에이전트컨트롤-플레인대시보드를-서비스로-실행)로도 설치합니다: `curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, 또는 `& ([scriptblock]::Create((irm .../install.ps1))) -Ticket pumasijoin...`. 소스에서 빌드하려면 `cargo build --release -p pumasi-cli`.
 
 ## 5분 만에 써 보기
 
@@ -411,7 +411,10 @@ macOS에서 `curl ... | sudo sh -s -- --ticket ...`으로 설치하면 에이전
 ```sh
 pumasi upgrade latest --check     # 최신 릴리스와 노드별 버전
 pumasi upgrade latest --wait      # 또는 --version v1.3.0
+pumasi upgrade latest --canary imac --canary-soak 1h   # imac 먼저, 나머지는 한 시간 뒤
 ```
+
+`--canary 노드|셀렉터`(1.7)를 주면 그 노드가 먼저 업그레이드되고, 카나리가 새 바이너리로 `--canary-tasks`개 작업을 문제없이 마치고 `--canary-soak`(기본 30분)이 지나면 나머지가 따라갑니다. 카나리가 설치에 실패하거나 노드 오류를 내면 `pumasi upgrade promote [노드...]`(더 많은 노드, 또는 전체)나 `pumasi upgrade cancel` 전까지 멈춥니다. `--canary-hold`는 항상 promote를 기다립니다. 대시보드 업그레이드 패널에서 체크박스로 카나리를 고르고 상태를 봅니다.
 
 컨트롤 플레인이 GitHub 릴리스에서 노드들이 쓰는 플랫폼의 바이너리를 받아, 릴리스의 `SHA256SUMS`, 실행 파일 헤더(플랫폼), 빌드 표식(버전)과 맞는지 확인한 뒤 아래와 같이 배포합니다. 이미 그 버전 이상인 노드는 건드리지 않습니다. 컨트롤 플레인과 대시보드는 자기 바이너리를 지켜보다가 롤아웃이 끝나면 새 버전으로 스스로 재시작합니다(`--no-follow-binary`로 끔, 대시보드에 로그인한 브라우저는 다시 로그인). 같은 PC의 에이전트가 멤버이면 에이전트가 바이너리를 설치하고, 컨트롤 플레인만 도는 PC(에이전트가 없거나 `pumasi remove-node`로 뺀 PC)에서는 컨트롤 플레인이 자기 플랫폼용 릴리스도 받아 직접 설치합니다. `pumasi cluster start --release-source URL`로 다른 GitHub 릴리스 주소를 쓸 수 있습니다.
 
@@ -601,15 +604,16 @@ pumasi ui            # 브라우저에서 http://127.0.0.1:7400/login?token=... 
 `pumasi ui`는 대시보드를 내 기기에서 띄우고 CLI와 같은 연결로 클러스터에 붙습니다. 그래서 컨트롤 플레인은 포트를 열지 않고, 티켓이 통하는 곳(`pumasi login`)이면 어디서든 됩니다. 바이너리에 들어 있어 Node나 따로 설치할 것이 없습니다. 화면은 다음과 같습니다.
 
 - **개요**: 온라인 노드, 실행·대기 중인 태스크, 진행 중인 작업, 사용 중인 GPU, 울리는 경보, 최근 작업과 이벤트를 몇 초마다 갱신
-- **노드**: 노드별 상태, CPU, 메모리, 디스크, 온도, GPU. 노드 하나의 1시간·하루·일주일 차트, 벤치마크, GPU, 라벨·테인트, cordon·drain·벤치마크 다시·제거 버튼
+- **노드**: 노드별 상태, CPU, 메모리, 디스크, 온도, GPU. 노드 하나의 1시간·하루·일주일 차트(새 샘플이 오면 바로 갱신), 벤치마크, GPU, 라벨·테인트, 작업을 받는 조건(슬롯, CPU 비율, 시간대, 유휴 시간, 전원 연결 시에만. 에이전트의 `agent.toml`에 쓰고 한가해지면 재시작), cordon·drain·벤치마크 다시·제거 버튼, 카나리 롤아웃이 되는 업그레이드 패널
 - **작업**: 작업 제출(job.toml 붙여넣기, 파일이나 폴더 첨부), 태스크별 stdout·stderr 실시간 보기, 취소, 출력 파일 하나 또는 전부를 zip으로 받기, 서명된 영수증(`pumasi verify-receipts` 형식)
 - **저장소**: 데이터셋과 버전, 쿼터 대비 사용량, 폴더를 새 버전으로 올리기, zip으로 받기
 - **CU**: 잔액과 원장. 관리자는 지급·인출
 - **계정**: 계정별 쿼터, 지금 쓰는 양, 작업 정책(허용 이미지와 실행기, 네트워크, 제한 시간, 태스크당 GPU, selector, toleration). 관리자는 폼에서 수정
 - **초대**: 설치 명령이 붙은 참가 티켓, 제공자 초대, 사람에게 주는 액세스 티켓
-- **요금**, **이벤트**(경보 규칙과 웹훅 포함)
+- **요금**(관리자가 수정), **예약 작업**(job.toml과 파일로 cron 예약 추가, 지금 실행, 삭제), **이벤트**(경보 규칙·웹훅·묵음을 그 자리에서 수정)
+- **설정**: 로그인한 브라우저 목록과 취소, `apply`로 바뀔 내용을 먼저 보여 주는 `cluster.toml` 편집기
 
-한국어와 영어를 지원합니다(브라우저 언어, 또는 머리말의 전환 링크).
+한국어와 영어를 지원합니다(브라우저 언어, 또는 머리말의 전환 링크). 휴대폰에서도 쓸 수 있습니다. 로그인은 컨트롤 플레인이 보관하므로 `pumasi ui`를 다시 시작하거나 업그레이드해도 유지됩니다(1.7). `pumasi access sessions`로 목록을 보고 `--revoke ID`로 하나를 로그아웃시킵니다.
 
 `pumasi ui`가 출력하는 URL은 내 티켓으로 로그인합니다. 다른 사람은 같은 로그인 화면에 액세스 티켓(`pumasi access create`)을 넣고, 그 역할이 허락하는 것만 보고 할 수 있습니다. CLI와 마찬가지로 컨트롤 플레인이 모든 호출을 확인합니다. `--login-only`는 링크 로그인을 끕니다. `--listen 0.0.0.0:7400`으로 다른 기기에도 열 수 있습니다. 이때는 항상 티켓으로 로그인하고 평문 HTTP이므로 앞에 TLS 리버스 프록시를 두세요.
 
@@ -838,7 +842,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md). 1.5.1은 `--trusted-proxy`를 더해, 다른 기기의 리버스 프록시 뒤에서 모든 클라이언트가 로그인 실패 제한 하나를 같이 쓰던 문제를 고쳤습니다: [노트](docs/releases/v1.5.1.md). 1.6.0은 실행 중인 microVM 태스크의 출력을 바로 보여 주고, 모든 GPU와 Windows 온도를 보고하고, 노드 사이 네트워크를 재고, 경보 일시 중지·반복 알림·노드별 기준을 더했습니다: [노트](docs/releases/v1.6.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를, 22단계(1.6)에서 모니터링을 다뤘습니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md). 1.5.1은 `--trusted-proxy`를 더해, 다른 기기의 리버스 프록시 뒤에서 모든 클라이언트가 로그인 실패 제한 하나를 같이 쓰던 문제를 고쳤습니다: [노트](docs/releases/v1.5.1.md). 1.6.0은 실행 중인 microVM 태스크의 출력을 바로 보여 주고, 모든 GPU와 Windows 온도를 보고하고, 노드 사이 네트워크를 재고, 경보 일시 중지·반복 알림·노드별 기준을 더했습니다: [노트](docs/releases/v1.6.0.md). 1.7.0은 대시보드 로그인을 재시작 뒤에도 유지하고, 경보 규칙·웹훅·요금·예약 작업·`cluster.toml`·노드 작업 조건을 브라우저에서 고치며, 카나리 롤아웃·실시간 차트·휴대폰 화면을 더했습니다: [노트](docs/releases/v1.7.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를, 22단계(1.6)에서 모니터링을, 23단계(1.7)에서 대시보드를 다뤘습니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -862,7 +866,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 20 | 실사용 이슈: 서비스를 다시 설치하지 않고 에이전트 옵션 바꾸고 보기(`service set`), 대시보드와 문서화된 API로 계정 쿼터·작업 정책 수정(추가·삭제), 제출자가 자기 정책 확인과 `?validate=1`, 태스크별 이미지 받기·실행·업로드 시간, 태스크 표시에 노드 이름 | 완료(1.4) |
 | 21 | 잠드는 기기와 Docker 없는 기기: 태스크 실행 중 잠자기 막기, 잠들기 전에 알려 태스크를 바로 옮기기, 대기 작업이 있으면 Wake-on-LAN으로 깨우기, `executor = "image"`(Docker가 있으면 Docker, 없으면 microVM), Windows 서비스에서 유휴 감지, `--on-pause requeue`, 2013~2014년 Mac에 Linux를 설치하는 안내 | 완료(1.5) |
 | 22 | 모니터링: microVM 실시간 출력, Windows 온도, Intel·AMD·Apple GPU 지표, 재시작해도 남는 최근 1시간 지표, 노드 간 지연·대역폭, 경보 일시 중지와 라벨별 임계값 | 완료(1.6) |
-| 23 | 대시보드: 재시작해도 유지되는 로그인, 경보·웹훅·요금·스케줄·라벨·노드 가용 정책을 브라우저에서 수정, 카나리 배포, 실시간 차트, 휴대폰 화면 | 예정(1.7) |
+| 23 | 대시보드: 재시작해도 유지되는 로그인, 경보·웹훅·요금·스케줄·라벨·노드 가용 정책을 브라우저에서 수정, 카나리 배포, 실시간 차트, 휴대폰 화면 | 완료(1.7) |
 | 24 | 여러 기기에 걸친 파일 저장소: 소유자 노드 복제본과 복구·검사, 충분한 사본에 쓴 뒤 완료 응답, S3 호환 게이트웨이 | 예정(1.8) |
 | 25 | 스케줄링: 갱 스케줄링, 어피니티·안티어피니티, CPU·메모리 쿼터, 라벨별 쿼터, 선점·drain 뒤에도 이어지는 체크포인트, 스케줄 시간대 | 예정(1.9) |
 | 26 | GPU: WebGPU 제한 시간과 GPU 챌린지, AMD 벤치마크와 Docker 작업, GPU 나눠 쓰기(분수, MIG) | 예정(1.10) |

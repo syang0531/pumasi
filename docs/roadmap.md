@@ -169,6 +169,15 @@ utilization.
 
 ## 23. Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts (1.7)
 
+Done in 1.7.0 ([release notes](releases/v1.7.0.md)). What differs from
+the plan below: node labels and taints were already editable, so the
+`cluster.toml` editor covers them with the alert rules; it refuses
+schedules and `url_env` and never prunes (both would read files or the
+environment on the dashboard's machine); per-node alert thresholds stay
+in the CLI; and the Upgrade panel picks canaries only for a published
+release (your own binaries take `pumasi upgrade rollout --canary`)
+([details](architecture.md#phase-23-the-dashboard-changes-settings-17)).
+
 - **Sessions kept in the control plane's state**, so restarting or
   upgrading `pumasi ui` (which 1.3's one-button upgrade does) no longer
   signs everyone out; a list of signed-in sessions with Revoke.

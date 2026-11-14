@@ -53,7 +53,7 @@ What is in it:
 *Pumasi* (품앗이) is the Korean custom of neighbours taking turns working
 each other's fields.
 
-**Status.** Pumasi is at 1.6 and it is young: so far it has been used on
+**Status.** Pumasi is at 1.7 and it is young: so far it has been used on
 one home cluster, of Windows PCs (one with an RTX 3080) and a 2014 iMac,
 since November 2026. It has had an internal security review but no
 outside audit yet ([SECURITY.md](SECURITY.md)), and the
@@ -79,7 +79,7 @@ curl -fsSL https://github.com/syang0531/pumasi/releases/latest/download/install.
 irm https://github.com/syang0531/pumasi/releases/latest/download/install.ps1 | iex
 ```
 
-Options: `--version v1.6.0` / `-Version`, `--dir` / `-Dir`, and a join
+Options: `--version v1.7.0` / `-Version`, `--dir` / `-Dir`, and a join
 ticket to also install the agent as a service
 ([services](#run-the-agent-the-control-plane-and-the-dashboard-as-services)):
 `curl ... | sudo sh -s -- --ticket pumasijoin... -- --allow-microvm`, or
@@ -757,7 +757,16 @@ dashboard's Nodes page, or `POST /api/v1/upgrade`):
 ```sh
 pumasi upgrade latest --check     # the newest release and each node's version
 pumasi upgrade latest --wait      # or --version v1.3.0
+pumasi upgrade latest --canary imac --canary-soak 1h   # imac first, the rest an hour later
 ```
+
+With `--canary NODE|SELECTOR` (1.7) those nodes upgrade first, and the
+others follow once the canaries run the new binary, have finished
+`--canary-tasks` tasks cleanly and `--canary-soak` (default 30m) has
+passed. A canary that fails to install or reports a node error halts the
+rollout until `pumasi upgrade promote [NODE...]` (more nodes, or all) or
+`pumasi upgrade cancel`; `--canary-hold` always waits for promote. The
+Upgrade panel picks canaries with checkboxes and shows their state.
 
 The control plane downloads, from the GitHub release, the binary of every
 platform its nodes run, checks each against the release's `SHA256SUMS`,
@@ -765,7 +774,7 @@ its executable header (platform) and its build marker (version), and
 rolls them out as below. Nodes already on that version or newer are left
 alone. The control plane and the dashboard watch their binary: once the
 rollout has settled they restart into the new version by themselves
-(`--no-follow-binary` turns that off; signed-in browsers sign in again).
+(`--no-follow-binary` turns that off; signed-in browsers stay signed in, since 1.7).
 On a machine whose agent is a member, the agent installs that binary; on
 a machine that runs only the control plane (no agent, or one removed with
 `pumasi remove-node`), the control plane fetches the release for its own
@@ -1048,8 +1057,9 @@ pumasi webhook add ops https://hooks.slack.com/services/...   # sends a test ale
 pumasi alert ls
 ```
 
-The dashboard's Events page shows all of it, and admins can add and end
-silences there and send a test notice to a webhook.
+The dashboard's Events page shows all of it, and admins edit the rules,
+repeat and resolved notices and webhooks there, add and end silences and
+send a test notice to a webhook.
 
 Both can also live in `cluster.toml` (`[alerts]` and `[webhooks.NAME]`,
 with `url_env` to keep the URL out of the file).
@@ -1118,9 +1128,12 @@ part of the binary: no Node, no separate install. The pages:
   in use, firing alerts, recent jobs and events, refreshed every few
   seconds.
 - **Nodes**: each node's state, CPU, memory, disk, temperature and GPUs;
-  one node's charts over an hour, a day or a week, its benchmark and
-  GPUs, its labels and taints, and buttons to cordon, drain, benchmark
-  again or remove it.
+  one node's charts over an hour, a day or a week (streaming as samples
+  arrive), its benchmark and GPUs, its labels and taints, when it takes
+  tasks (slots, CPU share, hours, idle minutes, AC power: written to the
+  agent's `agent.toml`, which restarts with them once idle), buttons to
+  cordon, drain, benchmark again or remove it, and the Upgrade panel with
+  canary rollouts.
 - **Jobs**: submit a job (paste a job.toml, attach its files or a
   folder), follow each task's stdout and stderr live, cancel, download one
   output file or all of them as a zip, and the signed receipts (the
@@ -1135,9 +1148,16 @@ part of the binary: no Node, no separate install. The pages:
   selector, tolerations); admins edit them in a form.
 - **Invites**: join tickets with the install commands, provider invites,
   and access tickets for people.
-- **Prices** and **Events** (with alert rules and webhooks).
+- **Prices** (admins edit them), **Schedules** (add a cron schedule from
+  a job.toml and its files, run now, remove) and **Events** (alert rules,
+  webhooks and silences, edited in place).
+- **Settings**: the browsers signed in, with Revoke, and a `cluster.toml`
+  editor that previews what `apply` would change before applying it.
 
 Korean and English (the browser's language, or the switch in the header).
+The pages work on a phone. Sign-ins are kept by the control plane, so
+restarting or upgrading `pumasi ui` keeps everyone signed in (1.7);
+`pumasi access sessions` lists them and `--revoke ID` signs one out.
 
 The URL `pumasi ui` prints signs the browser in with your ticket. Anyone
 else signs in on the same page with an access ticket (`pumasi access
@@ -1339,8 +1359,8 @@ defends against, including the API exposed to the internet.
 | `pumasi agent start [--allow-docker] [--allow-microvm] [--auto-upgrade\|--no-auto-upgrade]` | Reconnect to the cluster this machine joined before (no ticket needed). |
 | `pumasi service install [agent\|cluster\|ui] [--ticket T] [--user\|--system] [--dry-run] [-- OPTIONS]` | Run the agent (default), the control plane or the dashboard/API as a service that starts at boot (systemd, launchd, Windows service). `status [ROLE]` (with the options it runs with), `restart [ROLE]` (without a role every service here, the control plane first) and `uninstall [ROLE]` too. |
 | `pumasi service set [agent\|cluster\|ui] [--dry-run] -- OPTIONS` | Change the options a service runs with and restart it: `--NAME [VALUE]` adds or replaces, `--no-NAME` removes, the rest stay. |
-| `pumasi upgrade latest [--check] [--version TAG] [--wait] [--force]` | Have the control plane download the newest GitHub release (or `TAG`) for every platform in the cluster, check it against its SHA256SUMS, and roll it out; `--check` only shows the newest release and each node's version. |
-| `pumasi upgrade rollout FILE... [--wait] [--force]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node, `upgrade cancel` stops offering it. |
+| `pumasi upgrade latest [--check] [--version TAG] [--wait] [--force] [--canary NODE\|SELECTOR ...]` | Have the control plane download the newest GitHub release (or `TAG`) for every platform in the cluster, check it against its SHA256SUMS, and roll it out; `--check` only shows the newest release and each node's version. `--canary` upgrades those nodes first (`--canary-soak 30m`, `--canary-tasks N`, `--canary-hold`). |
+| `pumasi upgrade rollout FILE... [--wait] [--force] [--canary ...]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node (and the canary), `upgrade promote [NODE...]` upgrades more nodes past a canary or all of them, `upgrade cancel` stops offering it. |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
@@ -1350,6 +1370,7 @@ defends against, including the API exposed to the internet.
 | `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
 | `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency, GPUs) and recent jobs with their cost in CU. |
 | `pumasi node <NODE> [--rebenchmark]` | One node's benchmark profile, billed score, GPUs, latency and checks; `--rebenchmark` asks it to measure again. |
+| `pumasi node set <NODE> [--slots N\|--default-slots] [--max-cpu-percent P\|--all-cpus] [--hours 22:00-07:00\|--any-time] [--idle-minutes M\|--no-idle] [--only-on-ac\|--any-power]` | Change when a node takes tasks: its agent (a 1.7 service) writes them to `agent.toml` and restarts with them once idle. Without options, shows them. The dashboard's node page and `PUT /api/v1/nodes/NODE/settings` do the same. |
 | `pumasi node wake <NODE>` | Send the Wake-on-LAN magic packet of an offline node that runs with `--wake-on-lan`, from the machines of the cluster on its LAN. The dashboard's Wake button and `POST /api/v1/nodes/NODE/wake` do the same. |
 | `pumasi node rename <NODE> <NAME>` / `--reset` | Give a node a display name (status, dashboard, events, the `name` label, any NODE argument); it replaces the agent's `--name` until `--reset`. The dashboard's node page and `POST /api/v1/nodes/NODE/rename` do the same. |
 | `pumasi bench [--quick] [--json] [--dir DIR]` | Benchmark this machine the way the agent does and print the profile. |
@@ -1369,7 +1390,7 @@ defends against, including the API exposed to the internet.
 | `pumasi cordon \| uncordon \| drain <NODE>` | Stop new tasks going to a node, take it back, or also move its running tasks elsewhere. |
 | `pumasi label <NODE> k=v... \| k-` / `taint <NODE> key[=value]... \| key-` | Node labels for job selectors; taints keep away jobs that do not tolerate them. |
 | `pumasi quota [ACCOUNT --slots N --gpus N --cu-per-day CU --max-priority N --storage SIZE --images P,.. --require-digest yes --executors E,.. --network deny --selector S --tolerations T,.. --max-timeout D --max-gpus-per-task N] [--clear]` | Show every account's limits, job policy and usage, or change one (`none` or `any` lifts a limit). `--add-images`, `--remove-images` (and the same for `executors` and `tolerations`) change one entry of a list. |
-| `pumasi access create NAME --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|NAME` | Tickets with a role for other people; `pumasi whoami` shows the one in use, with a submitter's quota and job policy. |
+| `pumasi access create NAME --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|NAME` | Tickets with a role for other people; `pumasi whoami` shows the one in use, with a submitter's quota and job policy. `pumasi access sessions [--revoke ID]` lists the dashboard's signed-in browsers. |
 | `pumasi schedule add NAME job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm NAME` / `run NAME` | Jobs submitted on a cron schedule. |
 | `pumasi apply -f cluster.toml [--dry-run] [--prune]` | Make labels, taints, cordons, quotas, schedules, alert rules and webhooks match a file; applying twice changes nothing. |
 | `pumasi get nodes\|jobs\|accounts\|schedules\|access [-l SELECTOR] [-o json]` / `describe node\|job\|account\|schedule NAME` | List things, or show one in detail. |
@@ -1646,12 +1667,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-and phase 22 (1.6) fills in monitoring; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring and phase 23 (1.7) the dashboard; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1676,7 +1697,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 20 | Issues from real use: agent options changed and shown without reinstalling the service (`service set`), account quotas and job policies from the dashboard and a documented API with add/remove, submitters reading their own policy and `?validate=1`, per-task pull, run and upload times, node names in task views | done (1.4) |
 | 21 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue`, a guide for Linux on 2013-2014 Macs | done (1.5) |
 | 22 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | done (1.6) |
-| 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | planned (1.7) |
+| 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | done (1.7) |
 | 24 | File store on several machines: replicas on owner nodes with repair and scrubbing, writes acknowledged on enough copies, an S3-compatible gateway | planned (1.8) |
 | 25 | Scheduling: gangs, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption and drain, schedule time zones | planned (1.9) |
 | 26 | GPUs: WebGPU timeouts and GPU challenge, AMD benchmark and Docker jobs, shared GPUs (fractions, MIG) | planned (1.10) |

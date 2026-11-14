@@ -494,6 +494,10 @@ enum Cmd {
     /// an image locally in a microVM.
     #[command(subcommand)]
     Vm(VmCmd),
+    /// Docker on Windows without Docker Desktop: a WSL distro that Pumasi
+    /// manages, running from boot before anyone signs in.
+    #[command(subcommand)]
+    Docker(DockerCmd),
     /// Run a module locally in the same sandbox the agent uses.
     Exec {
         module: PathBuf,
@@ -658,6 +662,31 @@ enum SecretCmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+}
+
+#[derive(Subcommand)]
+enum DockerCmd {
+    /// Install Docker in a small WSL 2 distro that Pumasi manages (Windows,
+    /// administrator terminal): a hidden local account owns it, a scheduled
+    /// task keeps dockerd running from boot, and agents with
+    /// --allow-docker use it. Run it again to update or repair it.
+    Setup {
+        /// The daemon's TCP port on 127.0.0.1 (mutual TLS).
+        #[arg(long, default_value_t = pumasi_agent::wsl_docker::DEFAULT_PORT)]
+        port: u16,
+        /// Return once the task is started instead of waiting for Docker
+        /// to answer (the first start installs it).
+        #[arg(long)]
+        no_wait: bool,
+        /// Make new TLS certificates for the daemon and the agent.
+        #[arg(long)]
+        new_certificates: bool,
+    },
+    /// Show the distro, the scheduled task, whether Docker answers, and the
+    /// end of its log.
+    Status,
+    /// Remove the distro, the task, the account and the files.
+    Remove,
 }
 
 #[derive(Subcommand)]
@@ -1213,6 +1242,32 @@ fn main() {
     {
         let config = PathBuf::from(args.next().unwrap_or_default());
         std::process::exit(pumasi_agent::microvm::vz::run_main(&config));
+    }
+    // `pumasi __wsl-docker-run --dir DIR`: the scheduled task of `pumasi
+    // docker setup`, which keeps dockerd running in the WSL distro (1.11).
+    let mut args = std::env::args_os().skip(1);
+    if args
+        .next()
+        .is_some_and(|a| a == pumasi_agent::wsl_docker::RUN_ARG)
+    {
+        let dir = match (args.next(), args.next()) {
+            (Some(flag), Some(dir)) if flag == "--dir" => PathBuf::from(dir),
+            _ => {
+                eprintln!(
+                    "usage: pumasi {} --dir DIR",
+                    pumasi_agent::wsl_docker::RUN_ARG
+                );
+                std::process::exit(2);
+            }
+        };
+        let code = tokio::runtime::Runtime::new()
+            .map_err(anyhow::Error::from)
+            .and_then(|rt| rt.block_on(pumasi_agent::wsl_docker::run_task(&dir)))
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e:#}");
+                1
+            });
+        std::process::exit(code);
     }
     // `pumasi idle-helper`: started by the Windows agent service in each
     // signed-in session, to learn when someone is using the machine.
@@ -1972,6 +2027,25 @@ async fn run(cli: Cli) -> Result<i32> {
         } => manage::get(&home, &admin, kind, selector, output).await,
         Cmd::Describe { kind, name, admin } => manage::describe(&home, &admin, kind, &name).await,
         Cmd::Vm(cmd) => vm(&home, cmd).await,
+        Cmd::Docker(cmd) => {
+            use pumasi_agent::wsl_docker;
+            match cmd {
+                DockerCmd::Setup {
+                    port,
+                    no_wait,
+                    new_certificates,
+                } => {
+                    wsl_docker::setup(wsl_docker::SetupOptions {
+                        port,
+                        wait: !no_wait,
+                        new_certificates,
+                    })
+                    .await
+                }
+                DockerCmd::Status => wsl_docker::status().await,
+                DockerCmd::Remove => wsl_docker::remove().await,
+            }
+        }
         Cmd::Exec {
             module,
             args,

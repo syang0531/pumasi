@@ -36,6 +36,30 @@ pub const QEMU_WINDOWS: QemuInstaller = QemuInstaller {
     size: 206_615_928,
 };
 
+/// QEMU for Windows on Arm (aarch64), from the same builder: a native Arm
+/// build whose `qemu-system-aarch64` has the `whpx` accelerator (QEMU 11
+/// added WHPX on Arm) and falls back to TCG where Windows lacks the final
+/// Arm hypervisor API (before 24H2).
+pub const QEMU_WINDOWS_ARM64: QemuInstaller = QemuInstaller {
+    file: "qemu-arm-setup-20260811.exe",
+    version: "11.1.0 (20260811)",
+    urls: &[
+        "https://qemu.weilnetz.de/aarch64/qemu-arm-setup-20260811.exe",
+        "https://qemu.weilnetz.de/aarch64/2026/qemu-arm-setup-20260811.exe",
+    ],
+    sha256: "58bf65887e4d3af1eef705bdecdcb1fa25dead950fc970c20e6094662afc957f",
+    size: 151_734_264,
+};
+
+/// The pinned QEMU installer for Windows on `arch`.
+pub fn qemu_installer(arch: &str) -> Option<&'static QemuInstaller> {
+    match arch {
+        "x86_64" => Some(&QEMU_WINDOWS),
+        "aarch64" => Some(&QEMU_WINDOWS_ARM64),
+        _ => None,
+    }
+}
+
 /// Names the installer QEMU in `<vm dir>/qemu` came from, so a newer pin
 /// replaces it.
 const QEMU_MARKER: &str = "pumasi-installer.txt";
@@ -222,8 +246,10 @@ pub async fn setup(dir: &Path, guest: Option<&Path>, force: bool) -> Result<Setu
         }
     }
 
-    if cfg!(windows) && arch == "x86_64" {
-        install_qemu_windows(&http, dir, force, &mut report).await?;
+    if cfg!(windows)
+        && let Some(pin) = qemu_installer(arch)
+    {
+        install_qemu_windows(&http, pin, dir, force, &mut report).await?;
     }
 
     let dest = dir.join(GUEST_FILE);
@@ -257,11 +283,11 @@ pub async fn setup(dir: &Path, guest: Option<&Path>, force: bool) -> Result<Setu
 /// shell.
 async fn install_qemu_windows(
     http: &reqwest::Client,
+    pin: &QemuInstaller,
     dir: &Path,
     force: bool,
     report: &mut SetupReport,
 ) -> Result<()> {
-    let pin = &QEMU_WINDOWS;
     let target = dir.join(QEMU_DIR);
     let exe = target.join(format!("{}.exe", vmm::qemu_name()));
     let marker = target.join(QEMU_MARKER);
@@ -333,7 +359,7 @@ async fn run_installer(_installer: &Path, _target: &Path) -> Result<std::process
 
 /// Streams the first URL that answers into `dest`, checking size and
 /// SHA-256 before the file gets its final name.
-async fn download_to(
+pub(crate) async fn download_to(
     http: &reqwest::Client,
     urls: &[&str],
     sha256: &str,
@@ -460,6 +486,7 @@ mod tests {
             ("linux", "x86_64"),
             ("linux", "aarch64"),
             ("windows", "x86_64"),
+            ("windows", "aarch64"),
             ("macos", "x86_64"),
             ("macos", "aarch64"),
         ] {
@@ -470,5 +497,24 @@ mod tests {
         let (url, _, label) = kernel_source("macos", "x86_64").unwrap();
         assert!(url.ends_with("bzImage-x86_64") && label.contains("bzImage"));
         assert!(kernel_source("linux", "riscv64").is_none());
+    }
+
+    #[test]
+    fn windows_qemu_for_both_architectures() {
+        for (arch, file, url) in [
+            ("x86_64", "qemu-w64-setup-", "/w64/"),
+            ("aarch64", "qemu-arm-setup-", "/aarch64/"),
+        ] {
+            let pin = qemu_installer(arch).unwrap();
+            assert!(pin.file.starts_with(file), "{}", pin.file);
+            assert_eq!(pin.sha256.len(), 64);
+            assert!(pin.size > 100 << 20);
+            assert!(
+                pin.urls
+                    .iter()
+                    .all(|u| u.contains(url) && u.ends_with(pin.file))
+            );
+        }
+        assert!(qemu_installer("riscv64").is_none());
     }
 }

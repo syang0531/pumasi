@@ -309,7 +309,7 @@ fn probe_args(image: &str, wsl_libs: bool) -> Vec<String> {
 pub async fn probe(docker: &str, image: &str, wsl_libs: bool) -> Result<DockerGpuCheck> {
     let out = tokio::time::timeout(
         Duration::from_secs(15 * 60),
-        tokio::process::Command::new(docker)
+        crate::wsl_docker::docker_command(docker)
             .args(probe_args(image, wsl_libs))
             .stdin(Stdio::null())
             .output(),

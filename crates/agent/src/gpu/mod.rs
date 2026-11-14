@@ -190,7 +190,7 @@ pub async fn docker_nvidia(bin: &str) -> bool {
     }
     let out = tokio::time::timeout(
         Duration::from_secs(15),
-        tokio::process::Command::new(bin)
+        crate::wsl_docker::docker_command(bin)
             .args(["info", "--format", "{{json .Runtimes}}"])
             .stdin(std::process::Stdio::null())
             .output(),

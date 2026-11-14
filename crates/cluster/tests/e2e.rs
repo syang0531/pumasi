@@ -1352,9 +1352,10 @@ async fn mutual_mode_lends_and_borrows_without_grants() {
 // ---------------------------------------------------------------------------
 
 /// True when a Docker daemon that runs Linux containers is reachable
-/// (Windows CI runners have Docker in Windows-container mode).
+/// (Windows CI runners have Docker in Windows-container mode, and the
+/// Pumasi WSL distro once `pumasi docker setup` ran).
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
+    pumasi_agent::wsl_docker::docker_std_command("docker")
         .args(["version", "--format", "{{.Server.Os}}"])
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "linux")

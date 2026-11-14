@@ -95,14 +95,37 @@ pub struct Vmm {
     pub tsc_khz: Option<u64>,
 }
 
-/// QEMU's hardware accelerator on this OS.
-pub fn qemu_accel() -> &'static str {
-    if cfg!(target_os = "macos") {
+/// The machine QEMU runs on: what its command line depends on. Tests build
+/// the command lines of other hosts with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Host {
+    pub x86: bool,
+    pub windows: bool,
+    pub macos: bool,
+}
+
+impl Host {
+    pub const fn current() -> Self {
+        Self {
+            x86: cfg!(target_arch = "x86_64"),
+            windows: cfg!(windows),
+            macos: cfg!(target_os = "macos"),
+        }
+    }
+}
+
+/// QEMU's hardware accelerator on this host.
+pub fn qemu_accel(host: Host) -> &'static str {
+    if host.macos {
         "hvf"
-    } else if cfg!(windows) {
+    } else if host.windows && host.x86 {
         // The in-kernel (Hyper-V) local APIC trips up Linux guests on some
         // Windows builds; QEMU's own interrupt controllers always work.
         "whpx,kernel-irqchip=off"
+    } else if host.windows {
+        // Arm (QEMU 11+): the interrupt controller is Hyper-V's GICv3
+        // (`whpx-arm-gicv3`); QEMU has no other one for WHPX.
+        "whpx"
     } else {
         "kvm"
     }
@@ -124,7 +147,7 @@ impl Vmm {
         }
         match self.backend {
             Backend::Firecracker => self.firecracker(spec, dir),
-            Backend::Qemu => Ok(self.qemu(spec, dir)),
+            Backend::Qemu => Ok(self.qemu(spec, dir, Host::current())),
             Backend::Vz => self.vz(spec, dir),
         }
     }
@@ -231,9 +254,9 @@ impl Vmm {
         Ok(cmd)
     }
 
-    fn qemu(&self, spec: &VmSpec, dir: &Path) -> tokio::process::Command {
+    fn qemu(&self, spec: &VmSpec, dir: &Path, host: Host) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.bin);
-        let x86 = cfg!(target_arch = "x86_64");
+        let x86 = host.x86;
         // Passed-through GPUs need a PCI bus; the other devices then sit on
         // it too.
         let pci = !spec.pci.is_empty() || spec.tee.is_some();
@@ -242,7 +265,7 @@ impl Vmm {
             tee_machine(&mut cmd, t, spec.mem_mib);
         } else if pci {
             cmd.args(["-M", if x86 { "q35" } else { "virt" }]);
-        } else if x86 && cfg!(target_os = "macos") && self.accelerated {
+        } else if x86 && host.macos && self.accelerated {
             // HVF: no kvm-clock and no fixed TSC rate on the command line,
             // so the guest calibrates its TSC against the PIT.
             cmd.args(["-M", "microvm"]);
@@ -255,13 +278,17 @@ impl Vmm {
             // with KVM's in-kernel one. The local APIC timer, with kvm-clock
             // or the fixed TSC rate below, is all the guest needs.
             cmd.args(["-M", "microvm,pic=off,pit=off"]);
+        } else if host.windows {
+            // WHPX on Arm has only Hyper-V's GICv3; TCG, the fallback,
+            // emulates one too.
+            cmd.args(["-M", "virt,gic-version=3"]);
         } else {
             cmd.args(["-M", "virt"]);
         }
         // Escape hatches for trying other settings on a new machine, e.g.
         // PUMASI_QEMU_ACCEL=tcg or PUMASI_QEMU_ACCEL=whpx.
         let accel = std::env::var("PUMASI_QEMU_ACCEL").ok();
-        let whpx = cfg!(windows)
+        let whpx = host.windows
             && match &accel {
                 Some(a) => a.starts_with("whpx"),
                 None => self.accelerated,
@@ -272,7 +299,7 @@ impl Vmm {
             }
             None => {
                 if self.accelerated {
-                    cmd.args(["-accel", qemu_accel()]);
+                    cmd.args(["-accel", qemu_accel(host)]);
                 }
                 cmd.args(["-accel", "tcg"]);
             }
@@ -285,7 +312,9 @@ impl Vmm {
                 // SEV-SNP guests take the host's CPUID as the firmware
                 // checks it; TDX's module filters it.
                 Some(_) => "host",
-                None if whpx => "Nehalem",
+                None if whpx && x86 => "Nehalem",
+                // Arm: `max` is the host's CPU under WHPX, as under KVM
+                // and HVF, and still works when QEMU falls back to TCG.
                 None => "max",
             }
             .into()
@@ -295,29 +324,44 @@ impl Vmm {
             .args(["-smp", &spec.vcpus.to_string()])
             .args(["-nodefaults", "-no-user-config", "-no-reboot"])
             .args(["-display", "none"]);
-        if cfg!(windows) {
-            // QEMU's stdio console polls the console's input handle, which
-            // a service or a redirected NUL stdin does not have.
-            cmd.arg("-serial")
-                .arg(format!("file:{}", dir.join(SERIAL_LOG).display()));
+        // QEMU's stdio console polls the console's input handle, which a
+        // service or a redirected NUL stdin does not have: on Windows the
+        // console goes to a file.
+        let serial_log = format!("{}", dir.join(SERIAL_LOG).display());
+        let console = if x86 {
+            if host.windows {
+                cmd.arg("-serial").arg(format!("file:{serial_log}"));
+            } else {
+                cmd.args(["-serial", "stdio"]);
+            }
+            "console=ttyS0"
         } else {
-            cmd.args(["-serial", "stdio"]);
-        }
+            // The pinned Arm kernels have no PL011 driver (the `virt`
+            // machine's UART), but a virtio console, as under
+            // Virtualization.framework.
+            let chardev = if host.windows {
+                format!("file,id=con0,path={}", serial_log.replace(',', ",,"))
+            } else {
+                "stdio,id=con0".to_string()
+            };
+            cmd.arg("-chardev")
+                .arg(chardev)
+                .arg("-device")
+                .arg(format!("virtio-serial-{transport}"))
+                .arg("-device")
+                .arg("virtconsole,chardev=con0");
+            "console=hvc0"
+        };
         cmd.arg("-kernel")
             .arg(&spec.kernel)
             .arg("-initrd")
             .arg(&spec.initrd);
-        let console = if x86 {
-            "console=ttyS0"
-        } else {
-            "console=ttyAMA0"
-        };
         // The guest ends the VM by rebooting, which `-no-reboot` turns into
         // QEMU exiting. A triple fault (`reboot=t`) does that everywhere but
         // under WHPX, which reports it as an unrecoverable exception and
         // leaves QEMU hanging; the microvm machine's ACPI reset register
         // (`reboot=a`) is a clean reset request there.
-        let reboot = if whpx { "reboot=a" } else { "reboot=t" };
+        let reboot = if whpx && x86 { "reboot=a" } else { "reboot=t" };
         let mut args = vec![console.to_string(), reboot.into(), "panic=1".into()];
         if x86 && (!self.accelerated || whpx) {
             // Without KVM there is no kvm-clock, and calibrating the TSC
@@ -574,6 +618,91 @@ mod tests {
             ..vmm.clone()
         };
         assert!(fc.command(&net, Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn qemu_on_windows_arm() {
+        let vmm = Vmm {
+            backend: Backend::Qemu,
+            bin: "qemu".into(),
+            accelerated: true,
+            tsc_khz: None,
+        };
+        let spec = VmSpec {
+            kernel: "/k".into(),
+            initrd: "/i".into(),
+            mode: "run",
+            disks: vec![Disk {
+                path: "/a.img".into(),
+                read_only: true,
+            }],
+            vcpus: 2,
+            mem_mib: 300,
+            net: Some("127.0.0.1:4567".parse().unwrap()),
+            pci: vec![],
+            tee: None,
+        };
+        let line = |host: Host| -> String {
+            vmm.qemu(&spec, Path::new("/run/a,b"), host)
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let arm = Host {
+            x86: false,
+            windows: true,
+            macos: false,
+        };
+        let joined = line(arm);
+        assert!(joined.contains("-M virt,gic-version=3"), "{joined}");
+        // WHPX first, then TCG should QEMU not manage WHPX here.
+        assert!(joined.contains("-accel whpx -accel tcg"), "{joined}");
+        assert!(!joined.contains("kernel-irqchip"), "{joined}");
+        assert!(joined.contains("-cpu max"), "{joined}");
+        assert!(!joined.contains("Nehalem"), "{joined}");
+        // A virtio console into the file the agent watches.
+        let log = Path::new("/run/a,b").join(SERIAL_LOG).display().to_string();
+        assert!(
+            joined.contains(&format!(
+                "-chardev file,id=con0,path={}",
+                log.replace(',', ",,")
+            )),
+            "{joined}"
+        );
+        assert!(joined.contains("-device virtio-serial-device -device virtconsole,chardev=con0"));
+        assert!(joined.contains("console=hvc0"), "{joined}");
+        assert!(!joined.contains("tsc_early_khz"), "{joined}");
+        assert!(!joined.contains("reboot=a"), "{joined}");
+        assert!(!joined.contains(" -serial "), "{joined}");
+        assert!(joined.contains("virtio-blk-device,drive=d0"));
+        assert!(joined.contains("virtio-net-device,netdev=n0"));
+
+        // Windows on x86 is as it was.
+        let x86 = Host {
+            x86: true,
+            windows: true,
+            macos: false,
+        };
+        let joined = line(x86);
+        assert!(joined.contains("-M microvm,pic=off,pit=off"), "{joined}");
+        assert!(joined.contains("-accel whpx,kernel-irqchip=off -accel tcg"));
+        assert!(joined.contains("-cpu Nehalem"), "{joined}");
+        assert!(joined.contains("console=ttyS0"));
+        assert!(joined.contains("reboot=a"));
+        assert!(joined.contains("-serial file:"));
+
+        // Linux on Arm: KVM, and the virtio console on stdio.
+        let linux_arm = Host {
+            x86: false,
+            windows: false,
+            macos: false,
+        };
+        let joined = line(linux_arm);
+        assert!(joined.contains("-M virt -accel kvm -accel tcg"), "{joined}");
+        assert!(joined.contains("-chardev stdio,id=con0"), "{joined}");
+        assert!(joined.contains("console=hvc0"));
     }
 
     #[test]

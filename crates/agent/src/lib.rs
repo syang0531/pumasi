@@ -16,6 +16,7 @@ pub mod store;
 pub mod tempdir;
 pub mod upgrade;
 pub mod webgpu;
+pub mod wsl_docker;
 
 pub use agent::{Agent, AgentConfig, Membership, SettingsHook, default_node_name};
 pub use availability::AvailabilityConfig;

@@ -646,6 +646,184 @@ jobs:
             < /dev/null; echo "exit $?"
           tail -c 6000 bare.log
 
+  # The aarch64 guest init, for the Windows on Arm microVM job.
+  guest-aarch64:
+    name: guest init (linux-musl, aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: guest-aarch64
+      - run: cargo build --release -p pumasi-guest --target aarch64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pumasi-guest-aarch64
+          path: target/aarch64-unknown-linux-musl/release/pumasi-guest
+          if-no-files-found: error
+
+  # Windows on Arm (1.11): built on x64 Windows as releases are, run on an
+  # Arm runner.
+  build-windows-arm:
+    name: build (windows, aarch64)
+    needs: guest-aarch64
+    runs-on: windows-latest
+    env:
+      PUMASI_EMBED_GUEST: ${{ github.workspace }}\guest\pumasi-guest
+      CARGO_PROFILE_DEV_DEBUG: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: build-windows-arm
+      - uses: actions/download-artifact@v4
+        with:
+          name: pumasi-guest-aarch64
+          path: guest
+      - run: cargo build -p pumasi-cli --target aarch64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pumasi-windows-aarch64
+          path: target/aarch64-pc-windows-msvc/debug/pumasi.exe
+          if-no-files-found: error
+
+  microvm-windows-arm:
+    name: microvm (windows on arm, qemu)
+    needs: build-windows-arm
+    runs-on: windows-11-arm
+    env:
+      VM_DIR: ${{ github.workspace }}\.vm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pumasi-windows-aarch64
+          path: bin
+      # The QEMU installer is slow; reuse the installed copy.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .vm/qemu
+            .vm/vmlinux
+          key: vm-windows-arm-qemu-20260811-kernel-6.1.102
+      - name: Install the guest kernel and the pinned Arm QEMU
+        shell: bash
+        run: |
+          powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name; [Environment]::OSVersion.Version" || true
+          ./bin/pumasi.exe vm setup --vm-dir "$VM_DIR"
+          ./bin/pumasi.exe vm status --vm-dir "$VM_DIR" | tee status.txt
+          grep -q "built into this binary" status.txt
+          grep -q "qemu-system-aarch64.exe" status.txt
+      - name: Run an image in an Arm microVM
+        shell: bash
+        timeout-minutes: 30
+        env:
+          PUMASI_LOG: debug
+        run: |
+          mkdir -p in && echo "from the host" > in/note.txt
+          # WHPX where the runner has it (QEMU 11 on Windows 11 24H2),
+          # otherwise TCG, which the agent notices and says.
+          ./bin/pumasi.exe vm run --vm-dir "$VM_DIR" --input in --out vm-out \
+            busybox:1.36 -- sh -c 'cat /input/note.txt; uname -m; echo done > /output/r.txt' \
+            < /dev/null 2>&1 | tee vm.txt
+          if grep -q "QEMU could not use the hypervisor\|do not work under WHPX\|no hardware virtualization" vm.txt; then
+            echo "::notice::no usable WHPX on this Arm runner; the microVM ran under TCG"
+          else
+            echo "::notice::the Arm microVM ran under WHPX"
+          fi
+          grep -q "^from the host" vm.txt
+          grep -q "^aarch64" vm.txt
+          grep -q "^done" vm-out/r.txt
+      - name: Show the VM consoles when a microVM step failed
+        if: failure() || cancelled()
+        shell: bash
+        run: |
+          taskkill //F //IM qemu-system-aarch64.exe 2>/dev/null || true
+          find "$VM_DIR/run" -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | while read -r f; do
+            echo "=== $f"; tail -c 4000 "$f"; echo
+          done
+
+  # Docker without Docker Desktop (1.11): the WSL distro, its hidden
+  # account and the boot task, as far as the runner's nested
+  # virtualization lets WSL 2 go; then an agent runs Docker jobs on it.
+  wsl-docker:
+    name: wsl docker (windows)
+    runs-on: windows-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: wsl-docker
+      - run: cargo build -p pumasi-cli
+      - name: WSL on this runner
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wsl --version
+          wsl --status
+      - name: pumasi docker setup
+        id: setup
+        shell: bash
+        timeout-minutes: 45
+        run: |
+          set +e
+          ./target/debug/pumasi docker setup --no-wait 2>&1 | tee setup.txt
+          code=${PIPESTATUS[0]}
+          echo "setup exited $code"
+          log='C:/ProgramData/Pumasi/wsl-docker/logs/wsl-docker.log'
+          # Account, ACLs, downloads, certificates and the task come first,
+          # whatever WSL can do here.
+          net user pumasi-wsl > /dev/null || { echo "no account"; exit 1; }
+          schtasks //Query //TN '\Pumasi\WSL Docker' || { echo "no task"; exit 1; }
+          test -f 'C:/ProgramData/Pumasi/wsl-docker/bin/docker.exe' || exit 1
+          test -f 'C:/ProgramData/Pumasi/wsl-docker/tls/client/key.pem' || exit 1
+          icacls 'C:\ProgramData\Pumasi\wsl-docker\tls\client' | tee acl.txt
+          if grep -qi "pumasi-wsl\|BUILTIN\\\\Users" acl.txt; then echo "the client key is readable by others"; exit 1; fi
+          if [ "$code" = 3 ]; then
+            echo "::notice::WSL 2 needs a restart on this runner; checking the task up to that"
+            schtasks //Run //TN '\Pumasi\WSL Docker'
+          elif [ "$code" != 0 ]; then
+            exit 1
+          fi
+          # The task logs on as the hidden account and runs pumasi; then
+          # either Docker answers or WSL says why it cannot here.
+          for i in $(seq 1 120); do
+            if ./target/debug/pumasi docker status > status.txt 2>&1; then
+              echo "answer=yes" >> "$GITHUB_OUTPUT"; break
+            fi
+            if [ "$(grep -c 'error:' "$log" 2>/dev/null)" -ge 2 ]; then break; fi
+            sleep 10
+          done
+          cat status.txt || true
+          echo "=== task log"; cat "$log" || true
+          grep -q "starts the pumasi-docker distro as pumasi-wsl" "$log" || { echo "the task did not run as pumasi-wsl"; exit 1; }
+          if ! grep -q "answer=yes" "$GITHUB_OUTPUT"; then
+            echo "::notice::WSL 2 did not start a distro on this runner (nested virtualization); checked up to the task"
+          fi
+      - name: An agent runs Docker jobs in the WSL distro
+        if: steps.setup.outputs.answer == 'yes'
+        timeout-minutes: 30
+        run: cargo test -p pumasi-cluster --test e2e docker_tasks_get_files_and_run_only_on_docker_nodes -- --nocapture
+      - name: pumasi docker remove
+        if: always()
+        shell: bash
+        run: |
+          ./target/debug/pumasi docker remove || true
+          if net user pumasi-wsl > /dev/null 2>&1; then echo "the account is still there"; exit 1; fi
+          if schtasks //Query //TN '\Pumasi\WSL Docker' > /dev/null 2>&1; then echo "the task is still there"; exit 1; fi
+
   service:
     name: service and upgrade (${{ matrix.os }})
     strategy:

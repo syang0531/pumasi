@@ -168,8 +168,8 @@ again (the two commands are in its `job.toml`).
 ### Docker jobs: Python, files and more
 
 Start the agents that may run containers with `--allow-docker` (Docker or a
-compatible CLI must be installed there; on Windows, Docker Desktop with the
-WSL 2 backend in Linux containers mode):
+compatible CLI must be installed there; on Windows, `pumasi docker setup`
+or Docker Desktop with the WSL 2 backend in Linux containers mode):
 
 ```sh
 pumasi agent join pumasijoin... --allow-docker
@@ -379,9 +379,10 @@ the results across them; real GPUs are checked by hand.
 
 ### Windows
 
-Everything works on Windows 10 and 11 (x86_64): WASM jobs out of the box,
-Docker jobs through Docker Desktop, microVM jobs through QEMU with the
-Windows Hypervisor Platform (WHPX). From an administrator PowerShell:
+Everything works on Windows 10 and 11, x86_64 and Arm: WASM jobs out of
+the box, Docker jobs through a WSL distro Pumasi manages (or Docker
+Desktop), microVM jobs through QEMU with the Windows Hypervisor Platform
+(WHPX). From an administrator PowerShell:
 
 ```powershell
 # Once: the hypervisor API QEMU uses, then reboot.
@@ -389,8 +390,31 @@ Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform
 
 pumasi vm setup        # guest kernel + pinned QEMU (installed into ~\.pumasi\vm\qemu)
 pumasi vm status       # "whpx usable" means hardware-accelerated microVMs
+pumasi docker setup    # Docker in WSL, from boot, no Docker Desktop (1.11)
 pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
 ```
+
+**Docker without Docker Desktop (1.11).** `pumasi docker setup` installs
+Docker (Ubuntu's `docker.io`) in a small WSL 2 distro, `pumasi-docker`,
+that a hidden local account (`pumasi-wsl`) owns, and registers a scheduled
+task that starts it at boot, before anyone signs in, and keeps `dockerd`
+running. With an NVIDIA driver on Windows it adds the NVIDIA Container
+Toolkit, so GPU Docker jobs work there too (WSL's CUDA support). The
+daemon listens only on `127.0.0.1:2376` with mutual TLS (the client
+certificate is readable by SYSTEM and administrators only), the distro has
+no Windows drives and cannot start Windows programs, and every file lives
+in `C:\ProgramData\Pumasi\wsl-docker`. An agent with `--allow-docker` uses
+it whenever it is set up; to keep using Docker Desktop on such a machine,
+give the agent `--docker-bin "C:\Program Files\Docker\Docker\resources\bin\docker.exe"`.
+`pumasi docker status` shows the task, whether Docker answers and the end
+of its log; `pumasi docker remove` takes it all away again. Without WSL,
+`setup` installs it (`wsl --install --no-distribution`); after the restart
+the task sets Docker up on its own.
+
+**Windows on Arm (1.11).** `pumasi vm setup` installs QEMU's native Arm
+build, and microVMs run with WHPX on Windows 11 24H2 and later (QEMU 11),
+in software emulation before that; the agent boots one probe VM to tell
+and says which.
 
 - Without WHPX (feature off, or virtualization disabled in the firmware)
   microVMs still run, in QEMU's software emulation: correct but several
@@ -398,10 +422,10 @@ pumasi service install --ticket pumasijoin... -- --allow-microvm --allow-docker
   The agent also boots one small probe VM at start and falls back to that
   emulation when WHPX is there but breaks the VM's disks, as it does nested
   in cloud VMs; the log says so.
-- Docker jobs need Docker Desktop running with the WSL 2 backend and Linux
-  containers. Docker Desktop starts with the signed-in user, so a machine
-  nobody is logged into takes only WASM and microVM jobs (or set Docker
-  Desktop to start at sign-in and enable automatic sign-in).
+- With Docker Desktop instead, it must run with the WSL 2 backend and
+  Linux containers. Docker Desktop starts with the signed-in user, so such
+  a machine nobody is logged into takes only WASM and microVM jobs; `pumasi
+  docker setup` has no such limit.
 - `pumasi service install` adds a firewall rule letting the agent receive
   UDP on private and domain networks, so peers connect directly instead of
   through the relay; `service uninstall` removes it. On a network Windows
@@ -1461,6 +1485,7 @@ defends against, including the API exposed to the internet.
 | `pumasi upgrade rollout FILE... [--wait] [--force] [--canary ...]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node (and the canary), `upgrade promote [NODE...]` upgrades more nodes past a canary or all of them, `upgrade cancel` stops offering it. |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
+| `pumasi docker setup [--port 2376] [--no-wait] [--new-certificates]` / `docker status` / `docker remove` | Windows, administrator: Docker in a WSL 2 distro Pumasi manages, started at boot by a scheduled task before anyone signs in (no Docker Desktop), which agents with `--allow-docker` use; `status` shows the task, the daemon and its log, `remove` takes it all away. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
 | `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image IMAGE] [--wsl-libs auto\|yes\|no]]` / `gpu webgpu [--software]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally, and with `--docker-run` starts a container to see whether CUDA, OptiX and drawing (EGL, OpenGL, Vulkan) work in Docker (saved for the agent: `gpu.graphics`); `webgpu` lists the WebGPU adapters wasm jobs can use. |
 | `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
@@ -1769,12 +1794,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling and phase 26 (1.10) GPUs; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs and phase 27 (1.11) Windows; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1803,7 +1828,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 24 | File store on several machines: replicas on owner nodes labelled for storage with repair and scrubbing, writes acknowledged on enough copies, release binaries on every control plane, an S3-compatible gateway in `pumasi ui` | done (1.8) |
 | 25 | Scheduling: gangs, spreading, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption, drain, pauses and sleep (Docker and WASM), schedule time zones | done (1.9) |
 | 26 | GPUs: WebGPU shaders stopped at the job's timeout (worker process), the GPU challenge over WebGPU, `shader-f16` and subgroups, AMD and other CUDA-less GPUs benchmarked and checked over WebGPU, ROCm Docker jobs, parts of GPUs (`gpus = 0.5`), MIG slices as GPUs | done (1.10) |
-| 27 | Windows: Docker in a Pumasi-managed WSL distro (no Docker Desktop, no sign-in), ARM64 microVMs, an HCS backend if clearly faster | planned (1.11) |
+| 27 | Windows: Docker in a Pumasi-managed WSL distro (`pumasi docker setup`: no Docker Desktop, no sign-in, NVIDIA GPUs), ARM64 microVMs (QEMU 11, WHPX or TCG); no HCS backend (a script measures it on real PCs) | done (1.11) |
 | 28 | Operations: shared and per-peer request limits, audit log pruning behind a signed checkpoint, SCIM, the CLI behind an HTTPS proxy, follower reads | planned (1.12) |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | on hold |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | on hold |

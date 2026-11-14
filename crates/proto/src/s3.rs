@@ -51,7 +51,15 @@ pub fn same(a: &str, b: &str) -> bool {
 /// Checks the parts of a string to sign that the control plane can: the
 /// algorithm, that the scope is `date/region/s3/aws4_request`, and that
 /// its time is within [`MAX_SKEW_SECS`] of `now_unix`.
-pub fn check_string_to_sign(sts: &str, date: &str, region: &str, now_unix: u64) -> Result<(), String> {
+/// `expires`: a presigned URL's lifetime, which it may be used for after
+/// its time (a signed header must be within 15 minutes of now).
+pub fn check_string_to_sign(
+    sts: &str,
+    date: &str,
+    region: &str,
+    now_unix: u64,
+    expires: Option<u32>,
+) -> Result<(), String> {
     let mut lines = sts.split('\n');
     let algo = lines.next().unwrap_or("");
     if algo != "AWS4-HMAC-SHA256" {
@@ -69,8 +77,21 @@ pub fn check_string_to_sign(sts: &str, date: &str, region: &str, now_unix: u64) 
         return Err("the request time is not on the scope's day".into());
     }
     let t = parse_amz_date(time).ok_or("malformed x-amz-date")?;
-    if (t - now_unix as i64).abs() > MAX_SKEW_SECS {
-        return Err("RequestTimeTooSkewed".into());
+    let now = now_unix as i64;
+    match expires {
+        Some(e) => {
+            if t - now > MAX_SKEW_SECS {
+                return Err("RequestTimeTooSkewed".into());
+            }
+            if now > t + e as i64 {
+                return Err("AccessDenied: the presigned URL expired".into());
+            }
+        }
+        None => {
+            if (t - now).abs() > MAX_SKEW_SECS {
+                return Err("RequestTimeTooSkewed".into());
+            }
+        }
     }
     Ok(())
 }
@@ -104,8 +125,14 @@ mod tests {
             "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
         let now = parse_amz_date("20130524T000500Z").unwrap() as u64;
-        assert!(check_string_to_sign(&sts, "20130524", "us-east-1", now).is_ok());
-        assert!(check_string_to_sign(&sts, "20130524", "eu-west-1", now).is_err());
-        assert!(check_string_to_sign(&sts, "20130524", "us-east-1", now + 3600).is_err());
+        assert!(check_string_to_sign(&sts, "20130524", "us-east-1", now, None).is_ok());
+        assert!(check_string_to_sign(&sts, "20130524", "eu-west-1", now, None).is_err());
+        assert!(check_string_to_sign(&sts, "20130524", "us-east-1", now + 3600, None).is_err());
+        assert!(
+            check_string_to_sign(&sts, "20130524", "us-east-1", now + 3600, Some(86400)).is_ok()
+        );
+        assert!(
+            check_string_to_sign(&sts, "20130524", "us-east-1", now + 90000, Some(86400)).is_err()
+        );
     }
 }

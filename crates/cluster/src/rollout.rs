@@ -175,11 +175,7 @@ impl State {
     pub fn rollout_files(&self) -> Vec<([u8; 32], u64)> {
         self.rollout
             .iter()
-            .flat_map(|r| {
-                r.releases
-                    .iter()
-                    .map(|r| (r.file().sha256, r.file().size))
-            })
+            .flat_map(|r| r.releases.iter().map(|r| (r.file().sha256, r.file().size)))
             .collect()
     }
 

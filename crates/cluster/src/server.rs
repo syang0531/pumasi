@@ -948,7 +948,9 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
                     last_mirror = Some(Instant::now());
                     let shared = shared.clone();
                     tokio::spawn(async move {
-                        match ha::mirror::sync(&shared.endpoint, &shared.files, leader.clone()).await {
+                        match ha::mirror::sync(&shared.endpoint, &shared.files, leader.clone())
+                            .await
+                        {
                             Ok(0) => {}
                             Ok(n) => info!(collections = n, "copied from the leader's file store"),
                             Err(e) => debug!("copying the leader's file store: {e:#}"),
@@ -990,7 +992,8 @@ impl ha::AsyncTags for Tags {
     async fn mirror(&self, leader: EndpointAddr) -> Result<usize> {
         let shared = &self.0;
         let n = ha::mirror::sync(&shared.endpoint, &shared.files, leader.clone()).await?;
-        if let Err(e) = ha::mirror::sync_releases(&shared.endpoint, &shared.releases, leader).await {
+        if let Err(e) = ha::mirror::sync_releases(&shared.endpoint, &shared.releases, leader).await
+        {
             debug!("copying the leader's release binaries: {e:#}");
         }
         Ok(n)
@@ -1654,10 +1657,18 @@ fn s3_key_call(
     let admin = inner.admin_secret();
     let mut st = inner.state();
     let res: Result<AdminResponse> = match op {
-        AdminOp::S3KeyCreate { label } => st.create_s3_key(*parent, &label).map(|(secret, view)| {
-            st.audit(who, "s3.key.create", view.id.clone(), view.label.clone(), true);
-            AdminResponse::S3Key { secret, view }
-        }),
+        AdminOp::S3KeyCreate { label } => {
+            st.create_s3_key(*parent, &label).map(|(secret, view)| {
+                st.audit(
+                    who,
+                    "s3.key.create",
+                    view.id.clone(),
+                    view.label.clone(),
+                    true,
+                );
+                AdminResponse::S3Key { secret, view }
+            })
+        }
         AdminOp::S3Keys => Ok(AdminResponse::S3Keys(st.list_s3_keys(of))),
         AdminOp::S3KeyRevoke { id } => match st.revoke_s3_key(&id, of) {
             Ok(v) => {
@@ -1675,8 +1686,9 @@ fn s3_key_call(
             region,
             string_to_sign,
             signature,
+            expires,
         } => st
-            .s3_auth(&key, &date, &region, &string_to_sign, &signature)
+            .s3_auth(&key, &date, &region, &string_to_sign, &signature, expires)
             .and_then(|(token, signing_key, parent)| {
                 let c = if secrets_eq(&parent, &admin) {
                     Some(Caller::Admin {
@@ -1971,14 +1983,19 @@ async fn wait_copies(inner: &Arc<Inner>, v: &pumasi_proto::store::DatasetView) {
     // store worker gets to it.
     if let Err(e) = inner
         .files
-        .tag(&crate::files::ds_tag(&v.name, v.version), blobs::to_hash(&v.root))
+        .tag(
+            &crate::files::ds_tag(&v.name, v.version),
+            blobs::to_hash(&v.root),
+        )
         .await
     {
         warn!("tag {}@{}: {e:#}", v.name, v.version);
     }
     let cps = match inner.ha() {
         Some(ha) if ha.is_leader() => {
-            1 + ha.mirror_followers(timeout.min(Duration::from_secs(120))).await as u8
+            1 + ha
+                .mirror_followers(timeout.min(Duration::from_secs(120)))
+                .await as u8
         }
         _ => 1,
     };
@@ -2029,7 +2046,10 @@ async fn replica_worker(inner: Arc<Inner>) {
         let scrub_due = {
             let st = inner.state();
             let every = st.reps.scrub_every.as_secs();
-            let last = st.reps.leader_scrub.map_or(st.monitor.started_unix, |s| s.0);
+            let last = st
+                .reps
+                .leader_scrub
+                .map_or(st.monitor.started_unix, |s| s.0);
             crate::state::now_unix().saturating_sub(last) >= every
         };
         if scrub_due {
@@ -2072,7 +2092,9 @@ async fn repair_leader(inner: &Arc<Inner>) {
             .await;
             match got {
                 Ok(()) => {}
-                Err(e) => debug!(from = %from.fmt_short(), "fetch {} back: {e:#}", hash.fmt_short()),
+                Err(e) => {
+                    debug!(from = %from.fmt_short(), "fetch {} back: {e:#}", hash.fmt_short())
+                }
             }
             if matches!(blobs::missing(files.api(), hash).await, Ok((_, true))) {
                 done = true;
@@ -2431,7 +2453,9 @@ async fn handle_store_admin(
         } => {
             async {
                 let stored = files.stored(&root).await?;
-                let v = inner.state().s3_commit(stored, &name, base, account, meta)?;
+                let v = inner
+                    .state()
+                    .s3_commit(stored, &name, base, account, meta)?;
                 wait_copies(inner, &v).await;
                 Ok(AdminResponse::Datasets(vec![v]))
             }

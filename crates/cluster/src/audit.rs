@@ -334,7 +334,10 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
             none(),
         ),
         S3Commit {
-            name, account, meta, ..
+            name,
+            account,
+            meta,
+            ..
         } => (
             "s3.write",
             name.clone(),

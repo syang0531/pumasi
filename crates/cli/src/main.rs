@@ -2027,10 +2027,9 @@ async fn cluster_start(
     config.replica_repair_after = Duration::from_millis(
         parse_duration_ms(&metrics.replica_repair_after).context("--replica-repair-after")?,
     );
-    config.scrub_every = Duration::from_millis(
-        parse_duration_ms(&metrics.scrub_every).context("--scrub-every")?,
-    )
-    .max(Duration::from_secs(60));
+    config.scrub_every =
+        Duration::from_millis(parse_duration_ms(&metrics.scrub_every).context("--scrub-every")?)
+            .max(Duration::from_secs(60));
     config.disk_class = match storage_class {
         Some(StorageClassArg::Hdd) => DiskClass::Hdd,
         Some(StorageClassArg::Ssd) => DiskClass::Ssd,
@@ -3643,7 +3642,9 @@ async fn store(home: &Path, cmd: StoreCmd) -> Result<i32> {
                 if s == "default" {
                     return Ok(None);
                 }
-                let n: u8 = s.parse().with_context(|| format!("not a number of copies: {s}"))?;
+                let n: u8 = s
+                    .parse()
+                    .with_context(|| format!("not a number of copies: {s}"))?;
                 pumasi_proto::replica::validate_factor(n)?;
                 Ok(Some(n))
             };
@@ -3753,10 +3754,7 @@ fn print_replication(r: &pumasi_proto::replica::ReplicationView) {
         "default copies: {}; control planes: {}",
         r.default_factor, r.control_planes
     );
-    println!(
-        "{:<28} {:>10} {:>7}  NODES",
-        "DATASET", "SIZE", "COPIES"
-    );
+    println!("{:<28} {:>10} {:>7}  NODES", "DATASET", "SIZE", "COPIES");
     for d in &r.datasets {
         let nodes: Vec<String> = d
             .nodes
@@ -3779,8 +3777,16 @@ fn print_replication(r: &pumasi_proto::replica::ReplicationView) {
             format!("{}@{}", d.name, d.version),
             format_size(d.size),
             copies,
-            if nodes.is_empty() { "-".into() } else { nodes.join(", ") },
-            if d.leader_has { "" } else { "  [control plane fetching it back]" }
+            if nodes.is_empty() {
+                "-".into()
+            } else {
+                nodes.join(", ")
+            },
+            if d.leader_has {
+                ""
+            } else {
+                "  [control plane fetching it back]"
+            }
         );
     }
     if r.datasets.iter().any(|d| d.own_factor) {
@@ -3813,7 +3819,9 @@ fn print_replication(r: &pumasi_proto::replica::ReplicationView) {
                 "{:<20} {:>10} {:>10} {:>9}  {:<12} {scrub}",
                 n.name,
                 format_size(n.used),
-                n.quota.map(format_size).unwrap_or_else(|| "90% disk".into()),
+                n.quota
+                    .map(format_size)
+                    .unwrap_or_else(|| "90% disk".into()),
                 n.replicas,
                 state
             );

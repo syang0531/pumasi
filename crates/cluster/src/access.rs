@@ -212,7 +212,9 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
     use AdminOp::*;
     match &op {
         StoreFiles { name, version } => own_dataset(st, account, name, *version)?,
-        SetReplication { name: Some(name), .. } => {
+        SetReplication {
+            name: Some(name), ..
+        } => {
             for d in st.list_datasets(Some(name)) {
                 ensure!(
                     d.account == account,

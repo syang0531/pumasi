@@ -112,6 +112,101 @@ impl AdminClient {
         res
     }
 
+    /// This client's endpoint id: the uploader or reader the control plane
+    /// lets push or fetch.
+    pub fn endpoint_bytes(&self) -> [u8; 32] {
+        *self.endpoint.id().as_bytes()
+    }
+
+    /// Sends what the control plane lacks of a collection in `store`
+    /// (which must have those parts), resuming after interruptions; the
+    /// caller then commits it (1.8: the S3 gateway, whose collections
+    /// mostly reuse files the control plane has).
+    pub async fn push_collection(&self, store: &blobs::Store, root: blobs::Hash) -> Result<()> {
+        let mut attempt = 0;
+        for _ in 0..4 * ATTEMPTS {
+            let AdminResponse::StoreMissing { missing, have } = self
+                .call(AdminOp::StoreUpload {
+                    uploader: self.endpoint_bytes(),
+                    root: blobs::from_hash(root),
+                })
+                .await?
+            else {
+                bail!("unexpected response");
+            };
+            if have {
+                return Ok(());
+            }
+            // Until the control plane has the collection's root it cannot
+            // tell which of its files it has, and asks for all of them:
+            // send the root alone first (this store may lack those files).
+            let root_missing = missing
+                .iter_infinite()
+                .next()
+                .is_some_and(|r| !r.is_empty());
+            let ranges = if root_missing {
+                blobs::ChunkRangesSeq::root()
+            } else {
+                missing
+            };
+            let pushed = async {
+                let conn = self.blobs_conn().await?;
+                blobs::push(store, conn, root, ranges).await
+            }
+            .await;
+            if let Err(e) = pushed {
+                attempt += 1;
+                if attempt >= ATTEMPTS {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+            }
+        }
+        bail!("the upload of {} makes no progress", root.fmt_short())
+    }
+
+    /// Fetches some files of a dataset version into `store` (counted from
+    /// 0, each with the byte range wanted or all of it), with the
+    /// version's root and names.
+    pub async fn fetch_dataset_files(
+        &self,
+        store: &blobs::Store,
+        name: &str,
+        version: u32,
+        files: &[(u64, Option<std::ops::Range<u64>>)],
+    ) -> Result<()> {
+        let AdminResponse::StoreItems(items) = self
+            .call(AdminOp::StoreOpen {
+                reader: self.endpoint_bytes(),
+                target: StoreTarget::Dataset {
+                    name: name.to_string(),
+                    version: Some(version),
+                },
+            })
+            .await?
+        else {
+            bail!("unexpected response");
+        };
+        let item = items.first().context("nothing to download")?;
+        let root = blobs::to_hash(&item.root);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let got = async {
+                let conn = self.blobs_conn().await?;
+                let r = blobs::fetch_files(store, conn.clone(), root, files).await;
+                conn.close(0u32.into(), b"done");
+                r
+            }
+            .await;
+            match got {
+                Ok(_) => return Ok(()),
+                Err(e) if attempt >= ATTEMPTS => return Err(e),
+                Err(_) => tokio::time::sleep(Duration::from_secs(attempt as u64)).await,
+            }
+        }
+    }
+
     /// Submits a job. `upload` (path in `/input`, file) holds the shared
     /// input files that were too large to send with it
     /// ([`pumasi_proto::job::JobFile::load_split`]): they go through the

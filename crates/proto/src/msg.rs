@@ -1046,6 +1046,8 @@ pub enum AdminOp {
         region: String,
         string_to_sign: String,
         signature: String,
+        /// A presigned URL's lifetime.
+        expires: Option<u32>,
     },
 }
 

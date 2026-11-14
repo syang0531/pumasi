@@ -13,13 +13,13 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::endpoint::Connection;
 pub use iroh_blobs::{
     BlobFormat, Hash, HashAndFormat,
-    api::{Store, TempTag},
+    api::{Store, TempTag, blobs::BlobStatus, proto::ExportRangesItem},
     format::collection::Collection,
     protocol::{ChunkRangesSeq, PushRequest},
     store::{GcConfig, ProtectCb, ProtectOutcome, fs::FsStore},
 };
 use iroh_blobs::{
-    api::blobs::{AddPathOptions, BlobStatus, ExportMode, ExportOptions, ImportMode},
+    api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMode},
     hashseq::HashSeq,
     store::fs::options::Options,
 };
@@ -347,7 +347,11 @@ pub async fn reconcile_tags(
 pub async fn verify(store: &Store, root: Hash) -> Result<u64> {
     use n0_future::StreamExt;
     let members = hash_seq_members(store, root).await;
-    ensure!(members.len() > 1, "collection {} is missing", root.fmt_short());
+    ensure!(
+        members.len() > 1,
+        "collection {} is missing",
+        root.fmt_short()
+    );
     let mut bytes = 0u64;
     for hash in members {
         let size = blob_size(store, hash)
@@ -366,23 +370,28 @@ pub async fn verify(store: &Store, root: Hash) -> Result<u64> {
     Ok(bytes)
 }
 
-/// Fetches only some files of a collection over `conn`: `indices` count
-/// the collection's files from 0 (the names blob is fetched too).
+/// Fetches only some files of a collection over `conn`: `files` count
+/// the collection's files from 0, each with the byte range wanted (all
+/// of it with `None`). The names blob is fetched too.
 pub async fn fetch_files(
     store: &Store,
     conn: Connection,
     root: Hash,
-    indices: &[u64],
+    files: &[(u64, Option<std::ops::Range<u64>>)],
 ) -> Result<u64> {
-    use iroh_blobs::protocol::{ChunkRanges, GetRequest};
+    use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
     let mut b = GetRequest::builder()
         .root(ChunkRanges::all())
         .child(0, ChunkRanges::all());
-    let mut sorted = indices.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    for i in sorted {
-        b = b.child(i + 1, ChunkRanges::all());
+    let mut sorted = files.to_vec();
+    sorted.sort_by_key(|(i, _)| *i);
+    sorted.dedup_by_key(|(i, _)| *i);
+    for (i, range) in sorted {
+        let ranges = match range {
+            Some(r) => ChunkRanges::bytes(r),
+            None => ChunkRanges::all(),
+        };
+        b = b.child(i + 1, ranges);
     }
     let req = b.build(root);
     let stats = store
@@ -398,7 +407,9 @@ mod scrub_tests {
     use super::*;
 
     fn data(len: usize, seed: u8) -> Vec<u8> {
-        (0..len).map(|i| (i as u8).wrapping_mul(31) ^ seed).collect()
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+            .collect()
     }
 
     fn find_data_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -414,7 +425,8 @@ mod scrub_tests {
 
     #[tokio::test]
     async fn verify_finds_a_changed_byte() {
-        let dir = std::env::temp_dir().join(format!("pumasi-verify-{:016x}", rand::random::<u64>()));
+        let dir =
+            std::env::temp_dir().join(format!("pumasi-verify-{:016x}", rand::random::<u64>()));
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.bin"), data(1 << 20, 1)).unwrap();

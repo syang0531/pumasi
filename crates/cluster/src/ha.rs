@@ -1293,7 +1293,10 @@ fn op_size(op: &Op) -> usize {
 pub trait AsyncTags: Clone + Send + Sync + 'static {
     fn list(&self) -> impl std::future::Future<Output = Result<Vec<(String, BlobHash)>>> + Send;
     /// On a follower: one copy pass from the leader at `leader`.
-    fn mirror(&self, leader: EndpointAddr) -> impl std::future::Future<Output = Result<usize>> + Send;
+    fn mirror(
+        &self,
+        leader: EndpointAddr,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send;
     /// On the leader: the rollout's binaries (SHA-256, size).
     fn releases(&self) -> Result<Vec<([u8; 32], u64)>>;
     fn release_chunk(&self, sha256: &[u8; 32], offset: u64) -> Result<Vec<u8>>;

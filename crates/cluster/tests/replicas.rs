@@ -269,7 +269,11 @@ async fn replicas_bring_back_a_lost_store_and_leave_a_removed_node() {
         .unwrap();
     assert_eq!(view.unwrap().version, 1);
     let r = replication(&client, "corpus").await;
-    assert_eq!((r.datasets[0].copies, r.datasets[0].factor), (1, 2), "{r:#?}");
+    assert_eq!(
+        (r.datasets[0].copies, r.datasets[0].factor),
+        (1, 2),
+        "{r:#?}"
+    );
     assert_eq!(r.under, 1);
 
     // Two storage nodes: the version gets its second copy on one of them.
@@ -286,7 +290,11 @@ async fn replicas_bring_back_a_lost_store_and_leave_a_removed_node() {
     let more = data(2, MIB);
     let files2 = write_files(
         &src,
-        &[("big.bin", &big), ("dir/small.txt", &small), ("more.bin", &more)],
+        &[
+            ("big.bin", &big),
+            ("dir/small.txt", &small),
+            ("more.bin", &more),
+        ],
     );
     let (_, view) = client
         .store_put(&files2, Some("corpus".into()), None, |_| {})
@@ -387,22 +395,34 @@ async fn replicas_bring_back_a_lost_store_and_leave_a_removed_node() {
     .await;
     let mut found = false;
     for _ in 0..100 {
-        if events(&client).await.iter().any(|e| e.kind == "store.damaged") {
+        if events(&client)
+            .await
+            .iter()
+            .any(|e| e.kind == "store.damaged")
+        {
             found = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(found, "no store.damaged event");
-    let r = wait_for(&client, "corpus", "node-c's damaged copy not counted", |r| {
-        r.datasets.iter().any(|d| {
-            d.nodes
-                .iter()
-                .any(|n| n.name == "node-c" && n.state == ReplicaState::Copying)
-        })
-    })
+    let r = wait_for(
+        &client,
+        "corpus",
+        "node-c's damaged copy not counted",
+        |r| {
+            r.datasets.iter().any(|d| {
+                d.nodes
+                    .iter()
+                    .any(|n| n.name == "node-c" && n.state == ReplicaState::Copying)
+            })
+        },
+    )
     .await;
-    assert!(r.nodes.iter().any(|n| n.name == "node-c" && n.bad > 0), "{r:#?}");
+    assert!(
+        r.nodes.iter().any(|n| n.name == "node-c" && n.bad > 0),
+        "{r:#?}"
+    );
 
     // Removing the dataset drops its replicas.
     call(

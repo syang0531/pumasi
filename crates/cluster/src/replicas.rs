@@ -41,7 +41,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use iroh::EndpointAddr;
 use pumasi_proto::{
-    REPLICA_MINOR, Secret, secrets_eq,
+    REPLICA_MINOR, Secret,
     manage::AccessRole,
     monitor::EventLevel,
     msg::ToAgent,
@@ -50,7 +50,7 @@ use pumasi_proto::{
         ReplicationView, S3KeyView, S3Meta, STORAGE_LABEL, ScrubReport, StorageNodeView,
         storage_quota, validate_factor,
     },
-    s3,
+    s3, secrets_eq,
     store::{BlobHash, hash_hex},
 };
 use serde::{Deserialize, Serialize};
@@ -329,7 +329,7 @@ impl State {
         let mut gone: Vec<(BlobHash, String)> = Vec::new();
         // Replicas of collections no version uses, and of nodes that are no
         // longer storage nodes.
-        for ((root, node), _) in &self.reps.records {
+        for (root, node) in self.reps.records.keys() {
             if !wanted.contains_key(root) || !by_id.contains_key(node) {
                 gone.push((*root, node.clone()));
             }
@@ -716,15 +716,16 @@ impl State {
         }
         let need = factor.saturating_sub(self.reps.control_planes);
         let have = control_planes.saturating_add(held);
-        let can = control_planes.saturating_add(need.min(possible)).min(factor);
+        let can = control_planes
+            .saturating_add(need.min(possible))
+            .min(factor);
         (have, can.max(1))
     }
 
     pub fn replication_view(&self, name: Option<&str>) -> Result<ReplicationView> {
         let now = now_unix();
         let cands = self.candidates(now);
-        let live: HashMap<&str, &Candidate> =
-            cands.iter().map(|c| (c.id.as_str(), c)).collect();
+        let live: HashMap<&str, &Candidate> = cands.iter().map(|c| (c.id.as_str(), c)).collect();
         let mut datasets = Vec::new();
         let versions: Vec<&crate::state::DatasetRecord> = match name {
             Some(n) => {
@@ -944,6 +945,7 @@ impl State {
         region: &str,
         string_to_sign: &str,
         signature: &str,
+        expires: Option<u32>,
     ) -> Result<(Secret, [u8; 32], Secret)> {
         let r = self
             .reps
@@ -951,7 +953,7 @@ impl State {
             .get(key)
             .context("InvalidAccessKeyId")?
             .clone();
-        s3::check_string_to_sign(string_to_sign, date, region, now_unix())
+        s3::check_string_to_sign(string_to_sign, date, region, now_unix(), expires)
             .map_err(|e| anyhow::anyhow!(e))?;
         let signing = s3::signing_key(&r.secret, date, region);
         ensure!(
@@ -1040,6 +1042,19 @@ impl State {
             .commit_upload(stored, Some(name.to_string()), account)?
             .context("a named commit makes a version")?;
         self.store.put_s3_meta(name, &meta)?;
+        // S3 buckets have no versions: a write replaces the version the
+        // gateway's previous write made (each version counts against the
+        // account's quota). Versions made otherwise stay.
+        if let Some(b) = base
+            && b != view.version
+        {
+            if self.store.s3_version(name)? == Some(b) {
+                let _ = self.remove_datasets(name, Some(b));
+            }
+            self.store.put_s3_version(name, view.version)?;
+        } else if base.is_none() {
+            self.store.put_s3_version(name, view.version)?;
+        }
         Ok(view)
     }
 

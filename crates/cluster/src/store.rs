@@ -36,9 +36,9 @@ use crate::{
     state::{DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord},
 };
 use pumasi_proto::audit::AuditEntry;
-use pumasi_proto::store::BlobHash;
 use pumasi_proto::manage::{AccountPolicy, AccountQuota, NodeConfig};
 use pumasi_proto::monitor::{AlertPolicy, EventView, MetricPoint, WebhookSpec};
+use pumasi_proto::store::BlobHash;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("members");
@@ -132,6 +132,9 @@ const DS_REPLICATION: TableDefinition<&str, u8> = TableDefinition::new("ds_repli
 const S3_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("s3_keys");
 /// What the S3 gateway keeps about objects (1.8), by (dataset, path).
 const S3_META: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("s3_meta");
+/// The dataset version the S3 gateway wrote last (1.8), by dataset: the
+/// gateway's next write replaces it.
+const S3_VERSIONS: TableDefinition<&str, u32> = TableDefinition::new("s3_versions");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -197,7 +200,8 @@ macro_rules! tables {
             REPLICAS,
             DS_REPLICATION,
             S3_KEYS,
-            S3_META
+            S3_META,
+            S3_VERSIONS
         )
     };
 }
@@ -600,6 +604,7 @@ impl Store {
         tx.open_table(DS_REPLICATION)?;
         tx.open_table(S3_KEYS)?;
         tx.open_table(S3_META)?;
+        tx.open_table(S3_VERSIONS)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1468,6 +1473,19 @@ impl Store {
         for p in &paths {
             b.del(S3_META, (name, p.as_str()));
         }
+        b.del(S3_VERSIONS, name);
+        self.commit(b)
+    }
+
+    /// The version of dataset `name` the S3 gateway wrote last.
+    pub fn s3_version(&self, name: &str) -> Result<Option<u32>> {
+        let tx = self.read()?;
+        Ok(tx.open_table(S3_VERSIONS)?.get(name)?.map(|v| v.value()))
+    }
+
+    pub fn put_s3_version(&self, name: &str, version: u32) -> Result<()> {
+        let mut b = Batch::default();
+        b.put(S3_VERSIONS, name, version);
         self.commit(b)
     }
 

@@ -461,7 +461,10 @@ impl NodeStore {
             }
         }
         if !stale.is_empty() {
-            info!(replicas = stale.len(), "dropped replicas the cluster no longer keeps here");
+            info!(
+                replicas = stale.len(),
+                "dropped replicas the cluster no longer keeps here"
+            );
         }
         let quarantined: Vec<BlobHash> = {
             let r = self.replicas.lock().unwrap();
@@ -475,7 +478,10 @@ impl NodeStore {
             if let Err(e) = self
                 .store
                 .tags()
-                .set(tag.as_str(), blobs::HashAndFormat::hash_seq(blobs::to_hash(root)))
+                .set(
+                    tag.as_str(),
+                    blobs::HashAndFormat::hash_seq(blobs::to_hash(root)),
+                )
                 .await
             {
                 warn!("tag {tag}: {e}");
@@ -501,12 +507,18 @@ impl NodeStore {
                     .filter(|k| !r.quarantine.contains_key(*k))
                     .copied()
                     .collect::<Vec<_>>(),
-                r.failed.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>(),
+                r.failed
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect::<Vec<_>>(),
             )
         };
         let mut held = Vec::new();
         for root in want {
-            if matches!(blobs::missing(&self.store, blobs::to_hash(&root)).await, Ok((_, true))) {
+            if matches!(
+                blobs::missing(&self.store, blobs::to_hash(&root)).await,
+                Ok((_, true))
+            ) {
                 held.push(root);
             }
         }
@@ -561,7 +573,11 @@ impl NodeStore {
                     .await;
                 let mut last: Option<anyhow::Error> = None;
                 let never = AtomicBool::new(false);
-                for addr in sources.iter().filter(|a| a.id != self.endpoint.id()).chain([&cluster]) {
+                for addr in sources
+                    .iter()
+                    .filter(|a| a.id != self.endpoint.id())
+                    .chain([&cluster])
+                {
                     match self.fetch_from(addr, hash, &never).await {
                         Ok(_) => {}
                         Err(e) => last = Some(e),

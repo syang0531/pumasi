@@ -97,6 +97,7 @@ fn free_port() -> String {
 fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
     JobSubmission {
         placement: Default::default(),
+        gpu_ext: Default::default(),
         name: "echo".into(),
         executor: Executor::Wasm,
         module: wat::parse_str(ECHO_WAT).unwrap(),

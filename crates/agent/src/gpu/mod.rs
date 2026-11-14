@@ -1,10 +1,12 @@
 //! GPUs on this machine: what they are, what runs on them, and how fast.
 //!
 //! - NVIDIA: NVML (loaded at run time) for the list, the CUDA driver for
-//!   the benchmark and the GPU challenge ([`cuda`]).
+//!   the benchmark and the GPU challenge ([`cuda`]). A GPU in MIG mode is
+//!   listed as its slices, each a GPU of its own (1.10).
 //! - AMD (Linux): sysfs and the KFD topology; FP32 is estimated from the
-//!   SIMD count and clock. Docker jobs get `/dev/kfd` and the GPU's render
-//!   node.
+//!   SIMD count and clock until WebGPU (Vulkan) measures it, with the GPU
+//!   challenge too (1.10, `crate::webgpu::hash`). Docker jobs get
+//!   `/dev/kfd` and the GPU's render node (ROCm images).
 //! - Intel and Apple GPUs are listed for information only (and for their
 //!   metrics, [`usage`]): only the WebGPU executor uses them. On Windows
 //!   DXGI lists the GPUs NVML does not (1.6).
@@ -78,7 +80,11 @@ pub fn detect(env: &GpuEnv, notes: &mut Vec<String>) -> Vec<GpuInfo> {
     }
     mark_docker(&mut gpus, env);
     for g in gpus.iter_mut() {
-        if cfg!(target_os = "linux") && env.vfio && matches!(g.vendor, GpuVendor::Nvidia) {
+        if cfg!(target_os = "linux")
+            && env.vfio
+            && matches!(g.vendor, GpuVendor::Nvidia)
+            && !g.mig()
+        {
             match vfio::ready(&g.pci) {
                 Ok(()) if g.display => notes.push(format!(
                     "GPU {} drives a display; not passed through",
@@ -91,7 +97,13 @@ pub fn detect(env: &GpuEnv, notes: &mut Vec<String>) -> Vec<GpuInfo> {
     }
     if env.bench {
         for g in gpus.iter_mut() {
-            if g.vendor != GpuVendor::Nvidia || g.driver == "vfio-pci" || g.pci.is_empty() {
+            // MIG slices run no CUDA by PCI address (and the GPU none at
+            // all in MIG mode): their figures are estimated from the GPU's.
+            if g.vendor != GpuVendor::Nvidia
+                || g.driver == "vfio-pci"
+                || g.pci.is_empty()
+                || g.mig()
+            {
                 continue;
             }
             match cuda::Gpu::open(&g.pci).and_then(|c| c.measure(g.vram_mib)) {

@@ -1196,6 +1196,14 @@ fn parse_hours(s: &str) -> Result<Hours, String> {
 
 fn main() {
     pumasi_proto::build_info();
+    // `pumasi __webgpu-worker`: one wasm task's GPU work, in a process the
+    // agent can kill at the task's timeout (1.10).
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == pumasi_agent::webgpu::worker::WORKER_ARG)
+    {
+        std::process::exit(pumasi_agent::webgpu::worker::serve_stdio());
+    }
     // The signed Virtualization.framework helper (a copy of this binary)
     // runs one VM on its main thread; see `pumasi_agent::microvm::vz`.
     let mut args = std::env::args_os().skip(1);
@@ -2317,9 +2325,10 @@ async fn agent(
         corrupt_results: false,
         gpus: !opts.no_gpus,
         fake_gpus: None,
-        webgpu: (opts.allow_webgpu && !opts.no_gpus).then_some(pumasi_agent::webgpu::Options {
+        webgpu: (opts.allow_webgpu && !opts.no_gpus).then(|| pumasi_agent::webgpu::Options {
             software: opts.webgpu_software,
             bench: !opts.no_benchmark,
+            worker: pumasi_agent::webgpu::Worker::this_binary(),
         }),
         store_cache_bytes: opts.store_cache.as_deref().map(parse_size).transpose()?,
         gpu_graphics: opts.gpu_graphics.forced(),
@@ -2960,7 +2969,7 @@ fn print_status(s: &ClusterStatus, power: &[pumasi_proto::power::NodePowerView])
     println!("cluster {} ({})", s.cluster_name, short(&s.cluster_id));
     println!();
     println!(
-        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
+        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<16} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
         "NODE",
         "NAME",
         "STATE",
@@ -3014,14 +3023,19 @@ fn print_status(s: &ClusterStatus, power: &[pumasi_proto::power::NodePowerView])
             n.cpu_score,
             if n.perf_note.is_some() { "*" } else { "" }
         );
-        println!(
-            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
+        // Written to stdout directly: the row names the provider's account,
+        // which is the point of the table, not something to keep out of a
+        // log.
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
+            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<16} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
             short(&n.id),
             truncate(&n.info.name, 16),
             state,
             truncate(&role, 18),
             format!("{}/{}", n.info.os, n.info.arch),
-            truncate(&n.info.agent_version, 12),
+            truncate(&n.info.agent_version, 16),
             executor_list(&n.executors),
             n.info.slots,
             n.running,
@@ -4075,6 +4089,7 @@ async fn exec_local(
                     pumasi_agent::webgpu::Options {
                         software,
                         bench: false,
+                        worker: pumasi_agent::webgpu::Worker::this_binary(),
                     },
                     &[],
                     &mut notes,

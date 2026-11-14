@@ -157,6 +157,7 @@ async fn wait_online(cluster: &Cluster, n: usize) {
 fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
     JobSubmission {
         placement: Default::default(),
+        gpu_ext: Default::default(),
         name: "echo".into(),
         executor: Executor::Wasm,
         module: wat::parse_str(ECHO_WAT).unwrap(),
@@ -1363,6 +1364,7 @@ fn docker_available() -> bool {
 fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
     JobSubmission {
         placement: Default::default(),
+        gpu_ext: Default::default(),
         name: "docker-test".into(),
         executor: Executor::Docker,
         module: vec![],
@@ -2896,6 +2898,13 @@ if (id.x < arrayLength(&v)) { v[id.x] = v[id.x] * 3u + 1u; } }";
     )
 }
 
+/// The WebGPU worker process of the tests that start one: this binary,
+/// running only this test.
+#[test]
+fn webgpu_worker_entry() {
+    pumasi_agent::webgpu::worker::test_entry();
+}
+
 /// A wasm job with `gpus = 1` runs only on the node that offers a WebGPU
 /// adapter, one task at a time per adapter, and its receipts name the
 /// adapter. Uses a software rasterizer when the machine has no GPU
@@ -2907,6 +2916,7 @@ async fn webgpu_jobs_run_on_nodes_that_offer_a_gpu() {
     config.webgpu = Some(pumasi_agent::webgpu::Options {
         software: true,
         bench: true,
+        worker: pumasi_agent::webgpu::Worker::test_binary("webgpu_worker_entry"),
     });
     let gpu_agent = Agent::new(config).await.unwrap();
     let adapters = gpu_agent.webgpu().profile.adapters.clone();
@@ -2967,6 +2977,7 @@ async fn webgpu_jobs_run_on_nodes_that_offer_a_gpu() {
         let g = r.gpu.as_ref().expect("GPU billing on the receipt");
         assert!(g.names[0].contains("WebGPU"), "{g:?}");
     }
+    eprintln!("WebGPU views: {:#?}", node_named(&cluster, "gpu").webgpu);
 
     // Without an adapter the same module fails politely (exit 2).
     let mut plain = submission(vec![vec![]]);

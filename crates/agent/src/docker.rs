@@ -972,11 +972,11 @@ fn gpu_args(
         .collect();
     if !amd.is_empty() {
         a.extend(["--device".into(), "/dev/kfd".into()]);
-        for r in amd {
+        for r in &amd {
             a.extend(["--device".into(), r.to_string()]);
         }
         // ROCm needs the render and video groups' access to the nodes.
-        for node in ["/dev/kfd", gpus[0].render_node.as_str()] {
+        for node in ["/dev/kfd", amd[0]] {
             if let Some(gid) = group_of(node) {
                 a.extend(["--group-add".into(), gid.to_string()]);
             }

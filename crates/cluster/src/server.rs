@@ -1350,6 +1350,13 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                         warn!(node = %node_id, "rejected WebGPU profile: {e:#}");
                     }
                 }
+                Ok(Some(FromAgent::WebGpuExtra(e))) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    if let Err(e) = st.on_webgpu_extra(&node_id, generation, *e) {
+                        warn!(node = %node_id, "rejected WebGPU extra: {e:#}");
+                    }
+                }
                 Ok(Some(FromAgent::GpuResult { nonce, solutions })) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);

@@ -321,7 +321,7 @@ impl State {
             }
         } else {
             n.running.remove(&t);
-            n.gpu.busy.remove(&t);
+            n.gpu.release(&t);
             n.stopping.remove(&t);
             if let Some(tx) = &n.tx {
                 let _ = tx.send(ToAgent::Cancel(t));

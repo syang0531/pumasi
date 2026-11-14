@@ -1,0 +1,24 @@
+# The same training with two runs sharing one GPU (1.10).
+#
+# `gpus = 0.5` asks for half a GPU: two tasks run side by side on one
+# GPU (time-sliced by the driver), each limited to half its memory
+# (PUMASI_GPU_FRACTION, which train.py passes to PyTorch), and each pays
+# for half the GPU. Parts of GPUs are for Docker jobs on GPUs Docker can
+# use; a node keeps its GPUs to whole runs with the label
+# `gpu.share=off` (`pumasi label NODE gpu.share=off`).
+#
+#   pumasi run examples/pytorch-cuda/job-half.toml
+name = "pytorch-cuda-half"
+image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+command = ["python", "/input/train.py", "{shard}", "{shards}"]
+files = ["train.py"]
+shards = 2
+gpus = 0.5
+
+[gpu]
+vendor = "nvidia"
+
+[resources]
+memory_mb = 4096
+cpus = 2
+timeout = "15m"

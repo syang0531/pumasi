@@ -1408,7 +1408,7 @@ GPUs, Apple Silicon) and works on NVIDIA and AMD cards too.
 
 ### Host API
 
-`crates/agent/src/webgpu.rs` adds nine imports in the `pumasi_webgpu`
+`crates/agent/src/webgpu/` adds nine imports in the `pumasi_webgpu`
 module to the executor's linker, so every module links whether or not its
 task has a GPU (they fail with "this task has no GPU" when it does not):
 `adapter`, `shader`, `buffer`, `write`, `read`, `dispatch`, `wait`,
@@ -1431,11 +1431,13 @@ from its linear memory), and a buffer must fit the device's
 `max_buffer_size`. Waiting on the GPU (`read`, `wait`) polls the device in
 50 ms steps and stops at the task's deadline (a timeout) or when it is
 cancelled, like the epoch callback does for wasm code. Shaders themselves
-cannot be interrupted: a shader that never ends is stopped by the
-driver's watchdog (TDR on Windows, the kernel's hang check on Linux,
-macOS's GPU timeout). Fuel counts only wasm instructions. The device is
-opened at the task's first call with the adapter's own limits and no
-optional features, and dropped with the task. When the module used the
+cannot be interrupted, so since 1.10 the GPU work runs in a worker
+process that the agent kills at that point (see
+[phase 26](#phase-26-gpus-110)); before, a shader that never ended was
+stopped only by the driver's watchdog. Fuel counts only wasm
+instructions. The device is opened at the task's first call with the
+adapter's own limits (and, since 1.10, the optional features it has),
+and dropped with the task. When the module used the
 GPU, a line on its stderr says how many dispatches it ran and how long it
 waited for the GPU.
 
@@ -1474,9 +1476,8 @@ The run's receipt carries a `GpuBilling` naming the adapter
 (`<name> (WebGPU, <backend>)`) at the GFLOPS it is billed at: trusted
 nodes at what they measured; untrusted ones at the CUDA GPU's checked
 figure when the adapter is a GPU the cluster timed (a wrong answer bills
-nothing), else at most `UNCHECKED_WEBGPU_GFLOPS` (1 TFLOPS), since no
-challenge runs over WebGPU yet (the challenge hash uses only 32-bit
-integer operations, so a WGSL version is the obvious next step). GPU
+nothing), at what the cluster timed over WebGPU since 1.10, else at most
+`UNCHECKED_WEBGPU_GFLOPS` (1 TFLOPS). GPU
 float results differ between GPUs, so a wasm job with a GPU is not
 deterministic (`deterministic` defaults to off for it and cannot be
 turned on) and is never re-run to check it.
@@ -2618,6 +2619,113 @@ gives the accounts it lists no CPU or memory quota, as a 1.9 cluster.toml
 that lists them without one does). New admin ops
 and responses (`Resources`, `SetResources`, `Placement`) are appended.
 
+## Phase 26: GPUs (1.10)
+
+Release 1.10 makes the job's timeout stop WebGPU shaders, times WebGPU
+adapters with the GPU challenge, measures GPUs without CUDA, lets Docker
+tasks share a GPU and lists NVIDIA MIG slices as GPUs. The agent side
+lives in `agent/src/webgpu/` (`worker.rs`, `host.rs`, `hash.rs`) and
+`agent/src/gpu/nvml.rs`; the cluster side in `cluster/src/gpu.rs`.
+
+### The WebGPU worker process
+
+A wasm task's GPU calls no longer touch wgpu in the agent: the host
+functions (`host.rs`) send requests to a worker, `pumasi __webgpu-worker`
+(the same binary, started at the task's first GPU call), over its stdin
+and stdout as length-prefixed postcard frames (`worker.rs`: `Open`,
+`Shader`, `Buffer`, `Write`, `Read`, `Dispatch`, `Wait`, `Release`).
+The worker finds the task's adapter by backend, vendor, device id and
+name, opens the device with the adapter's limits and the optional
+features it has, and runs the same session code as before; it writes a
+hello line first, so anything a driver prints before it is skipped. The
+agent waits for each answer with the task's deadline and cancellation in
+view; when either comes, it kills the worker (taking the device and any
+shader still running with it), and the call fails as a timeout or
+cancellation, with "the GPU work was stopped at the task's end" in the
+task's GPU summary. The task always ends then; whether the GPU drops the
+running shader at once is the driver's business (a software rasterizer
+stops with the process; Apple's paravirtual GPU in macOS VMs keeps it
+running on the host until the host's watchdog, which CI showed).
+Dispatches are bounded pieces of work: at most 16
+wait on the queue at once (`MAX_IN_FLIGHT`), so a stop never waits behind
+a long backlog. Windows starts the worker without a console window. A
+worker that dies fails the task's later GPU calls with the tail of its
+stderr. Library users that want everything in one process can keep
+`Worker::Thread`, which serves the same frames from a thread and cannot
+stop a runaway shader; tests use the test binary itself as the worker
+(`Worker::test_binary`).
+
+### The GPU challenge over WebGPU
+
+`hash.rs` implements the challenge's hash (`pumasi_proto::gpu::gpu_hash`,
+32-bit operations only) in WGSL: each invocation hashes 256 consecutive
+values, 64 invocations a workgroup, and a dispatch is sized to take about
+100 ms; solutions go to an atomic counter and an array. The agent checks
+every answer against the CPU hash before sending it, and measures each
+adapter's hash rate at startup. Adapters' rates and features travel in
+`FromAgent::WebGpuExtra(SignedWebGpuExtra)` (minor 6, signed like the
+WebGPU profile, sent after it), stored in `member_webgpu_extra` with the
+cluster's checks of them (`WebGpuExtraRecord`).
+
+The control plane wants an untrusted node's adapters that are not listed
+GPUs and have a claim it has not timed, and sends them the usual
+`GpuChallenge` with the adapter's slot as the device (only to agents of
+minor 6); the agent answers it over WebGPU. Timing, strikes and re-checks
+after runs are those of CUDA GPUs; the adapter is then billed at no more
+than 1.25 times what was timed (`timed_cap`), and nothing after a wrong
+answer.
+
+GPUs the CUDA benchmark cannot measure (AMD, Intel, Apple, NVIDIA without
+CUDA) are measured over WebGPU when the agent benchmarks its GPUs
+(`needs_webgpu_measure`): the WebGPU FP32 benchmark, buffer-copy
+bandwidth and the hash rate fill the device profile's fields, and the
+agent answers challenges for those GPUs over WebGPU (`webgpu_checked`),
+so the cluster times an AMD GPU like a CUDA one.
+
+### WebGPU features
+
+`WebGpuFeature` names `shader-f16` and `subgroups`. A wasm job's
+`gpu = { features = [...] }` travels in `GpuExt` (with the GPU share,
+below) and `pick_webgpu_with` keeps to adapters whose extras list every
+feature. The adapter JSON a module reads adds `features`, `memory_limit`
+and the device's limits.
+
+### Parts of GPUs
+
+`gpus = 0.5` sets `GpuExt::share` in hundredths (`GPU_SHARE_WHOLE` is
+100) on a one-GPU request; it is valid for Docker and image jobs (which
+then run on Docker). The node's `GpuRuntime` keeps each run's GPUs and,
+for a part, its share; `GpuUse` sums them per GPU. `pick_shared` places a
+part on the fullest GPU it still fits on (best fit, so whole GPUs stay
+free), only on GPUs Docker can use and only when the node's label
+`gpu.share` is not `off`; a whole-GPU run takes only GPUs no part is on.
+Gang planning and preemption count parts the same way (`Room` holds
+`(gpu, share)` pairs). The assignment adds `PUMASI_GPU_FRACTION`,
+`TF_FORCE_GPU_ALLOW_GROWTH=true` and `XLA_PYTHON_CLIENT_MEM_FRACTION`
+to the task's environment unless it sets them. The run is billed for its
+share of the GPU's billed FP32 and memory, and the receipt's GPU name says
+`(0.5 GPU)`. The GPU view's note says how many runs share it and how much
+is in use.
+
+### MIG slices
+
+When NVML reports a GPU in MIG mode, `nvml.rs` lists its slices instead
+(`nvmlDeviceGetMigDeviceHandleByIndex`, `nvmlDeviceGetAttributes_v2`):
+one `GpuInfo` each, with the slice's UUID (`MIG-...`, which Docker's
+`--gpus device=` takes), memory, and an FP32 figure scaled from its share
+of the GPU's SMs. Slices are not benchmarked, challenged or passed
+through to microVMs.
+
+### Compatibility
+
+Protocol 14, minor 6 (`GPU_MINOR`): `WebGpuExtra` is sent only to a
+control plane of minor 6, and adapter challenges only to agents of minor
+6; jobs that need features find adapters only on such agents. Parts of
+GPUs need nothing new from the agent. `JobSubmission::gpu_ext` is
+`#[serde(skip)]` and travels in new admin ops (`SubmitExt`,
+`CheckJobExt`) that a client sends only when it is set; schedules refuse
+it for now.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -2722,6 +2830,12 @@ it), `account_resources` (CPU and memory quotas, by account) and
 name), last in `tables!`. Expired jobs lose their `job_place` and
 `checkpoints` rows. An older control plane ignores them.
 
+Phase 26 (1.10) keeps layout 7 and adds the tables `job_gpu_ext` (a
+job's GPU share and WebGPU features, by job id) and
+`member_webgpu_extra` (a node's signed WebGPU extras and the cluster's
+checks of its adapters, by node id), last in `tables!`. An older control
+plane ignores them.
+
 `PROTOCOL_VERSION` is 14 (phase 16, above): protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
@@ -2762,10 +2876,12 @@ remotely; install a current binary on them once.
   per-node quotas for caches beyond the size cap. Private images are pulled
   from the registry again for each job (nodes that already loaded the
   digest skip the download from the store).
-- GPUs: Intel and Apple GPUs are used only through WebGPU; AMD GPUs are not benchmarked, only
-  estimated, and cannot take the GPU challenge (billed at the reference at
-  most on providers); passthrough is NVIDIA-only and untested in CI; MIG
-  and vGPU slices are not scheduled separately.
+- GPUs: Intel and Apple GPUs are used only through WebGPU; AMD GPUs are
+  measured and challenged over WebGPU, so an agent without a WebGPU
+  adapter for them (no Vulkan driver) still estimates them; passthrough is
+  NVIDIA-only and untested in CI; parts of GPUs share memory on trust
+  (only MIG enforces it) and are Docker-only; MIG slices are estimated,
+  not benchmarked; vGPU is not handled.
 - MicroVM network: TCP and DNS only (no other UDP, ICMP or IPv6), no
   per-job allow lists or bandwidth caps, egress is not billed, and
   Firecracker without QEMU has no network (its cards need TAP devices;
@@ -2792,20 +2908,17 @@ remotely; install a current binary on them once.
   online; charts poll the control plane every 2 seconds behind the
   stream rather than being pushed by it.
 - WebGPU: compute shaders only (no textures, samplers or render
-  passes), one bind group, no optional features such as `shader-f16` or
-  subgroups, one adapter per task, no GPU challenge over WebGPU (so an
-  untrusted node's adapter is billed at 1 TFLOPS at most), shaders that
-  never end are stopped by the driver's watchdog rather than the job's
-  timeout, and core
-  modules only (no `wasi:webgpu` components until Wasmtime runs them).
+  passes), one bind group, one adapter per task, optional features
+  limited to `shader-f16` and subgroups, and core modules only (no
+  `wasi:webgpu` components until Wasmtime runs them).
 - Confidential tier: no NVIDIA confidential computing (no GPUs in
   confidential jobs), no network, x86-64 only, no encrypted scratch disk,
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Remaining roadmap: phases 24 to 28 ([roadmap.md](roadmap.md)) take
-  on many of the gaps in this list, starting with sleeping machines and
-  Docker-less nodes (phase 20, the open issues from real use, is done); phases 18 and 19 (the hub and buying CU) are on hold.
+- Remaining roadmap: phases 27 (Windows) and 28 (operations)
+  ([roadmap.md](roadmap.md)) take on many of the gaps in this list;
+  phases 18 and 19 (the hub and buying CU) are on hold.
 - Phase 17 leftovers: no per-peer limit on unauthenticated sign-in calls
   at the control plane, the audit log is never pruned (pruning behind a
   signed checkpoint), no SCIM provisioning (people appear when they first

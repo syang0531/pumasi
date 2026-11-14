@@ -1034,6 +1034,12 @@ impl ScheduleSpec {
             self.job.after.is_empty(),
             "a scheduled job cannot wait for other jobs (`after`)"
         );
+        // A schedule's record has no room for them yet; submit such jobs
+        // directly.
+        ensure!(
+            self.job.gpu_ext.is_empty(),
+            "a scheduled job cannot ask for part of a GPU or for WebGPU features yet"
+        );
         Ok(())
     }
 }

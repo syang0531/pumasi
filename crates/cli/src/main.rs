@@ -3848,8 +3848,13 @@ async fn s3_cmd(home: &Path, cmd: S3Cmd) -> Result<i32> {
                 bail!("unexpected response");
             };
             client.close().await;
-            println!("access key id:     {}", view.id);
-            println!("secret access key: {secret}");
+            // The one time the secret is shown, on purpose: written to
+            // stdout for the person who asked for it, never to a log.
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "access key id:     {}", view.id)?;
+            writeln!(out, "secret access key: {secret}")?;
+            out.flush()?;
+            drop(out);
             eprintln!(
                 "acts as {} ({}); the secret is not shown again. Point S3 clients at \
                  http://127.0.0.1:7400/s3 (pumasi ui), region us-east-1, path-style addressing.",

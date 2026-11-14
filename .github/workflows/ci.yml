@@ -421,6 +421,8 @@ jobs:
   # sync, multipart uploads, s3api), rclone (sync, check) and boto3.
   s3-gateway:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

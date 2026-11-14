@@ -941,12 +941,14 @@ impl State {
     pub(crate) fn s3_auth(
         &mut self,
         key: &str,
-        date: &str,
-        region: &str,
         string_to_sign: &str,
         signature: &str,
         expires: Option<u32>,
     ) -> Result<(Secret, [u8; 32], Secret)> {
+        // AWS4-HMAC-SHA256 / time / DATE/REGION/s3/aws4_request / hash
+        let scope = string_to_sign.split('\n').nth(2).unwrap_or("");
+        let mut parts = scope.split('/');
+        let (date, region) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         let r = self
             .reps
             .s3_keys

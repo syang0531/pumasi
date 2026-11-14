@@ -1682,13 +1682,11 @@ fn s3_key_call(
         },
         AdminOp::S3Auth {
             key,
-            date,
-            region,
             string_to_sign,
             signature,
             expires,
         } => st
-            .s3_auth(&key, &date, &region, &string_to_sign, &signature, expires)
+            .s3_auth(&key, &string_to_sign, &signature, expires)
             .and_then(|(token, signing_key, parent)| {
                 let c = if secrets_eq(&parent, &admin) {
                     Some(Caller::Admin {

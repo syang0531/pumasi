@@ -1040,10 +1040,9 @@ pub enum AdminOp {
     /// Answers with a credential that acts as the key's ticket for a few
     /// minutes, and the day's signing key for the request's chunk
     /// signatures.
+    /// The day and region come from the string to sign's scope.
     S3Auth {
         key: String,
-        date: String,
-        region: String,
         string_to_sign: String,
         signature: String,
         /// A presigned URL's lifetime.

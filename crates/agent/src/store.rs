@@ -89,6 +89,9 @@ pub struct NodeStore {
     replica_wake: Arc<tokio::sync::Notify>,
     /// One replica list at a time, in the order they came.
     hold_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Shared by every handle: the replica loop stops once it holds the
+    /// last one (the agent let go of the store, which can then close).
+    alive: Arc<()>,
 }
 
 impl NodeStore {
@@ -118,6 +121,7 @@ impl NodeStore {
             replicas: Default::default(),
             replica_wake: Default::default(),
             hold_lock: Default::default(),
+            alive: Default::default(),
         };
         this.load().await;
         tokio::spawn(this.clone().replica_loop());
@@ -534,7 +538,25 @@ impl NodeStore {
     /// Fetches wanted replicas the store lacks, one at a time.
     async fn replica_loop(self) {
         loop {
-            let _ = tokio::time::timeout(RETRY_EVERY, self.replica_wake.notified()).await;
+            // A wake, or the retry period; each second, whether the agent
+            // still uses this store.
+            let deadline = Instant::now() + RETRY_EVERY;
+            loop {
+                if Arc::strong_count(&self.alive) <= 1 {
+                    return;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let wait = left.min(Duration::from_secs(1));
+                if tokio::time::timeout(wait, self.replica_wake.notified())
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+            }
             let (want, sources, cluster) = {
                 let mut r = self.replicas.lock().unwrap();
                 let now = Instant::now();

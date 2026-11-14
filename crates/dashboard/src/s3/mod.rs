@@ -549,8 +549,6 @@ async fn authenticate(st: &St, signed: Signed) -> Result<Cred, S3Error> {
             st.backend.own_secret(),
             AdminOp::S3Auth {
                 key: signed.key.clone(),
-                date: signed.date.clone(),
-                region: signed.region.clone(),
                 string_to_sign: signed.string_to_sign.clone(),
                 signature: signed.signature.clone(),
                 expires: signed.expires,

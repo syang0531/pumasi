@@ -228,13 +228,55 @@ rsync -a /var/lib/pumasi/cluster/blobs/ backup-host:/pumasi/blobs/
 A backup holds the cluster key, the admin secret, SSO settings and the
 cluster's secrets: encrypt it and store it like the admin ticket. Back up
 daily (a cron job or timer running `pumasi backup`), and keep the file
-store's `blobs` directory with it. Restore on a fresh machine with
+store's `blobs` directory with it, or (1.8) let storage nodes keep copies
+of every dataset (below), in which case a restored control plane without
+`blobs` fetches the datasets back from them. Restore on a fresh machine with
 `pumasi cluster restore FILE` and then `pumasi cluster start`. Nodes,
 admin and access tickets know the control plane by the cluster key, not
 by its address, so in the default public network mode they find the
 restored one on any machine (its relay is published under that key);
 with `--net local` it needs the old IP address and `--bind` port.
 Practice a restore once before you need it.
+
+### Copies of the file store on other machines
+
+Label one or more owner machines with spare disk for storage, each with
+the most it may keep, and check where the copies are:
+
+```sh
+pumasi node label nas storage=2T          # or storage=yes: up to 90% of its disk
+pumasi store copies --default 2           # control planes included (the default)
+pumasi store replicas                     # copies per version; storage nodes, quotas, last scrub
+```
+
+Copies go to the storage nodes with the most room. A write is
+acknowledged once it is on as many copies as there can be (the leader,
+every control plane replica, and storage nodes with room, waiting up to
+5 minutes for them). A storage node offline for longer than
+`--replica-repair-after` (default 6h; `pumasi service set cluster --
+--replica-repair-after 2h`) or removed has its copies made again on
+other storage nodes. Every store is read back and checked against its
+BLAKE3 hashes each `--scrub-every` (default 7d), or now with `pumasi
+store scrub [NODE]`: a damaged copy on a node is dropped and fetched
+again; damage in the control plane's own store raises a critical
+`store.damaged` event. To repair that, stop the control plane, move its
+`blobs` directory aside and start it again: it fetches every version back
+from the storage nodes (`store.repaired` events; `store.missing` if no
+copy is left). Taking the `storage` label off a node drops its copies once
+others hold them.
+
+### The S3 gateway
+
+`pumasi ui` serves an S3-compatible API at `/s3` (also with `--api-only`
+and `--tls-cert`). People make keys from their own tickets with `pumasi
+s3 create-key` or on the Storage page; a key acts as its ticket and stops
+working when the ticket is revoked, expires or is rotated. `pumasi s3
+keys` with an admin ticket lists every key, and `pumasi s3 revoke-key`
+revokes one (the dashboard notices within 4 minutes, or at once for a
+signature of a new day or region). The gateway keeps uploads and what it
+reads in its own file store under the temporary directory (removed when
+it stops), so give that disk room for the largest object, and raise
+`--max-upload` (4 GiB) for larger objects.
 
 ### Run only the control plane on a machine
 
@@ -302,9 +344,10 @@ reach the cluster any more.
 `pumasi ha invite` on the running control plane gives a ticket for a
 replica; run `pumasi cluster replica <TICKET> --bind 0.0.0.0:7480` on each
 new machine (3 or 5 in total), then make new join and admin tickets so
-they list every replica. Watch `pumasi ha status`. The file store's data
-reaches replicas every 30 seconds, not with each write (README, known
-gaps).
+they list every replica. Watch `pumasi ha status`. Since 1.8 a write to
+the file store is acknowledged once the replicas have it too (they also
+catch up every 30 seconds), and release binaries uploaded for a rollout
+are copied to every replica, so a failover loses neither.
 
 ## 6. Watch it
 

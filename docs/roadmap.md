@@ -21,8 +21,8 @@ on real machines.
 | 20 | 1.4 | Issues from real use: account policies and agent options without a terminal, task timings and names | done |
 | 21 | 1.5 | Machines that sleep and machines without Docker | done |
 | 22 | 1.6 | Monitoring: live microVM output, every GPU and temperature, node-to-node network | done |
-| 23 | 1.7 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | planned |
-| 24 | 1.8 | File store on several machines and an S3-compatible gateway | planned |
+| 23 | 1.7 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | done |
+| 24 | 1.8 | File store on several machines and an S3-compatible gateway | done |
 | 25 | 1.9 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | planned |
 | 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | planned |
 | 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | planned |
@@ -198,6 +198,16 @@ owner changes an alert rule and a node's hours from a phone through the
 tunnel, and upgrades the cluster with a canary.
 
 ## 24. File store on several machines and an S3-compatible gateway (1.8)
+
+Done in 1.8.0 ([release notes](releases/v1.8.0.md)). What differs from
+the plan below: a storage node is an owner node with the `storage` label,
+whose value is its quota (`storage=200G`, or `yes` for 90% of its disk);
+the gateway also offers CopyObject, DeleteObjects, ListObjects v1,
+presigned URLs and streamed uploads, and each gateway write makes a
+dataset version that replaces the gateway's previous one; damage in the
+control plane's own store is reported, and repaired by restarting it
+without its `blobs` directory
+([details](architecture.md#phase-24-the-file-store-on-several-machines-18)).
 
 Why: the store's only full copy lives on the control plane's machine; on
 a single control plane a lost disk loses every dataset.

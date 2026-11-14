@@ -181,20 +181,6 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
     let top = html! {
         div class="page-head" { h1 { (l.t("Storage", "저장소")) } }
     };
-    let live = html! {
-        section {
-            h2 { (l.t("Datasets", "데이터셋")) }
-            (table(&[l.t("Name", "이름"), l.t("Latest", "최신"), l.t("Copies", "사본"), l.t("Files", "파일"), l.t("Size", "크기"),
-                     l.t("Account", "계정"), l.t("Created", "생성"), l.t("From job", "출처 작업"), ""],
-                rows, l.t("No datasets yet.", "아직 데이터셋이 없습니다.")))
-        }
-        @if let Some(r) = &rep { (replication_section(ctx, r)) }
-        section {
-            h2 { (l.t("Usage", "사용량")) }
-            @if disk > 0 { p class="dim" { (l.t("On the control plane's disk:", "컨트롤 플레인 디스크 사용:")) " " (format_size(disk)) } }
-            (table(&[l.t("Account", "계정"), l.t("Datasets", "데이터셋"), l.t("Stored", "저장량")], usage_rows, "—"))
-        }
-    };
     let keys = match ctx.call(AdminOp::S3Keys).await {
         Ok(AdminResponse::S3Keys(k)) => k,
         _ => Vec::new(),
@@ -215,6 +201,25 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
             }
         })
         .collect();
+    let live = html! {
+        section {
+            h2 { (l.t("Datasets", "데이터셋")) }
+            (table(&[l.t("Name", "이름"), l.t("Latest", "최신"), l.t("Copies", "사본"), l.t("Files", "파일"), l.t("Size", "크기"),
+                     l.t("Account", "계정"), l.t("Created", "생성"), l.t("From job", "출처 작업"), ""],
+                rows, l.t("No datasets yet.", "아직 데이터셋이 없습니다.")))
+        }
+        @if let Some(r) = &rep { (replication_section(ctx, r)) }
+        section #s3-keys {
+            h2 { (l.t("S3 access keys", "S3 액세스 키")) }
+            (table(&[l.t("Key id", "키 ID"), l.t("Label", "메모"), l.t("Acts as", "권한"), l.t("Created", "생성"), l.t("Last used", "마지막 사용"), ""],
+                key_rows, l.t("No S3 keys yet.", "아직 S3 키가 없습니다.")))
+        }
+        section {
+            h2 { (l.t("Usage", "사용량")) }
+            @if disk > 0 { p class="dim" { (l.t("On the control plane's disk:", "컨트롤 플레인 디스크 사용:")) " " (format_size(disk)) } }
+            (table(&[l.t("Account", "계정"), l.t("Datasets", "데이터셋"), l.t("Stored", "저장량")], usage_rows, "—"))
+        }
+    };
     let endpoint = format!("{}/s3", ctx.st.public_url);
     let bottom = html! {
         @if ctx.me.is_admin() {
@@ -234,15 +239,13 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
             }
         }
         section #s3 {
-            h2 { (l.t("S3 access keys", "S3 액세스 키")) }
+            h2 { (l.t("Make an S3 key", "S3 키 만들기")) }
             p class="dim" {
                 (l.t("S3 clients (aws, rclone, boto3) reach the datasets at", "S3 클라이언트(aws, rclone, boto3)는 다음 주소로 데이터셋을 씁니다:"))
                 " " code { (endpoint) } " "
                 (l.t("with path-style addressing and any region: buckets are datasets, objects their files. A key acts as the ticket it was made with.",
                      "(경로 방식 주소, 리전은 아무거나). 버킷은 데이터셋, 객체는 그 파일입니다. 키는 만든 티켓의 권한으로 동작합니다."))
             }
-            (table(&[l.t("Key id", "키 ID"), l.t("Label", "메모"), l.t("Acts as", "권한"), l.t("Created", "생성"), l.t("Last used", "마지막 사용"), ""],
-                key_rows, l.t("No S3 keys yet.", "아직 S3 키가 없습니다.")))
             form class="row" hx-post="/storage/s3-keys" hx-target="#flash" {
                 div { label for="s3-label" { (l.t("Label", "메모")) } input #s3-label name="label" placeholder="laptop rclone"; }
                 button type="submit" { (l.t("Create a key", "키 만들기")) }

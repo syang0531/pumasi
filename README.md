@@ -862,6 +862,52 @@ hdd|ssd|nvme`; `prices set --storage-hdd-gib-month`,
 with `store get` as egress. `prices set --default-quota 50G` caps every
 account without its own quota.
 
+**Copies on other machines (1.8).** Every dataset version is kept on 2
+copies by default: each control plane replica counts as one, and the rest
+go on your own nodes labelled for storage, each within a quota. A write
+(`store put`, an S3 upload, a job's output dataset) is acknowledged once
+it is on as many copies as the cluster can make, so losing the control
+plane's disk no longer loses the datasets:
+
+```sh
+pumasi node label nas storage=500G       # keep copies here, up to 500 GiB (storage=yes: up to 90% of the disk)
+pumasi store copies --default 3          # copies of every version, control planes included
+pumasi store copies corpus 1             # this dataset needs only the control plane's copy
+pumasi store replicas [corpus]           # where each version is, and each storage node's quota and use
+pumasi store scrub [NODE]                # read every copy back and check its hashes now (also weekly)
+```
+
+Only owner nodes (trusted, not providers) keep copies. A storage node
+that is removed, or offline longer than `cluster start
+--replica-repair-after` (6 hours), has its copies made again elsewhere;
+a scrub that finds damage drops the bad copy and fetches a good one, and
+if the control plane itself lacks a version (a lost or emptied `blobs`
+directory) it fetches it back from the nodes. Damage and repairs show up
+in `pumasi events` and on the dashboard's Storage page.
+
+**S3 gateway (1.8).** `pumasi ui` serves an S3-compatible API at `/s3`:
+buckets are datasets, objects are the files of their latest version, so
+`aws s3`, rclone and boto3 read and write the store. Keys act as the
+ticket they were made with (a submitter's key writes only its account's
+datasets, a viewer's only reads):
+
+```sh
+pumasi s3 create-key --label laptop     # access key id and secret, shown once
+aws configure set default.s3.addressing_style path
+aws --endpoint-url http://127.0.0.1:7400/s3 s3 cp results.csv s3://corpus/
+rclone sync data/ pumasi:corpus         # rclone: type s3, provider Other, endpoint .../s3
+pumasi s3 keys / pumasi s3 revoke-key PUMA...
+```
+
+GetObject (ranges), HeadObject, PutObject, CopyObject, DeleteObject(s),
+ListObjects (v1 and v2), ListBuckets, CreateBucket, DeleteBucket (empty
+only) and multipart uploads work, with SigV4 headers, presigned URLs and
+streamed (`aws-chunked`) uploads. Each write makes a new dataset version
+that replaces the one the gateway's previous write made (versions made
+with `store put` stay). There are no ACLs, policies, tags, object
+versions or object locks, and a key cannot be both a file and a folder
+(`a` and `a/b`), since a dataset is a file tree.
+
 **Private images.** Store a registry login as a cluster secret and jobs can
 use images from that registry, with Docker and in microVMs:
 
@@ -1366,6 +1412,8 @@ defends against, including the API exposed to the internet.
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
 | `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image IMAGE] [--wsl-libs auto\|yes\|no]]` / `gpu webgpu [--software]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally, and with `--docker-run` starts a container to see whether CUDA, OptiX and drawing (EGL, OpenGL, Vulkan) work in Docker (saved for the agent: `gpu.graphics`); `webgpu` lists the WebGPU adapters wasm jobs can use. |
 | `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
+| `pumasi store replicas [NAME]` / `copies NAME N\|default` / `copies --default N` / `scrub [NODE]` | Copies of each dataset version on control planes and nodes labelled `storage=SIZE`, how many to keep, and checking them against their hashes. |
+| `pumasi s3 create-key [--label L]` / `keys` / `revoke-key ID` | Access keys for the S3-compatible gateway at `pumasi ui`'s `/s3`, acting as this ticket. |
 | `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
 | `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
 | `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency, GPUs) and recent jobs with their cost in CU. |
@@ -1698,7 +1746,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 21 | Machines that sleep and machines without Docker: stay awake while running tasks, report sleep so tasks move at once, Wake-on-LAN for queued work, `executor = "image"` (Docker where there is Docker, a microVM elsewhere), idle detection under a Windows service, `--on-pause requeue`, a guide for Linux on 2013-2014 Macs | done (1.5) |
 | 22 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | done (1.6) |
 | 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | done (1.7) |
-| 24 | File store on several machines: replicas on owner nodes with repair and scrubbing, writes acknowledged on enough copies, an S3-compatible gateway | planned (1.8) |
+| 24 | File store on several machines: replicas on owner nodes labelled for storage with repair and scrubbing, writes acknowledged on enough copies, release binaries on every control plane, an S3-compatible gateway in `pumasi ui` | done (1.8) |
 | 25 | Scheduling: gangs, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption and drain, schedule time zones | planned (1.9) |
 | 26 | GPUs: WebGPU timeouts and GPU challenge, AMD benchmark and Docker jobs, shared GPUs (fractions, MIG) | planned (1.10) |
 | 27 | Windows: Docker in a Pumasi-managed WSL distro (no Docker Desktop, no sign-in), ARM64 microVMs, an HCS backend if clearly faster | planned (1.11) |
@@ -1706,20 +1754,14 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | on hold |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | on hold |
 
-Known gaps: the file store's data is copied to the other control plane
-replicas every 30 seconds rather than as part of each write (a file
-uploaded just before the leader dies may be missing until it comes back),
-agent binaries uploaded with `pumasi upgrade rollout` stay on the replica
-that took them (roll out again after a failover), and agents older than
-this release follow only the replica they joined. WebGPU is experimental: it is
+Known gaps: agents older than the release that added control plane
+replicas follow only the replica they joined. WebGPU is experimental: it is
 checked on software rasterizers in CI and on real GPUs by hand, offers
 compute shaders only (no textures or samplers, one bind group, no f16), a
 runaway shader is stopped by the GPU driver's watchdog rather than the
 job's timeout, and there is no GPU challenge over WebGPU yet. Accounts
 exist only inside one cluster (SSO signs people in, but there is no SCIM
-or SAML, and nobody is removed until their session ends or is revoked), CU are not connected to real payments, the file store lives
-only on the control plane (no replicas on owner nodes yet, no S3-compatible
-gateway). GPUs are checked on real hardware by hand, not in CI (hosted
+or SAML, and nobody is removed until their session ends or is revoked), and CU are not connected to real payments. GPUs are checked on real hardware by hand, not in CI (hosted
 runners have none); VFIO passthrough is experimental and NVIDIA-only
 (Turing and newer, with the open kernel modules); Intel and Apple GPUs are
 used only through WebGPU. MicroVM networks need QEMU or Virtualization.framework (not Firecracker

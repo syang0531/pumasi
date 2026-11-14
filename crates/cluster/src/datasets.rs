@@ -1014,6 +1014,9 @@ impl State {
                 out.push(d.view());
             }
         }
+        if self.dataset(name, None).is_err() {
+            self.forget_replication(name);
+        }
         Ok(out)
     }
 

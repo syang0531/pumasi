@@ -1418,6 +1418,23 @@ impl Agent {
                         }
                     }
                 }
+                Ok(Some(ToAgent::Hold { roots, sources })) => {
+                    // In order: the lock in `hold` is taken before this
+                    // returns to the next message.
+                    let store = self.node_store.clone();
+                    let cluster = cluster.clone();
+                    let (go, ready) = tokio::sync::oneshot::channel::<()>();
+                    tokio::spawn(async move {
+                        let held = store.hold_guard().await;
+                        let _ = go.send(());
+                        store.hold(held, roots, sources, cluster).await
+                    });
+                    let _ = ready.await;
+                }
+                Ok(Some(ToAgent::Scrub)) => {
+                    let store = self.node_store.clone();
+                    tokio::spawn(async move { store.scrub().await });
+                }
                 Ok(Some(ToAgent::Cancel(task))) => {
                     if let Some(flag) = running.lock().unwrap().get(&task) {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);

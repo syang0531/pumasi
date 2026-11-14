@@ -5,7 +5,7 @@ members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "cr
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/syang0531/pumasi"
@@ -50,6 +50,9 @@ flate2 = "1"
 ruzstd = "0.9.1"
 libc = "0.2"
 sha2 = "0.10"
+# S3 gateway (1.8): SigV4 signatures and MD5 ETags.
+hmac = "0.12"
+md-5 = "0.10"
 # Confidential tasks (phase 16): sealed streams and key release.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 x25519-dalek = { version = "3", default-features = false }

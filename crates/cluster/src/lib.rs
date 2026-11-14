@@ -21,6 +21,7 @@ pub mod perf;
 pub mod power;
 mod prometheus;
 pub mod remote;
+pub mod replicas;
 pub mod retention;
 pub mod rollout;
 pub mod server;

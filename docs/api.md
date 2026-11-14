@@ -580,6 +580,39 @@ curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/up
 <!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/upgrade/canary" | jq -e '. == null' -->
 <!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/sessions" | jq -e 'type == "array"' -->
 
+### Copies and the S3 gateway (1.8)
+
+Where the copies of each dataset version are, the storage nodes and
+their quotas (`POST /api/v1/op` takes any admin call as JSON; a
+submitter sees its own account's datasets):
+
+```sh
+curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' \
+  -d '{"Replication": {"name": null}}' "$PUMASI_URL/api/v1/op"
+```
+<!-- ci: curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{"Replication": {"name": null}}' "$PUMASI_URL/api/v1/op" | jq -e '.default_factor == 2 and (.nodes | type == "array")' -->
+
+`{"SetReplication": {"name": "corpus", "factor": 3}}` changes a
+dataset's number of copies (`"name": null` the cluster's default) and
+`{"Scrub": {"node": null}}` checks every copy now.
+
+The same server answers S3 clients at `/s3`, signed with keys made from
+a ticket. `S3KeyCreate` returns the secret once; curl signs requests
+itself:
+
+```sh
+key=$(curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' \
+  -d '{"S3KeyCreate": {"label": "curl"}}' "$PUMASI_URL/api/v1/op")
+id=$(echo "$key" | jq -r .view.id)
+secret=$(echo "$key" | jq -r .secret)
+curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$id:$secret" "$PUMASI_URL/s3/"
+```
+<!-- ci: curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$id:$secret" "$PUMASI_URL/s3/" | grep -q ListAllMyBucketsResult -->
+<!-- ci: curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d "{\"S3KeyRevoke\": {\"id\": \"$id\"}}" "$PUMASI_URL/api/v1/op" | jq -e --arg id "$id" 'type == "array" and all(.[]; .id != $id)' -->
+
+With the AWS CLI, rclone or boto3, use the endpoint `$PUMASI_URL/s3`,
+any region and path-style addressing (README, "S3 gateway").
+
 Every route, with its parameters, is in `$PUMASI_URL/api/openapi.json`
 (OpenAPI 3.1), which code generators and tools such as Postman read.
 

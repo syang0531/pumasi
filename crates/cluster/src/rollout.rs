@@ -171,6 +171,14 @@ impl State {
             .collect()
     }
 
+    /// The rollout's binaries (SHA-256, size).
+    pub fn rollout_files(&self) -> Vec<([u8; 32], u64)> {
+        self.rollout
+            .iter()
+            .flat_map(|r| r.releases.iter().map(|r| (r.file().sha256, r.file().size)))
+            .collect()
+    }
+
     /// Whether `node` may download the binary `sha256`.
     pub fn may_fetch(&self, node: &str, sha256: &[u8; 32]) -> bool {
         self.members.contains_key(node) && self.rollout_hashes().contains(sha256)

@@ -46,6 +46,25 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Attempts at the control plane after the peers.
 const CP_ATTEMPTS: u32 = 4;
 const CACHE_TAG: &str = "cache/";
+/// Tags of the dataset versions this node keeps as replicas (1.8). The
+/// cache's eviction never touches them.
+const REPLICA_TAG: &str = "replica/";
+/// A damaged replica waits this long for the garbage collector to delete
+/// its blobs before it is fetched again.
+const QUARANTINE: Duration = Duration::from_secs(3 * GC_INTERVAL.as_secs());
+/// Failed replica downloads are tried again after this long.
+const RETRY_EVERY: Duration = Duration::from_secs(30);
+
+/// The replicas this node should keep, from the control plane.
+#[derive(Default)]
+struct Replicas {
+    want: std::collections::BTreeSet<BlobHash>,
+    sources: Vec<EndpointAddr>,
+    cluster: Option<EndpointAddr>,
+    failed: HashMap<BlobHash, String>,
+    /// Damaged ones, until when they are left alone.
+    quarantine: HashMap<BlobHash, Instant>,
+}
 
 #[derive(Debug, Clone)]
 struct Cached {
@@ -66,6 +85,13 @@ pub struct NodeStore {
     fetching: Arc<Mutex<HashMap<BlobHash, Arc<tokio::sync::Mutex<()>>>>>,
     /// Where cache changes are reported (the current session).
     listener: Arc<Mutex<Option<mpsc::UnboundedSender<FromAgent>>>>,
+    replicas: Arc<Mutex<Replicas>>,
+    replica_wake: Arc<tokio::sync::Notify>,
+    /// One replica list at a time, in the order they came.
+    hold_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Shared by every handle: the replica loop stops once it holds the
+    /// last one (the agent let go of the store, which can then close).
+    alive: Arc<()>,
 }
 
 impl NodeStore {
@@ -92,8 +118,13 @@ impl NodeStore {
             cache: Default::default(),
             fetching: Default::default(),
             listener: Default::default(),
+            replicas: Default::default(),
+            replica_wake: Default::default(),
+            hold_lock: Default::default(),
+            alive: Default::default(),
         };
         this.load().await;
+        tokio::spawn(this.clone().replica_loop());
         Ok(this)
     }
 
@@ -395,6 +426,248 @@ impl NodeStore {
 
     pub async fn shutdown(&self) {
         let _ = self.store.shutdown().await;
+    }
+
+    // -- replicas (1.8) -------------------------------------------------------
+
+    /// The control plane's list of replicas to keep ([`pumasi_proto::msg::ToAgent::Hold`]):
+    /// drops the ones no longer listed, tags the new ones and fetches them
+    /// in the background, and says right away which it has.
+    pub async fn hold(
+        &self,
+        _one: tokio::sync::OwnedMutexGuard<()>,
+        roots: Vec<BlobHash>,
+        sources: Vec<EndpointAddr>,
+        cluster: EndpointAddr,
+    ) {
+        use n0_future::StreamExt;
+        let want: std::collections::BTreeSet<BlobHash> = roots.into_iter().collect();
+        {
+            let mut r = self.replicas.lock().unwrap();
+            r.want = want.clone();
+            r.sources = sources;
+            r.cluster = Some(cluster);
+            r.failed.retain(|k, _| want.contains(k));
+        }
+        // Drop the tags of replicas no longer wanted.
+        let mut stale = Vec::new();
+        if let Ok(mut tags) = self.store.tags().list_prefix(REPLICA_TAG).await {
+            while let Some(Ok(t)) = tags.next().await {
+                let root = blobs::from_hash(t.hash);
+                if !want.contains(&root) {
+                    stale.push(String::from_utf8_lossy(t.name.as_ref()).into_owned());
+                }
+            }
+        }
+        for name in &stale {
+            if let Err(e) = self.store.tags().delete(name.as_str()).await {
+                warn!("delete tag {name}: {e}");
+            }
+        }
+        if !stale.is_empty() {
+            info!(
+                replicas = stale.len(),
+                "dropped replicas the cluster no longer keeps here"
+            );
+        }
+        let quarantined: Vec<BlobHash> = {
+            let r = self.replicas.lock().unwrap();
+            r.quarantine.keys().copied().collect()
+        };
+        for root in &want {
+            if quarantined.contains(root) {
+                continue;
+            }
+            let tag = format!("{REPLICA_TAG}{}", hash_hex(root));
+            if let Err(e) = self
+                .store
+                .tags()
+                .set(
+                    tag.as_str(),
+                    blobs::HashAndFormat::hash_seq(blobs::to_hash(root)),
+                )
+                .await
+            {
+                warn!("tag {tag}: {e}");
+            }
+        }
+        self.report_held(None).await;
+        self.replica_wake.notify_one();
+    }
+
+    /// Taken before [`Self::hold`], so lists apply in the order they came.
+    pub async fn hold_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.hold_lock.clone().lock_owned().await
+    }
+
+    /// Says which wanted replicas are complete.
+    async fn report_held(&self, scrub: Option<pumasi_proto::replica::ScrubReport>) {
+        let (want, failed) = {
+            let r = self.replicas.lock().unwrap();
+            (
+                // A damaged one is not held, whatever its bitfield says.
+                r.want
+                    .iter()
+                    .filter(|k| !r.quarantine.contains_key(*k))
+                    .copied()
+                    .collect::<Vec<_>>(),
+                r.failed
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut held = Vec::new();
+        for root in want {
+            if matches!(
+                blobs::missing(&self.store, blobs::to_hash(&root)).await,
+                Ok((_, true))
+            ) {
+                held.push(root);
+            }
+        }
+        if let Some(tx) = self.listener.lock().unwrap().as_ref() {
+            let _ = tx.send(FromAgent::Held {
+                roots: held,
+                failed,
+                scrub,
+            });
+        }
+    }
+
+    /// Fetches wanted replicas the store lacks, one at a time.
+    async fn replica_loop(self) {
+        loop {
+            // A wake, or the retry period; each second, whether the agent
+            // still uses this store.
+            let deadline = Instant::now() + RETRY_EVERY;
+            loop {
+                if Arc::strong_count(&self.alive) <= 1 {
+                    return;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let wait = left.min(Duration::from_secs(1));
+                if tokio::time::timeout(wait, self.replica_wake.notified())
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            let (want, sources, cluster) = {
+                let mut r = self.replicas.lock().unwrap();
+                let now = Instant::now();
+                let back: Vec<BlobHash> = r
+                    .quarantine
+                    .iter()
+                    .filter(|(_, t)| **t <= now)
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in back {
+                    r.quarantine.remove(&k);
+                }
+                let want: Vec<BlobHash> = r
+                    .want
+                    .iter()
+                    .filter(|k| !r.quarantine.contains_key(*k))
+                    .copied()
+                    .collect();
+                (want, r.sources.clone(), r.cluster.clone())
+            };
+            let Some(cluster) = cluster else {
+                continue;
+            };
+            let mut changed = false;
+            for root in want {
+                let hash = blobs::to_hash(&root);
+                if matches!(blobs::missing(&self.store, hash).await, Ok((_, true))) {
+                    continue;
+                }
+                // Keep partial data from the garbage collector.
+                let tag = format!("{REPLICA_TAG}{}", hash_hex(&root));
+                let _ = self
+                    .store
+                    .tags()
+                    .set(tag.as_str(), blobs::HashAndFormat::hash_seq(hash))
+                    .await;
+                let mut last: Option<anyhow::Error> = None;
+                let never = AtomicBool::new(false);
+                for addr in sources
+                    .iter()
+                    .filter(|a| a.id != self.endpoint.id())
+                    .chain([&cluster])
+                {
+                    match self.fetch_from(addr, hash, &never).await {
+                        Ok(_) => {}
+                        Err(e) => last = Some(e),
+                    }
+                    if matches!(blobs::missing(&self.store, hash).await, Ok((_, true))) {
+                        last = None;
+                        break;
+                    }
+                }
+                // Still wanted? The list may have changed meanwhile.
+                let mut r = self.replicas.lock().unwrap();
+                if !r.want.contains(&root) {
+                    continue;
+                }
+                match last {
+                    None => {
+                        r.failed.remove(&root);
+                        info!(replica = %hash.fmt_short(), "replica stored");
+                    }
+                    Some(e) => {
+                        debug!(replica = %hash.fmt_short(), "replica download stopped: {e:#}");
+                        r.failed.insert(root, format!("{e:#}"));
+                    }
+                }
+                changed = true;
+            }
+            if changed {
+                self.report_held(None).await;
+            }
+        }
+    }
+
+    /// Reads every complete replica back against its hashes; damaged ones
+    /// are untagged so the garbage collector deletes them, and fetched
+    /// again after a while. Reports the result.
+    pub async fn scrub(&self) {
+        let want: Vec<BlobHash> = self.replicas.lock().unwrap().want.iter().copied().collect();
+        let mut report = pumasi_proto::replica::ScrubReport::default();
+        for root in want {
+            let hash = blobs::to_hash(&root);
+            if !matches!(blobs::missing(&self.store, hash).await, Ok((_, true))) {
+                continue;
+            }
+            report.checked += 1;
+            match blobs::verify(&self.store, hash).await {
+                Ok(b) => report.bytes += b,
+                Err(e) => {
+                    warn!("replica {} is damaged: {e:#}", hash.fmt_short());
+                    report.bad.push(root);
+                    for prefix in [REPLICA_TAG, CACHE_TAG] {
+                        let tag = format!("{prefix}{}", hash_hex(&root));
+                        let _ = self.store.tags().delete(tag.as_str()).await;
+                    }
+                    self.cache.lock().unwrap().remove(&root);
+                    self.replicas
+                        .lock()
+                        .unwrap()
+                        .quarantine
+                        .insert(root, Instant::now() + QUARANTINE);
+                }
+            }
+        }
+        info!(
+            checked = report.checked,
+            damaged = report.bad.len(),
+            "scrubbed the replicas"
+        );
+        self.report_held(Some(report)).await;
     }
 }
 

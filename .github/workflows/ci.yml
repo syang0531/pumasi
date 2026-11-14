@@ -416,6 +416,35 @@ jobs:
       - run: cargo build --release -p pumasi-cli
       - run: scripts/sso-e2e.sh --bin target/release/pumasi
 
+  # The S3 gateway of `pumasi ui` (1.8) against real clients
+  # (scripts/s3-gateway.sh): the AWS CLI v2 of the runner image (aws s3 cp,
+  # sync, multipart uploads, s3api), rclone (sync, check) and boto3.
+  s3-gateway:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: soak
+      - name: rclone and boto3
+        run: |
+          v=1.71.1
+          curl -sSfL -o "$RUNNER_TEMP/rclone.zip" \
+            "https://github.com/rclone/rclone/releases/download/v$v/rclone-v$v-linux-amd64.zip"
+          unzip -q -j "$RUNNER_TEMP/rclone.zip" "rclone-v$v-linux-amd64/rclone" -d "$RUNNER_TEMP/bin"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet boto3
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - run: aws --version && rclone version
+      - run: cargo build --release -p pumasi-cli
+      - run: scripts/s3-gateway.sh --bin target/release/pumasi
+
   # macOS: the binary's minimum OS, and the Virtualization.framework
   # helper (signing, loading the framework at run time). Hosted Mac
   # runners are VMs without nested virtualization, so booting a guest is

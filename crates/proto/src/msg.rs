@@ -363,6 +363,19 @@ pub enum ToAgent {
     /// service's options file and restart with them once its running
     /// tasks end. Answered with [`FromAgent::Settings`].
     Settings(Box<crate::ui::NodeSettings>),
+    // Minor 4 (1.8) from here.
+    /// The dataset collections this node keeps as replicas: every one of
+    /// them (the list replaces the last one). It fetches what it lacks,
+    /// from `sources` (other nodes holding some of them) and then the
+    /// control plane, keeps them out of its cache's eviction, drops
+    /// replicas no longer listed, and answers with [`FromAgent::Held`].
+    Hold {
+        roots: Vec<BlobHash>,
+        sources: Vec<EndpointAddr>,
+    },
+    /// Check every replica against its hashes now; answered with
+    /// [`FromAgent::Held`] carrying the scrub report.
+    Scrub,
 }
 
 /// How a task ended.
@@ -539,6 +552,16 @@ pub enum FromAgent {
     Settings {
         report: Box<crate::ui::SettingsReport>,
         error: Option<String>,
+    },
+    // Minor 4 (1.8) from here.
+    /// The replicas this node has complete, in answer to
+    /// [`ToAgent::Hold`] and whenever a download finishes; `failed` says
+    /// why some could not be fetched, and `scrub` is set after a
+    /// [`ToAgent::Scrub`].
+    Held {
+        roots: Vec<BlobHash>,
+        failed: Vec<(BlobHash, String)>,
+        scrub: Option<crate::replica::ScrubReport>,
     },
 }
 
@@ -967,6 +990,64 @@ pub enum AdminOp {
     PromoteCanary {
         nodes: Vec<String>,
     },
+    // 1.8 from here.
+    /// Where the copies of each dataset version are (one dataset, or all)
+    /// and the storage nodes.
+    Replication {
+        name: Option<String>,
+    },
+    /// How many copies of a dataset to keep, control planes included; or,
+    /// without a name, the default for datasets without their own.
+    /// `None` gives a dataset the default again.
+    SetReplication {
+        name: Option<String>,
+        factor: Option<u8>,
+    },
+    /// Checks every collection on the control plane, or on one node,
+    /// against its hashes now.
+    Scrub {
+        node: Option<String>,
+    },
+    /// The files of a dataset version (the latest without `version`),
+    /// with what the S3 gateway recorded about them.
+    StoreFiles {
+        name: String,
+        version: Option<u32>,
+    },
+    /// Records an uploaded collection as a new version of `name`, like
+    /// [`AdminOp::StoreCommit`], unless the latest version is no longer
+    /// `base` (another write came first: the caller builds on the new
+    /// one and tries again). `meta` sets (or with `None` drops) what the
+    /// S3 gateway keeps about a path. Answers once the version is on as
+    /// many copies as it can have.
+    S3Commit {
+        name: String,
+        base: Option<u32>,
+        root: BlobHash,
+        account: Option<String>,
+        meta: Vec<(String, Option<crate::replica::S3Meta>)>,
+    },
+    /// A new S3 access key acting as the calling ticket.
+    S3KeyCreate {
+        label: String,
+    },
+    S3Keys,
+    S3KeyRevoke {
+        id: String,
+    },
+    /// Checks a SigV4 signature made with the secret of S3 key `key` over
+    /// `string_to_sign`, whose scope is `date` (YYYYMMDD) and `region`.
+    /// Answers with a credential that acts as the key's ticket for a few
+    /// minutes, and the day's signing key for the request's chunk
+    /// signatures.
+    /// The day and region come from the string to sign's scope.
+    S3Auth {
+        key: String,
+        string_to_sign: String,
+        signature: String,
+        /// A presigned URL's lifetime.
+        expires: Option<u32>,
+    },
 }
 
 impl AdminOp {
@@ -1121,6 +1202,25 @@ pub enum AdminResponse {
     Sessions(Vec<crate::ui::SessionView>),
     NodeSettings(Box<crate::ui::NodeSettingsView>),
     Canary(Option<Box<crate::release::CanaryView>>),
+    // 1.8 from here.
+    Replication(Box<crate::replica::ReplicationView>),
+    StoreFiles {
+        dataset: crate::store::DatasetView,
+        files: Vec<crate::replica::FileView>,
+        s3: Vec<(String, crate::replica::S3Meta)>,
+    },
+    /// A new S3 key; its secret is shown only here.
+    S3Key {
+        secret: String,
+        view: crate::replica::S3KeyView,
+    },
+    S3Keys(Vec<crate::replica::S3KeyView>),
+    S3Auth {
+        token: crate::Secret,
+        signing_key: [u8; 32],
+        name: String,
+        role: crate::manage::AccessRole,
+    },
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

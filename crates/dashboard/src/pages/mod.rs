@@ -56,6 +56,10 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
             "/storage",
             get(storage::list).post(storage::upload).layer(uploads),
         )
+        .route("/storage/replication", post(storage::set_replication))
+        .route("/storage/scrub", post(storage::scrub))
+        .route("/storage/s3-keys", post(storage::create_key))
+        .route("/storage/s3-keys/{id}/revoke", post(storage::revoke_key))
         .route("/storage/{name}", get(storage::versions))
         .route("/storage/{name}/remove", post(storage::remove))
         .route("/storage/{name}/download.zip", get(storage::download))

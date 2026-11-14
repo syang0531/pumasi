@@ -2362,6 +2362,148 @@ with the editor's limits), `GET /api/v1/upgrade/canary` and `POST
 /api/v1/upgrade/canary/promote`; `POST /api/v1/upgrade` takes `canary`,
 `canary_soak`, `canary_tasks` and `canary_hold`.
 
+## Phase 24: the file store on several machines (1.8)
+
+Release 1.8 ends the file store's single full copy on the control
+plane's disk: dataset versions are kept on several copies (control plane
+replicas and owner nodes labelled for storage), writes wait for them,
+damage is found by scrubbing and repaired from the other copies, and
+`pumasi ui` speaks enough of the S3 API for `aws s3`, rclone and boto3.
+
+### Copies and where they go
+
+A dataset version is wanted on `factor` copies (`DEFAULT_REPLICAS`, 2,
+or the cluster's `replication_default`, or the dataset's own number in
+the `ds_replication` table; 1 to 9). Every control plane replica counts
+as one: the leader keeps every version, and followers mirror the
+leader's store. The rest are node replicas (`cluster/src/replicas.rs`).
+A storage node is an owner node (trusted, not a provider) with the
+`storage` label, whose value is the most it keeps (`storage=200G`;
+`yes`, `true`, `on` or empty: up to 90% of its disk), running an agent
+that speaks protocol minor 4 (`REPLICA_MINOR`). Its room is the quota
+less what is placed on it, never leaving less than 1 GiB free on its
+disk (the latest metrics sample); without a quota, it keeps 10% of the
+disk free.
+
+Every 500 ms the leader plans (`tick_replicas`): for each wanted version
+(the latest of each dataset, and older versions too: every version
+counts), it counts copies (control planes that have it, plus node
+replicas that are held, on a storage node that is online or offline for
+less than `--replica-repair-after`, default 6 hours) and places the
+missing ones on the candidates with the most room that do not have one;
+it drops replicas of versions nobody wants any more and of nodes that are
+no longer storage nodes, and extra copies (keeping held ones on online
+nodes). Placements are records `(root, node) -> {size, state, since}` in
+the `replicas` table, replicated by Raft with the rest of the state, so a
+new leader carries on where the old one stopped.
+
+A node learns its list from `ToAgent::Hold { roots, sources }` (the whole
+list each time it changes, with nodes that hold them as fetch sources):
+it tags each root `replica/<hash>` so garbage collection keeps it, untags
+the rest, and fetches what it lacks one collection at a time from the
+sources and then the control plane, resuming partial data
+(`agent/src/store.rs`, `replica_loop`). It answers with `FromAgent::Held`
+(the roots it has whole, and why the others failed), which turns
+`Copying` into `Held`. Tasks' mounts fetch from replica holders too.
+
+### Writes on enough copies
+
+`StoreCommit` and `S3Commit` (and a job's output dataset) answer once the
+new version is on as many copies as there can be (`wait_copies`): the
+leader tags it, asks every follower to mirror now (`RaftReq::Mirror`
+answers with the number of collections it fetched), then waits until the
+copies reach the number the planner can place (storage nodes with room
+count; full or missing ones do not), for up to 5 minutes
+(`replica_ack_timeout`), after which it is acknowledged anyway with a
+warning, so a write is not refused for a storage node that is slow. Before 1.8 followers caught up every 30 seconds, and a version
+written just before a failover could be missing on the new leader.
+
+Release binaries uploaded for a rollout (`rollout_files`) reach the
+followers too: their mirror loop asks the leader for its list
+(`RaftReq::Releases`) and fetches what it lacks in 4 MiB chunks
+(`ReleaseChunk`), checking each file's SHA-256, and prunes the rest, so
+`pumasi upgrade` keeps working after a failover.
+
+### The leader's own store
+
+If the leader lacks a version it should have (its `blobs` directory was
+lost, emptied, or restored from an old backup), the replica worker
+fetches it from node replicas every minute (`repair_leader`), raising
+`store.repaired` (info) when done and `store.missing` (critical) when no
+node has a copy. Moving `blobs` aside and restarting is how damage in the
+control plane's store is repaired.
+
+### Scrubs
+
+Every `--scrub-every` (7 days), and on `AdminOp::Scrub`, every store is
+read back and checked against its BLAKE3 tree: the leader's
+(`blobs::verify`, a validated bao export of every blob of every
+collection) and each storage node's (`ToAgent::Scrub`; the report rides
+on `Held`). A node quarantines a damaged replica: it drops its tag and
+leaves it for 90 seconds so garbage collection can delete the bad data,
+reports it as not held, and fetches it again; the leader plans the copy
+elsewhere meanwhile if needed. Damage in the leader's own store is
+reported only (`store.damaged`, critical). Results show in `pumasi store
+replicas`, the Storage page and the events (`store.scrub`).
+
+### The S3 gateway
+
+`pumasi ui` serves `/s3` (`dashboard/src/s3/`), path-style only (with
+`--api-only` too). Buckets are datasets and objects are the files of the
+latest version. The control plane holds every key's secret (`s3_keys`
+table: id `PUMA` + 16 base32 characters, a 40-character secret, the
+parent ticket's secret, a label); a key acts as its parent ticket and
+ends with it. The gateway never sees secrets: for each request it builds
+the canonical request and string to sign itself (`sigv4.rs`: the
+`Authorization` header or a presigned query, up to 7 days) and calls
+`AdminOp::S3Auth` with its own ticket. The control plane checks the
+scope, the time (15 minutes, or the presigned lifetime) and the
+signature, and answers with a credential secret that acts as the parent
+ticket for 5 minutes (resolved in `admin_call` after tickets and
+sessions; it cannot manage keys) and the day's signing key. With that
+key the gateway checks the same key's next requests for 4 minutes
+itself, and the chunk signatures of streamed uploads (`chunked.rs`:
+`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, with or without trailers, and
+`STREAMING-UNSIGNED-PAYLOAD-TRAILER`). Bodies are checked against
+`x-amz-content-sha256`, `Content-MD5` and CRC32 and SHA-256 checksums in
+headers or trailers (other checksum algorithms are accepted unchecked).
+
+Reads ask `AdminOp::StoreFiles` for the version's files and what the
+gateway recorded about them (`s3_meta` table: MD5 ETag, content type,
+`x-amz-meta-*`, modification time, valid while the file's hash is the
+same), cached 2 seconds per key and bucket; a GET fetches only the
+blocks its range covers into the gateway's own store (a temporary
+directory, garbage collected; what it read is kept 10 minutes). Files
+written otherwise have an ETag made from their BLAKE3 hash, shaped like
+a multipart ETag (`<hex>-1`) so clients do not take it for an MD5.
+
+Writes stream the body into the gateway's store, then build the new
+collection from the version's files and the change, push what the
+control plane lacks (the root first, so it can tell which files it
+already has) and commit with `S3Commit { base }`, which fails with a
+conflict if another write made a version meanwhile (the gateway retries).
+Writes to one bucket that arrive while one is committed are committed
+together. S3 buckets have no versions, so a gateway write removes the
+version the gateway's previous write made (`s3_versions` table);
+versions made by `store put` or jobs stay. A key that would be both a
+file and a folder is refused, since a dataset is a file tree. Multipart
+parts live in the gateway's store until completed (24 hours at most),
+and are joined into one blob there; the ETag is the MD5 of the parts'
+MD5s with `-N`. Objects are served with `Content-Security-Policy:
+default-src 'none'; sandbox`, so an HTML object cannot run scripts on
+the dashboard's origin.
+
+### Compatibility
+
+Protocol 14, minor 4: `Hold`, `Scrub` and `Held` go only to agents that
+announced minor 4, so 1.7 agents keep working and are not storage nodes.
+New admin ops and responses are appended. The stored state's layout (7)
+is unchanged; the new tables (`replicas`, `ds_replication`, `s3_keys`,
+`s3_meta`, `s3_versions`) are created empty. A 1.7 follower does
+not understand `Mirror` or the release list: a write is then acknowledged
+without it (it catches up within 30 seconds as before) and release
+binaries stay on the leader, so upgrade every control plane.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster

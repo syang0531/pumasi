@@ -3234,6 +3234,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4531,7 +4541,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-agent"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4572,7 +4582,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-cli"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4598,7 +4608,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-cluster"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4639,16 +4649,18 @@ dependencies = [
 
 [[package]]
 name = "pumasi-dashboard"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "axum",
  "blake3",
+ "chrono",
  "crc32fast",
  "data-encoding",
  "iroh",
  "jsonwebtoken",
  "maud",
+ "md-5",
  "n0-future",
  "pumasi-agent",
  "pumasi-cluster",
@@ -4658,6 +4670,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -4669,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-guest"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "chacha20poly1305",
  "flate2",
@@ -4686,12 +4699,13 @@ dependencies = [
 
 [[package]]
 name = "pumasi-proto"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "blake3",
  "chrono",
  "data-encoding",
+ "hmac",
  "iroh",
  "iroh-blobs",
  "n0-future",

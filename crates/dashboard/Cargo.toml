@@ -25,6 +25,10 @@ tokio-util = { workspace = true, features = ["io"] }
 axum.workspace = true
 maud = "0.27"
 crc32fast = "1"
+# The S3 gateway (1.8): payload hashes, MD5 ETags, HTTP dates.
+sha2.workspace = true
+md-5.workspace = true
+chrono.workspace = true
 # HTTPS without a proxy (`--tls-cert`), on the same ring provider iroh uses.
 rustls.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

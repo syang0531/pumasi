@@ -13,13 +13,13 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::endpoint::Connection;
 pub use iroh_blobs::{
     BlobFormat, Hash, HashAndFormat,
-    api::{Store, TempTag},
+    api::{Store, TempTag, blobs::BlobStatus, proto::ExportRangesItem},
     format::collection::Collection,
     protocol::{ChunkRangesSeq, PushRequest},
     store::{GcConfig, ProtectCb, ProtectOutcome, fs::FsStore},
 };
 use iroh_blobs::{
-    api::blobs::{AddPathOptions, BlobStatus, ExportMode, ExportOptions, ImportMode},
+    api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMode},
     hashseq::HashSeq,
     store::fs::options::Options,
 };
@@ -338,4 +338,121 @@ pub async fn reconcile_tags(
         }
     }
     Ok(stale.len())
+}
+
+/// Reads back every blob of a complete collection (root, names, files)
+/// and checks it against its BLAKE3 tree: a scrub (1.8). Returns the bytes
+/// read, or an error naming the first blob whose data no longer matches.
+/// Blobs the store does not have count as damaged too.
+pub async fn verify(store: &Store, root: Hash) -> Result<u64> {
+    use n0_future::StreamExt;
+    let members = hash_seq_members(store, root).await;
+    ensure!(
+        members.len() > 1,
+        "collection {} is missing",
+        root.fmt_short()
+    );
+    let mut bytes = 0u64;
+    for hash in members {
+        let size = blob_size(store, hash)
+            .await
+            .with_context(|| format!("blob {} is missing", hash.fmt_short()))?;
+        let stream = store
+            .blobs()
+            .export_bao(hash, iroh_blobs::protocol::ChunkRanges::all())
+            .into_byte_stream();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(item) = stream.next().await {
+            item.map_err(|e| anyhow::anyhow!("blob {} is damaged: {e}", hash.fmt_short()))?;
+        }
+        bytes += size;
+    }
+    Ok(bytes)
+}
+
+/// Fetches only some files of a collection over `conn`: `files` count
+/// the collection's files from 0, each with the byte range wanted (all
+/// of it with `None`). The names blob is fetched too.
+pub async fn fetch_files(
+    store: &Store,
+    conn: Connection,
+    root: Hash,
+    files: &[(u64, Option<std::ops::Range<u64>>)],
+) -> Result<u64> {
+    use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
+    let mut b = GetRequest::builder()
+        .root(ChunkRanges::all())
+        .child(0, ChunkRanges::all());
+    let mut sorted = files.to_vec();
+    sorted.sort_by_key(|(i, _)| *i);
+    sorted.dedup_by_key(|(i, _)| *i);
+    for (i, range) in sorted {
+        let ranges = match range {
+            Some(r) => ChunkRanges::bytes(r),
+            None => ChunkRanges::all(),
+        };
+        b = b.child(i + 1, ranges);
+    }
+    let req = b.build(root);
+    let stats = store
+        .remote()
+        .execute_get(conn, req)
+        .await
+        .map_err(|e| anyhow::anyhow!("download {}: {e}", root.fmt_short()))?;
+    Ok(stats.payload_bytes_read)
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    fn data(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+            .collect()
+    }
+
+    fn find_data_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                find_data_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "data") {
+                out.push(p);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_finds_a_changed_byte() {
+        let dir =
+            std::env::temp_dir().join(format!("pumasi-verify-{:016x}", rand::random::<u64>()));
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), data(1 << 20, 1)).unwrap();
+        std::fs::write(src.join("b.txt"), b"small").unwrap();
+        let store = open_store(&dir.join("store"), None).await.unwrap();
+        let files = vec![
+            ("a.bin".to_string(), src.join("a.bin")),
+            ("b.txt".to_string(), src.join("b.txt")),
+        ];
+        let (tt, size, _) = import_files(&store, &files, false).await.unwrap();
+        let root = tt.hash();
+        let read = verify(&store, root).await.unwrap();
+        assert!(read >= size, "read {read} of {size}");
+        store.shutdown().await.unwrap();
+        drop(store);
+        let mut found = Vec::new();
+        find_data_files(&dir.join("store"), &mut found);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let mut bytes = std::fs::read(&found[0]).unwrap();
+        bytes[300_000] ^= 0xff;
+        std::fs::write(&found[0], bytes).unwrap();
+        let store = open_store(&dir.join("store"), None).await.unwrap();
+        let err = verify(&store, root).await.unwrap_err();
+        assert!(format!("{err:#}").contains("damaged"), "{err:#}");
+        store.shutdown().await.unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

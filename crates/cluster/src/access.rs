@@ -102,6 +102,13 @@ fn op_name(op: &AdminOp) -> &'static str {
             "roll out upgrades"
         }
         Canary => "read the rollout",
+        Replication { .. } => "read where the store's copies are",
+        SetReplication { .. } => "change how many copies datasets have",
+        Scrub { .. } => "check the store",
+        StoreFiles { .. } => "list datasets",
+        S3Commit { .. } => "upload to the store",
+        S3KeyCreate { .. } | S3Keys | S3KeyRevoke { .. } => "manage S3 keys",
+        S3Auth { .. } => "check S3 signatures",
     }
 }
 
@@ -151,6 +158,8 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | Confidential
             | Canary
             | NodeSettings { .. }
+            | Replication { .. }
+            | StoreFiles { .. }
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -202,6 +211,18 @@ fn own_mounts(st: &State, account: &str, sub: &JobSubmission) -> Result<()> {
 fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<AdminOp> {
     use AdminOp::*;
     match &op {
+        StoreFiles { name, version } => own_dataset(st, account, name, *version)?,
+        SetReplication {
+            name: Some(name), ..
+        } => {
+            for d in st.list_datasets(Some(name)) {
+                ensure!(
+                    d.account == account,
+                    "dataset {name} has versions of account {}",
+                    d.account
+                );
+            }
+        }
         Cancel { id }
         | Receipts { id }
         | TaskFiles { id, .. }
@@ -256,7 +277,29 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | Confidential
         | Canary
         | StoreList { .. }
+        | StoreFiles { .. }
+        | Replication { .. }
+        | SetReplication { name: Some(_), .. }
         | StoreUpload { .. }) => op,
+        S3Commit {
+            name,
+            base,
+            root,
+            account: mut asked,
+            meta,
+        } => {
+            pin(&mut asked, account)?;
+            if st.dataset(&name, None).is_ok() {
+                own_dataset(st, account, &name, None)?;
+            }
+            S3Commit {
+                name,
+                base,
+                root,
+                account: asked,
+                meta,
+            }
+        }
         Ledger {
             account: mut asked,
             limit,
@@ -348,6 +391,12 @@ pub fn scope(caller: &Caller, resp: AdminResponse) -> AdminResponse {
         AdminResponse::Datasets(mut v) => {
             v.retain(|d| d.account == *account);
             AdminResponse::Datasets(v)
+        }
+        AdminResponse::Replication(mut r) => {
+            r.datasets.retain(|d| d.account == *account);
+            r.under = r.datasets.iter().filter(|d| d.copies < d.factor).count() as u32;
+            r.leader_missing = r.datasets.iter().filter(|d| !d.leader_has).count() as u32;
+            AdminResponse::Replication(r)
         }
         AdminResponse::StoreUsage { mut usage, .. } => {
             usage.retain(|u| u.account == *account);

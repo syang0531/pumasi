@@ -23,6 +23,7 @@ mod fmt;
 mod i18n;
 mod limit;
 mod pages;
+mod s3;
 mod tls;
 mod uploads;
 mod zip;
@@ -104,6 +105,8 @@ pub(crate) struct AppState {
     waits: limit::Waits,
     /// Where the provider sends browsers back to.
     public_url: String,
+    /// The S3 gateway's state (1.8).
+    s3: s3::Gateway,
 }
 
 pub(crate) type St = Arc<AppState>;
@@ -200,6 +203,7 @@ pub async fn start_on(listener: TcpListener, config: UiConfig) -> Result<Ui> {
         sign_ins: limit::Buckets::new(limit::SIGN_IN_BURST, limit::SIGN_IN_PER_MIN / 60.0),
         waits: limit::Waits::default(),
         public_url,
+        s3: s3::Gateway::default(),
     });
     let app = router(state).into_make_service_with_connect_info::<ClientAddr>();
     let https = config.tls.is_some();
@@ -256,7 +260,9 @@ fn router(state: St) -> Router {
     let api = Router::new()
         .nest("/api/v1", api::routes(uploads))
         .route("/api/openapi.json", get(api::openapi))
-        .route("/healthz", get(|| async { "ok" }));
+        .route("/healthz", get(|| async { "ok" }))
+        // The S3 gateway (1.8) signs its own requests, also with `--api-only`.
+        .merge(s3::routes());
     let app = if state.api_only {
         api
     } else {

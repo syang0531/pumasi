@@ -119,6 +119,10 @@ enum Cmd {
     /// logins (`registry/<host>`).
     #[command(subcommand)]
     Secret(SecretCmd),
+    /// Access keys for the S3-compatible gateway that `pumasi ui` serves
+    /// at `/s3` (datasets are buckets).
+    #[command(subcommand)]
+    S3(S3Cmd),
     /// Show the CU rates and settlement policy, or change them.
     Prices {
         #[command(subcommand)]
@@ -574,6 +578,60 @@ enum StoreCmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Where the copies of each dataset version are: control planes and
+    /// nodes labelled `storage` (all datasets, or every version of NAME),
+    /// and the storage nodes with their quotas.
+    Replicas {
+        name: Option<String>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// How many copies to keep of dataset NAME (control planes included),
+    /// or `default` to use the cluster's; with --default, the cluster's
+    /// number for datasets without their own (2 unless set).
+    Copies {
+        /// NAME COPIES, or COPIES with --default.
+        #[arg(required = true, num_args = 1..=2)]
+        args: Vec<String>,
+        #[arg(long)]
+        default: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Read every stored collection back and check it against its hashes
+    /// now: the control plane's store and every storage node's replicas,
+    /// or one node's. Results appear in `pumasi events` and
+    /// `pumasi store replicas`.
+    Scrub {
+        node: Option<String>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum S3Cmd {
+    /// Make an S3 access key that acts as this ticket (its role and
+    /// account), for `aws s3`, rclone or boto3 against `pumasi ui`'s `/s3`.
+    /// The secret is shown once.
+    CreateKey {
+        /// A note to tell keys apart (`laptop rclone`).
+        #[arg(long, default_value = "")]
+        label: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// List S3 keys (this ticket's, or every one with an admin ticket).
+    Keys {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Revoke an S3 key.
+    RevokeKey {
+        id: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -920,6 +978,14 @@ struct MetricsArgs {
     /// file store cache; `off` never asks.
     #[arg(long, default_value = "20s", value_name = "DURATION|off")]
     net_probe_every: String,
+    /// How long a storage node may stay offline before its dataset
+    /// replicas are copied to other storage nodes, e.g. 6h.
+    #[arg(long, default_value = "6h", value_name = "DURATION")]
+    replica_repair_after: String,
+    /// How often every store is read back and checked against its hashes
+    /// (the control plane's and each storage node's), e.g. 7d.
+    #[arg(long, default_value = "7d", value_name = "DURATION")]
+    scrub_every: String,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1426,6 +1492,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Cmd::Webhook(cmd) => monitor::webhook(&home, cmd).await,
         Cmd::Store(cmd) => store(&home, cmd).await,
         Cmd::Secret(cmd) => secret(&home, cmd).await,
+        Cmd::S3(cmd) => s3_cmd(&home, cmd).await,
         Cmd::Agent(cmd) => agent(&home, cmd, ctrl_c(), false).await,
         Cmd::Service(cmd) => service_cmd(&home, cmd),
         Cmd::Upgrade(cmd) => upgrade::run(&home, cmd).await,
@@ -1957,6 +2024,12 @@ async fn cluster_start(
             parse_duration_ms(&metrics.net_probe_every).context("--net-probe-every")?,
         ))
     };
+    config.replica_repair_after = Duration::from_millis(
+        parse_duration_ms(&metrics.replica_repair_after).context("--replica-repair-after")?,
+    );
+    config.scrub_every =
+        Duration::from_millis(parse_duration_ms(&metrics.scrub_every).context("--scrub-every")?)
+            .max(Duration::from_secs(60));
     config.disk_class = match storage_class {
         Some(StorageClassArg::Hdd) => DiskClass::Hdd,
         Some(StorageClassArg::Ssd) => DiskClass::Ssd,
@@ -3427,6 +3500,9 @@ async fn store(home: &Path, cmd: StoreCmd) -> Result<i32> {
             let (stored, view) = client
                 .store_put(&files, Some(name.clone()), account, |m| eprintln!("{m}"))
                 .await?;
+            if let Some(d) = &view {
+                print_copies(&client, d).await;
+            }
             client.close().await;
             match view {
                 Some(d) => println!(
@@ -3547,6 +3623,71 @@ async fn store(home: &Path, cmd: StoreCmd) -> Result<i32> {
             }
             Ok(0)
         }
+        StoreCmd::Replicas { name, admin } => {
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Replication(r) = client.call(AdminOp::Replication { name }).await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            print_replication(&r);
+            Ok(0)
+        }
+        StoreCmd::Copies {
+            args,
+            default,
+            admin,
+        } => {
+            let parse = |s: &str| -> Result<Option<u8>> {
+                if s == "default" {
+                    return Ok(None);
+                }
+                let n: u8 = s
+                    .parse()
+                    .with_context(|| format!("not a number of copies: {s}"))?;
+                pumasi_proto::replica::validate_factor(n)?;
+                Ok(Some(n))
+            };
+            let (name, factor) = match (default, args.as_slice()) {
+                (true, [n]) => (None, parse(n)?),
+                (false, [name, n]) => (Some(name.clone()), parse(n)?),
+                (true, _) => bail!("give one number with --default"),
+                (false, _) => bail!("give a dataset and a number of copies (or `default`)"),
+            };
+            anyhow::ensure!(
+                name.is_some() || factor.is_some(),
+                "the default needs a number"
+            );
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::Replication(r) = client
+                .call(AdminOp::SetReplication {
+                    name: name.clone(),
+                    factor,
+                })
+                .await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            match (name, factor) {
+                (Some(n), Some(f)) => eprintln!("{n} keeps {f} copies"),
+                (Some(n), None) => eprintln!("{n} keeps the default {} copies", r.default_factor),
+                (None, _) => eprintln!("datasets keep {} copies unless set", r.default_factor),
+            }
+            Ok(0)
+        }
+        StoreCmd::Scrub { node, admin } => {
+            let client = connect_admin(home, &admin).await?;
+            client.call(AdminOp::Scrub { node: node.clone() }).await?;
+            client.close().await;
+            match node {
+                Some(n) => eprintln!("{n} is checking its replicas; see `pumasi events`"),
+                None => eprintln!(
+                    "the control plane and the storage nodes are checking their stores; see `pumasi events`"
+                ),
+            }
+            Ok(0)
+        }
         StoreCmd::Quota {
             account,
             size,
@@ -3569,6 +3710,187 @@ async fn store(home: &Path, cmd: StoreCmd) -> Result<i32> {
                 Some(b) => eprintln!("{account} may store {}", format_size(b)),
                 None => eprintln!("{account} has no quota of its own"),
             }
+            Ok(0)
+        }
+    }
+}
+
+/// Says on how many copies a new version is (1.8 control planes).
+async fn print_copies(client: &AdminClient, d: &pumasi_proto::store::DatasetView) {
+    let Ok(AdminResponse::Replication(r)) = client
+        .call(AdminOp::Replication {
+            name: Some(d.name.clone()),
+        })
+        .await
+    else {
+        return;
+    };
+    let Some(v) = r.datasets.iter().find(|v| v.version == d.version) else {
+        return;
+    };
+    let mut on = vec![if r.control_planes > 1 {
+        format!("{} control planes", r.control_planes)
+    } else {
+        "the control plane".to_string()
+    }];
+    on.extend(v.nodes.iter().filter(|n| n.counted).map(|n| n.name.clone()));
+    eprintln!("on {} of {} copies: {}", v.copies, v.factor, on.join(", "));
+    if v.copies < v.factor {
+        let usable = r.nodes.iter().filter(|n| n.not_used.is_none()).count();
+        if usable == 0 {
+            eprintln!(
+                "warning: no node keeps replicas; label owner nodes with \
+                 `pumasi node label NODE storage=SIZE` (e.g. storage=200G)"
+            );
+        } else {
+            eprintln!("warning: fewer copies than wanted; see `pumasi store replicas`");
+        }
+    }
+}
+
+fn print_replication(r: &pumasi_proto::replica::ReplicationView) {
+    use pumasi_proto::replica::ReplicaState;
+    println!(
+        "default copies: {}; control planes: {}",
+        r.default_factor, r.control_planes
+    );
+    println!("{:<28} {:>10} {:>7}  NODES", "DATASET", "SIZE", "COPIES");
+    for d in &r.datasets {
+        let nodes: Vec<String> = d
+            .nodes
+            .iter()
+            .map(|n| {
+                let state = match (n.state, n.counted) {
+                    (ReplicaState::Held, true) => "",
+                    (ReplicaState::Held, false) => " (offline, not counted)",
+                    (ReplicaState::Copying, _) => " (copying)",
+                };
+                format!("{}{state}", n.name)
+            })
+            .collect();
+        let mut copies = format!("{}/{}", d.copies, d.factor);
+        if d.own_factor {
+            copies.push('*');
+        }
+        println!(
+            "{:<28} {:>10} {:>7}  {}{}",
+            format!("{}@{}", d.name, d.version),
+            format_size(d.size),
+            copies,
+            if nodes.is_empty() {
+                "-".into()
+            } else {
+                nodes.join(", ")
+            },
+            if d.leader_has {
+                ""
+            } else {
+                "  [control plane fetching it back]"
+            }
+        );
+    }
+    if r.datasets.iter().any(|d| d.own_factor) {
+        println!("* the dataset's own number of copies");
+    }
+    if !r.nodes.is_empty() {
+        println!();
+        println!(
+            "{:<20} {:>10} {:>10} {:>9}  {:<12} SCRUBBED",
+            "STORAGE NODE", "USED", "QUOTA", "REPLICAS", "STATE"
+        );
+        for n in &r.nodes {
+            let state = match &n.not_used {
+                None => "in use".to_string(),
+                Some(why) => why.clone(),
+            };
+            let scrub = match n.scrubbed_unix {
+                Some(t) => format!(
+                    "{}{}",
+                    crate::monitor::local_time(t, true),
+                    if n.bad > 0 {
+                        format!(" ({} damaged)", n.bad)
+                    } else {
+                        String::new()
+                    }
+                ),
+                None => "never".into(),
+            };
+            println!(
+                "{:<20} {:>10} {:>10} {:>9}  {:<12} {scrub}",
+                n.name,
+                format_size(n.used),
+                n.quota
+                    .map(format_size)
+                    .unwrap_or_else(|| "90% disk".into()),
+                n.replicas,
+                state
+            );
+        }
+    }
+    if r.under > 0 {
+        println!("{} dataset versions have fewer copies than wanted", r.under);
+    }
+    if r.bad > 0 {
+        println!(
+            "the control plane's last scrub found {} damaged collections",
+            r.bad
+        );
+    }
+}
+
+async fn s3_cmd(home: &Path, cmd: S3Cmd) -> Result<i32> {
+    match cmd {
+        S3Cmd::CreateKey { label, admin } => {
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::S3Key { secret, view } =
+                client.call(AdminOp::S3KeyCreate { label }).await?
+            else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            // The one time the secret is shown, on purpose: written to
+            // stdout for the person who asked for it, never to a log.
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "access key id:     {}", view.id)?;
+            writeln!(out, "secret access key: {secret}")?;
+            out.flush()?;
+            drop(out);
+            eprintln!(
+                "acts as {} ({}); the secret is not shown again. Point S3 clients at \
+                 http://127.0.0.1:7400/s3 (pumasi ui), region us-east-1, path-style addressing.",
+                view.name, view.role
+            );
+            Ok(0)
+        }
+        S3Cmd::Keys { admin } => {
+            let client = connect_admin(home, &admin).await?;
+            let AdminResponse::S3Keys(keys) = client.call(AdminOp::S3Keys).await? else {
+                bail!("unexpected response");
+            };
+            client.close().await;
+            println!(
+                "{:<26} {:<20} {:<12} {:<20} LABEL",
+                "ID", "TICKET", "ROLE", "LAST USED"
+            );
+            for k in keys {
+                println!(
+                    "{:<26} {:<20} {:<12} {:<20} {}",
+                    k.id,
+                    k.name,
+                    k.role.to_string(),
+                    k.last_used_unix
+                        .map(|t| crate::monitor::local_time(t, true))
+                        .unwrap_or_else(|| "never".into()),
+                    k.label
+                );
+            }
+            Ok(0)
+        }
+        S3Cmd::RevokeKey { id, admin } => {
+            let client = connect_admin(home, &admin).await?;
+            client.call(AdminOp::S3KeyRevoke { id: id.clone() }).await?;
+            client.close().await;
+            eprintln!("revoked {id}");
             Ok(0)
         }
     }

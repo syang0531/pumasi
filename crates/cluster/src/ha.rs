@@ -527,6 +527,17 @@ pub enum RaftReq {
     },
     /// The leader's file store tags, for followers' copies.
     Tags,
+    // 1.8 from here.
+    /// To a follower: copy what the leader's file store has now, and
+    /// answer once done (a write waits for its copies).
+    Mirror,
+    /// The release binaries of the leader's rollout (SHA-256, size).
+    Releases,
+    /// One chunk of a release binary.
+    ReleaseChunk {
+        sha256: [u8; 32],
+        offset: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -538,6 +549,11 @@ pub enum RaftResp {
     Tags(Vec<(String, BlobHash)>),
     /// Refused: not a replica, or not ready.
     Refused(String),
+    // 1.8 from here.
+    /// Collections copied by a [`RaftReq::Mirror`].
+    Mirrored(usize),
+    Releases(Vec<([u8; 32], u64)>),
+    Chunk(Vec<u8>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -984,6 +1000,12 @@ impl Ha {
                 .await
             {
                 Ok(_) => break,
+                // Shut down (a crash or a stop): nothing more to add, and
+                // this task must let go of the endpoint.
+                Err(RaftError::Fatal(e)) => {
+                    debug!(replica = %peer.fmt_short(), "not adding the replica: {e}");
+                    return;
+                }
                 Err(e) if Instant::now() < deadline => {
                     debug!(replica = %peer.fmt_short(), "adding a learner: {e}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1005,6 +1027,10 @@ impl Ha {
             {
                 Ok(_) => {
                     info!(replica = %peer.fmt_short(), "a control plane replica joined");
+                    break;
+                }
+                Err(RaftError::Fatal(e)) => {
+                    debug!(replica = %peer.fmt_short(), "not making the replica a voter: {e}");
                     break;
                 }
                 Err(e) if Instant::now() < deadline => {
@@ -1136,6 +1162,23 @@ impl Ha {
                 Ok(t) => RaftResp::Tags(t),
                 Err(e) => RaftResp::Refused(format!("{e:#}")),
             },
+            RaftReq::Mirror => match self.leader_addr() {
+                Some(leader) if leader.id != self.endpoint.id() => {
+                    match tags.mirror(leader).await {
+                        Ok(n) => RaftResp::Mirrored(n),
+                        Err(e) => RaftResp::Refused(format!("{e:#}")),
+                    }
+                }
+                _ => RaftResp::Refused("not a follower".into()),
+            },
+            RaftReq::Releases => match tags.releases() {
+                Ok(r) => RaftResp::Releases(r),
+                Err(e) => RaftResp::Refused(format!("{e:#}")),
+            },
+            RaftReq::ReleaseChunk { sha256, offset } => match tags.release_chunk(&sha256, offset) {
+                Ok(b) => RaftResp::Chunk(b),
+                Err(e) => RaftResp::Refused(format!("{e:#}")),
+            },
             RaftReq::Join { .. } => unreachable!("handled above"),
         }
     }
@@ -1200,6 +1243,45 @@ impl Ha {
         in_flight.applied(u64::MAX);
     }
 
+    /// Asks every follower to copy the leader's file store now (1.8).
+    /// Returns how many did within `wait`.
+    pub async fn mirror_followers(&self, wait: Duration) -> usize {
+        let followers: Vec<EndpointAddr> = self
+            .members()
+            .into_iter()
+            .filter(|(id, _)| *id != self.id)
+            .filter_map(|(_, n)| n.addr)
+            .collect();
+        let mut set = tokio::task::JoinSet::new();
+        for addr in followers {
+            let endpoint = self.endpoint.clone();
+            set.spawn(async move {
+                let r: Result<usize> = async {
+                    let conn = endpoint.connect(addr, RAFT_ALPN).await?;
+                    let resp = call(&conn, &RaftReq::Mirror).await;
+                    conn.close(0u32.into(), b"done");
+                    match resp? {
+                        RaftResp::Mirrored(n) => Ok(n),
+                        RaftResp::Refused(why) => bail!("{why}"),
+                        other => bail!("unexpected answer {other:?}"),
+                    }
+                }
+                .await;
+                r
+            });
+        }
+        let mut ok = 0;
+        let deadline = tokio::time::Instant::now() + wait;
+        while let Ok(Some(r)) = tokio::time::timeout_at(deadline, set.join_next()).await {
+            match r {
+                Ok(Ok(_)) => ok += 1,
+                Ok(Err(e)) => debug!("a follower did not copy the store: {e:#}"),
+                Err(_) => {}
+            }
+        }
+        ok
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.raft.shutdown().await;
     }
@@ -1216,9 +1298,18 @@ fn op_size(op: &Op) -> usize {
     }
 }
 
-/// Lists the file store's tags (name, root), for followers' copies.
+/// Lists the file store's tags (name, root), for followers' copies, and
+/// the release binaries; copies the leader's on a follower.
 pub trait AsyncTags: Clone + Send + Sync + 'static {
     fn list(&self) -> impl std::future::Future<Output = Result<Vec<(String, BlobHash)>>> + Send;
+    /// On a follower: one copy pass from the leader at `leader`.
+    fn mirror(
+        &self,
+        leader: EndpointAddr,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send;
+    /// On the leader: the rollout's binaries (SHA-256, size).
+    fn releases(&self) -> Result<Vec<([u8; 32], u64)>>;
+    fn release_chunk(&self, sha256: &[u8; 32], offset: u64) -> Result<Vec<u8>>;
 }
 
 /// Asks the replicas in `candidates` to let this one join, following
@@ -1348,5 +1439,55 @@ pub mod mirror {
         }
         files.reconcile(&have).await?;
         Ok(fetched)
+    }
+
+    /// Copies the leader's release binaries (1.8), so a rollout continues
+    /// after a failover; drops binaries the leader no longer offers.
+    pub async fn sync_releases(
+        endpoint: &Endpoint,
+        releases: &crate::rollout::ReleaseStore,
+        leader: EndpointAddr,
+    ) -> Result<usize> {
+        const CHUNK: u64 = 4 << 20;
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            endpoint.connect(leader.clone(), RAFT_ALPN),
+        )
+        .await
+        .context("timed out")??;
+        let list = match call(&conn, &RaftReq::Releases).await? {
+            RaftResp::Releases(l) => l,
+            RaftResp::Refused(why) => bail!("{why}"),
+            other => bail!("unexpected answer {other:?}"),
+        };
+        let mut copied = 0;
+        for (sha, size) in &list {
+            if releases.has(sha, *size) {
+                continue;
+            }
+            let mut offset = 0;
+            while offset < *size {
+                let bytes = match call(
+                    &conn,
+                    &RaftReq::ReleaseChunk {
+                        sha256: *sha,
+                        offset,
+                    },
+                )
+                .await?
+                {
+                    RaftResp::Chunk(b) if !b.is_empty() => b,
+                    RaftResp::Refused(why) => bail!("{why}"),
+                    other => bail!("unexpected answer {other:?}"),
+                };
+                let len = (bytes.len() as u64).min(CHUNK);
+                offset = releases.upload(sha, *size, offset, &bytes[..len as usize])?;
+            }
+            copied += 1;
+        }
+        conn.close(0u32.into(), b"done");
+        let keep: Vec<[u8; 32]> = list.iter().map(|(s, _)| *s).collect();
+        releases.prune(&keep);
+        Ok(copied)
     }
 }

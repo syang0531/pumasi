@@ -992,12 +992,43 @@ pub struct ScheduleSpec {
     pub job: JobSubmission,
     /// Start a run even when the previous one has not finished.
     pub overlap: bool,
+    // 1.9 from here, never on the wire inside the spec (postcard skips
+    // it): [`AdminOp::SetScheduleExt`](crate::msg::AdminOp) carries it.
+    /// The IANA time zone the cron expression is read in (`Asia/Seoul`);
+    /// without one, the control plane's.
+    #[serde(skip)]
+    pub tz: Option<String>,
 }
 
 impl ScheduleSpec {
+    /// What the spec has that postcard does not carry (1.9).
+    pub fn ext(&self) -> crate::sched::ScheduleExt {
+        crate::sched::ScheduleExt {
+            tz: self.tz.clone(),
+            placement: self.job.placement.clone(),
+        }
+    }
+
+    /// Puts back what [`Self::ext`] took out.
+    pub fn set_ext(&mut self, ext: crate::sched::ScheduleExt) {
+        self.tz = ext.tz;
+        self.job.placement = ext.placement;
+    }
+
+    /// The first run after `after` (unix seconds) in its time zone.
+    pub fn next_after(&self, after: i64) -> Option<i64> {
+        self.cron
+            .parse::<Cron>()
+            .ok()?
+            .next_in(after, self.tz.as_deref())
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_schedule_name(&self.name)?;
         self.cron.parse::<Cron>()?;
+        if let Some(tz) = &self.tz {
+            crate::sched::validate_tz(tz)?;
+        }
         self.job.validate()?;
         ensure!(
             self.job.after.is_empty(),
@@ -1192,6 +1223,16 @@ impl Cron {
     pub fn next_local(&self, after: i64) -> Option<i64> {
         self.next_after(after, &chrono::Local)
     }
+
+    /// [`Self::next_after`] in the IANA time zone `tz` (`Asia/Seoul`), or
+    /// in the machine's local time without one. `None` for a zone this
+    /// build does not know.
+    pub fn next_in(&self, after: i64, tz: Option<&str>) -> Option<i64> {
+        match tz {
+            None => self.next_local(after),
+            Some(name) => self.next_after(after, &name.parse::<chrono_tz::Tz>().ok()?),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1266,36 @@ pub struct ApplySpec {
     // Phase 15 from here.
     /// The job policy of every account in `accounts`.
     pub policies: Vec<(String, AccountPolicy)>,
+    // 1.9 from here, never on the wire inside the spec (postcard skips
+    // it): [`AdminOp::ApplyExt`](crate::msg::AdminOp) carries it with the
+    // schedules' time zones and placements.
+    /// The CPU and memory quota of every account in `accounts`.
+    #[serde(skip)]
+    pub resources: Vec<(String, crate::sched::ResourceQuota)>,
+}
+
+impl ApplySpec {
+    /// What the spec has that postcard does not carry (1.9).
+    pub fn ext(&self) -> crate::sched::ApplyExt {
+        crate::sched::ApplyExt {
+            resources: self.resources.clone(),
+            schedules: self
+                .schedules
+                .iter()
+                .map(|s| (s.name.clone(), s.ext()))
+                .collect(),
+        }
+    }
+
+    /// Puts back what [`Self::ext`] took out.
+    pub fn set_ext(&mut self, ext: crate::sched::ApplyExt) {
+        self.resources = ext.resources;
+        for (name, e) in ext.schedules {
+            if let Some(s) = self.schedules.iter_mut().find(|s| s.name == name) {
+                s.set_ext(e);
+            }
+        }
+    }
 }
 
 impl ApplySpec {
@@ -1248,6 +1319,9 @@ impl ApplySpec {
         }
         for (a, p) in &self.policies {
             p.validate().with_context(|| format!("account {a}"))?;
+        }
+        for (a, r) in &self.resources {
+            r.validate().with_context(|| format!("account {a}"))?;
         }
         let mut seen = BTreeSet::new();
         for s in &self.schedules {
@@ -1474,6 +1548,11 @@ pub struct AccountFile {
     pub tolerations: Option<Vec<String>>,
     pub max_timeout: Option<String>,
     pub max_gpus_per_task: Option<u32>,
+    // 1.9: CPUs and memory, across the cluster and per node label.
+    pub cpus: Option<u32>,
+    pub memory: Option<String>,
+    #[serde(default)]
+    pub label_quotas: Vec<crate::sched::LabelQuotaFile>,
 }
 
 /// `allow` or `deny` (`--network`, `network =` in cluster.toml): whether
@@ -1487,6 +1566,21 @@ pub fn parse_network_rule(s: &str) -> Result<bool> {
 }
 
 impl AccountFile {
+    /// The `[accounts.NAME]` CPU and memory fields (1.9).
+    pub fn resources(&self) -> Result<crate::sched::ResourceQuota> {
+        let q = crate::sched::ResourceQuota {
+            cpus: self.cpus,
+            memory_bytes: self.memory.as_deref().map(parse_size).transpose()?,
+            labels: self
+                .label_quotas
+                .iter()
+                .map(|l| l.quota())
+                .collect::<Result<_>>()?,
+        };
+        q.validate()?;
+        Ok(q)
+    }
+
     /// The `[accounts.NAME]` policy fields.
     pub fn policy(&self) -> Result<AccountPolicy> {
         let mut executors = self.executors.clone();
@@ -1552,6 +1646,8 @@ pub struct ScheduleFile {
     pub account: Option<String>,
     #[serde(default)]
     pub overlap: bool,
+    /// The IANA time zone of `cron` (1.9): `"Asia/Seoul"`.
+    pub tz: Option<String>,
 }
 
 impl ClusterFile {
@@ -1591,6 +1687,9 @@ impl ClusterFile {
             let policy = a
                 .policy()
                 .with_context(|| format!("account {account}: policy"))?;
+            let resources = a
+                .resources()
+                .with_context(|| format!("account {account}: cpus and memory"))?;
             let q = AccountQuota {
                 slots: a.slots,
                 gpus: a.gpus,
@@ -1608,6 +1707,7 @@ impl ClusterFile {
                     .with_context(|| format!("account {account}: storage"))?,
             };
             spec.policies.push((account.clone(), policy));
+            spec.resources.push((account.clone(), resources));
             spec.accounts.push((account, q));
         }
         for (name, s) in self.schedules {
@@ -1627,6 +1727,7 @@ impl ClusterFile {
                 cron: s.cron,
                 job,
                 overlap: s.overlap,
+                tz: s.tz,
             });
         }
         if let Some(a) = &self.alerts {
@@ -2044,6 +2145,18 @@ mod tests {
         assert_eq!(spec.accounts.len(), 2);
         assert_eq!(spec.schedules[0].job.tasks.len(), 4);
         assert_eq!(spec.alerts, Some(AlertPolicy::default()));
+        // 1.9: CPU and memory quotas and a schedule's time zone.
+        assert_eq!(spec.schedules[0].tz.as_deref(), Some("Asia/Seoul"));
+        let alice = &spec.resources.iter().find(|(a, _)| a == "alice").unwrap().1;
+        assert_eq!(alice.cpus, Some(16));
+        assert_eq!(alice.memory_bytes, Some(64 << 30));
+        assert_eq!(
+            alice.labels[0].to_string(),
+            "zone=office slots=4 cpus=8 memory=16G"
+        );
+        let bob = &spec.resources.iter().find(|(a, _)| a == "bob").unwrap().1;
+        assert!(bob.is_empty());
+        assert!(!spec.ext().is_empty());
     }
 
     #[test]

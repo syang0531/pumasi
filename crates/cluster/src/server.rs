@@ -1292,6 +1292,35 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                         }
                     }
                 }
+                Ok(Some(FromAgent::Stopped { task, checkpoint, error })) => {
+                    // A checkpoint counts only when it is complete in the
+                    // store, like a stored output.
+                    let (checkpoint, error) = match checkpoint {
+                        None => (None, error),
+                        Some(c) if c.size > MAX_STORE_OUTPUT_BYTES => (
+                            None,
+                            Some(format!(
+                                "the checkpoint of {} is over the {} limit",
+                                format_size(c.size),
+                                format_size(MAX_STORE_OUTPUT_BYTES)
+                            )),
+                        ),
+                        Some(c) => match inner.files.stored(&c.root).await {
+                            Ok(got) if got == c => (Some(c), error),
+                            Ok(got) => (
+                                None,
+                                Some(format!(
+                                    "the checkpoint has {} files of {} bytes, not {} of {}",
+                                    got.files, got.size, c.files, c.size
+                                )),
+                            ),
+                            Err(e) => (None, Some(format!("checkpoint: {e:#}"))),
+                        },
+                    };
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_stopped(&node_id, generation, task, checkpoint, error);
+                }
                 Ok(Some(FromAgent::Held { roots, failed, scrub })) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
@@ -1543,6 +1572,9 @@ impl ProtocolHandler for AdminHandler {
 /// Runs one ticket-holding admin call: checks the ticket and its role,
 /// runs the call, filters the reply, and writes the audit log.
 async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str) -> AdminResponse {
+    // 1.9 carries placements, time zones and CPU quotas beside the old
+    // calls; from here on they are the old calls with those filled in.
+    let op = op.joined();
     let admin = inner.admin_secret();
     let by_ticket = |st: &crate::state::State, secret: &Secret| {
         if secrets_eq(secret, &admin) {
@@ -2830,6 +2862,14 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             Ok(AdminResponse::Ok)
         }
         AdminOp::Quotas => Ok(AdminResponse::Quotas(inner.state().quotas())),
+        AdminOp::Resources => Ok(AdminResponse::Resources(inner.state().resources())),
+        AdminOp::SetResources { account, quota } => {
+            inner.state().set_resources(&account, *quota)?;
+            Ok(AdminResponse::Ok)
+        }
+        AdminOp::Placement { id } => Ok(AdminResponse::Placement(Box::new(
+            inner.state().placement_view(id).context("no such job")?,
+        ))),
         AdminOp::SetAccountPolicy { account, policy } => {
             inner.state().set_account_policy(&account, *policy)?;
             Ok(AdminResponse::Ok)

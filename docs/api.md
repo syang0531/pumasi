@@ -613,6 +613,32 @@ curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$id:$secret" "$PUMASI_URL/s
 With the AWS CLI, rclone or boto3, use the endpoint `$PUMASI_URL/s3`,
 any region and path-style addressing (README, "S3 gateway").
 
+### Placement, CPU quotas and checkpoints (1.9)
+
+A job's placement (`gang`, `spread`, `affinity`, `checkpoint` from its
+job.toml), why it waits when placement holds it back, the tasks saving a
+checkpoint before they move, and each task's last checkpoint (a submitter
+reads its own jobs):
+
+```sh
+curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/placement"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/placement" | jq -e '(.checkpoints | type == "array") and (.stopping | type == "array") and .placement.gang == false' -->
+
+CPU and memory quotas: whole CPUs and memory an account's running tasks
+hold at once (a WASM task holds one CPU), and limits on the nodes a label
+selector picks. `PUT` replaces the whole quota (admin ticket); `{}`
+removes it:
+
+```sh
+curl -fsS -X PUT -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' \
+  -d '{"cpus": 8, "memory": "16G", "label_quotas": ["zone=office slots=4 gpus=1"]}' \
+  "$PUMASI_URL/api/v1/accounts/lab/resources"
+curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/resources"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/resources" | jq -e '.[] | select(.account == "lab") | .quota.cpus == 8 and .quota.memory_bytes == 17179869184 and (.quota.labels | length) == 1 and .used.cpus == 0' -->
+<!-- ci: curl -fsS -X PUT -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{}' "$PUMASI_URL/api/v1/accounts/lab/resources" | jq -e '.ok' -->
+
 Every route, with its parameters, is in `$PUMASI_URL/api/openapi.json`
 (OpenAPI 3.1), which code generators and tools such as Postman read.
 

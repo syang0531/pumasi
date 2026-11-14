@@ -26,14 +26,26 @@ cu_per_day = 50                    # CU spent in any 24 hours
 max_priority = 10                  # highest job priority it may ask for
 storage = "100G"                   # file store space
 
+# CPU and memory its running tasks hold at once (1.9; a WASM task holds
+# one CPU), and limits on the nodes a label selector picks.
+cpus = 16
+memory = "64G"
+
+[[accounts.alice.label_quotas]]
+selector = "zone=office"
+slots = 4
+cpus = 8
+memory = "16G"
+
 [accounts.bob]
 slots = 2
 
 # Jobs submitted on a cron schedule (minute hour day month weekday, in the
-# control plane's local time; @hourly, @daily, @weekly and @monthly work
-# too). `job` is relative to this file.
+# control plane's local time, or in `tz`; @hourly, @daily, @weekly and
+# @monthly work too). `job` is relative to this file.
 [schedules.nightly-wordcount]
 cron = "0 3 * * *"
+tz = "Asia/Seoul"                  # 03:00 in Seoul, wherever the control plane is
 job = "python-wordcount/job.toml"
 account = "alice"
 overlap = false                    # skip a run while the last one is going

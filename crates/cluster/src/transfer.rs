@@ -232,7 +232,7 @@ impl AdminClient {
                 },
             );
         }
-        match self.call(AdminOp::Submit(Box::new(sub))).await? {
+        match self.call(AdminOp::submit(sub)).await? {
             AdminResponse::Submitted { id } => Ok(id),
             _ => bail!("unexpected response"),
         }

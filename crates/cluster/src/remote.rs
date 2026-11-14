@@ -286,7 +286,7 @@ impl State {
         if self.members.is_empty() {
             return "the cluster has no nodes".into();
         }
-        let usage = self.account_usage();
+        let usage = self.usage();
         if !self.within_quota(&need, &usage) {
             return format!(
                 "account {} is at its quota (`pumasi quota {}`)",
@@ -301,10 +301,12 @@ impl State {
                 let name = self.node_name(id);
                 let why = match self.nodes.get(id) {
                     None => "offline".to_string(),
-                    Some(n) => match self.refusal(id, n, &need, &labels, 0, &[]) {
-                        Some(r) => r.to_string(),
-                        None => "busy with other work".to_string(),
-                    },
+                    Some(n) => {
+                        match self.refusal(id, n, &need, &labels, &crate::sched::Room::default()) {
+                            Some(r) => r.to_string(),
+                            None => "busy with other work".to_string(),
+                        }
+                    }
                 };
                 format!("{name} ({why})")
             })
@@ -346,6 +348,8 @@ impl State {
             && !self.over_daily(&account);
         let confidential = sub.tier == Tier::Confidential;
         let need = Need {
+            place: None,
+            checkpoint: sub.placement.checkpoint.is_some(),
             item: QueueItem {
                 job: JobId(0),
                 index: 0,
@@ -387,16 +391,18 @@ impl State {
             let name = self.node_name(id);
             let why = match self.nodes.get(id) {
                 None => Some("offline".to_string()),
-                Some(n) => match self.refusal(id, n, &need, &labels, 0, &[]) {
-                    Some(r) => Some(r.to_string()),
-                    None if confidential
-                        && (n.perf.protocol < pumasi_proto::CONFIDENTIAL_PROTOCOL
-                            || self.conf.usable_tees(id).is_empty()) =>
-                    {
-                        Some("does not start confidential VMs (SEV-SNP or TDX)".to_string())
+                Some(n) => {
+                    match self.refusal(id, n, &need, &labels, &crate::sched::Room::default()) {
+                        Some(r) => Some(r.to_string()),
+                        None if confidential
+                            && (n.perf.protocol < pumasi_proto::CONFIDENTIAL_PROTOCOL
+                                || self.conf.usable_tees(id).is_empty()) =>
+                        {
+                            Some("does not start confidential VMs (SEV-SNP or TDX)".to_string())
+                        }
+                        None => None,
                     }
-                    None => None,
-                },
+                }
             };
             match why {
                 None => ready_nodes.push(name),
@@ -408,7 +414,7 @@ impl State {
                 [one] => format!("it waits for job {one}"),
                 many => format!("it waits for {} jobs", many.len()),
             })
-        } else if !self.within_quota(&need, &self.account_usage()) {
+        } else if !self.within_quota(&need, &self.usage()) {
             ready_nodes.clear();
             Some(format!(
                 "account {account} is at its quota (`pumasi quota {account}`)"
@@ -501,6 +507,8 @@ impl State {
             .is_some_and(|a| a.balance > floor)
             && !self.over_daily(account);
         let need_for = |executor: Executor, gpu: Option<GpuRequest>, graphics: bool| Need {
+            place: None,
+            checkpoint: false,
             item: QueueItem {
                 job: JobId(0),
                 index: 0,
@@ -526,7 +534,7 @@ impl State {
             trusted_only: false,
             confidential: None,
         };
-        let usage = self.account_usage();
+        let usage = self.usage();
         let at_quota = !self.within_quota(&need_for(Executor::Wasm, None, false), &usage);
         let labels = self.online_labels();
         let one_gpu = GpuRequest {
@@ -558,7 +566,7 @@ impl State {
             let mut reasons: Vec<String> = Vec::new();
             for &e in &executors {
                 let need = need_for(e, None, false);
-                match self.refusal(id, n, &need, &labels, 0, &[]) {
+                match self.refusal(id, n, &need, &labels, &crate::sched::Room::default()) {
                     None => ok.push(e),
                     Some(r) => {
                         let r = r.to_string();
@@ -600,8 +608,7 @@ impl State {
                             n,
                             &need_for(e, Some(one_gpu.clone()), graphics),
                             &labels,
-                            0,
-                            &[],
+                            &crate::sched::Room::default(),
                         )
                         .is_none()
                     })

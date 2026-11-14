@@ -5,7 +5,7 @@ members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "cr
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "1.8.0"
+version = "1.9.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/syang0531/pumasi"
@@ -42,6 +42,8 @@ data-encoding = "2"
 sysinfo = "0.37"
 # Local time of day for availability hours.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# IANA time zones for schedules (1.9).
+chrono-tz = "0.10"
 redb = "4"
 uuid = { version = "1", features = ["v4", "serde"] }
 # microVM executor: image layers, the guest's disks and registry pulls.

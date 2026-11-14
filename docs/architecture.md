@@ -2504,6 +2504,120 @@ not understand `Mirror` or the release list: a write is then acknowledged
 without it (it catches up within 30 seconds as before) and release
 binaries stay on the leader, so upgrade every control plane.
 
+## Phase 25: scheduling (1.9)
+
+Release 1.9 adds to the scheduler what a job says about where its tasks
+go and how they move: gangs, spreading and affinity between jobs, CPU and
+memory quotas (also on the nodes a label picks), checkpoints that survive
+preemption, drain, pauses and sleep, and cron schedules in a time zone.
+The new logic lives in `cluster/src/sched.rs`; the types, job.toml fields
+and their checks in `proto/src/sched.rs`.
+
+### Placement
+
+A job's `Placement` (`gang`, `spread`, `near`, `away`, `by`, `checkpoint`)
+comes from job.toml and is checked with the submission (at most 16 jobs
+named, a grace period of 10 minutes at most, no checkpoints for microVM,
+confidential or deterministic jobs; an image job that checkpoints runs on
+Docker). It is kept beside the job's metadata (`job_place`) and the
+scheduler's `Need` carries what it implies for one run (`PlaceNeed`):
+the job's runs per spread group, and the groups (`Domain::of`: the node,
+or the values of a label key) where the named jobs run now. A node a
+placement rules out is refused with a reason (`NoLabel`, `Spread`,
+`NotNear`, `Away`, `LabelQuota`), which `pumasi job` and the job page show
+as the job's `waiting` line.
+
+`best_node` picks among the nodes that fit: the emptiest spread group
+first, then the run's own (or, for check runs, trusted) machines, then
+the most free slots. Affinity only looks at jobs of the same account, by
+name or id, and only at runs that are running (a queued job attracts
+nothing).
+
+### Gangs
+
+The queue walk pulls every queued run of a gang job together
+(`place_gang`) and plans them on a copy of the usage and of each node's
+room (`Room`: slots and GPUs freed by stopping runs, taken by runs
+planned before). When free room is short it plans preemption for the
+rest (`plan_preempt` with the runs already chosen), and when any victim
+stops with a grace period, or runs are already stopping there, the gang
+waits for them instead of starting part of itself. Either every run is
+placed or none is. When a run of a gang goes back to the queue (moved, or
+retried after a failure), its running mates are stopped too
+(`stop_gang_mates`), gently when they checkpoint, so the gang starts
+again together; mates that already finished stay finished.
+
+### CPU and memory quotas
+
+`ResourceQuota` adds whole CPUs and memory to an account's slot, GPU and
+CU limits, plus `LabelQuota`s: a selector and the slots, CPUs, memory and
+GPUs the account may hold on the nodes it matches. A run holds what it
+asks for: one CPU for WASM, `vcpus(cpu_millis)` for images, its memory
+limit, its GPUs. `usage()` sums the runs on every node, by account and by
+(node, account); `within_quota` checks the account totals and
+`label_quota_refusal` the label quotas of the node being considered.
+Runs being cancelled or stopped keep counting until their node reports,
+as they keep their slot. The quotas are set with `AdminOp::SetResources`
+(`pumasi quota --cpus --memory --label-quota`, the Accounts page, `PUT
+/api/v1/accounts/NAME/resources`, or `cpus`, `memory` and
+`label_quotas` in cluster.toml, where an account listed without them has
+none).
+
+### Checkpoints
+
+A run of a checkpointing job gets `TaskAssignment::checkpoint`: its
+grace period and its last checkpoint (`restore`, a collection in the file
+store), plus `PUMASI_CHECKPOINT=/checkpoint` in its environment. The
+agent puts the checkpoint (or an empty directory) at `/checkpoint`:
+`docker cp` into the container (mode 0777, so any user writes), or a
+preopened WASI directory.
+
+When such a run has to move (preemption, drain, `--on-pause requeue`, a
+gang mate moving), `evict` sends `ToAgent::Stop` with the grace period
+instead of `Cancel`, and the run stays in the node's `running` and
+`stopping` maps, keeping its slot and GPUs, so nothing else lands on
+them. The agent's executor sends Docker containers SIGTERM (`docker kill
+--signal TERM`, passed on by `--init`) and kills them when the grace
+period is over; a WASM run cannot catch a signal and is stopped at once.
+Then the agent copies `/checkpoint` out, pushes it to the file store like
+an output, and answers `FromAgent::Stopped` instead of a report. The
+control plane checks the collection is complete in its store (as for
+stored outputs), tags it `ckpt/<job>/<index>`, records it in
+`checkpoints`, frees the slot and puts the task back in the queue
+without counting an attempt. A run that is not done within its grace
+period plus `STOP_MARGIN` (5 minutes, for the upload) is cancelled and
+goes on from the checkpoint it had. A run that finishes during its grace
+period reports as usual.
+
+A machine going to sleep stops its checkpointing runs first, with 10
+seconds for all of them (`SLEEP_STOP_BUDGET`), before it says goodbye.
+Checkpoint tags go when the job ends; the records stay, so the job's page
+still shows how often its tasks resumed, until the job itself expires.
+
+### Schedules in a time zone
+
+`ScheduleSpec::tz` (an IANA name, checked against chrono-tz) makes
+`Cron::next_in` count in that zone; without it the control plane's local
+time as before. `pumasi schedule add --tz`, `tz` in cluster.toml and the
+Schedules page set it; the schedule list shows it after the cron line
+(`0 9 * * * (Asia/Seoul)`).
+
+### Compatibility
+
+Protocol 14, minor 5 (`CHECKPOINT_MINOR`): checkpointing runs go only to
+agents that announced minor 5, and `Stop` only to them; 1.8 agents keep
+working and never get such runs. The 1.9 fields of `JobSubmission`,
+`ScheduleSpec` and `ApplySpec` are `#[serde(skip)]`, so their postcard
+layout (and layout 7 of the stored state) is unchanged; they travel in
+new admin ops (`SubmitPlaced`, `CheckJobPlaced`, `SetScheduleExt`,
+`ApplyExt`), which a client sends only when one is set and the control
+plane joins back into the old ones (`AdminOp::joined`). So a 1.9 CLI
+works against a 1.8 control plane for everything that does not use the
+new fields, and a 1.8 CLI against a 1.9 control plane (its `apply`
+gives the accounts it lists no CPU or memory quota, as a 1.9 cluster.toml
+that lists them without one does). New admin ops
+and responses (`Resources`, `SetResources`, `Placement`) are appended.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -2600,6 +2714,14 @@ holding the hash, never the secret) and the meta key `rollout_canary`.
 An older control plane ignores both; its dashboard sessions are in
 memory as before.
 
+Phase 25 (1.9) keeps layout 7 and adds the tables `job_place` (a job's
+placement, by job id), `checkpoints` (by job and task index: the
+checkpoint's root, size, files, node and how often a run resumed from
+it), `account_resources` (CPU and memory quotas, by account) and
+`schedule_ext` (a schedule's time zone and its job's placement, by
+name), last in `tables!`. Expired jobs lose their `job_place` and
+`checkpoints` rows. An older control plane ignores them.
+
 `PROTOCOL_VERSION` is 14 (phase 16, above): protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
@@ -2632,7 +2754,8 @@ remotely; install a current binary on them once.
   ACME (certificates come from certbot, a proxy or a tunnel), failed
   sign-in counts live in each `pumasi ui` process, `?wait=` polls the
   control plane, and policies cannot limit CPU, memory or CU per job
-  (quotas cover slots, GPUs and CU per day).
+  (account quotas cover slots, GPUs, CU per day, and since 1.9 CPUs and
+  memory).
 
 - File store: replicas on owner nodes (the control plane is the only full
   copy, so back up `<cluster dir>/blobs`), an S3-compatible gateway, and
@@ -2647,11 +2770,12 @@ remotely; install a current binary on them once.
   per-job allow lists or bandwidth caps, egress is not billed, and
   Firecracker without QEMU has no network (its cards need TAP devices;
   install QEMU next to it).
-- Cluster management: no affinity or anti-affinity between jobs, no
-  gang scheduling (all tasks of a job at once), no per-node or per-label
-  quotas, quotas count tasks rather than CPU or memory, preemption stops a
-  task instead of letting it checkpoint, and schedules use the control
-  plane's time zone only.
+- Cluster management: microVM tasks cannot checkpoint (and WASM tasks
+  are stopped without warning, keeping what they saved so far); a
+  checkpoint is saved when a run moves, not periodically, so a machine
+  that dies without notice loses the progress since the last move;
+  affinity sees only running tasks of the same account; CPU quotas count
+  whole CPUs a run asks for, not what it uses.
 - Monitoring: live microVM output covers the first MiB of each stream;
   Intel and Apple GPUs report use and memory but no temperature or power;
   DRM fdinfo sees only processes the agent may read; Windows desktops

@@ -453,6 +453,11 @@ pub struct JobSubmission {
     /// Driver capabilities its Docker GPU tasks need beyond `compute` and
     /// `utility` (NVIDIA).
     pub gpu_capabilities: Vec<GpuCapability>,
+    // 1.9 from here, never on the wire inside a submission (postcard skips
+    // it): see [`crate::sched`].
+    /// Gangs, spreading, affinity and checkpoints.
+    #[serde(skip)]
+    pub placement: crate::sched::Placement,
 }
 
 impl JobSubmission {
@@ -471,7 +476,8 @@ impl JobSubmission {
         }
         if self.tier == Tier::Confidential {
             self.executor = Executor::Microvm;
-        } else if !self.gpu_capabilities.is_empty() {
+        } else if !self.gpu_capabilities.is_empty() || self.placement.checkpoint.is_some() {
+            // Checkpoints need Docker's stop signal (microVMs have none yet).
             self.executor = Executor::Docker;
         }
     }
@@ -606,6 +612,7 @@ impl JobSubmission {
             self.limits.memory_bytes >= 64 * 1024,
             "memory limit must be at least 64 KiB"
         );
+        self.placement.validate(self)?;
         Ok(())
     }
 }
@@ -708,6 +715,21 @@ pub struct JobFile {
     /// Fail a task no node took within this long (`"2m"`), with the
     /// reason, instead of leaving it in the queue.
     pub queue_timeout: Option<String>,
+    // 1.9 from here.
+    /// Start every task together or none (`gang = true`).
+    #[serde(default)]
+    pub gang: bool,
+    /// Spread the tasks over nodes (`"node"`) or a label's values
+    /// (`"zone"`), or `{ by = "zone", max = 2 }` for at most 2 at once in
+    /// each.
+    pub spread: Option<crate::sched::SpreadFile>,
+    /// `near = ["db"]`, `away = ["batch"]`, `by = "zone"`: run only where
+    /// (or never where) those jobs' tasks run.
+    pub affinity: Option<crate::sched::AffinityFile>,
+    /// `true` or `{ grace = "1m" }`: a task that has to move gets SIGTERM
+    /// and the grace period, and its `/checkpoint` comes back when it runs
+    /// again.
+    pub checkpoint: Option<crate::sched::CheckpointFile>,
 }
 
 /// `gpus = 2` or `gpus = "all"`.
@@ -1183,6 +1205,13 @@ impl JobFile {
             .transpose()
             .context("queue_timeout")?;
         let wants_gpu = gpu.is_some();
+        let placement = crate::sched::placement_of(
+            self.gang,
+            self.spread.as_ref(),
+            self.affinity.as_ref(),
+            self.checkpoint.as_ref(),
+        )?;
+        let checkpoints = placement.checkpoint.is_some();
         let output_dataset = match &self.output {
             Some(o) => {
                 let name = o
@@ -1194,6 +1223,7 @@ impl JobFile {
             None => None,
         };
         let sub = JobSubmission {
+            placement,
             queue_timeout_ms,
             gpu_capabilities,
             priority: self.priority.unwrap_or(0),
@@ -1224,8 +1254,9 @@ impl JobFile {
             max_price_per_hour: self.max_price_per_hour,
             account: None,
             deterministic: match executor {
-                // GPU results are not bit-identical across GPUs.
-                Executor::Wasm => self.deterministic.unwrap_or(!wants_gpu),
+                // GPU results are not bit-identical across GPUs, and a
+                // resumed run does not compute what a whole one would.
+                Executor::Wasm => self.deterministic.unwrap_or(!wants_gpu && !checkpoints),
                 Executor::Docker | Executor::Microvm | Executor::Image => {
                     ensure!(
                         self.deterministic != Some(true),
@@ -1413,6 +1444,58 @@ mod tests {
     }
 
     #[test]
+    fn placement_fields_resolve() {
+        let dir = tempdir();
+        let f = JobFile::parse(
+            r#"
+            image = "python:3.12-slim"
+            command = ["python", "train.py"]
+            shards = 4
+            gang = true
+            spread = { by = "zone", max = 2 }
+            affinity = { near = ["db"], away = ["batch"], by = "rack" }
+            checkpoint = { grace = "45s" }
+            "#,
+        )
+        .unwrap();
+        let sub = f.resolve(&dir).unwrap();
+        let p = &sub.placement;
+        assert!(p.gang);
+        let sp = p.spread.as_ref().unwrap();
+        assert_eq!(sp.by, crate::sched::Domain::Label("zone".into()));
+        assert_eq!(sp.max, Some(2));
+        assert_eq!(p.near, vec!["db"]);
+        assert_eq!(p.away, vec!["batch"]);
+        assert_eq!(p.by, crate::sched::Domain::Label("rack".into()));
+        assert_eq!(p.checkpoint.as_ref().unwrap().grace_ms, 45_000);
+        sub.validate().unwrap();
+
+        // Short forms; a checkpointing WASM job is not deterministic.
+        let f =
+            JobFile::parse("module = \"m.wasm\"\nspread = \"node\"\ncheckpoint = true").unwrap();
+        std::fs::write(dir.join("m.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        let sub = f.resolve(&dir).unwrap();
+        assert_eq!(
+            sub.placement.spread.as_ref().unwrap().by,
+            crate::sched::Domain::Node
+        );
+        assert_eq!(
+            sub.placement.checkpoint.as_ref().unwrap().grace_ms,
+            crate::sched::DEFAULT_GRACE_MS
+        );
+        assert!(!sub.deterministic);
+
+        // Checkpoints need Docker or WASM, and a run that may stop.
+        let vm = JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\ncheckpoint = true")
+            .unwrap();
+        assert!(vm.resolve(&dir).and_then(|s| s.validate()).is_err());
+        let long = JobFile::parse("image = \"busybox\"\ncheckpoint = { grace = \"2h\" }").unwrap();
+        assert!(long.resolve(&dir).and_then(|s| s.validate()).is_err());
+        let typo = JobFile::parse("image = \"busybox\"\nspread = { by = \"zone\", mx = 2 }");
+        assert!(typo.is_err() || typo.unwrap().resolve(&dir).is_err());
+    }
+
+    #[test]
     fn microvm_job_uses_the_docker_fields() {
         let dir = tempdir();
         let f = JobFile::parse(
@@ -1452,6 +1535,16 @@ mod tests {
             assert_eq!(sub.gpu.as_ref().map(|g| g.count), Some(count), "{file}");
             sub.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn checkpoint_example_resolves() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/checkpoint");
+        let text = std::fs::read_to_string(dir.join("job.toml")).unwrap();
+        let sub = JobFile::parse(&text).unwrap().resolve(&dir).unwrap();
+        sub.validate().unwrap();
+        assert_eq!(sub.executor, Executor::Docker);
+        assert_eq!(sub.placement.checkpoint.unwrap().grace_ms, 30_000);
     }
 
     #[test]

@@ -15,6 +15,7 @@ n0-future.workspace = true
 tokio.workspace = true
 blake3.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 data-encoding.workspace = true
 sha2.workspace = true
 hmac.workspace = true

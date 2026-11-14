@@ -659,6 +659,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+dependencies = [
+ "chrono",
+ "phf",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4223,6 +4233,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4541,7 +4569,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-agent"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4582,7 +4610,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-cli"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4608,7 +4636,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-cluster"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4649,7 +4677,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-dashboard"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4682,7 +4710,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-guest"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "chacha20poly1305",
  "flate2",
@@ -4699,11 +4727,12 @@ dependencies = [
 
 [[package]]
 name = "pumasi-proto"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "blake3",
  "chrono",
+ "chrono-tz",
  "data-encoding",
  "hmac",
  "iroh",
@@ -5653,6 +5682,12 @@ checksum = "2b6f884fa9a8d48101774bfbd3aeb81e968dd22cffd19a372da69f183db22c1a"
 dependencies = [
  "bitflags 2.13.2",
 ]
+
+[[package]]
+name = "siphasher"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "slab"

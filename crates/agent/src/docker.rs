@@ -507,6 +507,9 @@ impl DockerExecutor {
 
         self.copy_in(&name, shared_files, &input.files, io.staged.as_deref())
             .await?;
+        if let Some(c) = &io.checkpoint {
+            self.copy_checkpoint_in(&name, &c.dir).await?;
+        }
 
         let mut child = Command::new(&self.bin)
             .args(["start", "--attach", "--interactive", &name])
@@ -539,13 +542,27 @@ impl DockerExecutor {
 
         let deadline = run_start + Duration::from_millis(limits.timeout_ms);
         let mut stopped: Option<Outcome> = None;
+        // A checkpointing run asked to stop: told so (SIGTERM, which
+        // `--init` passes on), and killed when its grace period is over.
+        let mut grace_end: Option<Instant> = None;
         let status = loop {
             tokio::select! {
                 s = child.wait() => break s?,
                 _ = tokio::time::sleep(Duration::from_millis(100)), if stopped.is_none() => {
-                    if cancel.load(Ordering::Relaxed) {
+                    if let Some(c) = &io.checkpoint
+                        && grace_end.is_none()
+                        && let Some(grace) = c.stop.requested()
+                    {
+                        debug!(container = %name, ?grace, "asking the container to stop");
+                        c.stop.deliver();
+                        grace_end = Some(Instant::now() + grace);
+                        let _ = self.cli(&["kill", "--signal", "TERM", &name]).await;
+                    }
+                    if cancel.load(Ordering::Relaxed)
+                        || grace_end.is_some_and(|g| Instant::now() >= g)
+                    {
                         stopped = Some(Outcome::Cancelled);
-                    } else if Instant::now() >= deadline {
+                    } else if grace_end.is_none() && Instant::now() >= deadline {
                         stopped = Some(Outcome::Timeout);
                     }
                     if stopped.is_some() {
@@ -555,6 +572,11 @@ impl DockerExecutor {
                 }
             }
         };
+        if let Some(c) = &io.checkpoint
+            && c.stop.delivered()
+        {
+            self.copy_checkpoint_out(&name, &c.dir).await?;
+        }
         let stdout = out_task.await.unwrap_or_default();
         let mut stderr = err_task.await.unwrap_or_default();
 
@@ -645,6 +667,80 @@ impl DockerExecutor {
         fed.context("copy input files")?
             .context("copy input files")?;
         Ok(())
+    }
+
+    /// Puts the task's last checkpoint (or an empty directory) at
+    /// `/checkpoint`, writable by any user.
+    async fn copy_checkpoint_in(&self, name: &str, dir: &std::path::Path) -> Result<()> {
+        let files = pumasi_proto::job::dir_files(dir)?;
+        let bytes: u64 = files.iter().map(|(_, _, n)| n).sum();
+        let timeout = CLI_TIMEOUT + Duration::from_secs(bytes / (10 << 20));
+        let mut child = Command::new(&self.bin)
+            .args(["cp", "-", &format!("{name}:/")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("docker cp")?;
+        let stdin = child.stdin.take().expect("piped");
+        let feed = tokio::task::spawn_blocking(move || -> Result<()> {
+            let w = tokio_util::io::SyncIoBridge::new(stdin);
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, w);
+            write_checkpoint_tar(&mut w, &files)?;
+            std::io::Write::flush(&mut w)?;
+            Ok(())
+        });
+        let out = tokio::time::timeout(timeout, child.wait_with_output())
+            .await
+            .context("copying the checkpoint in timed out")??;
+        let fed = feed.await;
+        if !out.status.success() {
+            bail!(
+                "copy the checkpoint in: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        fed.context("copy the checkpoint in")?
+            .context("copy the checkpoint in")?;
+        Ok(())
+    }
+
+    /// Replaces `dir` with the container's `/checkpoint` (`docker cp
+    /// name:/checkpoint -`), up to the file store's output limit.
+    async fn copy_checkpoint_out(&self, name: &str, dir: &std::path::Path) -> Result<()> {
+        let mut child = Command::new(&self.bin)
+            .args([
+                "cp",
+                &format!("{name}:{}", pumasi_proto::sched::CHECKPOINT_DIR),
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("docker cp")?;
+        let out = child.stdout.take().expect("piped");
+        let dir = dir.to_path_buf();
+        let res = tokio::task::spawn_blocking(move || -> Result<u32> {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)?;
+            }
+            std::fs::create_dir_all(&dir)?;
+            extract_dir_tar(tokio_util::io::SyncIoBridge::new(out), &dir, "checkpoint/")
+        })
+        .await;
+        let _ = child.kill().await;
+        match res {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(dropped)) => bail!(
+                "the checkpoint is over {} GiB ({dropped} files left out)",
+                MAX_STORE_OUTPUT_BYTES >> 30
+            ),
+            Ok(Err(e)) => Err(e.context("read the checkpoint")),
+            Err(e) => bail!("read the checkpoint: {e}"),
+        }
     }
 
     /// Extracts `/output` into `dir` (`docker cp name:/output -`), up to
@@ -924,6 +1020,58 @@ fn input_tar(shared: &[FileEntry], own: &[FileEntry]) -> Result<Vec<u8>> {
 /// Writes the input tar: `/input` with the files mounted from the store
 /// (`staged`: path in `/input`, file on disk, size), then the job's shared
 /// files and the task's own (later ones win), and an empty `/output`.
+/// A tar of `checkpoint/` (open to any user) and the files of the last
+/// checkpoint under it.
+fn write_checkpoint_tar<W: std::io::Write>(
+    w: W,
+    files: &[(String, std::path::PathBuf, u64)],
+) -> Result<()> {
+    let mut b = tar::Builder::new(w);
+    b.mode(tar::HeaderMode::Deterministic);
+    let mut dirs = std::collections::BTreeSet::new();
+    dirs.insert(String::new());
+    let mut dir = |b: &mut tar::Builder<W>, path: &str| -> Result<()> {
+        if !dirs.insert(path.to_string()) {
+            return Ok(());
+        }
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o777);
+        h.set_size(0);
+        b.append_data(&mut h, format!("checkpoint/{path}"), std::io::empty())?;
+        Ok(())
+    };
+    {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o777);
+        h.set_size(0);
+        b.append_data(&mut h, "checkpoint/", std::io::empty())?;
+    }
+    for (path, file, size) in files {
+        validate_rel_path(path)?;
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut parent = String::new();
+        for part in &parts[..parts.len() - 1] {
+            parent.push_str(part);
+            parent.push('/');
+            dir(&mut b, &parent)?;
+        }
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o666);
+        h.set_size(*size);
+        let f = std::fs::File::open(file).with_context(|| format!("read {}", file.display()))?;
+        b.append_data(
+            &mut h,
+            format!("checkpoint/{path}"),
+            std::io::Read::take(f, *size),
+        )?;
+    }
+    b.finish()?;
+    Ok(())
+}
+
 fn write_input_tar<W: std::io::Write>(
     w: W,
     shared: &[FileEntry],
@@ -992,6 +1140,15 @@ fn write_input_tar<W: std::io::Write>(
 /// Writes the regular files under `output/` of a tar stream into `dir`,
 /// within the file store's output limits. Returns how many were left out.
 pub(crate) fn extract_output_tar<R: std::io::Read>(r: R, dir: &std::path::Path) -> Result<u32> {
+    extract_dir_tar(r, dir, "output/")
+}
+
+/// [`extract_output_tar`] for the files under `prefix`.
+pub(crate) fn extract_dir_tar<R: std::io::Read>(
+    r: R,
+    dir: &std::path::Path,
+    prefix: &str,
+) -> Result<u32> {
     let mut ar = tar::Archive::new(r);
     let mut total = 0u64;
     let mut kept = 0usize;
@@ -1002,7 +1159,7 @@ pub(crate) fn extract_output_tar<R: std::io::Read>(r: R, dir: &std::path::Path) 
             continue;
         }
         let name = entry.path()?.to_string_lossy().replace('\\', "/");
-        let Some(rel) = name.strip_prefix("output/") else {
+        let Some(rel) = name.strip_prefix(prefix) else {
             continue;
         };
         let rel = rel.to_string();

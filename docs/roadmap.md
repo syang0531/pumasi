@@ -23,7 +23,7 @@ on real machines.
 | 22 | 1.6 | Monitoring: live microVM output, every GPU and temperature, node-to-node network | done |
 | 23 | 1.7 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | done |
 | 24 | 1.8 | File store on several machines and an S3-compatible gateway | done |
-| 25 | 1.9 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | planned |
+| 25 | 1.9 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | done |
 | 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | planned |
 | 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | planned |
 | 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | planned |
@@ -233,6 +233,15 @@ hand: a dataset survives moving the control plane to another PC without
 copying `blobs`.
 
 ## 25. Scheduling: gangs, affinity, CPU and memory quotas, checkpoints (1.9)
+
+Done in 1.9.0 ([release notes](releases/v1.9.0.md)). What differs from
+the plan below: `spread` caps a group with `max` or only prefers the
+emptiest without it; affinity names jobs of the same account by name or
+id; a machine going to sleep gives checkpointing runs 10 seconds at most;
+microVM tasks cannot checkpoint yet, and a WASM task is stopped at once
+with what it saved so far (it cannot catch a signal); a checkpoint is
+saved when a run is moved, not periodically
+([details](architecture.md#phase-25-scheduling-19)).
 
 - **Gang scheduling** (`gang = true`): all tasks of a job start together
   or none do.

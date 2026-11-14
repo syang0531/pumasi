@@ -299,6 +299,21 @@ pub struct TaskAssignment {
     /// A confidential task: the job's image, command, environment and
     /// inputs above are left out, and come sealed instead.
     pub confidential: Option<crate::confidential::ConfidentialTask>,
+    // Minor 5 (1.9) from here; only agents of minor 5 get checkpointing
+    // tasks.
+    /// The task keeps checkpoints: how to stop it, and what to put back in
+    /// its checkpoint directory first.
+    pub checkpoint: Option<CheckpointTask>,
+}
+
+/// How a checkpointing task runs (minor 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointTask {
+    /// From the stop signal to the kill when [`ToAgent::Stop`] comes.
+    pub grace_ms: u64,
+    /// The last checkpoint, fetched from the file store into
+    /// [`crate::sched::CHECKPOINT_DIR`] before the run starts.
+    pub restore: Option<Mount>,
 }
 
 /// Which executors a node can run right now, and why the others it was
@@ -376,6 +391,15 @@ pub enum ToAgent {
     /// Check every replica against its hashes now; answered with
     /// [`FromAgent::Held`] carrying the scrub report.
     Scrub,
+    // Minor 5 (1.9) from here.
+    /// Stop a checkpointing run so it can move: the stop signal, at most
+    /// `grace_ms` for it to end, then the kill. The agent pushes the run's
+    /// checkpoint directory to the file store and answers with
+    /// [`FromAgent::Stopped`] instead of a report.
+    Stop {
+        task: TaskRef,
+        grace_ms: u64,
+    },
 }
 
 /// How a task ended.
@@ -562,6 +586,15 @@ pub enum FromAgent {
         roots: Vec<BlobHash>,
         failed: Vec<(BlobHash, String)>,
         scrub: Option<crate::replica::ScrubReport>,
+    },
+    // Minor 5 (1.9) from here.
+    /// A run stopped after [`ToAgent::Stop`] (or because the machine is
+    /// about to sleep): its checkpoint, pushed to the file store before
+    /// this, when it left one; `error` says why there is none.
+    Stopped {
+        task: TaskRef,
+        checkpoint: Option<StoredOutput>,
+        error: Option<String>,
     },
 }
 
@@ -1048,9 +1081,136 @@ pub enum AdminOp {
         /// A presigned URL's lifetime.
         expires: Option<u32>,
     },
+    // 1.9 from here. The first four carry what postcard leaves out of a
+    // submission, a schedule or an `apply` (see [`crate::sched`]); a
+    // client sends them only when there is something to carry
+    // ([`AdminOp::submit`] and friends), so a 1.8 control plane takes the
+    // rest as before. The control plane turns them back into the plain
+    // calls ([`AdminOp::joined`]) before anything else looks at them.
+    /// [`AdminOp::Submit`] with a placement.
+    SubmitPlaced {
+        sub: Box<JobSubmission>,
+        placement: Box<crate::sched::Placement>,
+    },
+    /// [`AdminOp::CheckJob`] with a placement.
+    CheckJobPlaced {
+        sub: Box<JobSubmission>,
+        placement: Box<crate::sched::Placement>,
+        upload_bytes: u64,
+    },
+    /// [`AdminOp::SetSchedule`] with a time zone or a placement.
+    SetScheduleExt {
+        spec: Box<ScheduleSpec>,
+        ext: Box<crate::sched::ScheduleExt>,
+    },
+    /// [`AdminOp::Apply`] with CPU and memory quotas or schedules' time
+    /// zones and placements.
+    ApplyExt {
+        spec: Box<ApplySpec>,
+        ext: Box<crate::sched::ApplyExt>,
+    },
+    /// Every account's CPU and memory quota and what it holds.
+    Resources,
+    /// Sets (replaces) an account's CPU and memory quota; answers like
+    /// [`AdminOp::Resources`].
+    SetResources {
+        account: String,
+        quota: Box<crate::sched::ResourceQuota>,
+    },
+    /// A job's placement, its runs being stopped and its tasks'
+    /// checkpoints.
+    Placement {
+        id: JobId,
+    },
 }
 
 impl AdminOp {
+    /// The call that submits `sub`: [`AdminOp::SubmitPlaced`] when it has a
+    /// placement, else [`AdminOp::Submit`].
+    pub fn submit(mut sub: JobSubmission) -> AdminOp {
+        if sub.placement.is_empty() {
+            return AdminOp::Submit(Box::new(sub));
+        }
+        let placement = Box::new(std::mem::take(&mut sub.placement));
+        AdminOp::SubmitPlaced {
+            sub: Box::new(sub),
+            placement,
+        }
+    }
+
+    /// The call that checks `sub` ([`AdminOp::CheckJob`]).
+    pub fn check_job(mut sub: JobSubmission, upload_bytes: u64) -> AdminOp {
+        if sub.placement.is_empty() {
+            return AdminOp::CheckJob {
+                sub: Box::new(sub),
+                upload_bytes,
+            };
+        }
+        let placement = Box::new(std::mem::take(&mut sub.placement));
+        AdminOp::CheckJobPlaced {
+            sub: Box::new(sub),
+            placement,
+            upload_bytes,
+        }
+    }
+
+    /// The call that sets a schedule ([`AdminOp::SetSchedule`]).
+    pub fn set_schedule(spec: ScheduleSpec) -> AdminOp {
+        let ext = spec.ext();
+        if ext.is_empty() {
+            AdminOp::SetSchedule(Box::new(spec))
+        } else {
+            AdminOp::SetScheduleExt {
+                spec: Box::new(spec),
+                ext: Box::new(ext),
+            }
+        }
+    }
+
+    /// The call that applies a `cluster.toml` ([`AdminOp::Apply`]). A plain
+    /// `Apply` means no CPU or memory quota for the accounts it lists and
+    /// no time zone or placement for its schedules, which is what a file
+    /// an older CLI could read says.
+    pub fn apply(spec: ApplySpec) -> AdminOp {
+        let ext = spec.ext();
+        if ext.is_empty() {
+            AdminOp::Apply(Box::new(spec))
+        } else {
+            AdminOp::ApplyExt {
+                spec: Box::new(spec),
+                ext: Box::new(ext),
+            }
+        }
+    }
+
+    /// The plain call with what the 1.9 calls carry put back in place
+    /// (the control plane's side of [`AdminOp::submit`] and friends).
+    pub fn joined(self) -> AdminOp {
+        match self {
+            AdminOp::SubmitPlaced { mut sub, placement } => {
+                sub.placement = *placement;
+                AdminOp::Submit(sub)
+            }
+            AdminOp::CheckJobPlaced {
+                mut sub,
+                placement,
+                upload_bytes,
+            } => {
+                sub.placement = *placement;
+                AdminOp::CheckJob { sub, upload_bytes }
+            }
+            AdminOp::SetScheduleExt { mut spec, ext } => {
+                spec.set_ext(*ext);
+                AdminOp::SetSchedule(spec)
+            }
+            AdminOp::ApplyExt { mut spec, ext } => {
+                spec.set_ext(*ext);
+                AdminOp::Apply(spec)
+            }
+            op => op,
+        }
+    }
+
     /// Calls anyone may make, without a ticket (sign-in).
     pub fn is_sign_in(&self) -> bool {
         matches!(
@@ -1221,6 +1381,9 @@ pub enum AdminResponse {
         name: String,
         role: crate::manage::AccessRole,
     },
+    // 1.9 from here.
+    Resources(Vec<crate::sched::ResourceView>),
+    Placement(Box<crate::sched::PlacementView>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part
@@ -1739,6 +1902,84 @@ mod tests {
             "AdminOp is {} bytes",
             std::mem::size_of::<AdminOp>()
         );
+    }
+
+    /// 1.9 fields ride in new calls only when set, and come back intact
+    /// through postcard.
+    #[test]
+    fn placements_and_time_zones_travel_beside_old_calls() {
+        use crate::sched::{Checkpoint, Placement};
+        let sub = crate::job::JobSubmission {
+            name: "j".into(),
+            executor: crate::job::Executor::Wasm,
+            module: vec![],
+            docker: None,
+            files: vec![],
+            tasks: vec![],
+            limits: Default::default(),
+            tier: crate::job::Tier::Open,
+            max_attempts: 1,
+            max_price_per_hour: None,
+            account: None,
+            deterministic: false,
+            mounts: vec![],
+            task_mounts: vec![],
+            output_dataset: None,
+            gpu: None,
+            priority: 0,
+            selector: Default::default(),
+            tolerations: vec![],
+            after: vec![],
+            queue_timeout_ms: None,
+            gpu_capabilities: vec![],
+            placement: Default::default(),
+        };
+        assert!(matches!(AdminOp::submit(sub.clone()), AdminOp::Submit(_)));
+        let mut placed = sub.clone();
+        placed.placement = Placement {
+            gang: true,
+            checkpoint: Some(Checkpoint { grace_ms: 9_000 }),
+            ..Default::default()
+        };
+        let op = AdminOp::submit(placed.clone());
+        assert!(matches!(op, AdminOp::SubmitPlaced { .. }));
+        let bytes = postcard::to_stdvec(&op).unwrap();
+        let back: AdminOp = postcard::from_bytes(&bytes).unwrap();
+        let AdminOp::Submit(got) = back.joined() else {
+            panic!("not joined");
+        };
+        assert_eq!(got.placement, placed.placement);
+
+        let spec = crate::manage::ScheduleSpec {
+            name: "s".into(),
+            cron: "0 9 * * *".into(),
+            job: sub,
+            overlap: false,
+            tz: Some("Asia/Seoul".into()),
+        };
+        let op = AdminOp::set_schedule(spec.clone());
+        let bytes = postcard::to_stdvec(&op).unwrap();
+        let back: AdminOp = postcard::from_bytes(&bytes).unwrap();
+        let AdminOp::SetSchedule(got) = back.joined() else {
+            panic!("not joined");
+        };
+        assert_eq!(*got, spec);
+        let mut plain = spec;
+        plain.tz = None;
+        assert!(matches!(
+            AdminOp::set_schedule(plain),
+            AdminOp::SetSchedule(_)
+        ));
+    }
+
+    #[test]
+    fn cron_runs_in_its_time_zone() {
+        let c: crate::manage::Cron = "0 9 * * *".parse().unwrap();
+        // 2026-03-01 00:00 UTC; 09:00 in Seoul is 00:00 UTC.
+        let t0 = 1_772_323_200;
+        assert_eq!(c.next_in(t0, Some("Asia/Seoul")), Some(t0 + 86_400));
+        assert_eq!(c.next_in(t0, Some("UTC")), Some(t0 + 9 * 3600));
+        assert_eq!(c.next_in(t0, Some("Mars/Base")), None);
     }
 
     fn node() -> NodeInfo {

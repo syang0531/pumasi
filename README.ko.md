@@ -513,10 +513,28 @@ pumasi whoami
 
 submitter는 노드 퇴출, 단가·쿼터 변경, 다른 계정의 작업 보기나 데이터셋 마운트를 할 수 없고, 계정의 `max_priority`가 허용하지 않으면 우선순위 0으로만 제출합니다. `pumasi whoami`(와 `GET /api/v1/whoami`)는 submitter에게 자기 계정의 쿼터와 작업 정책을 보여 주므로, 쓸 수 있는 이미지와 실행기를 직접 확인할 수 있습니다.
 
-**스케줄과 의존성.** 작업을 cron 일정(컨트롤 플레인의 현지 시간)으로 돌릴 수 있고, 이전 실행이 아직 끝나지 않았으면 그 회차는 건너뜁니다(`--overlap`이면 겹쳐 실행). `after`는 지정한 작업들이 성공할 때까지 작업을 붙잡아 두고, 하나라도 실패하면 함께 실패시킵니다.
+**갱·분산·어피니티(1.9).** job.toml에서 `gang = true`면 작업의 태스크가 모두 함께 시작하거나 하나도 시작하지 않습니다(하나가 옮겨지면 나머지도 멈췄다가 함께 다시 시작). `spread`는 태스크를 서로 다른 노드나 라벨 값에 나누고, `affinity`는 같은 계정의 다른 작업 옆에 두거나 떨어뜨립니다.
+
+```toml
+gang = true
+spread = { by = "zone", max = 2 }             # spread = "node"는 상한 없이 나누기만 선호
+affinity = { near = ["db"], away = ["batch"], by = "node" }
+```
+
+이런 작업이 왜 기다리는지는 `pumasi job ID`와 대시보드의 작업 페이지에 나옵니다.
+
+**CPU·메모리 쿼터(1.9).** 태스크 수뿐 아니라, 계정의 실행 중인 태스크가 한꺼번에 차지하는 CPU(정수 개, WASM 태스크는 1개)와 메모리, 그리고 라벨 셀렉터로 고른 노드에서 차지하는 양을 제한할 수 있습니다.
 
 ```sh
-pumasi schedule add nightly job.toml --cron "0 3 * * *" --account alice
+pumasi quota alice --cpus 16 --memory 64G --label-quota "zone=office slots=4 cpus=8 memory=16G"
+```
+
+**체크포인트(1.9).** `checkpoint = true`(또는 `{ grace = "1m" }`)인 태스크는 옮겨져야 할 때(선점, `pumasi drain`, `--on-pause requeue`로 일시 중지된 기기, 잠드는 기기) 바로 죽지 않고 SIGTERM과 유예 시간(기본 30초)을 받습니다. `/checkpoint`(`$PUMASI_CHECKPOINT`)에 써 둔 것은 파일 저장소로 올라가고, 다음 실행은 어느 노드에서든 그 내용을 그대로 받아 시작합니다. Docker와 WASM 태스크가 체크포인트를 쓸 수 있습니다(WASM은 그때까지 저장한 것으로 바로 멈춤). [`examples/checkpoint`](examples/checkpoint)는 긴 계산을 이어서 끝냅니다.
+
+**스케줄과 의존성.** 작업을 cron 일정(컨트롤 플레인의 현지 시간, 또는 `--tz Asia/Seoul`이나 cluster.toml의 `tz`로 정한 시간대)으로 돌릴 수 있고, 이전 실행이 아직 끝나지 않았으면 그 회차는 건너뜁니다(`--overlap`이면 겹쳐 실행). `after`는 지정한 작업들이 성공할 때까지 작업을 붙잡아 두고, 하나라도 실패하면 함께 실패시킵니다.
+
+```sh
+pumasi schedule add nightly job.toml --cron "0 3 * * *" --tz Asia/Seoul --account alice
 pumasi schedule ls
 pumasi run merge.toml --after 작업ID         # 또는 job.toml에 after = ["작업ID"]
 ```
@@ -842,7 +860,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md). 1.5.1은 `--trusted-proxy`를 더해, 다른 기기의 리버스 프록시 뒤에서 모든 클라이언트가 로그인 실패 제한 하나를 같이 쓰던 문제를 고쳤습니다: [노트](docs/releases/v1.5.1.md). 1.6.0은 실행 중인 microVM 태스크의 출력을 바로 보여 주고, 모든 GPU와 Windows 온도를 보고하고, 노드 사이 네트워크를 재고, 경보 일시 중지·반복 알림·노드별 기준을 더했습니다: [노트](docs/releases/v1.6.0.md). 1.7.0은 대시보드 로그인을 재시작 뒤에도 유지하고, 경보 규칙·웹훅·요금·예약 작업·`cluster.toml`·노드 작업 조건을 브라우저에서 고치며, 카나리 롤아웃·실시간 차트·휴대폰 화면을 더했습니다: [노트](docs/releases/v1.7.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를, 22단계(1.6)에서 모니터링을, 23단계(1.7)에서 대시보드를 다뤘습니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md). 1.5.1은 `--trusted-proxy`를 더해, 다른 기기의 리버스 프록시 뒤에서 모든 클라이언트가 로그인 실패 제한 하나를 같이 쓰던 문제를 고쳤습니다: [노트](docs/releases/v1.5.1.md). 1.6.0은 실행 중인 microVM 태스크의 출력을 바로 보여 주고, 모든 GPU와 Windows 온도를 보고하고, 노드 사이 네트워크를 재고, 경보 일시 중지·반복 알림·노드별 기준을 더했습니다: [노트](docs/releases/v1.6.0.md). 1.7.0은 대시보드 로그인을 재시작 뒤에도 유지하고, 경보 규칙·웹훅·요금·예약 작업·`cluster.toml`·노드 작업 조건을 브라우저에서 고치며, 카나리 롤아웃·실시간 차트·휴대폰 화면을 더했습니다: [노트](docs/releases/v1.7.0.md). 1.8.0은 파일 저장소를 여러 기기에 두고 S3 게이트웨이를 더했습니다: [노트](docs/releases/v1.8.0.md). 1.9.0은 갱 스케줄링, 분산·어피니티, CPU·메모리 쿼터, 체크포인트, 스케줄 시간대를 더했습니다: [노트](docs/releases/v1.9.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를, 22단계(1.6)에서 모니터링을, 23단계(1.7)에서 대시보드를, 24단계(1.8)에서 파일 저장소를, 25단계(1.9)에서 스케줄링을 다뤘습니다. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -867,8 +885,8 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 21 | 잠드는 기기와 Docker 없는 기기: 태스크 실행 중 잠자기 막기, 잠들기 전에 알려 태스크를 바로 옮기기, 대기 작업이 있으면 Wake-on-LAN으로 깨우기, `executor = "image"`(Docker가 있으면 Docker, 없으면 microVM), Windows 서비스에서 유휴 감지, `--on-pause requeue`, 2013~2014년 Mac에 Linux를 설치하는 안내 | 완료(1.5) |
 | 22 | 모니터링: microVM 실시간 출력, Windows 온도, Intel·AMD·Apple GPU 지표, 재시작해도 남는 최근 1시간 지표, 노드 간 지연·대역폭, 경보 일시 중지와 라벨별 임계값 | 완료(1.6) |
 | 23 | 대시보드: 재시작해도 유지되는 로그인, 경보·웹훅·요금·스케줄·라벨·노드 가용 정책을 브라우저에서 수정, 카나리 배포, 실시간 차트, 휴대폰 화면 | 완료(1.7) |
-| 24 | 여러 기기에 걸친 파일 저장소: 소유자 노드 복제본과 복구·검사, 충분한 사본에 쓴 뒤 완료 응답, S3 호환 게이트웨이 | 예정(1.8) |
-| 25 | 스케줄링: 갱 스케줄링, 어피니티·안티어피니티, CPU·메모리 쿼터, 라벨별 쿼터, 선점·drain 뒤에도 이어지는 체크포인트, 스케줄 시간대 | 예정(1.9) |
+| 24 | 여러 기기에 걸친 파일 저장소: 소유자 노드 복제본과 복구·검사, 충분한 사본에 쓴 뒤 완료 응답, S3 호환 게이트웨이 | 완료(1.8) |
+| 25 | 스케줄링: 갱 스케줄링, 분산, 어피니티·안티어피니티, CPU·메모리 쿼터, 라벨별 쿼터, 선점·drain·일시 중지·잠자기 뒤에도 이어지는 체크포인트(Docker·WASM), 스케줄 시간대 | 완료(1.9) |
 | 26 | GPU: WebGPU 제한 시간과 GPU 챌린지, AMD 벤치마크와 Docker 작업, GPU 나눠 쓰기(분수, MIG) | 예정(1.10) |
 | 27 | Windows: Pumasi가 관리하는 WSL 배포판의 Docker(Docker Desktop·로그인 불필요), ARM64 microVM, 확실히 빠르면 HCS 백엔드 | 예정(1.11) |
 | 28 | 운영: 공유·피어별 요청 제한, 서명된 체크포인트 뒤 감사 로그 정리, SCIM, HTTPS 프록시 뒤의 CLI, 팔로워 읽기 | 예정(1.12) |

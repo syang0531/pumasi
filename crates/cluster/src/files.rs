@@ -519,7 +519,7 @@ impl FileStore {
 }
 
 /// Every tag the control plane manages.
-const TAG_PREFIXES: &[&str] = &["ds/", "out/", "chk/", "in/", "up/", "img/", "job/"];
+const TAG_PREFIXES: &[&str] = &["ds/", "out/", "chk/", "in/", "up/", "img/", "job/", "ckpt/"];
 
 pub fn ds_tag(name: &str, version: u32) -> String {
     format!("ds/{name}/{version}")
@@ -535,6 +535,15 @@ pub fn out_prefix(job: u128) -> String {
 
 pub fn chk_tag(job: u128, index: u32, attempt: u32) -> String {
     format!("chk/{job:016x}/{index}/{attempt}")
+}
+
+/// A task's latest checkpoint (1.9).
+pub fn ckpt_tag(job: u128, index: u32) -> String {
+    format!("ckpt/{job:016x}/{index}")
+}
+
+pub fn ckpt_prefix(job: u128) -> String {
+    format!("ckpt/{job:016x}/")
 }
 
 pub fn in_prefix(job: u128) -> String {

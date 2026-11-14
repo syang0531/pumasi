@@ -216,6 +216,7 @@ async fn metrics_live_logs_events_and_prometheus() {
     // first output shows while it runs, within a second of being printed.
     let id = {
         let sub = JobSubmission {
+            placement: Default::default(),
             name: "clock".into(),
             executor: Executor::Wasm,
             module: wat::parse_str(CLOCK_THEN_DONE_WAT).unwrap(),

@@ -182,7 +182,8 @@ impl State {
         if !self.current(id, generation) {
             return;
         }
-        let moved = self.move_runs(id, "node went to sleep");
+        // The agent stopped its checkpointing runs before it said so.
+        let moved = self.move_runs(id, "node went to sleep", false);
         let r = self.power.nodes.entry(id.to_string()).or_default();
         r.asleep_since = Some(now_unix());
         r.wake_tries = 0;
@@ -208,8 +209,9 @@ impl State {
     }
 
     /// Stops the node's runs and puts them back in the queue, without
-    /// counting them against their jobs. Returns how many.
-    pub(crate) fn move_runs(&mut self, id: &str, reason: &str) -> u32 {
+    /// counting them against their jobs. Returns how many. With
+    /// `graceful`, runs that keep checkpoints save them first (1.9).
+    pub(crate) fn move_runs(&mut self, id: &str, reason: &str, graceful: bool) -> u32 {
         let running: Vec<TaskRef> = self
             .nodes
             .get(id)
@@ -217,7 +219,7 @@ impl State {
             .unwrap_or_default();
         let mut moved = 0;
         for t in running {
-            if self.evict(id, t, reason) {
+            if self.evict_with(id, t, reason, graceful) {
                 moved += 1;
             }
         }
@@ -365,7 +367,7 @@ impl State {
             .keys()
             .map(|id| (id.clone(), self.node_labels(id)))
             .collect();
-        let usage = self.account_usage();
+        let usage = self.usage();
         let items: Vec<_> = self.queue.iter().take(WAKE_SCAN).copied().collect();
         let mut claimed: HashMap<String, u32> = HashMap::new();
         let mut wake = BTreeSet::new();
@@ -382,7 +384,7 @@ impl State {
             let mut busy = false;
             let mut ready = false;
             for (id, n) in self.nodes.iter().filter(|(_, n)| n.online) {
-                match self.refusal(id, n, &need, &labels, 0, &[]) {
+                match self.refusal(id, n, &need, &labels, &crate::sched::Room::default()) {
                     None => ready = true,
                     Some(
                         Refusal::Full
@@ -409,7 +411,7 @@ impl State {
                     let n = &self.nodes[id.as_str()];
                     claimed.get(id.as_str()).copied().unwrap_or(0) < n.info.slots
                         && self
-                            .refusal_as(id, n, &need, &labels, 0, &[], true)
+                            .refusal_as(id, n, &need, &labels, &crate::sched::Room::default(), true)
                             .is_none()
                 })
                 .collect();

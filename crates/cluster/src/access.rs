@@ -109,6 +109,13 @@ fn op_name(op: &AdminOp) -> &'static str {
         S3Commit { .. } => "upload to the store",
         S3KeyCreate { .. } | S3Keys | S3KeyRevoke { .. } => "manage S3 keys",
         S3Auth { .. } => "check S3 signatures",
+        SubmitPlaced { .. } => "submit jobs",
+        CheckJobPlaced { .. } => "check jobs",
+        SetScheduleExt { .. } => "change schedules",
+        ApplyExt { .. } => "apply cluster files",
+        Resources => "read quotas",
+        SetResources { .. } => "set quotas",
+        Placement { .. } => "read jobs",
     }
 }
 
@@ -160,6 +167,8 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | NodeSettings { .. }
             | Replication { .. }
             | StoreFiles { .. }
+            | Resources
+            | Placement { .. }
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -229,6 +238,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | Job { id, .. }
         | TaskDetails { id }
         | TaskExecutors { id }
+        | Placement { id }
         | Logs { job: id, .. } => own_job(st, account, id)?,
         RemoveSchedule { name } | RunSchedule { name } => {
             if let Some(other) = st.schedule_account(name) {
@@ -263,6 +273,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | Job { .. }
         | TaskDetails { .. }
         | TaskExecutors { .. }
+        | Placement { .. }
         | Logs { .. }) => op,
         op @ (Metrics { .. } | Events { .. } | Alerts | AlertTuning | Net) => op,
         op @ (Status
@@ -272,6 +283,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | GetStoragePolicy
         | StoreUsage
         | Quotas
+        | Resources
         | Schedules
         | WhoAmI
         | Confidential
@@ -408,6 +420,10 @@ pub fn scope(caller: &Caller, resp: AdminResponse) -> AdminResponse {
         AdminResponse::Quotas(mut v) => {
             v.retain(|q| q.account == *account);
             AdminResponse::Quotas(v)
+        }
+        AdminResponse::Resources(mut v) => {
+            v.retain(|r| r.account == *account);
+            AdminResponse::Resources(v)
         }
         AdminResponse::Schedules(mut v) => {
             v.retain(|s| s.account == *account);

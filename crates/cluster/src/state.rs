@@ -157,6 +157,10 @@ pub struct JobMeta {
     /// in their own table.
     #[serde(skip)]
     pub origin: crate::remote::JobOrigin,
+    /// Gang, spreading, affinity and checkpoints (1.9), persisted in their
+    /// own table.
+    #[serde(skip)]
+    pub place: pumasi_proto::sched::Placement,
 }
 
 /// What a run produced, kept for a check run until the check settles in
@@ -301,10 +305,14 @@ pub(crate) struct NodeRuntime {
     pub unavailable: Vec<(Executor, String)>,
     /// Its Docker GPU tasks can draw.
     pub gpu_graphics: bool,
+    /// Runs told to stop so they can move (1.9), and when the control
+    /// plane stops waiting for their checkpoint. They stay in `running`
+    /// (holding their slot and GPUs) until they have stopped.
+    pub stopping: HashMap<TaskRef, Instant>,
 }
 
 impl NodeRuntime {
-    fn free_slots(&self) -> u32 {
+    pub(crate) fn free_slots(&self) -> u32 {
         self.info.slots.saturating_sub(self.running.len() as u32)
     }
 }
@@ -349,6 +357,11 @@ pub(crate) struct Need {
     pub trusted_only: bool,
     /// `tier = "confidential"`: only TEE nodes, once sealed (phase 16).
     pub confidential: Option<crate::confidential::ConfNeed>,
+    /// Spreading and affinity (1.9): where the job's and the named jobs'
+    /// runs are.
+    pub place: Option<Box<crate::sched::PlaceNeed>>,
+    /// The run keeps checkpoints (1.9): only agents of minor 5.
+    pub checkpoint: bool,
 }
 
 /// Why a node cannot take a run, for `queue_timeout` failures and the
@@ -382,6 +395,17 @@ pub(crate) enum Refusal<'a> {
     Tee(Option<&'a str>),
     /// The confidential image or input is not sealed yet.
     Sealing(&'static str),
+    /// The node lacks the label the job spreads or keeps close by (1.9).
+    NoLabel(&'a str),
+    /// As many of the job's runs as `spread.max` allows already run in the
+    /// node's group.
+    Spread(u32, &'a pumasi_proto::sched::Domain),
+    /// No run of this job (`near`) is in the node's group.
+    NotNear(&'a str),
+    /// A run of this job (`away`) is in the node's group.
+    Away(&'a str),
+    /// The account holds all its quota on nodes this selector matches.
+    LabelQuota(&'a pumasi_proto::manage::Selector),
 }
 
 impl std::fmt::Display for Refusal<'_> {
@@ -419,6 +443,18 @@ impl std::fmt::Display for Refusal<'_> {
             Refusal::Tee(Some(why)) => write!(f, "confidential VMs unavailable: {why}"),
             Refusal::Tee(None) => f.write_str("does not start confidential VMs (SEV-SNP or TDX)"),
             Refusal::Sealing(what) => f.write_str(what),
+            Refusal::NoLabel(k) => write!(f, "no label {k} (the job spreads or keeps close by it)"),
+            Refusal::Spread(max, by) => write!(
+                f,
+                "{max} of the job's tasks already run in its {} (spread.max)",
+                match by {
+                    pumasi_proto::sched::Domain::Node => "node".to_string(),
+                    d => format!("{d}"),
+                }
+            ),
+            Refusal::NotNear(j) => write!(f, "no task of job {j} runs here (affinity near)"),
+            Refusal::Away(j) => write!(f, "a task of job {j} runs here (affinity away)"),
+            Refusal::LabelQuota(s) => write!(f, "the account's quota on {s} nodes is used up"),
         }
     }
 }
@@ -483,6 +519,8 @@ pub struct State {
     pub(crate) settings: crate::canary::SettingsState,
     /// Replicas of datasets on nodes and S3 keys (1.8).
     pub(crate) reps: crate::replicas::RepState,
+    /// CPU and memory quotas, checkpoints, gangs waiting (1.9).
+    pub(crate) sched: crate::sched::SchedState,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -568,6 +606,7 @@ impl State {
             canary: None,
             settings: Default::default(),
             reps: Default::default(),
+            sched: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -577,6 +616,9 @@ impl State {
         let loaded = Instant::now();
         let mut job_origin: HashMap<u128, crate::remote::JobOrigin> =
             snap.job_origin.into_iter().collect();
+        let mut job_place: HashMap<u128, pumasi_proto::sched::Placement> =
+            snap.job_place.into_iter().collect();
+        state.load_sched(snap.checkpoints, snap.account_resources);
         state.rollout = state.load_rollout()?;
         state.names = state.load_node_names()?;
         state.power.nodes = state.load_power()?;
@@ -590,6 +632,7 @@ impl State {
             meta.ext = job_ext.remove(&meta.id.0).unwrap_or_default();
             meta.sched = job_sched.remove(&meta.id.0).unwrap_or_default();
             meta.origin = job_origin.remove(&meta.id.0).unwrap_or_default();
+            meta.place = job_place.remove(&meta.id.0).unwrap_or_default();
             meta.gpu = job_gpu.remove(&meta.id.0).or_else(|| {
                 // Jobs from before phase 9 passed `--gpus` to docker: that
                 // was every NVIDIA GPU of the node.
@@ -980,6 +1023,7 @@ impl State {
                 gpu: GpuRuntime::default(),
                 unavailable: Vec::new(),
                 gpu_graphics: false,
+                stopping: HashMap::new(),
             },
         );
         self.power_on_connect(id);
@@ -1034,7 +1078,7 @@ impl State {
         if let Some(reason) = self.nodes.get(id).and_then(|n| n.paused.clone())
             && self.requeues_on_pause(id)
         {
-            self.move_runs(id, &format!("node paused ({reason})"));
+            self.move_runs(id, &format!("node paused ({reason})"), true);
         }
         self.schedule();
     }
@@ -1058,6 +1102,7 @@ impl State {
             let _ = kill.send(());
         }
         let lost: Vec<TaskRef> = node.running.drain().map(|(t, _)| t).collect();
+        node.stopping.clear();
         self.forget_replicas_sent(id);
         if !lost.is_empty() {
             warn!(node = %id, tasks = lost.len(), "node lost; rescheduling its tasks");
@@ -1114,9 +1159,14 @@ impl State {
             self.on_disconnect(&id, g);
         }
 
+        self.tick_stopping();
         let mut hung = Vec::new();
         for (id, n) in &self.nodes {
-            for (t, started) in &n.running {
+            for (t, started) in n
+                .running
+                .iter()
+                .filter(|(t, _)| !n.stopping.contains_key(t))
+            {
                 let limit = self
                     .jobs
                     .get(&t.job)
@@ -1249,6 +1299,7 @@ impl State {
             }
         };
         let sched = sched_of(&sub, schedule);
+        let place = std::mem::take(&mut sub.placement);
         let origin = crate::remote::JobOrigin {
             submitted_by: by,
             queue_timeout_ms: sub.queue_timeout_ms,
@@ -1274,6 +1325,7 @@ impl State {
             deterministic: sub.deterministic,
             ext,
             sched,
+            place,
             gpu: sub.gpu,
         };
         self.next_seq += 1;
@@ -1431,6 +1483,8 @@ impl State {
             // Stale: the task was already rescheduled elsewhere.
             return;
         };
+        // A run told to stop that finished first counts as it is.
+        node.stopping.remove(&report.task);
         let gpus = node.gpu.busy.remove(&report.task).unwrap_or_default();
         node.completed += 1;
         let observed_ms = placed.elapsed().as_millis() as u64;
@@ -1520,6 +1574,7 @@ impl State {
             return;
         }
         node.gpu.busy.remove(&task);
+        node.stopping.remove(&task);
         warn!(node = %node_id, task = %task, "report rejected: {why}");
         self.requeue_run(task, why);
         self.schedule();
@@ -1810,6 +1865,8 @@ impl State {
             // Retries go first (within their priority) so a job is not
             // starved by later jobs.
             self.push_run(r.job, r.index, false, true);
+            // A gang starts again together (1.9).
+            self.stop_gang_mates(r.job, reason);
         }
         if let Some(why) = gave_up {
             self.event(
@@ -1897,23 +1954,27 @@ impl State {
                 .contains(&pumasi_proto::job::GpuCapability::Graphics),
             trusted_only: tier == Tier::Trusted,
             confidential,
+            place: None,
+            checkpoint: !item.check && job.meta.place.checkpoint.is_some(),
+        })
+        .map(|mut need| {
+            need.place = self.place_need(item.job).map(Box::new);
+            need
         })
     }
 
-    /// Whether node `id` can take the run, with `extra_slots` more free
-    /// slots and the GPUs in `freed` free (what stopping some of its runs
-    /// would give).
+    /// Whether node `id` can take the run with `room`'s changes to its
+    /// slots and GPUs (what stopping some of its runs would free, what runs
+    /// planned before it would take).
     pub(crate) fn fits(
         &self,
         id: &str,
         n: &NodeRuntime,
         need: &Need,
         labels: &HashMap<String, LabelSet>,
-        extra_slots: u32,
-        freed: &[u32],
+        room: &crate::sched::Room,
     ) -> bool {
-        self.refusal(id, n, need, labels, extra_slots, freed)
-            .is_none()
+        self.refusal(id, n, need, labels, room).is_none()
     }
 
     /// Why node `id` cannot take the run (the first reason found), or
@@ -1924,10 +1985,9 @@ impl State {
         n: &'a NodeRuntime,
         need: &'a Need,
         labels: &HashMap<String, LabelSet>,
-        extra_slots: u32,
-        freed: &[u32],
+        room: &crate::sched::Room,
     ) -> Option<Refusal<'a>> {
-        self.refusal_as(id, n, need, labels, extra_slots, freed, false)
+        self.refusal_as(id, n, need, labels, room, false)
     }
 
     /// The executor node `id` would run the need with: the job's own, or
@@ -1977,15 +2037,13 @@ impl State {
 
     /// [`Self::refusal`], or with `awake` what it would be if the node
     /// (asleep now) were online and not paused.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn refusal_as<'a>(
         &'a self,
         id: &str,
         n: &'a NodeRuntime,
         need: &'a Need,
         labels: &HashMap<String, LabelSet>,
-        extra_slots: u32,
-        freed: &[u32],
+        room: &crate::sched::Room,
         awake: bool,
     ) -> Option<Refusal<'a>> {
         use Refusal as R;
@@ -2072,19 +2130,24 @@ impl State {
         if need.gpu_graphics && !n.gpu_graphics {
             return Some(R::GpuGraphics);
         }
+        if need.checkpoint && self.agent_minor(id) < pumasi_proto::CHECKPOINT_MINOR {
+            return Some(R::OldAgent);
+        }
+        if let Some(p) = &need.place
+            && let Some(why) = p.refusal(id, labels)
+        {
+            return Some(why);
+        }
         if let Some(req) = &need.gpu {
             if n.gpu.checking() {
                 return Some(R::GpuCheck);
             }
-            let mut busy = n.gpu.busy_set();
-            for g in freed {
-                busy.remove(g);
-            }
+            let busy = room.busy_gpus(n);
             if self.pick_gpus(id, req, run_as, &busy).is_none() {
                 return Some(R::Gpu);
             }
         }
-        if n.free_slots() + extra_slots == 0 {
+        if n.free_slots() + room.freed_slots <= room.taken_slots {
             return Some(R::Full);
         }
         None
@@ -2092,6 +2155,7 @@ impl State {
 
     /// Places as many queued runs as free slots allow, highest priority
     /// first, stopping lower-priority runs when a higher one finds no room.
+    /// A gang's runs are placed together or not at all.
     pub fn schedule(&mut self) {
         // Idle nodes due for an upgrade get it before any new task, and
         // idle nodes due for a benchmark check get that.
@@ -2102,6 +2166,7 @@ impl State {
         self.sweep_leases();
         if self.queue.is_empty() {
             self.monitor.quota_blocked = 0;
+            self.sched.waiting.clear();
             return;
         }
         let labels: HashMap<String, LabelSet> = self
@@ -2110,11 +2175,33 @@ impl State {
             .filter(|(_, n)| n.online)
             .map(|(id, _)| (id.clone(), self.node_labels(id)))
             .collect();
-        let mut usage = self.account_usage();
+        let mut usage = self.usage();
         let mut skipped = VecDeque::new();
         let mut dirty: Vec<(JobId, u32)> = Vec::new();
         let mut quota_blocked = 0;
+        let mut waiting: HashMap<JobId, String> = HashMap::new();
         while let Some(item) = self.queue.pop_front() {
+            // A gang's queued runs go together.
+            if !item.check && self.is_gang(item.job) {
+                let mut items = vec![item];
+                let mut i = 0;
+                while i < self.queue.len() {
+                    if self.queue[i].job == item.job && !self.queue[i].check {
+                        items.extend(self.queue.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                match self.place_gang(&items, &labels, &mut usage) {
+                    crate::sched::GangOutcome::Placed(placed) => dirty.extend(placed),
+                    crate::sched::GangOutcome::Wait(why) => {
+                        waiting.insert(item.job, why);
+                        skipped.extend(items);
+                    }
+                    crate::sched::GangOutcome::Stale => {}
+                }
+                continue;
+            }
             let Some(need) = self.need_for(&item) else {
                 continue;
             };
@@ -2125,26 +2212,18 @@ impl State {
                 skipped.push_back(item);
                 continue;
             }
-            // Free (same account) and trusted nodes first, then most free
-            // slots to spread work.
-            let best = self
-                .nodes
-                .iter()
-                .filter(|(id, n)| self.fits(id, n, &need, &labels, 0, &[]))
-                .max_by_key(|(_, n)| {
-                    let pref = if item.check {
-                        n.trusted
-                    } else {
-                        n.account == need.consumer
-                    };
-                    (pref, n.free_slots())
-                })
-                .map(|(id, _)| id.clone());
-            let node_id = match best {
+            let node_id = match self.best_node(&need, &labels, &usage, &HashMap::new()) {
                 Some(id) => id,
-                None => match self.preempt_for(&need, &labels) {
-                    Some(id) => id,
-                    None => {
+                None => match self.preempt_for(&need, &labels, &usage) {
+                    crate::sched::Preempt::Room(id) => id,
+                    crate::sched::Preempt::Wait => {
+                        skipped.push_back(item);
+                        continue;
+                    }
+                    crate::sched::Preempt::None => {
+                        if need.place.is_some() && !waiting.contains_key(&item.job) {
+                            waiting.insert(item.job, self.why_unplaced_now(&need, &labels));
+                        }
                         skipped.push_back(item);
                         // Nothing behind it can preempt either: the queue
                         // is in priority order.
@@ -2162,15 +2241,14 @@ impl State {
             };
             match self.place(&need, &node_id) {
                 Some(gpus) => {
-                    let e = usage.entry(need.consumer.clone()).or_default();
-                    e.0 += 1;
-                    e.1 += gpus;
+                    usage.add(&need, &node_id, gpus);
                     dirty.push((item.job, item.index));
                 }
                 None => skipped.push_back(item),
             }
         }
         self.monitor.quota_blocked = quota_blocked;
+        self.sched.waiting = waiting;
         // Whatever could not be placed keeps its order at the front.
         while let Some(item) = skipped.pop_back() {
             self.queue.push_front(item);
@@ -2189,7 +2267,7 @@ impl State {
 
     /// Sends a run to a node. Returns the number of GPUs it got, or `None`
     /// if the node could not take it after all.
-    fn place(&mut self, need: &Need, node_id: &str) -> Option<u32> {
+    pub(crate) fn place(&mut self, need: &Need, node_id: &str) -> Option<u32> {
         let item = need.item;
         // A confidential run gets a lease (its nonce) before it goes out.
         let conf_task = match &need.confidential {
@@ -2215,6 +2293,13 @@ impl State {
             None => None,
         };
         let run_as = self.run_as(node_id, self.nodes.get(node_id)?, need).ok()?;
+        // A checkpointing run gets its last checkpoint back (1.9).
+        let checkpoint = if need.checkpoint {
+            self.checkpoint_task(item.job, item.index)
+        } else {
+            None
+        };
+        let resumed = checkpoint.as_ref().is_some_and(|c| c.restore.is_some());
         let job = self.jobs.get_mut(&item.job)?;
         let task = job.tasks.get_mut(item.index as usize)?;
         let node = self.nodes.get_mut(node_id)?;
@@ -2257,6 +2342,12 @@ impl State {
         });
         let mut roots: Vec<BlobHash> = mounts.iter().map(|m| m.root).collect();
         roots.extend(image.as_ref().map(|i| i.root));
+        roots.extend(
+            checkpoint
+                .as_ref()
+                .and_then(|c| c.restore.as_ref())
+                .map(|m| m.root),
+        );
         let mut peers = crate::datasets::peers_for(&self.files.caches, node_id, &roots, |p| {
             self.net.rtt_between(node_id, p)
         });
@@ -2301,7 +2392,16 @@ impl State {
             docker: job.meta.docker.clone(),
             files_hash,
             files,
-            input: task.input.clone(),
+            input: {
+                let mut input = task.input.clone();
+                if checkpoint.is_some() {
+                    input.env.insert(
+                        pumasi_proto::sched::CHECKPOINT_ENV.into(),
+                        pumasi_proto::sched::CHECKPOINT_DIR.into(),
+                    );
+                }
+                input
+            },
             limits: job.meta.limits,
             seed: job
                 .meta
@@ -2313,6 +2413,7 @@ impl State {
             peers,
             gpu_capabilities: job.meta.origin.gpu_capabilities.clone(),
             confidential: None,
+            checkpoint,
         };
         let mut assignment = assignment;
         if let Some(c) = conf_task {
@@ -2363,6 +2464,9 @@ impl State {
                 queued_ms: item.since.elapsed().as_millis() as u64,
                 ..Default::default()
             };
+        }
+        if resumed {
+            self.note_resumed(item.job, item.index, node_id);
         }
         Some(n_gpus)
     }
@@ -2673,6 +2777,7 @@ mod tests {
 
     fn job(executor: Executor, tasks: usize) -> JobSubmission {
         JobSubmission {
+            placement: Default::default(),
             name: "j".into(),
             executor,
             module: match executor {
@@ -3640,6 +3745,7 @@ mod tests {
     fn schedules_submit_on_time_without_overlap() {
         let mut st = state();
         let spec = ScheduleSpec {
+            tz: None,
             name: "nightly".into(),
             cron: "0 3 * * *".into(),
             job: job(Executor::Wasm, 2),
@@ -3704,6 +3810,7 @@ mod tests {
                 },
             )],
             schedules: vec![ScheduleSpec {
+                tz: None,
                 name: "hourly".into(),
                 cron: "@hourly".into(),
                 job: job(Executor::Wasm, 1),
@@ -4381,7 +4488,13 @@ mod tests {
             })
             .unwrap();
         let n = &st.nodes[&node];
-        let why = st.refusal(&node, n, &need, &HashMap::new(), 0, &[]);
+        let why = st.refusal(
+            &node,
+            n,
+            &need,
+            &HashMap::new(),
+            &crate::sched::Room::default(),
+        );
         assert!(matches!(why, Some(Refusal::Tee(_))), "{why:?}");
         test_tee(&mut st, true);
         st.schedule();
@@ -5098,5 +5211,296 @@ mod tests {
         let mut sub = job(Executor::Image, 1);
         both.admit(&mut sub).unwrap();
         assert_eq!(sub.executor, Executor::Image);
+    }
+
+    // -- 1.9: gangs, spread, affinity, CPU quotas, checkpoints ---------------
+
+    use pumasi_proto::sched::{Checkpoint, Domain, LabelQuota, Placement, ResourceQuota, Spread};
+
+    fn running_on(st: &State, job: JobId) -> Vec<String> {
+        let mut v: Vec<String> = st
+            .nodes
+            .iter()
+            .flat_map(|(id, n)| {
+                n.running
+                    .keys()
+                    .filter(|t| t.job == job)
+                    .map(|_| st.node_name(id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn gangs_start_together_or_not_at_all() {
+        let mut st = state();
+        let (_, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let mut sub = job(Executor::Wasm, 3);
+        sub.placement = Placement {
+            gang: true,
+            ..Default::default()
+        };
+        let id = st.submit(sub).unwrap();
+        // Two slots for three tasks: none starts.
+        assert!(assigned(&mut a_rx).is_empty());
+        let why = st.placement_view(id).unwrap().waiting.unwrap();
+        assert!(why.contains("of its 3 tasks"), "{why}");
+        let (_, mut b_rx) = join(&mut st, "b", vec![Executor::Wasm], None);
+        let started = assigned(&mut a_rx).len() + assigned(&mut b_rx).len();
+        assert_eq!(started, 3, "all three start at once");
+        assert_eq!(running_on(&st, id).len(), 3);
+        assert!(st.placement_view(id).unwrap().waiting.is_none());
+
+        // One of them has to move: its mates stop too, and with room for
+        // only two the gang waits again.
+        let on_a = running_on(&st, id).iter().filter(|n| *n == "a").count();
+        let (drain, keep) = if on_a == 1 { ("a", "b") } else { ("b", "a") };
+        st.drain(drain).unwrap();
+        assert!(running_on(&st, id).is_empty(), "the whole gang stopped");
+        assert!(
+            st.jobs[&id]
+                .tasks
+                .iter()
+                .all(|t| t.state == TaskState::Pending)
+        );
+        let _ = keep;
+        st.edit_node(
+            drain,
+            &NodeEdit {
+                cordon: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(running_on(&st, id).len(), 3, "back together");
+    }
+
+    /// Nodes a (zone x) and b (zone y), two slots each.
+    fn two_zones() -> State {
+        let mut st = state();
+        for (n, z) in [("a", "x"), ("b", "y")] {
+            let (_, rx) = join(&mut st, n, vec![Executor::Wasm], None);
+            std::mem::forget(rx);
+            labels(&mut st, n, &[("zone", z)]);
+        }
+        st
+    }
+
+    #[test]
+    fn spread_and_affinity_choose_nodes() {
+        // Soft spread: one task on each node.
+        let mut st = two_zones();
+        let mut sub = job(Executor::Wasm, 2);
+        sub.placement.spread = Some(Spread {
+            by: Domain::Node,
+            max: None,
+        });
+        let soft = st.submit(sub).unwrap();
+        assert_eq!(running_on(&st, soft), vec!["a", "b"]);
+
+        // At most one per zone: the third waits.
+        let mut st = two_zones();
+        let mut sub = job(Executor::Wasm, 3);
+        sub.placement.spread = Some(Spread {
+            by: Domain::Label("zone".into()),
+            max: Some(1),
+        });
+        let capped = st.submit(sub).unwrap();
+        assert_eq!(running_on(&st, capped), vec!["a", "b"]);
+        let why = st.placement_view(capped).unwrap().waiting.unwrap();
+        assert!(why.contains("spread.max"), "{why}");
+
+        // A database on a; a cache next to it, a batch job away from it.
+        let mut st = two_zones();
+        let mut db = job(Executor::Wasm, 1);
+        db.name = "db".into();
+        db.selector = "zone=x".parse().unwrap();
+        let db = st.submit(db).unwrap();
+        assert_eq!(running_on(&st, db), vec!["a"]);
+        let mut near = job(Executor::Wasm, 1);
+        near.placement.near = vec!["db".into()];
+        let near = st.submit(near).unwrap();
+        assert_eq!(running_on(&st, near), vec!["a"]);
+        let mut away = job(Executor::Wasm, 1);
+        away.placement.away = vec![db.to_string()];
+        let away = st.submit(away).unwrap();
+        assert_eq!(running_on(&st, away), vec!["b"]);
+        // Near a job that is not running: waits.
+        let mut lost = job(Executor::Wasm, 1);
+        lost.placement.near = vec!["nothing".into()];
+        let lost = st.submit(lost).unwrap();
+        assert!(running_on(&st, lost).is_empty());
+        let why = st.placement_view(lost).unwrap().waiting.unwrap();
+        assert!(why.contains("nothing"), "{why}");
+    }
+
+    #[test]
+    fn cpu_memory_and_label_quotas_hold_work() {
+        let mut st = state();
+        let (_, _, _rx) = join_keyed(&mut st, "big", 8);
+        st.set_resources(
+            OWNER_ACCOUNT,
+            ResourceQuota {
+                cpus: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A WASM run holds one CPU.
+        let id = st.submit(job(Executor::Wasm, 3)).unwrap();
+        assert_eq!(running_on(&st, id).len(), 2);
+        let v = st
+            .resources()
+            .into_iter()
+            .find(|r| r.account == OWNER_ACCOUNT)
+            .unwrap();
+        assert_eq!(v.used.cpus, 2);
+
+        // Cancelled runs hold their room until their node reports, so
+        // each part starts afresh.
+        let mut st = state();
+        let (_, _, _rx) = join_keyed(&mut st, "big", 8);
+        let mem = Limits::default().memory_bytes;
+        st.set_resources(
+            OWNER_ACCOUNT,
+            ResourceQuota {
+                memory_bytes: Some(mem * 3 / 2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let id = st.submit(job(Executor::Wasm, 3)).unwrap();
+        assert_eq!(running_on(&st, id).len(), 1);
+
+        // At most one run on the office nodes; the rest go elsewhere.
+        let mut st = state();
+        let (_, _, _rx) = join_keyed(&mut st, "big", 8);
+        let (_, _, _rx2) = join_keyed(&mut st, "office", 8);
+        labels(&mut st, "office", &[("zone", "office")]);
+        labels(&mut st, "big", &[("zone", "lab")]);
+        st.set_resources(
+            OWNER_ACCOUNT,
+            ResourceQuota {
+                labels: vec![LabelQuota {
+                    selector: "zone=office".parse().unwrap(),
+                    slots: Some(1),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sub = job(Executor::Wasm, 4);
+        sub.placement.spread = Some(Spread {
+            by: Domain::Node,
+            max: None,
+        });
+        let id = st.submit(sub).unwrap();
+        let on = running_on(&st, id);
+        assert_eq!(on.len(), 4);
+        assert_eq!(on.iter().filter(|n| *n == "office").count(), 1, "{on:?}");
+    }
+
+    fn checkpoint_job(tasks: usize) -> JobSubmission {
+        let mut sub = job(Executor::Wasm, tasks);
+        sub.deterministic = false;
+        sub.placement.checkpoint = Some(Checkpoint { grace_ms: 5_000 });
+        sub
+    }
+
+    fn stops(rx: &mut mpsc::UnboundedReceiver<ToAgent>) -> Vec<(TaskRef, u64)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let ToAgent::Stop { task, grace_ms } = m {
+                out.push((task, grace_ms));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn checkpointed_runs_stop_gently_and_resume_elsewhere() {
+        let mut st = state();
+        // An agent before 1.9 cannot keep checkpoints: the job waits.
+        let (a_id, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let id = st.submit(checkpoint_job(1)).unwrap();
+        assert!(assigned(&mut a_rx).is_empty());
+        let g = st.nodes[&a_id].generation;
+        st.on_minor(&a_id, g, pumasi_proto::CHECKPOINT_MINOR);
+        st.schedule();
+        let got = assigned(&mut a_rx);
+        assert_eq!(got.len(), 1);
+        let c = got[0].checkpoint.clone().expect("a checkpointing run");
+        assert_eq!(c.grace_ms, 5_000);
+        assert!(c.restore.is_none(), "nothing saved yet");
+        assert_eq!(
+            got[0]
+                .input
+                .env
+                .get(pumasi_proto::sched::CHECKPOINT_ENV)
+                .map(String::as_str),
+            Some(pumasi_proto::sched::CHECKPOINT_DIR)
+        );
+        let first = got[0].task;
+
+        // Draining asks it to stop; it keeps its slot until it has.
+        st.drain("a").unwrap();
+        assert_eq!(stops(&mut a_rx), vec![(first, 5_000)]);
+        assert!(matches!(
+            st.jobs[&id].tasks[0].state,
+            TaskState::Running { .. }
+        ));
+        assert_eq!(st.placement_view(id).unwrap().stopping, vec![0]);
+        let (b_id, mut b_rx) = join(&mut st, "b", vec![Executor::Wasm], None);
+        let g = st.nodes[&b_id].generation;
+        st.on_minor(&b_id, g, pumasi_proto::CHECKPOINT_MINOR);
+        st.schedule();
+        assert!(assigned(&mut b_rx).is_empty(), "still stopping on a");
+
+        // It stops with a checkpoint: back in the queue, and on b it
+        // starts from that checkpoint.
+        let saved = StoredOutput {
+            root: [7; 32],
+            size: 42,
+            files: 1,
+        };
+        let g = st.nodes[&a_id].generation;
+        st.on_stopped(&a_id, g, first, Some(saved), None);
+        let got = assigned(&mut b_rx);
+        assert_eq!(got.len(), 1);
+        let restore = got[0]
+            .checkpoint
+            .as_ref()
+            .and_then(|c| c.restore.as_ref())
+            .expect("the checkpoint comes back");
+        assert_eq!(restore.root, [7; 32]);
+        let view = st.placement_view(id).unwrap();
+        assert_eq!(view.checkpoints.len(), 1);
+        assert_eq!(view.checkpoints[0].resumed, 1);
+        assert!(view.stopping.is_empty());
+        // Moved, not failed.
+        assert_eq!(st.job_view(id, false).unwrap().tasks[0].preempted, 1);
+
+        // A run that does not stop in time is cancelled after its grace
+        // period and the margin, and goes on from the checkpoint it had.
+        let second = got[0].task;
+        st.drain("b").unwrap();
+        assert_eq!(stops(&mut b_rx).len(), 1);
+        st.nodes
+            .get_mut(&b_id)
+            .unwrap()
+            .stopping
+            .insert(second, Instant::now());
+        st.tick_stopping();
+        let (_, cancelled) = cancels(&mut b_rx);
+        assert_eq!(cancelled, vec![second]);
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+        assert_eq!(
+            st.placement_view(id).unwrap().checkpoints[0].size,
+            42,
+            "the old checkpoint stays"
+        );
     }
 }

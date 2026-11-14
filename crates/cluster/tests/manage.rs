@@ -145,6 +145,7 @@ async fn wait_online(cluster: &Cluster, n: usize) {
 fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
     JobSubmission {
         placement: Default::default(),
+        gpu_ext: Default::default(),
         name: "echo".into(),
         executor: Executor::Wasm,
         module: wat::parse_str(SLOW_ECHO_WAT).unwrap(),

@@ -217,6 +217,7 @@ async fn metrics_live_logs_events_and_prometheus() {
     let id = {
         let sub = JobSubmission {
             placement: Default::default(),
+            gpu_ext: Default::default(),
             name: "clock".into(),
             executor: Executor::Wasm,
             module: wat::parse_str(CLOCK_THEN_DONE_WAT).unwrap(),

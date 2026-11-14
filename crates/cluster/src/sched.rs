@@ -65,19 +65,16 @@ pub(crate) struct SchedState {
 pub(crate) struct Room {
     pub freed_slots: u32,
     pub taken_slots: u32,
-    pub freed_gpus: Vec<u32>,
-    pub taken_gpus: Vec<u32>,
+    /// GPUs given back and taken, each with the part held in hundredths
+    /// (1.10).
+    pub freed_gpus: Vec<(u32, u32)>,
+    pub taken_gpus: Vec<(u32, u32)>,
 }
 
 impl Room {
-    /// The node's busy GPUs with this room's changes.
-    pub fn busy_gpus(&self, n: &NodeRuntime) -> HashSet<u32> {
-        let mut busy = n.gpu.busy_set();
-        for g in &self.freed_gpus {
-            busy.remove(g);
-        }
-        busy.extend(self.taken_gpus.iter().copied());
-        busy
+    /// What the node's GPUs hold with this room's changes.
+    pub fn busy_gpus(&self, n: &NodeRuntime) -> pumasi_proto::gpu::GpuUse {
+        crate::gpu::gpu_use(&n.gpu, &self.freed_gpus, &self.taken_gpus)
     }
 }
 
@@ -411,8 +408,7 @@ impl State {
             for t in n.running.keys() {
                 if n.stopping.contains_key(t) || chosen.contains(t) {
                     room.freed_slots += 1;
-                    room.freed_gpus
-                        .extend(n.gpu.busy.get(t).cloned().unwrap_or_default());
+                    room.freed_gpus.extend(n.gpu.held(t));
                 }
             }
             if self.fits(id, n, need, labels, &room) {
@@ -446,8 +442,7 @@ impl State {
                     }
                     if node == *id {
                         room.freed_slots += 1;
-                        room.freed_gpus
-                            .extend(n.gpu.busy.get(&v).cloned().unwrap_or_default());
+                        room.freed_gpus.extend(n.gpu.held(&v));
                     }
                     victims.push((node, v));
                 }
@@ -528,8 +523,7 @@ impl State {
                                 && !chosen.contains(t)
                             {
                                 room.freed_slots += 1;
-                                room.freed_gpus
-                                    .extend(n.gpu.busy.get(t).cloned().unwrap_or_default());
+                                room.freed_gpus.extend(n.gpu.held(t));
                                 chosen.insert(*t);
                             }
                         }
@@ -554,11 +548,15 @@ impl State {
                 .as_ref()
                 .and_then(|req| {
                     let run_as = self.run_as(&node, n, need).ok()?;
-                    self.pick_gpus(&node, req, run_as, &room.busy_gpus(n))
+                    self.pick_gpus(&node, req, &need.gpu_ext, run_as, &room.busy_gpus(n))
                 })
                 .unwrap_or_default();
             room.taken_slots += 1;
-            room.taken_gpus.extend(gpus.iter().copied());
+            let share = match need.gpu_ext.share {
+                0 => pumasi_proto::gpu::GPU_SHARE_WHOLE,
+                s => s,
+            };
+            room.taken_gpus.extend(gpus.iter().map(|g| (*g, share)));
             trial.add(need, &node, gpus.len() as u32);
             if let Some(p) = place.as_mut() {
                 p.note(&node, labels);
@@ -744,7 +742,7 @@ impl State {
         if n.running.remove(&task).is_none() {
             return;
         }
-        n.gpu.busy.remove(&task);
+        n.gpu.release(&task);
         let current = self
             .jobs
             .get(&task.job)
@@ -807,7 +805,7 @@ impl State {
             if let Some(n) = self.nodes.get_mut(&id) {
                 n.stopping.remove(&t);
                 n.running.remove(&t);
-                n.gpu.busy.remove(&t);
+                n.gpu.release(&t);
                 if let Some(tx) = &n.tx {
                     let _ = tx.send(ToAgent::Cancel(t));
                 }

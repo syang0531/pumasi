@@ -2,7 +2,7 @@
 //! tasks on the executor, and reports results.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex, atomic::AtomicBool},
@@ -214,6 +214,13 @@ pub struct Agent {
     /// WebGPU adapters wasm tasks may use, and their signed profile.
     webgpu: Option<Arc<crate::webgpu::WebGpu>>,
     webgpu_profile: pumasi_proto::webgpu::SignedWebGpu,
+    /// What the offered adapters have beyond the profile (1.10).
+    webgpu_extra: pumasi_proto::webgpu::SignedWebGpuExtra,
+    /// The adapters GPU challenges run on over WebGPU (1.10): the offered
+    /// ones, or those found to measure GPUs without CUDA.
+    hashing: Option<Arc<crate::webgpu::WebGpu>>,
+    /// GPUs (by index) measured, and so checked, over WebGPU.
+    webgpu_checked: HashSet<u32>,
     /// Samples the machine for the cluster's monitoring.
     sampler: Arc<Mutex<Sampler>>,
     /// Confidential runs waiting for the cluster's answer about their
@@ -440,6 +447,53 @@ impl Agent {
             } else {
                 (Vec::new(), Vec::new())
             };
+            // WebGPU adapters (1.10: also how GPUs without CUDA are
+            // measured and checked), before the device profile is signed.
+            let offer = config.webgpu.clone();
+            let measure =
+                config.gpus && config.bench.is_some() && gpus.iter().any(needs_webgpu_measure);
+            let node = *key.public().as_bytes();
+            let (gpus, wg, notes, checked) = if offer.is_some() || measure {
+                let opts = offer.clone().unwrap_or(crate::webgpu::Options {
+                    software: false,
+                    bench: true,
+                    worker: crate::webgpu::Worker::Thread,
+                });
+                let opts = crate::webgpu::Options {
+                    bench: opts.bench || measure,
+                    ..opts
+                };
+                tokio::task::spawn_blocking(move || {
+                    let mut gpus = gpus;
+                    let mut notes = notes;
+                    let mut checked = HashSet::new();
+                    let mut wnotes = Vec::new();
+                    let w = crate::webgpu::WebGpu::detect(opts, &gpus, &mut wnotes);
+                    if measure {
+                        for g in gpus.iter_mut().filter(|g| needs_webgpu_measure(g)) {
+                            if let Some((gflops, bw, hash)) = w.measured_gpu(g.index) {
+                                info!(gpu = %g.name, gflops, mem_bw = bw, hash_rate = hash, "GPU benchmark (WebGPU)");
+                                if gflops > 0 {
+                                    g.fp32_gflops = gflops;
+                                    g.measured = true;
+                                }
+                                g.mem_bw_gb_s = bw;
+                                g.hash_rate = hash;
+                                if hash > 0 {
+                                    checked.insert(g.index);
+                                }
+                            }
+                        }
+                    }
+                    if offer.is_none() {
+                        notes.extend(wnotes.iter().cloned());
+                    }
+                    (gpus, Some((w, wnotes)), notes, checked)
+                })
+                .await?
+            } else {
+                (gpus, None, notes, HashSet::new())
+            };
             for g in &gpus {
                 info!(
                     gpu = g.index,
@@ -450,40 +504,59 @@ impl Agent {
                 );
             }
             let network = microvm.as_ref().is_some_and(|m| m.network_capable());
-            let profile = crate::gpu::profile(*key.public().as_bytes(), gpus, network, notes);
-            Some(pumasi_proto::gpu::SignedDevices::sign(profile, &key))
+            let profile = crate::gpu::profile(node, gpus, network, notes);
+            (
+                Some(pumasi_proto::gpu::SignedDevices::sign(profile, &key)),
+                wg,
+                checked,
+            )
         };
-        let (webgpu, webgpu_profile) = {
-            let listed = devices
-                .as_ref()
-                .map(|d| d.profile.gpus.clone())
-                .unwrap_or_default();
-            let node = *key.public().as_bytes();
-            match config.webgpu {
-                Some(opts) => {
-                    let (gpu, notes) = tokio::task::spawn_blocking(move || {
-                        let mut notes = Vec::new();
-                        let gpu = crate::webgpu::WebGpu::detect(opts, &listed, &mut notes);
-                        (gpu, notes)
-                    })
-                    .await?;
-                    if gpu.is_empty() {
-                        warn!("no WebGPU adapter can run compute shaders here: {notes:?}");
-                    }
-                    let profile = gpu.profile(node, notes);
-                    (
-                        (!gpu.is_empty()).then(|| Arc::new(gpu)),
-                        pumasi_proto::webgpu::SignedWebGpu::sign(profile, &key),
-                    )
+        // The GPUs measured over WebGPU rather than CUDA: their checks go
+        // over WebGPU too.
+        let (devices, measured, webgpu_checked) = devices;
+        let node = *key.public().as_bytes();
+        let (webgpu, hashing, webgpu_profile, webgpu_extra) = match (measured, &config.webgpu) {
+            (Some((gpu, notes)), offer) => {
+                let gpu = Arc::new(gpu);
+                let offered = offer.is_some() && !gpu.is_empty();
+                if offer.is_some() && gpu.is_empty() {
+                    warn!("no WebGPU adapter can run compute shaders here: {notes:?}");
                 }
-                None => (
-                    None,
-                    pumasi_proto::webgpu::SignedWebGpu::sign(
+                let (profile, extra) = if offered {
+                    (gpu.profile(node, notes), gpu.extra(node))
+                } else {
+                    (
                         crate::webgpu::profile(node, Vec::new(), Vec::new()),
-                        &key,
-                    ),
-                ),
+                        pumasi_proto::webgpu::WebGpuExtra {
+                            node,
+                            measured_unix: 0,
+                            adapters: Vec::new(),
+                        },
+                    )
+                };
+                (
+                    offered.then(|| gpu.clone()),
+                    Some(gpu),
+                    pumasi_proto::webgpu::SignedWebGpu::sign(profile, &key),
+                    pumasi_proto::webgpu::SignedWebGpuExtra::sign(extra, &key),
+                )
             }
+            (None, _) => (
+                None,
+                None,
+                pumasi_proto::webgpu::SignedWebGpu::sign(
+                    crate::webgpu::profile(node, Vec::new(), Vec::new()),
+                    &key,
+                ),
+                pumasi_proto::webgpu::SignedWebGpuExtra::sign(
+                    pumasi_proto::webgpu::WebGpuExtra {
+                        node,
+                        measured_unix: 0,
+                        adapters: Vec::new(),
+                    },
+                    &key,
+                ),
+            ),
         };
         if docker.is_some() {
             info.executors.push(Executor::Docker);
@@ -544,7 +617,10 @@ impl Agent {
             node_store,
             devices: devices_rx,
             webgpu,
+            hashing,
+            webgpu_checked,
             webgpu_profile,
+            webgpu_extra,
             sampler: Arc::new(Mutex::new(sampler)),
             key_waiters: Default::default(),
             stops: Default::default(),
@@ -1015,6 +1091,9 @@ impl Agent {
         }
         // The control plane is never older than its agents, so it knows this.
         let _ = out_tx.send(FromAgent::WebGpu(Box::new(self.webgpu_profile.clone())));
+        if cp_minor >= pumasi_proto::GPU_MINOR {
+            let _ = out_tx.send(FromAgent::WebGpuExtra(Box::new(self.webgpu_extra.clone())));
+        }
         let mut docker = self.docker.clone();
         let microvm_on = self.microvm.is_some();
         let _ = out_tx.send(FromAgent::Executors(Box::new(report_of(
@@ -1396,9 +1475,19 @@ impl Agent {
                         .and_then(|d| d.profile.gpus.iter().find(|g| g.index == ch.device))
                         .map(|g| g.pci.clone())
                         .unwrap_or_default();
+                    // A WebGPU adapter's slot, or a GPU measured over
+                    // WebGPU (1.10); else CUDA.
+                    let over_webgpu = (ch.device >= pumasi_proto::webgpu::WEBGPU_SLOT_BASE
+                        || self.webgpu_checked.contains(&ch.device))
+                    .then(|| self.hashing.clone())
+                    .flatten();
                     let out_tx = out_tx.clone();
                     tokio::spawn(async move {
-                        let solutions = if pci.is_empty() {
+                        let solutions = if let Some(w) = over_webgpu {
+                            tokio::task::spawn_blocking(move || w.solve(ch.device, &ch))
+                                .await
+                                .unwrap_or_default()
+                        } else if pci.is_empty() {
                             Vec::new()
                         } else {
                             tokio::task::spawn_blocking(move || crate::gpu::solve(&pci, &ch))
@@ -2178,6 +2267,13 @@ impl DockerWatch {
             profile, &self.key,
         )));
     }
+}
+
+/// A GPU the CUDA benchmark did not measure, which WebGPU can (1.10):
+/// AMD, Intel and Apple GPUs, and NVIDIA ones without CUDA (old Macs).
+/// GPUs bound to `vfio-pci` have no driver here to measure them with.
+fn needs_webgpu_measure(g: &pumasi_proto::gpu::GpuInfo) -> bool {
+    !g.measured && g.driver != "vfio-pci" && !g.mig()
 }
 
 fn node_info(config: &AgentConfig) -> NodeInfo {

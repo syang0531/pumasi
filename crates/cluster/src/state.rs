@@ -161,6 +161,10 @@ pub struct JobMeta {
     /// own table.
     #[serde(skip)]
     pub place: pumasi_proto::sched::Placement,
+    /// Parts of GPUs and WebGPU features (1.10), persisted in their own
+    /// table.
+    #[serde(skip)]
+    pub gpu_ext: pumasi_proto::gpu::GpuExt,
 }
 
 /// What a run produced, kept for a check run until the check settles in
@@ -338,6 +342,8 @@ pub(crate) struct Need {
     pub cpus: u32,
     pub store_job: bool,
     pub gpu: Option<GpuRequest>,
+    /// Part of a GPU, WebGPU features (1.10).
+    pub gpu_ext: pumasi_proto::gpu::GpuExt,
     /// An image job that wants a network: a node that would run it in a
     /// microVM must be able to give its microVMs one.
     pub vm_network: bool,
@@ -495,6 +501,8 @@ pub struct State {
     pub(crate) devices: HashMap<String, DeviceRecord>,
     /// Nodes' signed WebGPU adapters (phase 14).
     pub(crate) webgpu: HashMap<String, pumasi_proto::webgpu::SignedWebGpu>,
+    /// What their adapters have beyond the profile (1.10).
+    pub(crate) webgpu_extra: HashMap<String, crate::gpu::WebGpuExtraRecord>,
     /// Labels, quotas, access tickets, schedules and the rest of cluster
     /// management.
     pub(crate) mgmt: Mgmt,
@@ -521,6 +529,23 @@ pub struct State {
     pub(crate) reps: crate::replicas::RepState,
     /// CPU and memory quotas, checkpoints, gangs waiting (1.9).
     pub(crate) sched: crate::sched::SchedState,
+}
+
+/// What a run holding part of a GPU (1.10) finds in its environment:
+/// its part, and settings that keep common frameworks from taking the
+/// whole GPU's memory (TensorFlow and JAX do by default). A task's own
+/// values win.
+pub(crate) const GPU_FRACTION_ENV: &str = "PUMASI_GPU_FRACTION";
+
+fn share_env(env: &mut std::collections::BTreeMap<String, String>, share: u32) {
+    let fraction = pumasi_proto::gpu::format_share(share);
+    for (k, v) in [
+        (GPU_FRACTION_ENV, fraction.clone()),
+        ("TF_FORCE_GPU_ALLOW_GROWTH", "true".to_string()),
+        ("XLA_PYTHON_CLIENT_MEM_FRACTION", fraction),
+    ] {
+        env.entry(k.to_string()).or_insert(v);
+    }
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -594,6 +619,7 @@ impl State {
             files: FileState::default(),
             devices: snap.devices.into_iter().collect(),
             webgpu: snap.webgpu.into_iter().collect(),
+            webgpu_extra: snap.webgpu_extra.into_iter().collect(),
             mgmt: Mgmt::default(),
             monitor: Monitor::default(),
             conf: Default::default(),
@@ -618,6 +644,8 @@ impl State {
             snap.job_origin.into_iter().collect();
         let mut job_place: HashMap<u128, pumasi_proto::sched::Placement> =
             snap.job_place.into_iter().collect();
+        let mut job_gpu_ext: HashMap<u128, pumasi_proto::gpu::GpuExt> =
+            snap.job_gpu_ext.into_iter().collect();
         state.load_sched(snap.checkpoints, snap.account_resources);
         state.rollout = state.load_rollout()?;
         state.names = state.load_node_names()?;
@@ -633,6 +661,7 @@ impl State {
             meta.sched = job_sched.remove(&meta.id.0).unwrap_or_default();
             meta.origin = job_origin.remove(&meta.id.0).unwrap_or_default();
             meta.place = job_place.remove(&meta.id.0).unwrap_or_default();
+            meta.gpu_ext = job_gpu_ext.remove(&meta.id.0).unwrap_or_default();
             meta.gpu = job_gpu.remove(&meta.id.0).or_else(|| {
                 // Jobs from before phase 9 passed `--gpus` to docker: that
                 // was every NVIDIA GPU of the node.
@@ -923,6 +952,7 @@ impl State {
         self.members.remove(id);
         self.devices.remove(id);
         self.webgpu.remove(id);
+        self.webgpu_extra.remove(id);
         self.conf.trusted_nodes.remove(id);
         self.conf.tees.remove(id);
         self.mgmt.node_config.remove(id);
@@ -1204,7 +1234,7 @@ impl State {
             warn!(node = %id, task = %t, "task exceeded its lease; rescheduling");
             if let Some(n) = self.nodes.get_mut(&id) {
                 n.running.remove(&t);
-                n.gpu.busy.remove(&t);
+                n.gpu.release(&t);
                 if let Some(tx) = &n.tx {
                     let _ = tx.send(ToAgent::Cancel(t));
                 }
@@ -1300,6 +1330,7 @@ impl State {
         };
         let sched = sched_of(&sub, schedule);
         let place = std::mem::take(&mut sub.placement);
+        let gpu_ext = std::mem::take(&mut sub.gpu_ext);
         let origin = crate::remote::JobOrigin {
             submitted_by: by,
             queue_timeout_ms: sub.queue_timeout_ms,
@@ -1326,6 +1357,7 @@ impl State {
             ext,
             sched,
             place,
+            gpu_ext,
             gpu: sub.gpu,
         };
         self.next_seq += 1;
@@ -1485,7 +1517,7 @@ impl State {
         };
         // A run told to stop that finished first counts as it is.
         node.stopping.remove(&report.task);
-        let gpus = node.gpu.busy.remove(&report.task).unwrap_or_default();
+        let (gpus, share) = node.gpu.release(&report.task);
         node.completed += 1;
         let observed_ms = placed.elapsed().as_millis() as u64;
         let r = report.task;
@@ -1521,7 +1553,7 @@ impl State {
             return;
         }
         if let Some(signed) = report.usage.clone() {
-            self.settle_run(node_id, signed, observed_ms, &gpus);
+            self.settle_run(node_id, signed, observed_ms, &gpus, share);
             self.sample_gpus(node_id, &gpus);
         }
         self.conf.leases.remove(&r);
@@ -1573,7 +1605,7 @@ impl State {
         if node.generation != generation || node.running.remove(&task).is_none() {
             return;
         }
-        node.gpu.busy.remove(&task);
+        node.gpu.release(&task);
         node.stopping.remove(&task);
         warn!(node = %node_id, task = %task, "report rejected: {why}");
         self.requeue_run(task, why);
@@ -1635,6 +1667,7 @@ impl State {
         signed: pumasi_proto::receipt::SignedUsage,
         observed_ms: u64,
         gpus: &[u32],
+        share: u32,
     ) {
         let r = signed.usage.task;
         let Some(job) = self.jobs.get(&r.job) else {
@@ -1648,7 +1681,7 @@ impl State {
         let consumer = job.meta.account.clone();
         let billed_wall_ms = signed.usage.wall_ms.min(observed_ms);
         let cpu_score = self.billing_score_of(node_id);
-        let mut gpu = self.gpu_billing(node_id, signed.usage.executor, gpus);
+        let mut gpu = self.gpu_billing(node_id, signed.usage.executor, gpus, share);
         let metered = Metered {
             executor: signed.usage.executor,
             fuel_used: signed.usage.fuel_used,
@@ -1937,6 +1970,7 @@ impl State {
             },
             store_job: job.meta.ext.needs_store,
             gpu: job.meta.gpu.clone(),
+            gpu_ext: job.meta.gpu_ext.clone(),
             vm_network: executor.runs_images()
                 && job.meta.docker.as_ref().is_some_and(|d| d.network),
             images,
@@ -2018,7 +2052,9 @@ impl State {
             }
             // GPUs this executor reaches on the node at all (busy or not).
             if let Some(req) = &need.gpu
-                && self.pick_gpus(id, req, e, &HashSet::new()).is_none()
+                && self
+                    .pick_gpus(id, req, &need.gpu_ext, e, &Default::default())
+                    .is_none()
             {
                 refused.get_or_insert(R::Gpu);
                 continue;
@@ -2142,8 +2178,11 @@ impl State {
             if n.gpu.checking() {
                 return Some(R::GpuCheck);
             }
-            let busy = room.busy_gpus(n);
-            if self.pick_gpus(id, req, run_as, &busy).is_none() {
+            let used = room.busy_gpus(n);
+            if self
+                .pick_gpus(id, req, &need.gpu_ext, run_as, &used)
+                .is_none()
+            {
                 return Some(R::Gpu);
             }
         }
@@ -2372,13 +2411,19 @@ impl State {
             .gpu
             .as_ref()
             .and_then(|req| {
+                let maps = crate::gpu::GpuMaps {
+                    devices: &self.devices,
+                    webgpu: &self.webgpu,
+                    extra: &self.webgpu_extra,
+                    config: &self.mgmt.node_config,
+                };
                 crate::gpu::pick_gpus(
-                    &self.devices,
-                    &self.webgpu,
+                    &maps,
                     node_id,
                     req,
+                    &need.gpu_ext,
                     run_as,
-                    &node.gpu.busy_set(),
+                    &node.gpu.usage(),
                 )
             })
             .unwrap_or_default();
@@ -2399,6 +2444,9 @@ impl State {
                         pumasi_proto::sched::CHECKPOINT_ENV.into(),
                         pumasi_proto::sched::CHECKPOINT_DIR.into(),
                     );
+                }
+                if !gpus.is_empty() && need.gpu_ext.share > 0 {
+                    share_env(&mut input.env, need.gpu_ext.share);
                 }
                 input
             },
@@ -2444,9 +2492,7 @@ impl State {
         node.sent_modules.extend(files_hash);
         node.running.insert(r, Instant::now());
         let n_gpus = gpus.len() as u32;
-        if !gpus.is_empty() {
-            node.gpu.busy.insert(r, gpus);
-        }
+        node.gpu.hold(r, gpus, need.gpu_ext.share);
         if item.check {
             if let Some(c) = task.check.as_mut() {
                 c.attempts = attempt;
@@ -2778,6 +2824,7 @@ mod tests {
     fn job(executor: Executor, tasks: usize) -> JobSubmission {
         JobSubmission {
             placement: Default::default(),
+            gpu_ext: Default::default(),
             name: "j".into(),
             executor,
             module: match executor {
@@ -3402,6 +3449,210 @@ mod tests {
                 assert_eq!(node.strikes, 1);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // GPUs (phase 26, 1.10)
+    // -----------------------------------------------------------------------
+
+    fn half_gpu_job(tasks: usize) -> JobSubmission {
+        let mut sub = gpu_job(1, tasks);
+        sub.gpu_ext.share = 50;
+        sub
+    }
+
+    #[test]
+    fn half_gpu_runs_share_a_gpu_and_pay_half() {
+        let mut st = state();
+        let (id, key, mut rx) = join_gpus(&mut st, "one", vec![gpu(0, 12_000, 0)], None);
+        let job = st.submit(half_gpu_job(3)).unwrap();
+        let got = assigned(&mut rx);
+        assert_eq!(got.len(), 2, "two halves fit on one GPU: {got:?}");
+        for a in &got {
+            assert_eq!(a.gpus, vec![0]);
+            assert_eq!(a.input.env[GPU_FRACTION_ENV], "0.5");
+            assert_eq!(a.input.env["TF_FORCE_GPU_ALLOW_GROWTH"], "true");
+        }
+        // A whole-GPU run waits for the GPU to be free.
+        let whole = st.submit(gpu_job(1, 1)).unwrap();
+        assert!(assigned(&mut rx).is_empty());
+        assert_eq!(st.jobs[&whole].tasks[0].state, TaskState::Pending);
+        let view = st.status();
+        let node = view.nodes.iter().find(|n| n.id == id).unwrap();
+        assert!(node.gpus[0].busy.is_some());
+        assert!(
+            node.gpus[0]
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("shared by 2 runs"),
+            "{:?}",
+            node.gpus[0].note
+        );
+
+        // A half ends: it pays half the GPU, and the third half takes its
+        // place (the whole run still cannot).
+        finish(&mut st, &id, &key, &got[0]);
+        let r = st.receipts(job).unwrap();
+        let g = r[0].gpu.as_ref().expect("GPU billing on the receipt");
+        assert_eq!(g.gflops, 6_000);
+        assert_eq!(g.vram_mib, 6 * 1024);
+        assert_eq!(g.names, vec!["Test GPU 0 (0.5 GPU)".to_string()]);
+        let next = assigned(&mut rx);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].task.job, job);
+        // Both halves end: the whole run gets the GPU.
+        finish(&mut st, &id, &key, &got[1]);
+        assert!(assigned(&mut rx).is_empty());
+        finish(&mut st, &id, &key, &next[0]);
+        let next = assigned(&mut rx);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].task.job, whole);
+        assert!(!next[0].input.env.contains_key(GPU_FRACTION_ENV));
+    }
+
+    #[test]
+    fn nodes_can_refuse_to_share_their_gpus() {
+        let mut st = state();
+        let (id, _, mut rx) = join_gpus(&mut st, "one", vec![gpu(0, 12_000, 0)], None);
+        let mut config = NodeConfig::default();
+        config
+            .labels
+            .insert(crate::gpu::SHARE_LABEL.into(), "off".into());
+        st.mgmt.node_config.insert(id.clone(), config);
+        let job = st.submit(half_gpu_job(1)).unwrap();
+        assert!(assigned(&mut rx).is_empty(), "gpu.share=off");
+        assert_eq!(st.jobs[&job].tasks[0].state, TaskState::Pending);
+        // A GPU that Docker cannot reach is not shared either.
+        let mut vm_only = gpu(0, 12_000, 0);
+        vm_only.docker = false;
+        vm_only.vfio = true;
+        let (_, _, mut vm_rx) = join_gpus(&mut st, "vm", vec![vm_only], None);
+        st.schedule();
+        assert!(assigned(&mut vm_rx).is_empty());
+    }
+
+    fn got_gpu_challenge(rx: &mut mpsc::UnboundedReceiver<ToAgent>) -> bool {
+        let mut got = false;
+        while let Ok(m) = rx.try_recv() {
+            got |= matches!(m, ToAgent::GpuChallenge(_));
+        }
+        got
+    }
+
+    fn send_webgpu_extra(
+        st: &mut State,
+        id: &str,
+        key: &SecretKey,
+        adapters: Vec<pumasi_proto::webgpu::AdapterExtra>,
+    ) {
+        let generation = st.nodes[id].generation;
+        let extra = pumasi_proto::webgpu::WebGpuExtra {
+            node: *key.public().as_bytes(),
+            measured_unix: 0,
+            adapters,
+        };
+        st.on_webgpu_extra(
+            id,
+            generation,
+            pumasi_proto::webgpu::SignedWebGpuExtra::sign(extra, key),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn webgpu_adapters_are_timed_over_webgpu() {
+        use pumasi_proto::webgpu::{
+            AdapterExtra, UNCHECKED_WEBGPU_GFLOPS, WEBGPU_SLOT_BASE, WebGpuFeature,
+        };
+        for honest in [true, false] {
+            let mut st = state();
+            st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+            // A provider whose only GPU is one WebGPU reaches (an iMac's,
+            // say), with an agent that times it over WebGPU.
+            let (bob_id, bob_key, mut rx) = join_gpus(&mut st, "bob", vec![], bob(true));
+            let generation = st.nodes[&bob_id].generation;
+            st.on_minor(&bob_id, generation, pumasi_proto::GPU_MINOR);
+            send_webgpu(&mut st, &bob_id, &bob_key, vec![adapter(0, None, 5_000)]);
+            assert!(
+                !got_gpu_challenge(&mut rx),
+                "no challenge before the node's own hash rate"
+            );
+            send_webgpu_extra(
+                &mut st,
+                &bob_id,
+                &bob_key,
+                vec![AdapterExtra {
+                    index: 0,
+                    hash_rate: 2_000_000,
+                    features: vec![WebGpuFeature::ShaderF16],
+                }],
+            );
+            st.drive_gpu_challenges();
+            let challenge = loop {
+                match rx.try_recv() {
+                    Ok(ToAgent::GpuChallenge(c)) => break c,
+                    Ok(_) => continue,
+                    Err(_) => panic!("no GPU challenge"),
+                }
+            };
+            assert_eq!(challenge.device, WEBGPU_SLOT_BASE);
+            let view = st.status();
+            let node = view.nodes.iter().find(|n| n.id == bob_id).unwrap();
+            assert_eq!(node.webgpu[0].billed_gflops, UNCHECKED_WEBGPU_GFLOPS);
+            // No WebGPU work while the adapter is timed.
+            let job = st.submit(webgpu_job(1)).unwrap();
+            assert!(assigned(&mut rx).is_empty());
+            let mut answer =
+                pumasi_proto::gpu::solve_cpu(challenge.seed, challenge.target, challenge.solutions);
+            if !honest {
+                answer[0] ^= 1;
+            }
+            st.on_gpu_result(&bob_id, generation, challenge.nonce, answer);
+            let view = st.status();
+            let node = view.nodes.iter().find(|n| n.id == bob_id).unwrap();
+            if honest {
+                assert_eq!(node.webgpu[0].billed_gflops, 5_000, "timed: billed in full");
+                assert_eq!(node.strikes, 0);
+                let got = assigned(&mut rx);
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0].task.job, job);
+                assert_eq!(got[0].gpus, vec![WEBGPU_SLOT_BASE]);
+                // A job that needs a feature the adapter lacks waits.
+                let mut sub = webgpu_job(1);
+                sub.gpu_ext.features = vec![WebGpuFeature::Subgroups];
+                let sub_id = st.submit(sub).unwrap();
+                assert_eq!(st.jobs[&sub_id].tasks[0].state, TaskState::Pending);
+            } else {
+                assert_eq!(
+                    node.webgpu[0].billed_gflops, 0,
+                    "wrong answers bill nothing"
+                );
+                assert_eq!(node.strikes, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn older_agents_get_no_webgpu_challenge() {
+        use pumasi_proto::webgpu::AdapterExtra;
+        let mut st = state();
+        let (bob_id, bob_key, mut rx) = join_gpus(&mut st, "bob", vec![], bob(true));
+        let generation = st.nodes[&bob_id].generation;
+        st.on_minor(&bob_id, generation, pumasi_proto::CHECKPOINT_MINOR);
+        send_webgpu(&mut st, &bob_id, &bob_key, vec![adapter(0, None, 5_000)]);
+        send_webgpu_extra(
+            &mut st,
+            &bob_id,
+            &bob_key,
+            vec![AdapterExtra {
+                index: 0,
+                hash_rate: 2_000_000,
+                features: vec![],
+            }],
+        );
+        st.drive_gpu_challenges();
+        assert!(!got_gpu_challenge(&mut rx));
     }
 
     // -----------------------------------------------------------------------

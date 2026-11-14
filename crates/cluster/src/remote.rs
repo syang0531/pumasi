@@ -365,6 +365,7 @@ impl State {
             },
             store_job: ext.needs_store || upload_bytes > 0,
             gpu: sub.gpu.clone(),
+            gpu_ext: sub.gpu_ext.clone(),
             vm_network: sub.executor.runs_images()
                 && sub.docker.as_ref().is_some_and(|d| d.network),
             // A private image is pulled into the store after the job is
@@ -521,6 +522,7 @@ impl State {
             cpus: 1,
             store_job: false,
             gpu,
+            gpu_ext: Default::default(),
             vm_network: false,
             images: None,
             consumer: account.to_string(),

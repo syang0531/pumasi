@@ -550,7 +550,12 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | Placement { .. } => return None,
         SetResources { account, quota } => ("resources.set", account.clone(), quota.describe()),
         // Joined into the plain calls before they get here.
-        SubmitPlaced { .. } | CheckJobPlaced { .. } | SetScheduleExt { .. } | ApplyExt { .. } => {
+        SubmitPlaced { .. }
+        | CheckJobPlaced { .. }
+        | SetScheduleExt { .. }
+        | ApplyExt { .. }
+        | SubmitExt { .. }
+        | CheckJobExt { .. } => {
             return describe(&op.clone().joined());
         }
         // Sign-ins log themselves, with who it turned out to be.

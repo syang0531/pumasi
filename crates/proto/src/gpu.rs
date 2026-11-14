@@ -14,7 +14,11 @@
 //! speed. The agent measures its own hash rate the same way when it
 //! benchmarks, so the control plane compares like with like.
 
-use std::{collections::HashSet, fmt, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{PublicKey, SecretKey, Signature};
@@ -234,6 +238,70 @@ pub struct GpuRequest {
 /// Most GPUs one task may ask for.
 pub const MAX_GPUS_PER_TASK: u32 = 16;
 
+/// A whole GPU in [`GpuExt::share`]'s hundredths.
+pub const GPU_SHARE_WHOLE: u32 = 100;
+
+/// What a job asks of its GPUs beyond its [`GpuRequest`] (1.10). It rides
+/// beside the submission ([`crate::job::JobExt`]), never inside it, so the
+/// submission keeps its layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuExt {
+    /// Part of one GPU per task, in hundredths (1 to 99): `gpus = 0.5` is
+    /// 50. Tasks with parts share a GPU by time-slicing (no memory
+    /// partitioning). 0: whole GPUs, as [`GpuRequest::count`] says.
+    pub share: u32,
+    /// WebGPU features the adapter must have (wasm jobs).
+    pub features: Vec<crate::webgpu::WebGpuFeature>,
+}
+
+impl GpuExt {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.share < GPU_SHARE_WHOLE,
+            "a GPU part must be less than a whole GPU"
+        );
+        ensure!(self.features.len() <= 8, "too many WebGPU features");
+        Ok(())
+    }
+}
+
+/// `0.5` from 50 hundredths.
+pub fn format_share(share: u32) -> String {
+    if share.is_multiple_of(10) {
+        format!("0.{}", share / 10)
+    } else {
+        format!("0.{share:02}")
+    }
+}
+
+/// What a node's GPUs hold now (1.10): GPUs taken whole, and the parts of
+/// shared GPUs in hundredths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GpuUse {
+    pub whole: HashSet<u32>,
+    pub shared: HashMap<u32, u32>,
+}
+
+impl GpuUse {
+    /// Every GPU in use, whole or in part: what a whole-GPU run must avoid.
+    pub fn busy(&self) -> HashSet<u32> {
+        let mut b = self.whole.clone();
+        b.extend(self.shared.iter().filter(|(_, s)| **s > 0).map(|(g, _)| *g));
+        b
+    }
+
+    /// Nothing in use but these whole GPUs (callers that know no parts).
+    pub fn of_busy(busy: &HashSet<u32>) -> Self {
+        Self {
+            whole: busy.clone(),
+            shared: HashMap::new(),
+        }
+    }
+}
 impl GpuRequest {
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -284,6 +352,51 @@ impl GpuRequest {
     /// free).
     pub fn possible(&self, gpus: &[GpuInfo], executor: Executor) -> bool {
         self.pick(gpus, &HashSet::new(), executor).is_some()
+    }
+
+    /// Picks GPUs for one task when it may take `share` hundredths of one
+    /// (1.10): a GPU no run holds whole, that `shareable` allows and that
+    /// has room left, the fullest that fits so whole GPUs stay free. With
+    /// `share` 0 this is [`Self::pick`] around every GPU in use.
+    pub fn pick_shared(
+        &self,
+        gpus: &[GpuInfo],
+        used: &GpuUse,
+        executor: Executor,
+        share: u32,
+        shareable: impl Fn(&GpuInfo) -> bool,
+    ) -> Option<Vec<u32>> {
+        if share == 0 || share >= GPU_SHARE_WHOLE {
+            return self.pick(gpus, &used.busy(), executor);
+        }
+        gpus.iter()
+            .filter(|g| self.matches(g, executor) && shareable(g))
+            .filter(|g| !used.whole.contains(&g.index))
+            .filter_map(|g| {
+                let taken = used.shared.get(&g.index).copied().unwrap_or(0);
+                (taken + share <= GPU_SHARE_WHOLE).then_some((taken, g))
+            })
+            .max_by_key(|(taken, g)| {
+                (
+                    *taken,
+                    std::cmp::Reverse((g.vram_mib, g.fp32_gflops, g.index)),
+                )
+            })
+            .map(|(_, g)| vec![g.index])
+    }
+}
+
+impl GpuInfo {
+    /// Whether runs can share it by time-slicing (1.10): Docker reaches
+    /// it. A GPU passed through to a microVM belongs to that VM alone.
+    pub fn shareable(&self) -> bool {
+        self.docker
+    }
+
+    /// An NVIDIA MIG slice (its UUID starts with `MIG-`), listed as a GPU
+    /// of its own (1.10).
+    pub fn mig(&self) -> bool {
+        self.uuid.starts_with("MIG-")
     }
 }
 
@@ -450,6 +563,69 @@ mod tests {
                 count: 99,
                 vendor: None,
                 min_vram_mib: 0
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parts_of_gpus_share_and_whole_runs_keep_out() {
+        let gpus = vec![
+            gpu(0, GpuVendor::Nvidia, 24, true),
+            gpu(1, GpuVendor::Nvidia, 10, true),
+            gpu(2, GpuVendor::Nvidia, 10, false),
+        ];
+        let one = GpuRequest {
+            count: 1,
+            vendor: None,
+            min_vram_mib: 0,
+        };
+        let all = |_: &GpuInfo| true;
+        let mut used = GpuUse::default();
+        // The smallest Docker GPU first, then the same one again while it
+        // has room.
+        assert_eq!(
+            one.pick_shared(&gpus, &used, Executor::Docker, 50, all),
+            Some(vec![1])
+        );
+        used.shared.insert(1, 50);
+        assert_eq!(
+            one.pick_shared(&gpus, &used, Executor::Docker, 50, all),
+            Some(vec![1])
+        );
+        // Too little left on it: the next GPU.
+        assert_eq!(
+            one.pick_shared(&gpus, &used, Executor::Docker, 60, all),
+            Some(vec![0])
+        );
+        // A whole run avoids every GPU with parts on it.
+        assert_eq!(
+            one.pick_shared(&gpus, &used, Executor::Docker, 0, all),
+            Some(vec![0])
+        );
+        used.whole.insert(0);
+        assert_eq!(
+            one.pick_shared(&gpus, &used, Executor::Docker, 60, all),
+            None
+        );
+        assert_eq!(
+            one.pick_shared(&gpus, &used, Executor::Docker, 0, all),
+            None
+        );
+        // A node that does not share its GPUs.
+        assert_eq!(
+            one.pick_shared(&gpus, &GpuUse::default(), Executor::Docker, 50, |_| false),
+            None
+        );
+        assert_eq!(used.busy(), HashSet::from([0, 1]));
+        assert_eq!(format_share(50), "0.5");
+        assert_eq!(format_share(25), "0.25");
+        assert_eq!(format_share(5), "0.05");
+        assert!(
+            GpuExt {
+                share: 100,
+                features: vec![]
             }
             .validate()
             .is_err()

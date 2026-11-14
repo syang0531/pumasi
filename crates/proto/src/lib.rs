@@ -78,7 +78,7 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 5;
+pub const PROTOCOL_MINOR: u32 = 6;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
@@ -103,6 +103,12 @@ pub const REPLICA_MINOR: u32 = 4;
 /// period when asked ([`msg::ToAgent::Stop`]) or before its machine
 /// sleeps, and answers with their checkpoint ([`msg::FromAgent::Stopped`]).
 pub const CHECKPOINT_MINOR: u32 = 5;
+/// The first minor with the 1.10 GPUs: the agent sends what its WebGPU
+/// adapters have beyond the phase 14 profile (their challenge hash rate
+/// and optional features, [`msg::FromAgent::WebGpuExtra`]) and answers GPU
+/// challenges for WebGPU adapters ([`webgpu::WEBGPU_SLOT_BASE`] and up)
+/// and for GPUs without CUDA over WebGPU.
+pub const GPU_MINOR: u32 = 6;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

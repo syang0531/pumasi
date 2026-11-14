@@ -144,6 +144,11 @@ const CHECKPOINTS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("c
 const ACCOUNT_RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("account_resources");
 /// A schedule's time zone and its job's placement (1.9), by name.
 const SCHEDULE_EXT: TableDefinition<&str, &[u8]> = TableDefinition::new("schedule_ext");
+/// A job's GPU parts and WebGPU features (1.10), by job id.
+const JOB_GPU_EXT: TableDefinition<u128, &[u8]> = TableDefinition::new("job_gpu_ext");
+/// What a node's WebGPU adapters have beyond its profile (1.10), by node.
+const MEMBER_WEBGPU_EXTRA: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("member_webgpu_extra");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -214,7 +219,9 @@ macro_rules! tables {
             JOB_PLACE,
             CHECKPOINTS,
             ACCOUNT_RESOURCES,
-            SCHEDULE_EXT
+            SCHEDULE_EXT,
+            JOB_GPU_EXT,
+            MEMBER_WEBGPU_EXTRA
         )
     };
 }
@@ -475,6 +482,8 @@ pub struct Snapshot {
     pub account_policies: Vec<(String, AccountPolicy)>,
     pub job_origin: Vec<(u128, JobOrigin)>,
     pub job_place: Vec<(u128, pumasi_proto::sched::Placement)>,
+    pub job_gpu_ext: Vec<(u128, pumasi_proto::gpu::GpuExt)>,
+    pub webgpu_extra: Vec<(String, crate::gpu::WebGpuExtraRecord)>,
     pub checkpoints: Vec<((u128, u32), crate::sched::CheckpointRecord)>,
     pub account_resources: Vec<(String, pumasi_proto::sched::ResourceQuota)>,
     pub measurements: Vec<(String, crate::confidential::MeasurementRecord)>,
@@ -625,6 +634,8 @@ impl Store {
         tx.open_table(CHECKPOINTS)?;
         tx.open_table(ACCOUNT_RESOURCES)?;
         tx.open_table(SCHEDULE_EXT)?;
+        tx.open_table(JOB_GPU_EXT)?;
+        tx.open_table(MEMBER_WEBGPU_EXTRA)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1119,6 +1130,15 @@ impl Store {
             let (k, v) = row?;
             snap.job_place.push((k.value(), dec(v.value())?));
         }
+        for row in tx.open_table(JOB_GPU_EXT)?.iter()? {
+            let (k, v) = row?;
+            snap.job_gpu_ext.push((k.value(), dec(v.value())?));
+        }
+        for row in tx.open_table(MEMBER_WEBGPU_EXTRA)?.iter()? {
+            let (k, v) = row?;
+            snap.webgpu_extra
+                .push((k.value().to_string(), dec(v.value())?));
+        }
         for row in tx.open_table(CHECKPOINTS)?.iter()? {
             let (k, v) = row?;
             snap.checkpoints.push((k.value(), dec(v.value())?));
@@ -1169,6 +1189,7 @@ impl Store {
         b.del(MEMBERS, id);
         b.del(MEMBER_DEVICES, id);
         b.del(MEMBER_WEBGPU, id);
+        b.del(MEMBER_WEBGPU_EXTRA, id);
         b.del(NODE_CONFIG, id);
         b.del(TRUSTED_NODES, id);
         self.commit(b)
@@ -1183,6 +1204,12 @@ impl Store {
     pub fn put_webgpu(&self, id: &str, w: &pumasi_proto::webgpu::SignedWebGpu) -> Result<()> {
         let mut b = Batch::default();
         b.put(MEMBER_WEBGPU, id, enc(w).as_slice());
+        self.commit(b)
+    }
+
+    pub fn put_webgpu_extra(&self, id: &str, e: &crate::gpu::WebGpuExtraRecord) -> Result<()> {
+        let mut b = Batch::default();
+        b.put(MEMBER_WEBGPU_EXTRA, id, enc(e).as_slice());
         self.commit(b)
     }
 
@@ -1228,6 +1255,9 @@ impl Store {
         if !meta.place.is_empty() {
             b.put(JOB_PLACE, meta.id.0, enc(&meta.place).as_slice());
         }
+        if !meta.gpu_ext.is_empty() {
+            b.put(JOB_GPU_EXT, meta.id.0, enc(&meta.gpu_ext).as_slice());
+        }
         for (i, task) in tasks.iter().enumerate() {
             b.put(TASKS, (meta.id.0, i as u32), enc(task).as_slice());
             if !task.ext.is_empty() {
@@ -1252,6 +1282,7 @@ impl Store {
             b.del(JOB_SCHED, job);
             b.del(JOB_ORIGIN, job);
             b.del(JOB_PLACE, job);
+            b.del(JOB_GPU_EXT, job);
             for i in 0..tasks {
                 b.del(CHECKPOINTS, (job, i));
                 b.del(TASKS, (job, i));
@@ -2224,6 +2255,7 @@ pub(crate) mod legacy {
                 sched: Default::default(),
                 origin: Default::default(),
                 place: Default::default(),
+                gpu_ext: Default::default(),
             }
         }
     }
@@ -2316,6 +2348,7 @@ pub(crate) mod legacy {
                     cron: r.spec.cron,
                     job: pumasi_proto::job::JobSubmission {
                         placement: Default::default(),
+                        gpu_ext: Default::default(),
                         name: j.name,
                         executor: j.executor,
                         module: j.module,
@@ -2426,6 +2459,7 @@ mod tests {
                 cron: "@daily".into(),
                 job: JobSubmission {
                     placement: Default::default(),
+                    gpu_ext: Default::default(),
                     name: "report".into(),
                     executor: Executor::Wasm,
                     module: b"\0asm\x01\0\0\0".to_vec(),

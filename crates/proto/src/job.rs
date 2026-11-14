@@ -458,9 +458,39 @@ pub struct JobSubmission {
     /// Gangs, spreading, affinity and checkpoints.
     #[serde(skip)]
     pub placement: crate::sched::Placement,
+    // 1.10 from here, never on the wire inside a submission either.
+    /// Parts of GPUs and WebGPU features ([`JobExt`] carries them).
+    #[serde(skip)]
+    pub gpu_ext: crate::gpu::GpuExt,
+}
+
+/// What postcard leaves out of a [`JobSubmission`], sent beside it in
+/// [`crate::msg::AdminOp::SubmitExt`] (1.10). Fields are only ever added
+/// at the end: it is the last thing in its frame, so an older control
+/// plane would ignore what it does not know (but it refuses the op
+/// itself, which is the point: a job that needs these never runs as if
+/// it did not).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobExt {
+    pub placement: crate::sched::Placement,
+    pub gpu: crate::gpu::GpuExt,
 }
 
 impl JobSubmission {
+    /// Takes out what postcard does not carry.
+    pub fn take_ext(&mut self) -> JobExt {
+        JobExt {
+            placement: std::mem::take(&mut self.placement),
+            gpu: std::mem::take(&mut self.gpu_ext),
+        }
+    }
+
+    /// Puts back what [`Self::take_ext`] took out.
+    pub fn set_ext(&mut self, ext: JobExt) {
+        self.placement = ext.placement;
+        self.gpu_ext = ext.gpu;
+    }
+
     /// Whether its tasks need a node whose Docker GPUs can draw.
     pub fn needs_gpu_graphics(&self) -> bool {
         self.gpu_capabilities.contains(&GpuCapability::Graphics)
@@ -476,8 +506,12 @@ impl JobSubmission {
         }
         if self.tier == Tier::Confidential {
             self.executor = Executor::Microvm;
-        } else if !self.gpu_capabilities.is_empty() || self.placement.checkpoint.is_some() {
-            // Checkpoints need Docker's stop signal (microVMs have none yet).
+        } else if !self.gpu_capabilities.is_empty()
+            || self.placement.checkpoint.is_some()
+            || self.gpu_ext.share > 0
+        {
+            // Checkpoints need Docker's stop signal (microVMs have none
+            // yet), and a microVM takes its GPU whole.
             self.executor = Executor::Docker;
         }
     }
@@ -533,6 +567,27 @@ impl JobSubmission {
                     "GPU results differ from GPU to GPU, so a wasm job with a GPU cannot be deterministic"
                 );
             }
+        }
+        self.gpu_ext.validate()?;
+        if self.gpu_ext.share > 0 {
+            let g = self
+                .gpu
+                .as_ref()
+                .context("a part of a GPU needs a GPU request")?;
+            ensure!(
+                g.count == 1,
+                "a task takes part of one GPU or whole GPUs, not both"
+            );
+            ensure!(
+                matches!(self.executor, Executor::Docker | Executor::Image),
+                "parts of GPUs are for docker jobs (a microVM takes its GPU whole, and a wasm task its adapter)"
+            );
+        }
+        if !self.gpu_ext.features.is_empty() {
+            ensure!(
+                self.executor == Executor::Wasm && self.gpu.is_some(),
+                "gpu.features are WebGPU features, for wasm jobs with a GPU"
+            );
         }
         for f in self
             .files
@@ -732,27 +787,49 @@ pub struct JobFile {
     pub checkpoint: Option<crate::sched::CheckpointFile>,
 }
 
-/// `gpus = 2` or `gpus = "all"`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `gpus = 2`, `gpus = "all"` or `gpus = 0.5` (1.10).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum GpusField {
     Count(u32),
+    Part(f64),
     Text(String),
 }
 
 impl GpusField {
     /// GPUs per task, 0 for all of them.
     pub fn count(&self) -> Result<u32> {
+        Ok(self.count_and_share()?.0)
+    }
+
+    /// GPUs per task (0 for all of them) and the part of one GPU in
+    /// hundredths (0 when it asks for whole GPUs).
+    pub fn count_and_share(&self) -> Result<(u32, u32)> {
+        let part = |v: f64| -> Result<(u32, u32)> {
+            if v >= 1.0 && v.fract() == 0.0 && v <= u32::MAX as f64 {
+                return Ok((v as u32, 0));
+            }
+            let share = (v * 100.0).round();
+            ensure!(
+                v > 0.0 && v < 1.0 && (1.0..=99.0).contains(&share),
+                "`gpus` is a number of GPUs, \"all\", or a part of one GPU between 0.01 and 0.99, not {v}"
+            );
+            Ok((1, share as u32))
+        };
         match self {
             GpusField::Count(n) => {
-                ensure!(*n >= 1, "`gpus` must be at least 1 (or \"all\")");
-                Ok(*n)
+                ensure!(
+                    *n >= 1,
+                    "`gpus` must be at least 1 (or \"all\", or a part like 0.5)"
+                );
+                Ok((*n, 0))
             }
-            GpusField::Text(t) if t.trim() == "all" => Ok(0),
-            GpusField::Text(t) => match t.trim().parse::<u32>() {
-                Ok(n) if n >= 1 => Ok(n),
+            GpusField::Part(v) => part(*v),
+            GpusField::Text(t) if t.trim() == "all" => Ok((0, 0)),
+            GpusField::Text(t) => match t.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => part(v),
                 _ => bail!(
-                    "`gpus` is a number of GPUs or \"all\", not {t:?} (the cluster picks the devices)"
+                    "`gpus` is a number of GPUs, \"all\" or a part like 0.5, not {t:?} (the cluster picks the devices)"
                 ),
             },
         }
@@ -769,6 +846,10 @@ pub struct GpuFile {
     /// (OpenGL, EGL, Vulkan) and `video` (NVENC, NVDEC). Docker, NVIDIA.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// WebGPU features the adapter must have: `shader-f16`, `subgroups`
+    /// (wasm jobs, 1.10).
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1151,6 +1232,26 @@ impl JobFile {
             network: self.network,
             gpus: None,
         });
+        let gpu_share = match &self.gpus {
+            Some(g) => g.count_and_share()?.1,
+            None => 0,
+        };
+        let gpu_features = {
+            let mut f = self
+                .gpu
+                .as_ref()
+                .map(|g| {
+                    g.features
+                        .iter()
+                        .map(|f| f.parse::<crate::webgpu::WebGpuFeature>())
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            f.sort();
+            f.dedup();
+            f
+        };
         let gpu = match (&self.gpus, &self.gpu) {
             (None, None) => None,
             (count, which) => {
@@ -1224,6 +1325,10 @@ impl JobFile {
         };
         let sub = JobSubmission {
             placement,
+            gpu_ext: crate::gpu::GpuExt {
+                share: gpu_share,
+                features: gpu_features,
+            },
             queue_timeout_ms,
             gpu_capabilities,
             priority: self.priority.unwrap_or(0),
@@ -1557,6 +1662,44 @@ mod tests {
             assert_eq!(sub.needs_gpu_graphics(), graphics, "{file}");
             assert_eq!(sub.queue_timeout_ms, Some(30 * 60_000), "{file}");
             assert_eq!(sub.tasks.len(), 4);
+        }
+    }
+
+    #[test]
+    fn parts_of_gpus_and_webgpu_features() {
+        let dir = tempdir();
+        write_module(&dir);
+        let get = |t: &str| JobFile::parse(t).and_then(|f| f.resolve(&dir));
+        let sub = get("image = \"pytorch/pytorch\"\ngpus = 0.5").unwrap();
+        assert_eq!(sub.gpu.as_ref().unwrap().count, 1);
+        assert_eq!(sub.gpu_ext.share, 50);
+        sub.validate().unwrap();
+        let mut image = sub.clone();
+        image.executor = Executor::Image;
+        image.narrow_executor();
+        assert_eq!(
+            image.executor,
+            Executor::Docker,
+            "a part of a GPU is Docker's"
+        );
+        let sub = get("image = \"x\"\ngpus = \"0.25\"").unwrap();
+        assert_eq!(sub.gpu_ext.share, 25);
+        let sub = get("image = \"x\"\ngpus = 2.0").unwrap();
+        assert_eq!((sub.gpu.unwrap().count, sub.gpu_ext.share), (2, 0));
+        let wasm = get("module = \"m.wasm\"\ngpus = 1\ngpu = { features = [\"shader-f16\", \"subgroups\", \"shader-f16\"] }").unwrap();
+        assert_eq!(wasm.gpu_ext.features.len(), 2);
+        wasm.validate().unwrap();
+        for bad in [
+            "image = \"x\"\ngpus = 1.5",
+            "image = \"x\"\ngpus = 0.001",
+            "image = \"x\"\ngpus = -0.5",
+            "executor = \"microvm\"\nimage = \"x\"\ngpus = 0.5",
+            "module = \"m.wasm\"\ngpus = 0.5",
+            "image = \"x\"\ngpus = 1\ngpu = { features = [\"shader-f16\"] }",
+            "module = \"m.wasm\"\ngpus = 1\ngpu = { features = [\"f64\"] }",
+        ] {
+            let r = get(bad).and_then(|s| s.validate());
+            assert!(r.is_err(), "{bad}");
         }
     }
 

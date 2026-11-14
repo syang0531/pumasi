@@ -596,6 +596,11 @@ pub enum FromAgent {
         checkpoint: Option<StoredOutput>,
         error: Option<String>,
     },
+    // Minor 6 (1.10) from here.
+    /// What the node's WebGPU adapters have beyond its
+    /// [`FromAgent::WebGpu`] profile (challenge hash rates, optional
+    /// features), signed, sent after it.
+    WebGpuExtra(Box<crate::webgpu::SignedWebGpuExtra>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,12 +1127,34 @@ pub enum AdminOp {
     Placement {
         id: JobId,
     },
+    // 1.10 from here.
+    /// [`AdminOp::Submit`] with what postcard leaves out of a submission:
+    /// its placement and its GPU parts and WebGPU features. Sent only when
+    /// the GPU part is set ([`AdminOp::submit`]), so a 1.9 control plane
+    /// still takes everything else.
+    SubmitExt {
+        sub: Box<JobSubmission>,
+        ext: Box<crate::job::JobExt>,
+    },
+    /// [`AdminOp::CheckJob`] with what [`AdminOp::SubmitExt`] carries.
+    CheckJobExt {
+        sub: Box<JobSubmission>,
+        ext: Box<crate::job::JobExt>,
+        upload_bytes: u64,
+    },
 }
 
 impl AdminOp {
     /// The call that submits `sub`: [`AdminOp::SubmitPlaced`] when it has a
     /// placement, else [`AdminOp::Submit`].
     pub fn submit(mut sub: JobSubmission) -> AdminOp {
+        if !sub.gpu_ext.is_empty() {
+            let ext = Box::new(sub.take_ext());
+            return AdminOp::SubmitExt {
+                sub: Box::new(sub),
+                ext,
+            };
+        }
         if sub.placement.is_empty() {
             return AdminOp::Submit(Box::new(sub));
         }
@@ -1140,6 +1167,14 @@ impl AdminOp {
 
     /// The call that checks `sub` ([`AdminOp::CheckJob`]).
     pub fn check_job(mut sub: JobSubmission, upload_bytes: u64) -> AdminOp {
+        if !sub.gpu_ext.is_empty() {
+            let ext = Box::new(sub.take_ext());
+            return AdminOp::CheckJobExt {
+                sub: Box::new(sub),
+                ext,
+                upload_bytes,
+            };
+        }
         if sub.placement.is_empty() {
             return AdminOp::CheckJob {
                 sub: Box::new(sub),
@@ -1206,6 +1241,18 @@ impl AdminOp {
             AdminOp::ApplyExt { mut spec, ext } => {
                 spec.set_ext(*ext);
                 AdminOp::Apply(spec)
+            }
+            AdminOp::SubmitExt { mut sub, ext } => {
+                sub.set_ext(*ext);
+                AdminOp::Submit(sub)
+            }
+            AdminOp::CheckJobExt {
+                mut sub,
+                ext,
+                upload_bytes,
+            } => {
+                sub.set_ext(*ext);
+                AdminOp::CheckJob { sub, upload_bytes }
             }
             op => op,
         }
@@ -1933,8 +1980,29 @@ mod tests {
             queue_timeout_ms: None,
             gpu_capabilities: vec![],
             placement: Default::default(),
+            gpu_ext: Default::default(),
         };
         assert!(matches!(AdminOp::submit(sub.clone()), AdminOp::Submit(_)));
+        // 1.10: a part of a GPU rides with the placement in its own call.
+        let mut part = sub.clone();
+        part.gpu_ext.share = 50;
+        part.placement.gang = true;
+        let op = AdminOp::submit(part.clone());
+        assert!(matches!(op, AdminOp::SubmitExt { .. }));
+        let back: AdminOp = postcard::from_bytes(&postcard::to_stdvec(&op).unwrap()).unwrap();
+        let AdminOp::Submit(got) = back.joined() else {
+            panic!("not joined");
+        };
+        assert_eq!((got.gpu_ext.share, got.placement.gang), (50, true));
+        let op = AdminOp::check_job(part, 7);
+        let AdminOp::CheckJob {
+            sub: got,
+            upload_bytes: 7,
+        } = op.joined()
+        else {
+            panic!("not joined");
+        };
+        assert_eq!(got.gpu_ext.share, 50);
         let mut placed = sub.clone();
         placed.placement = Placement {
             gang: true,

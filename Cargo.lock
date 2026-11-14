@@ -4583,6 +4583,7 @@ dependencies = [
  "n0-future",
  "objc2",
  "pollster",
+ "postcard",
  "pumasi-guest",
  "pumasi-proto",
  "rand 0.10.3",

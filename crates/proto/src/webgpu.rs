@@ -40,9 +40,117 @@ pub const WEBGPU_IMPORTS: &[&str] = &[
 pub const WEBGPU_SLOT_BASE: u32 = 1 << 16;
 
 /// FP32 GFLOPS an untrusted node's WebGPU adapter is billed at, at most,
-/// when the cluster cannot time it (no GPU challenge runs on WebGPU yet):
-/// about a recent laptop's integrated GPU.
+/// until the cluster has timed it with a GPU challenge (1.10: over WebGPU
+/// itself, or as the CUDA GPU it is): about a recent laptop's integrated
+/// GPU.
 pub const UNCHECKED_WEBGPU_GFLOPS: u32 = 1_000;
+
+const WEBGPU_EXTRA_DOMAIN: &[u8] = b"pumasi/webgpu-extra/node/v1\0";
+
+/// Optional WebGPU features a device is opened with when its adapter has
+/// them (1.10); a wasm job can require them (`gpu.features`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum WebGpuFeature {
+    /// `enable f16;` in WGSL: 16-bit floats.
+    ShaderF16,
+    /// `enable subgroups;` in WGSL: subgroup operations.
+    Subgroups,
+}
+
+impl WebGpuFeature {
+    pub const ALL: [WebGpuFeature; 2] = [WebGpuFeature::ShaderF16, WebGpuFeature::Subgroups];
+}
+
+impl fmt::Display for WebGpuFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The names WebGPU itself uses.
+        f.write_str(match self {
+            WebGpuFeature::ShaderF16 => "shader-f16",
+            WebGpuFeature::Subgroups => "subgroups",
+        })
+    }
+}
+
+impl std::str::FromStr for WebGpuFeature {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|f| f.to_string() == s)
+            .ok_or_else(|| {
+                anyhow::anyhow!("unknown WebGPU feature {s:?} (shader-f16 or subgroups)")
+            })
+    }
+}
+
+/// What one adapter has beyond [`WebGpuAdapter`] (1.10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterExtra {
+    /// [`WebGpuAdapter::index`].
+    pub index: u32,
+    /// GPU challenge hashes per second over WebGPU, as the node measured
+    /// them (0: not measured). The cluster times the adapter against it.
+    pub hash_rate: u64,
+    /// Optional features its devices are opened with.
+    pub features: Vec<WebGpuFeature>,
+}
+
+/// What a node's WebGPU adapters have beyond its [`WebGpuProfile`],
+/// signed by it (1.10). A message of its own, so the phase 14 profile and
+/// what is stored of it keep their layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebGpuExtra {
+    /// The node's public key.
+    pub node: [u8; 32],
+    pub measured_unix: u64,
+    pub adapters: Vec<AdapterExtra>,
+}
+
+impl WebGpuExtra {
+    pub fn get(&self, index: u32) -> Option<&AdapterExtra> {
+        self.adapters.iter().find(|a| a.index == index)
+    }
+
+    /// Whether adapter `index` has every one of `features`.
+    pub fn has(&self, index: u32, features: &[WebGpuFeature]) -> bool {
+        features.is_empty()
+            || self
+                .get(index)
+                .is_some_and(|a| features.iter().all(|f| a.features.contains(f)))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedWebGpuExtra {
+    pub extra: WebGpuExtra,
+    pub sig: Signature,
+}
+
+fn extra_message(e: &WebGpuExtra) -> Vec<u8> {
+    let mut m = WEBGPU_EXTRA_DOMAIN.to_vec();
+    m.extend(postcard::to_stdvec(e).expect("extra encodes"));
+    m
+}
+
+impl SignedWebGpuExtra {
+    pub fn sign(extra: WebGpuExtra, key: &SecretKey) -> Self {
+        let sig = key.sign(&extra_message(&extra));
+        Self { extra, sig }
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let key = PublicKey::from_bytes(&self.extra.node).context("bad node key")?;
+        key.verify(&extra_message(&self.extra), &self.sig)
+            .map_err(|_| anyhow::anyhow!("WebGPU extra signature does not match"))?;
+        let indices: HashSet<u32> = self.extra.adapters.iter().map(|a| a.index).collect();
+        ensure!(
+            indices.len() == self.extra.adapters.len(),
+            "WebGPU extra lists an adapter twice"
+        );
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WebGpuBackend {
@@ -204,9 +312,22 @@ impl GpuRequest {
     /// Picks a WebGPU adapter for one wasm task, leaving out busy slots:
     /// hardware before software, then the fastest. Returns its slot.
     pub fn pick_webgpu(&self, adapters: &[WebGpuAdapter], busy: &HashSet<u32>) -> Option<Vec<u32>> {
+        self.pick_webgpu_with(adapters, None, &[], busy)
+    }
+
+    /// [`Self::pick_webgpu`] among the adapters that have `features`
+    /// (1.10), as the node's [`WebGpuExtra`] says.
+    pub fn pick_webgpu_with(
+        &self,
+        adapters: &[WebGpuAdapter],
+        extra: Option<&WebGpuExtra>,
+        features: &[WebGpuFeature],
+        busy: &HashSet<u32>,
+    ) -> Option<Vec<u32>> {
         adapters
             .iter()
             .filter(|a| self.matches_webgpu(a) && !busy.contains(&a.slot()))
+            .filter(|a| features.is_empty() || extra.is_some_and(|e| e.has(a.index, features)))
             .max_by_key(|a| (!a.software(), a.fp32_gflops, std::cmp::Reverse(a.index)))
             .map(|a| vec![a.slot()])
     }
@@ -302,5 +423,62 @@ mod tests {
             &key,
         );
         assert!(twice.verify().is_err(), "two adapters on one GPU");
+    }
+
+    #[test]
+    fn features_pick_and_sign() {
+        let key = SecretKey::generate();
+        let extra = WebGpuExtra {
+            node: *key.public().as_bytes(),
+            measured_unix: 1,
+            adapters: vec![
+                AdapterExtra {
+                    index: 0,
+                    hash_rate: 5,
+                    features: vec![WebGpuFeature::ShaderF16],
+                },
+                AdapterExtra {
+                    index: 1,
+                    hash_rate: 9,
+                    features: vec![],
+                },
+            ],
+        };
+        let signed = SignedWebGpuExtra::sign(extra.clone(), &key);
+        signed.verify().unwrap();
+        let mut forged = signed.clone();
+        forged.extra.adapters[1].hash_rate = 99;
+        assert!(forged.verify().is_err());
+        let adapters = vec![
+            adapter(0, None, WebGpuDeviceType::Integrated),
+            adapter(1, None, WebGpuDeviceType::Discrete),
+        ];
+        let req = GpuRequest {
+            count: 1,
+            vendor: None,
+            min_vram_mib: 0,
+        };
+        let none = HashSet::new();
+        // The faster adapter without a feature requirement...
+        assert_eq!(
+            req.pick_webgpu_with(&adapters, Some(&extra), &[], &none),
+            Some(vec![WEBGPU_SLOT_BASE + 1])
+        );
+        // ...the one with f16 when the job needs it, and none for both.
+        let f16 = [WebGpuFeature::ShaderF16];
+        assert_eq!(
+            req.pick_webgpu_with(&adapters, Some(&extra), &f16, &none),
+            Some(vec![WEBGPU_SLOT_BASE])
+        );
+        assert_eq!(req.pick_webgpu_with(&adapters, None, &f16, &none), None);
+        assert_eq!(
+            req.pick_webgpu_with(&adapters, Some(&extra), &WebGpuFeature::ALL, &none),
+            None
+        );
+        assert_eq!(
+            "Shader-F16".parse::<WebGpuFeature>().unwrap(),
+            WebGpuFeature::ShaderF16
+        );
+        assert!("f64".parse::<WebGpuFeature>().is_err());
     }
 }

@@ -122,15 +122,19 @@ pub async fn run(home: &std::path::Path, cmd: GpuCmd) -> Result<i32> {
 }
 
 async fn webgpu(software: bool, bench: bool, json: bool) -> Result<i32> {
-    let (adapters, notes) = tokio::task::spawn_blocking(move || {
+    let (adapters, extra, notes) = tokio::task::spawn_blocking(move || {
         let mut notes = Vec::new();
         let gpus = gpu::detect(&GpuEnv::default(), &mut notes);
         let w = pumasi_agent::webgpu::WebGpu::detect(
-            pumasi_agent::webgpu::Options { software, bench },
+            pumasi_agent::webgpu::Options {
+                software,
+                bench,
+                ..Default::default()
+            },
             &gpus,
             &mut notes,
         );
-        (w.adapters(), notes)
+        (w.adapters(), w.extra([0; 32]).adapters, notes)
     })
     .await?;
     if json {
@@ -138,6 +142,7 @@ async fn webgpu(software: bool, bench: bool, json: bool) -> Result<i32> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "adapters": adapters,
+                "extra": extra,
                 "notes": notes,
             }))?
         );
@@ -169,6 +174,15 @@ async fn webgpu(software: bool, bench: bool, json: bool) -> Result<i32> {
             "buffers up to {} MiB (bindings {} MiB)",
             a.max_buffer_mib, a.max_binding_mib
         ));
+        if let Some(e) = extra.iter().find(|e| e.index == a.index) {
+            if e.hash_rate > 0 {
+                facts.push(format!("{:.2} Ghash/s", e.hash_rate as f64 / 1e9));
+            }
+            if !e.features.is_empty() {
+                let f: Vec<String> = e.features.iter().map(|f| f.to_string()).collect();
+                facts.push(format!("features {}", f.join(" ")));
+            }
+        }
         println!("  {}", facts.join(", "));
     }
     for n in &notes {

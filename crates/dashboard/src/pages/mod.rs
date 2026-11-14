@@ -132,7 +132,13 @@ fn is_live(h: &HeaderMap) -> bool {
 }
 
 impl Ctx {
+    /// Pages ask a follower for the status, events and latest metrics
+    /// when the cluster has replicas (1.12): their live regions poll
+    /// every few seconds, and a moment behind the leader is fine there.
     pub async fn call(&self, op: AdminOp) -> anyhow::Result<AdminResponse> {
+        if op.follower_may_answer() {
+            return self.st.backend.read(self.me.secret, op).await;
+        }
         self.st.backend.call(self.me.secret, op).await
     }
 

@@ -9,10 +9,11 @@ use pumasi_proto::{
     economy::{CuRates, Policy},
     ha::HaView,
     job::{Executor, JobId, JobSubmission, Limits, TaskInput, Tier},
+    manage::AccessRole,
     msg::{AccountView, AdminOp, AdminResponse, Invite, JobState, JobView},
     net::NetMode,
     receipt::Receipt,
-    ticket::{JoinTicket, ReplicaTicket},
+    ticket::{AdminTicket, JoinTicket, ReplicaTicket},
 };
 use tokio::task::JoinHandle;
 
@@ -529,4 +530,160 @@ async fn a_backup_restores_the_cluster() {
     assert_eq!(again.status().cluster_id, r.cluster_id);
     client.close().await;
     again.shutdown().await.unwrap();
+}
+
+/// A secret from an access ticket the cluster made.
+async fn access_secret(client: &AdminClient, name: &str, role: AccessRole) -> pumasi_proto::Secret {
+    match call(
+        client,
+        AdminOp::CreateAccess {
+            name: name.into(),
+            role,
+            ttl_secs: None,
+        },
+    )
+    .await
+    {
+        AdminResponse::AccessTicket { ticket, .. } => ticket.parse::<AdminTicket>().unwrap().secret,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A client whose main connection is to one replica only.
+async fn client_of(replica: &Cluster, secret: pumasi_proto::Secret) -> AdminClient {
+    let t = AdminTicket {
+        cluster: replica.addr(),
+        secret,
+        replicas: Vec::new(),
+    };
+    AdminClient::connect(&t, NetMode::Local).await.unwrap()
+}
+
+/// 1.12: followers answer the status, events and latest metrics from
+/// what the leader hands them, for admins and viewers; submitters, and
+/// tickets revoked a moment ago, are sent to the leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn followers_answer_reads() {
+    init_tracing();
+    let (dir_a, dir_b) = (tempdir("ra"), tempdir("rb"));
+    let a = Cluster::start(config(dir_a.clone(), &free_port()))
+        .await
+        .unwrap();
+    let admin = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+    let b = Cluster::join_replica(
+        config(dir_b.clone(), "127.0.0.1:0"),
+        &invite_replica(&admin).await,
+    )
+    .await
+    .unwrap();
+    wait_replicated(&admin, 2).await;
+    assert!(a.is_leader() && !b.is_leader());
+    let viewer = access_secret(&admin, "watcher", AccessRole::Viewer).await;
+    let submitter = access_secret(
+        &admin,
+        "robot",
+        AccessRole::Submitter {
+            account: "owner".into(),
+        },
+    )
+    .await;
+
+    // The follower answers once the leader handed it a cache.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    return_to_follower_retry(&b, viewer, deadline).await;
+    let on_b = client_of(&b, viewer).await;
+    for op in [
+        AdminOp::Events {
+            after: 0,
+            since_unix: 0,
+            limit: 20,
+        },
+        AdminOp::Metrics {
+            node: None,
+            since_secs: 0,
+        },
+    ] {
+        let r = on_b
+            .call(AdminOp::FollowerRead(Box::new(op)))
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, AdminResponse::Events(_) | AdminResponse::Metrics(_)),
+            "{r:?}"
+        );
+        assert_eq!(
+            on_b.connected_to(),
+            b.endpoint_id(),
+            "the follower sent a read on"
+        );
+    }
+    // A plain call still goes to the leader.
+    call(&on_b, AdminOp::Status).await;
+    assert_eq!(on_b.connected_to(), a.endpoint_id());
+
+    // A submitter's view differs: the leader answers.
+    let sub_b = client_of(&b, submitter).await;
+    call(&sub_b, AdminOp::FollowerRead(Box::new(AdminOp::Status))).await;
+    assert_eq!(sub_b.connected_to(), a.endpoint_id());
+
+    // A revoked ticket is refused by the follower as soon as the
+    // revocation reached its copy of the state.
+    call(
+        &admin,
+        AdminOp::RevokeAccess {
+            id: "watcher".into(),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let gone = client_of(&b, viewer).await;
+    let e = gone
+        .call(AdminOp::FollowerRead(Box::new(AdminOp::Status)))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:#}").contains("invalid admin credentials"),
+        "{e:#}"
+    );
+
+    // `read` uses a follower when the ticket names replicas.
+    let full = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+    assert!(matches!(
+        full.read(AdminOp::Status).await.unwrap(),
+        AdminResponse::Status(_)
+    ));
+
+    for c in [on_b, sub_b, gone, full, admin] {
+        c.close().await;
+    }
+    b.shutdown().await.unwrap();
+    a.shutdown().await.unwrap();
+}
+
+/// Waits until a fresh client on the follower gets a follower answer.
+async fn return_to_follower_retry(
+    b: &Cluster,
+    secret: pumasi_proto::Secret,
+    deadline: tokio::time::Instant,
+) {
+    loop {
+        let c = client_of(b, secret).await;
+        let r = c
+            .call(AdminOp::FollowerRead(Box::new(AdminOp::Status)))
+            .await;
+        let here = c.connected_to() == b.endpoint_id();
+        c.close().await;
+        if r.is_ok() && here {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the follower never answered"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }

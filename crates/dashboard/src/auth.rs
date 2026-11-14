@@ -449,10 +449,30 @@ fn csrf_ok(parts: &Parts, ident: &Identity) -> bool {
 
 /// Slows down a ticket that makes requests faster than
 /// [`crate::limit::TICKET_RATE`] a second (phase 17).
-fn throttle(st: &St, ident: &Identity) -> Result<(), Response> {
-    st.tickets.take(&ident.secret).map_err(|wait| {
-        crate::limit::slow_down(wait, "too many requests with this ticket; slow down")
-    })
+/// Since 1.12 the bucket is on the control plane, shared by every
+/// dashboard: tokens are taken a few at a time and spent here.
+async fn throttle(st: &St, ident: &Identity) -> Result<(), Response> {
+    let slow =
+        |wait| crate::limit::slow_down(wait, "too many requests with this ticket; slow down");
+    if st.shared.on() {
+        let key = pumasi_proto::limit::ticket_key(&ident.secret);
+        if st.shared.spend_lease(&key) {
+            return Ok(());
+        }
+        match st
+            .shared_take(
+                pumasi_proto::limit::Bucket::Ticket,
+                key,
+                pumasi_proto::limit::TICKET_LEASE,
+            )
+            .await
+        {
+            crate::limit::Shared::Allowed => return Ok(()),
+            crate::limit::Shared::Wait(w) => return Err(slow(w)),
+            crate::limit::Shared::Local => {}
+        }
+    }
+    st.tickets.take(&ident.secret).map_err(slow)
 }
 
 /// A signed-in browser, for pages. Others are sent to the sign-in page.
@@ -471,7 +491,7 @@ impl FromRequestParts<St> for Page {
         if !csrf_ok(parts, &ident) {
             return Err((StatusCode::FORBIDDEN, "missing or wrong CSRF token").into_response());
         }
-        throttle(st, &ident)?;
+        throttle(st, &ident).await?;
         Ok(Page(ident))
     }
 }
@@ -492,7 +512,7 @@ impl FromRequestParts<St> for Api {
             // The control plane still checks the secret and its role on
             // every call.
             let ident = self::bearer(st, parts, text).await?;
-            throttle(st, &ident)?;
+            throttle(st, &ident).await?;
             return Ok(Api(ident));
         }
         if st.api_only {
@@ -503,7 +523,7 @@ impl FromRequestParts<St> for Api {
         }
         match session_of(st, parts).await? {
             Some(ident) if csrf_ok(parts, &ident) => {
-                throttle(st, &ident)?;
+                throttle(st, &ident).await?;
                 Ok(Api(ident))
             }
             Some(_) => Err(crate::api::error(

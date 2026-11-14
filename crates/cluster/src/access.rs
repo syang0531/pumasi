@@ -116,6 +116,13 @@ fn op_name(op: &AdminOp) -> &'static str {
         Resources => "read quotas",
         SetResources { .. } => "set quotas",
         Placement { .. } => "read jobs",
+        AuditPrune { .. } => "prune the audit log",
+        AuditCheckpoint | AuditFrom { .. } => "read the audit log",
+        Limit(_) => "share request limits (a dashboard's own ticket)",
+        Scim(_) => "provision users",
+        ScimTokenCreate { .. } | ScimTokenRevoke { .. } => "manage SCIM tokens",
+        ScimView => "read provisioned users",
+        FollowerRead(inner) => op_name(inner),
     }
 }
 

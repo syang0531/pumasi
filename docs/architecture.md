@@ -2869,6 +2869,147 @@ on machines without the setup, and every other platform, behave as in
 1.10. Linux Arm QEMU VMs change their console from `ttyAMA0` (which the
 pinned kernels never had) to `hvc0`.
 
+## Phase 28: operations (1.12)
+
+Release 1.12 closes the operational gaps phase 17 left: limits that hold
+across dashboards, an audit log that can shrink, provisioning from the
+identity provider, the CLI behind a company proxy, and followers that
+answer reads. The code is `proto/src/{limit,scim,net}.rs`,
+`cluster/src/{limits,scim}.rs`, the audit and HA modules, and
+`dashboard/src/{limit,scim}.rs`.
+
+### Limits
+
+The control plane now limits unauthenticated sign-in calls per peer
+(`cluster/src/limits.rs`): 10 at once and then 10 a minute for each
+iroh endpoint (`SsoStart`, `SsoFinish`, `SsoDeviceStart`, `LdapLogin`), 5 and then 20
+a minute for device-flow polls, and 120 a minute for all peers together,
+so a flood from many endpoints cannot keep the leader busy either.
+`SsoInfo` is free; callers holding the admin secret (a dashboard) are
+exempt, because the dashboard limits per client address itself. A wrong
+SCIM token costs the peer the same way, except through such a dashboard,
+which counts it as a failure of its client's address instead (charging
+the dashboard would let anyone shut the identity provider out).
+
+Dashboards share their limits through the leader with one admin call,
+`Limit(LimitOp)`:
+
+- `Take { bucket, key, want }` takes tokens from a shared token bucket
+  (`Ticket` keyed by a BLAKE3 hash of the ticket, `SignIn` keyed by
+  client address) and returns how many it got and how long to wait.
+  The dashboard takes 8 at a time and spends them locally (a lease), so
+  a busy ticket costs one round trip per 8 requests, not one each.
+- `Failed { ip }` records a failed sign-in or wrong ticket; ten in a
+  minute block the address for five minutes everywhere. The reply, and
+  `Blocked` every 3 seconds, carry the blocked list, which each
+  dashboard checks beside its own.
+
+Only the admin may call `Limit` (it is outside the viewer and submitter
+lists), so a dashboard run with another ticket gets "cannot share request
+limits" once and keeps its own buckets for good; a dashboard whose
+control plane does not answer falls back to its own buckets for a
+minute. The numbers are the same as before (`proto/src/limit.rs`, where
+`Buckets` and `Failures` moved). They live in the leader's memory: a
+failover or restart resets them, which costs an attacker nothing they
+did not have before 1.12.
+
+### Audit log pruning
+
+`AuditPrune { through, hash }` checks the whole chain from the current
+start, signs an `AuditCheckpoint` with the cluster key (the domain
+`pumasi/audit-checkpoint/v1`, the last pruned entry's number, hash and
+time, the previous checkpoint's number and the signing time), and writes
+it to `meta` in the same Raft batch that deletes the first 50,000
+entries; further batches delete the rest. A crash in between leaves a
+checkpoint whose entries are partly still there, which is harmless:
+reads and `verify` start after the checkpoint. The caller passes the
+hash it saw for `through`, so a prune never removes entries the admin
+did not save. The prune itself is then logged (`audit.prune`) with the
+range and the hash.
+
+`AuditVerify` starts from the checkpoint: it verifies the checkpoint's
+signature with the cluster key, then the chain from its hash, and
+reports how many entries it checked. `verify_pruned_head` lets
+`pumasi audit verify --against HEAD --pruned FILE` check a head saved
+before the prune: the saved entries must chain from the old head to the
+checkpoint's hash. `--keep-audit` prunes hourly on the leader without
+saving, and never the newest entry. `AuditFrom { from, limit }` pages
+from a number (the old `Audit { after: 0 }` means "the newest"), which
+the prune command needs to read the oldest entries.
+
+### SCIM
+
+`pumasi ui` forwards `/scim/v2/*` to the control plane as
+`Scim(ScimRequest)` with the bearer token, method, path, query, body and
+its public URL; `cluster/src/scim.rs` does the rest, so every dashboard
+and every replica (after a failover) sees the same people. Tokens
+(`pumasi-scim-` plus 32 base32 characters) are stored as BLAKE3 hashes
+with a label; users and groups live in two new tables and are
+replicated like every other write.
+
+It implements what Entra ID and Okta send: `GET` with `eq` filters
+joined by `and`, paging, `POST`, `PUT`, `PATCH` (case-insensitive ops,
+Entra's `"False"` strings, Okta's path-less values, `emails[type eq
+"work"].value`, `members[value eq "id"]`) and `DELETE`, plus the
+discovery documents. Unknown attributes are ignored. SCIM never grants
+access; it only takes it away:
+
+- a user set inactive or deleted has every access ticket named after
+  them revoked (`sso:` plus the lower-case `userName` or any e-mail,
+  `ldap:` plus the `userName`) and every dashboard session whose parent
+  is one of those tickets ended; while inactive, `sso_session` refuses
+  them (audited);
+- a member leaving a group that a `group:` rule names (by display name,
+  id or external id), or a group deleted, ends the member's sessions so
+  the next sign-in applies the rules afresh.
+
+Keycloak has no SCIM client, so CI sends Entra- and Okta-shaped request
+sequences (unit and state tests) and `scripts/sso-e2e.sh` plays the
+directory with curl against a Keycloak-signed-in user.
+
+### The CLI behind an HTTPS proxy
+
+`proto/src/net.rs` reads `PUMASI_PROXY`, then `HTTPS_PROXY`,
+`HTTP_PROXY` and `ALL_PROXY` (and their lower-case forms), and hands
+iroh's endpoint builder the proxy URL (`http` or `https`, with basic
+auth) and a TLS configuration with the built-in roots plus
+`PUMASI_CA_FILE` and, when a proxy is set, the system's roots. iroh then
+opens relay connections with CONNECT through it; direct paths still try
+UDP and fail quietly, so the connection stays on the relay. It applies
+to every `--net public` endpoint, so agents and control planes behind a
+proxy work too; `PUMASI_PROXY=off` opts a process out. CI
+(`cluster/tests/proxy.rs`) runs an iroh relay with a certificate from a
+test CA and a CONNECT proxy that records its targets: the CLI reaches
+the cluster only through the proxy, and fails without the CA.
+
+### Followers answer reads
+
+Every 2 seconds a leader with followers builds a `ReadCache` (the
+status as the owner sees it, the newest 500 events, current node
+metrics) and sends it to each follower over the Raft ALPN
+(`RaftReq::Reads`); a follower keeps it only from the leader it knows.
+`AdminOp::FollowerRead(op)` asks a follower to answer `Status`, `Events`
+or `Metrics` (no history) from a copy younger than 6 seconds; it checks
+the caller against its replicated store (the admin secret, a live
+admin or viewer access ticket, or a dashboard session within its idle
+time) and otherwise says `NotLeader`, as for any other call. Submitters,
+who see only their own jobs, always go to the leader. `AdminClient::read`
+keeps one connection to a follower and falls back to the leader (for 30
+seconds after a miss); the dashboard's pages use it, while the API and
+the CLI keep reading from the leader.
+
+### Compatibility
+
+New admin calls, responses and the `Reads` Raft message are appended to
+their enums. A 1.12 CLI against a 1.11 control plane gets an error for
+prune and the SCIM commands, and `audit verify` works as before (no
+checkpoint); a 1.12 dashboard against 1.11 keeps its own limits. Upgrade
+every replica together: a 1.11 follower cannot decode `Reads` and
+drops that connection, which costs only the copy. The two
+new tables are created on first start; going back to 1.11 leaves them
+unused. Processes that see `HTTPS_PROXY` now use it for relays: set
+`PUMASI_PROXY=off` where that is not wanted.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -3007,10 +3148,10 @@ remotely; install a current binary on them once.
 
 ## Not yet
 
-- Remote API: no iroh proxy for the CLI behind HTTP-only networks, no
-  ACME (certificates come from certbot, a proxy or a tunnel), failed
-  sign-in counts live in each `pumasi ui` process, `?wait=` polls the
-  control plane, and policies cannot limit CPU, memory or CU per job
+- Remote API: no ACME (certificates come from certbot, a proxy or a
+  tunnel), the CLI behind a proxy needs one that passes WebSocket after
+  CONNECT, shared limits need dashboards run with the admin ticket and
+  reset on a failover, `?wait=` polls the control plane, and policies cannot limit CPU, memory or CU per job
   (account quotas cover slots, GPUs, CU per day, and since 1.9 CPUs and
   memory).
 
@@ -3059,13 +3200,11 @@ remotely; install a current binary on them once.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Remaining roadmap: phases 27 (Windows) and 28 (operations)
-  ([roadmap.md](roadmap.md)) take on many of the gaps in this list;
+- Roadmap: phases 20 to 28 are done ([roadmap.md](roadmap.md));
   phases 18 and 19 (the hub and buying CU) are on hold.
-- Phase 17 leftovers: no per-peer limit on unauthenticated sign-in calls
-  at the control plane, the audit log is never pruned (pruning behind a
-  signed checkpoint), no SCIM provisioning (people appear when they first
-  sign in and their sessions simply expire), no SAML (1.2 added the
+- Phase 17 leftovers: SCIM takes access away but never creates it
+  (people still appear when they first sign in), filters support only
+  `eq` and `and`, no SAML (1.2 added the
   control plane's service installer, `pumasi service install cluster`). 1.0 was tagged after a green
   long-checks run on the tagged commit. The internal security review is done (threat
   model, "Internal review for 1.0"); no third-party audit yet.
@@ -3076,8 +3215,9 @@ remotely; install a current binary on them once.
 - High availability: release binaries are not mirrored to followers, the
   file store's data reaches them only every 30 seconds, a replica's
   address in the membership is the one it joined with (a replica that
-  moves must be removed and invited again), and replicas take no reads
-  (followers serve nothing; the leader does all the work).
+  moves must be removed and invited again), and followers answer only
+  the dashboard's status, events and current metrics (the API, the CLI,
+  history and submitters still read from the leader).
 - CU cannot be bought or exchanged, and there is no platform fee; both
   belong to the hub.
 - "Honeypot" tasks with known answers (needed for non-deterministic Docker

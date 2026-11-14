@@ -538,6 +538,10 @@ pub enum RaftReq {
         sha256: [u8; 32],
         offset: u64,
     },
+    // 1.12 from here.
+    /// From the leader: what followers answer reads with. No answer is
+    /// sent (an older follower cannot read it and drops it).
+    Reads(Box<pumasi_proto::ha::ReadCache>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -759,6 +763,8 @@ pub struct Ha {
     invites: Mutex<HashMap<Secret, Instant>>,
     /// Who may send Raft messages before this replica has a membership.
     join_peers: Mutex<HashSet<EndpointId>>,
+    /// On a follower: the leader's latest [`RaftReq::Reads`] (1.12).
+    reads: Mutex<Option<(Instant, Arc<pumasi_proto::ha::ReadCache>)>>,
 }
 
 impl Ha {
@@ -797,6 +803,7 @@ impl Ha {
             seen,
             invites: Default::default(),
             join_peers: Mutex::new(join_peers),
+            reads: Mutex::new(None),
         });
         if bootstrap && !ha.raft.is_initialized().await? {
             let mut members = BTreeMap::new();
@@ -1179,6 +1186,13 @@ impl Ha {
                 Ok(b) => RaftResp::Chunk(b),
                 Err(e) => RaftResp::Refused(format!("{e:#}")),
             },
+            RaftReq::Reads(cache) => {
+                // Only the leader's word counts.
+                if self.leader_addr().is_some_and(|l| l.id == peer) && peer != self.endpoint.id() {
+                    *self.reads.lock().unwrap() = Some((Instant::now(), Arc::new(*cache)));
+                }
+                RaftResp::Mirrored(0)
+            }
             RaftReq::Join { .. } => unreachable!("handled above"),
         }
     }
@@ -1284,6 +1298,64 @@ impl Ha {
 
     pub async fn shutdown(&self) {
         let _ = self.raft.shutdown().await;
+    }
+
+    /// The leader's read cache, while it is fresh and this replica is a
+    /// follower of a known leader (1.12).
+    pub fn fresh_reads(&self) -> Option<Arc<pumasi_proto::ha::ReadCache>> {
+        if self.is_leader() || self.leader_addr().is_none() {
+            return None;
+        }
+        let guard = self.reads.lock().unwrap();
+        let (at, cache) = guard.as_ref()?;
+        (at.elapsed() < Duration::from_millis(pumasi_proto::ha::READ_CACHE_FRESH_MS))
+            .then(|| cache.clone())
+    }
+
+    /// Sends the read cache to every follower, keeping one connection to
+    /// each in `conns` (1.12). Fire and forget: a follower that misses one
+    /// gets the next, two seconds later.
+    pub async fn push_reads(
+        &self,
+        cache: pumasi_proto::ha::ReadCache,
+        conns: &mut HashMap<EndpointId, Connection>,
+    ) {
+        let followers: Vec<EndpointAddr> = self
+            .members()
+            .into_iter()
+            .filter(|(id, _)| *id != self.id)
+            .filter_map(|(_, n)| n.addr)
+            .collect();
+        conns.retain(|id, c| c.close_reason().is_none() && followers.iter().any(|f| f.id == *id));
+        let req = RaftReq::Reads(Box::new(cache));
+        for addr in followers {
+            let conn = match conns.get(&addr.id) {
+                Some(c) => c.clone(),
+                None => match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    self.endpoint.connect(addr.clone(), RAFT_ALPN),
+                )
+                .await
+                {
+                    Ok(Ok(c)) => {
+                        conns.insert(addr.id, c.clone());
+                        c
+                    }
+                    _ => continue,
+                },
+            };
+            let sent: Result<()> = async {
+                let (mut send, _recv) = conn.open_bi().await?;
+                write_frame(&mut send, &req).await?;
+                send.finish()?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = sent {
+                debug!("read cache to {}: {e:#}", addr.id.fmt_short());
+                conns.remove(&addr.id);
+            }
+        }
     }
 
     pub fn dir(&self) -> &Path {

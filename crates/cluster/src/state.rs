@@ -514,6 +514,8 @@ pub struct State {
     pub(crate) audit_tip: crate::audit::AuditTip,
     /// SSO settings and sign-ins under way (phase 17).
     pub(crate) sso: crate::sso::SsoState,
+    /// SCIM tokens, users and groups (1.12).
+    pub(crate) scim: crate::scim::ScimState,
     /// Display names an admin gave nodes (1.3), by node id.
     pub(crate) names: std::collections::BTreeMap<String, crate::names::NameOverride>,
     /// Nodes' sleep and wake state (1.5).
@@ -625,6 +627,7 @@ impl State {
             conf: Default::default(),
             audit_tip: Default::default(),
             sso: Default::default(),
+            scim: Default::default(),
             names: Default::default(),
             power: Default::default(),
             net: Default::default(),
@@ -748,6 +751,7 @@ impl State {
         state.load_conf(snap.measurements, snap.trusted_nodes);
         state.load_audit()?;
         state.load_sso()?;
+        state.load_scim()?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(

@@ -51,6 +51,35 @@ pub enum AuditCmd {
         /// it.
         #[arg(long)]
         against: Option<PathBuf>,
+        /// The entries a prune removed (the file `pumasi audit prune
+        /// --save` wrote), for a saved head older than the prune.
+        #[arg(long)]
+        pruned: Option<PathBuf>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Remove old entries behind a checkpoint signed by the cluster key
+    /// (1.12). The whole chain is checked first; afterwards `verify`
+    /// checks the rest from the checkpoint. Without --yes, only says what
+    /// would go.
+    Prune {
+        /// Remove entries older than this: a duration (365d) or a UTC date
+        /// (2026-01-01).
+        #[arg(long, conflicts_with = "through")]
+        before: Option<String>,
+        /// Remove entries up to and including this number.
+        #[arg(long)]
+        through: Option<u64>,
+        /// Save the entries first, one JSON object per line, with the
+        /// checkpoint next to them (FILE.checkpoint.json).
+        #[arg(long, value_name = "FILE")]
+        save: Option<PathBuf>,
+        /// Do not save them (they are gone for good unless exported).
+        #[arg(long, conflicts_with = "save")]
+        no_save: bool,
+        /// Prune now.
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -192,6 +221,36 @@ pub enum SsoCmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// SCIM provisioning (1.12): tokens for identity providers, and the
+    /// people and groups they pushed.
+    #[command(subcommand)]
+    Scim(ScimCmd),
+}
+
+#[derive(Subcommand)]
+pub enum ScimCmd {
+    /// The SCIM tokens, people and groups.
+    Status {
+        /// As JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// A new token for an identity provider (printed once). The provider
+    /// calls `<dashboard URL>/scim/v2` with it as a bearer token.
+    Token {
+        /// The provider's name, e.g. "Entra ID".
+        label: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Revoke a token (its id, a unique prefix, or its label).
+    Revoke {
+        id: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -265,6 +324,7 @@ pub async fn audit(home: &Path, cmd: AuditCmd) -> Result<i32> {
         AuditCmd::Verify {
             json,
             against,
+            pruned,
             admin,
         } => {
             let client = connect_admin(home, &admin).await?;
@@ -278,6 +338,16 @@ pub async fn audit(home: &Path, cmd: AuditCmd) -> Result<i32> {
                 "the head is signed by {}, not this cluster's key",
                 head.cluster
             );
+            let checkpoint = audit_checkpoint(&client).await?;
+            if let Some(cp) = &checkpoint {
+                cp.verify().context("the audit checkpoint")?;
+                anyhow::ensure!(
+                    cp.cluster == head.cluster,
+                    "the audit checkpoint is signed by {}, not this cluster's key",
+                    cp.cluster
+                );
+                eprintln!("{}", cp.line());
+            }
             if let Some(path) = against {
                 let old: AuditHead = serde_json::from_str(
                     &std::fs::read_to_string(&path)
@@ -294,7 +364,27 @@ pub async fn audit(home: &Path, cmd: AuditCmd) -> Result<i32> {
                     head.seq,
                     old.seq
                 );
-                if old.seq > 0 {
+                let floor = checkpoint.as_ref().map_or(0, |c| c.seq);
+                if old.seq > 0 && old.seq <= floor {
+                    let cp = checkpoint.as_ref().expect("floor > 0");
+                    if old.seq == cp.seq {
+                        anyhow::ensure!(
+                            old.hash == cp.hash,
+                            "the checkpoint at #{} does not have the saved head's hash: the log was rewritten",
+                            cp.seq
+                        );
+                    } else {
+                        let Some(file) = &pruned else {
+                            bail!(
+                                "the saved head #{} was pruned (the log starts at #{}); give the entries the prune saved with --pruned FILE",
+                                old.seq,
+                                floor + 1
+                            );
+                        };
+                        let saved = read_entries(file)?;
+                        pumasi_proto::audit::verify_pruned_head(&old, &saved, cp)?;
+                    }
+                } else if old.seq > 0 {
                     let e = fetch(&client, old.seq - 1, 1).await?;
                     anyhow::ensure!(
                         e.first()
@@ -328,7 +418,178 @@ pub async fn audit(home: &Path, cmd: AuditCmd) -> Result<i32> {
             hostname,
             admin,
         } => export(home, syslog, state, after, follow, hostname, admin).await,
+        AuditCmd::Prune {
+            before,
+            through,
+            save,
+            no_save,
+            yes,
+            admin,
+        } => prune(home, before, through, save, no_save, yes, admin).await,
     }
+}
+
+/// The latest prune's checkpoint; `None` from a control plane older than
+/// 1.12, which never prunes.
+async fn audit_checkpoint(
+    client: &AdminClient,
+) -> Result<Option<pumasi_proto::audit::AuditCheckpoint>> {
+    match client.call(AdminOp::AuditCheckpoint).await {
+        Ok(AdminResponse::AuditCheckpoint(c)) => Ok(c.map(|b| *b)),
+        Ok(AdminResponse::Error(e)) if e.contains("unexpected admin call") => Ok(None),
+        Ok(AdminResponse::Error(e)) => bail!("{e}"),
+        Ok(_) => bail!("unexpected response"),
+        // An older control plane cannot read the call and drops it.
+        Err(_) => Ok(None),
+    }
+}
+
+/// Audit entries as `--json` and `prune --save` write them.
+fn read_entries(path: &Path) -> Result<Vec<AuditEntry>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::from_str(l)
+                .with_context(|| format!("{} line {}: not an audit entry", path.display(), i + 1))
+        })
+        .collect()
+}
+
+/// The UNIX time `before` names: a duration ago, or a UTC date.
+fn cutoff(before: &str, now: u64) -> Result<u64> {
+    let b = before.trim();
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(b, "%Y-%m-%d") {
+        let t = d
+            .and_hms_opt(0, 0, 0)
+            .context("bad date")?
+            .and_utc()
+            .timestamp();
+        return u64::try_from(t).context("a date before 1970");
+    }
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(b) {
+        return u64::try_from(t.timestamp()).context("a date before 1970");
+    }
+    let ms = pumasi_proto::job::parse_duration_ms(b)
+        .with_context(|| format!("--before {b:?}: a duration (365d) or a date (2026-01-01)"))?;
+    Ok(now.saturating_sub(ms / 1000))
+}
+
+async fn prune(
+    home: &Path,
+    before: Option<String>,
+    through: Option<u64>,
+    save: Option<PathBuf>,
+    no_save: bool,
+    yes: bool,
+    admin: AdminArgs,
+) -> Result<i32> {
+    anyhow::ensure!(
+        before.is_some() || through.is_some(),
+        "say what to prune: --before 365d (or a date) or --through NUMBER"
+    );
+    anyhow::ensure!(
+        save.is_some() || no_save,
+        "give --save FILE to keep the entries (or --no-save to drop them)"
+    );
+    if let Some(path) = &save {
+        anyhow::ensure!(!path.exists(), "{} exists; give a new file", path.display());
+    }
+    let client = connect_admin(home, &admin).await?;
+    let floor = audit_checkpoint(&client).await?.map_or(0, |c| c.seq);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let cut = before.as_deref().map(|b| cutoff(b, now)).transpose()?;
+    // Read what would go, oldest first.
+    let mut doomed: Vec<AuditEntry> = Vec::new();
+    let mut from = floor + 1;
+    let mut newest = floor;
+    'pages: loop {
+        let page = match client
+            .call(AdminOp::AuditFrom { from, limit: 5000 })
+            .await?
+        {
+            AdminResponse::Audit(v) => v,
+            AdminResponse::Error(e) => bail!("{e}"),
+            _ => bail!("unexpected response"),
+        };
+        let Some(last) = page.last() else { break };
+        from = last.seq + 1;
+        for e in &page {
+            newest = newest.max(e.seq);
+            let goes = match (through, cut) {
+                (Some(t), _) => e.seq <= t,
+                (None, Some(c)) => e.unix < c,
+                _ => false,
+            };
+            if !goes {
+                break 'pages;
+            }
+            doomed.push(e.clone());
+        }
+        if page.len() < 5000 {
+            break;
+        }
+    }
+    // Keep the newest entry: the head stays where `verify` finds it.
+    while doomed.last().is_some_and(|e| e.seq >= newest) && through.is_none() {
+        doomed.pop();
+    }
+    let Some(last) = doomed.last().cloned() else {
+        eprintln!("nothing to prune");
+        client.close().await;
+        return Ok(0);
+    };
+    if let Some(t) = through {
+        anyhow::ensure!(
+            last.seq == t,
+            "the log has no entry #{t} to prune up to (it ends at #{})",
+            last.seq
+        );
+    }
+    let first = doomed.first().map_or(0, |e| e.seq);
+    eprintln!(
+        "{} entries (#{first} to #{}, up to {} UTC) would be pruned",
+        doomed.len(),
+        last.seq,
+        pumasi_proto::audit::rfc3339(last.unix)
+    );
+    if !yes {
+        eprintln!("run again with --yes to prune");
+        client.close().await;
+        return Ok(1);
+    }
+    if let Some(path) = &save {
+        let mut out = String::new();
+        for e in &doomed {
+            out.push_str(&serde_json::to_string(e)?);
+            out.push('\n');
+        }
+        std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
+        eprintln!("saved them to {}", path.display());
+    }
+    let cp = match client
+        .call(AdminOp::AuditPrune {
+            through: last.seq,
+            hash: last.hash,
+        })
+        .await?
+    {
+        AdminResponse::AuditCheckpoint(Some(c)) => *c,
+        AdminResponse::Error(e) => bail!("{e}"),
+        _ => bail!("unexpected response (is the control plane older than 1.12?)"),
+    };
+    cp.verify().context("the new checkpoint")?;
+    if let Some(path) = &save {
+        let side = PathBuf::from(format!("{}.checkpoint.json", path.display()));
+        std::fs::write(&side, serde_json::to_string_pretty(&cp)? + "\n")
+            .with_context(|| format!("write {}", side.display()))?;
+    }
+    client.close().await;
+    println!("{}", cp.line());
+    Ok(0)
 }
 
 enum Sink {
@@ -415,6 +676,17 @@ async fn export(
     let mut sent = 0u64;
     loop {
         let v = fetch(&client, last, 500).await?;
+        if last > 0
+            && let Some(first) = v.first()
+            && first.seq > last + 1
+        {
+            eprintln!(
+                "warning: entries #{} to #{} were pruned before they were sent; the export goes on from #{}",
+                last + 1,
+                first.seq - 1,
+                first.seq
+            );
+        }
         for e in &v {
             sink.send(&syslog_line(e, &host)).await?;
             last = e.seq;
@@ -511,8 +783,82 @@ fn print_sso(v: &SsoView) {
     }
 }
 
+pub async fn scim(home: &Path, cmd: ScimCmd) -> Result<i32> {
+    match cmd {
+        ScimCmd::Token { label, admin } => {
+            let AdminResponse::ScimToken { token, view } =
+                call(home, &admin, AdminOp::ScimTokenCreate { label }).await?
+            else {
+                bail!("unexpected response (is the control plane older than 1.12?)");
+            };
+            eprintln!(
+                "SCIM token {} ({}) created; it is shown only now. In the identity provider, set the tenant URL to <dashboard URL>/scim/v2 and the secret token to:",
+                view.id, view.label
+            );
+            eprintln!();
+            println!("{token}");
+            Ok(0)
+        }
+        ScimCmd::Revoke { id, admin } => {
+            let AdminResponse::ScimView(_) =
+                call(home, &admin, AdminOp::ScimTokenRevoke { id: id.clone() }).await?
+            else {
+                bail!("unexpected response");
+            };
+            eprintln!("SCIM token {id} revoked");
+            Ok(0)
+        }
+        ScimCmd::Status { json, admin } => {
+            let AdminResponse::ScimView(v) = call(home, &admin, AdminOp::ScimView).await? else {
+                bail!("unexpected response (is the control plane older than 1.12?)");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&*v)?);
+                return Ok(0);
+            }
+            println!("tokens:");
+            if v.tokens.is_empty() {
+                println!("  none (pumasi sso scim token LABEL)");
+            }
+            for t in &v.tokens {
+                println!(
+                    "  {}  {}  created {} UTC, last used {}",
+                    t.id,
+                    t.label,
+                    utc(t.created_unix),
+                    if t.last_used_unix == 0 {
+                        "never".to_string()
+                    } else {
+                        format!("{} UTC", utc(t.last_used_unix))
+                    }
+                );
+            }
+            println!("people ({}):", v.users.len());
+            for u in &v.users {
+                println!(
+                    "  {:<32} {:<8} sessions {}{}",
+                    u.user_name,
+                    if u.active { "active" } else { "OFF" },
+                    u.sessions,
+                    if u.groups.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  groups: {}", u.groups.join(", "))
+                    }
+                );
+            }
+            println!("groups ({}):", v.groups.len());
+            for g in &v.groups {
+                println!("  {:<32} {} member(s)", g.display_name, g.members);
+            }
+            Ok(0)
+        }
+    }
+}
+
 pub async fn sso(home: &Path, cmd: SsoCmd) -> Result<i32> {
     let (admin, op) = match cmd {
+        SsoCmd::Scim(cmd) => return scim(home, cmd).await,
         SsoCmd::Status { admin } => (admin, AdminOp::SsoGet),
         SsoCmd::Oidc {
             issuer,

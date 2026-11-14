@@ -396,6 +396,9 @@ With an admin ticket, `GET /api/v1/audit?after=N&limit=N` returns the
 entries (oldest first, with their hashes) and `GET /api/v1/audit/verify`
 checks the whole chain and returns its head signed by the cluster key,
 the same as `pumasi audit ls --json` and `pumasi audit verify --json`.
+After old entries are pruned (1.12, `pumasi audit prune`), the chain
+starts at a checkpoint the cluster signed: `{"AuditCheckpoint": null}`
+through `POST /api/v1/op` returns it (`null` if nothing was pruned).
 
 ### Cancel
 
@@ -613,6 +616,28 @@ curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$id:$secret" "$PUMASI_URL/s
 With the AWS CLI, rclone or boto3, use the endpoint `$PUMASI_URL/s3`,
 any region and path-style addressing (README, "S3 gateway").
 
+### SCIM provisioning (1.12)
+
+The same server answers SCIM 2.0 (RFC 7643/7644) at `/scim/v2`, for an
+identity provider (Entra ID, Okta, OneLogin) that creates, deactivates
+and deletes people and groups. It authenticates with its own bearer
+token, made with an admin ticket and shown once (`pumasi sso scim token`
+does the same):
+
+```sh
+scim=$(curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' \
+  -d '{"ScimTokenCreate": {"label": "directory"}}' "$PUMASI_URL/api/v1/op" | jq -r .token)
+curl -fsS -H "Authorization: Bearer $scim" "$PUMASI_URL/scim/v2/ServiceProviderConfig"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $scim" "$PUMASI_URL/scim/v2/Users" | jq -e '.totalResults == 0 and (.schemas | index("urn:ietf:params:scim:api:messages:2.0:ListResponse"))' -->
+<!-- ci: test "$(curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer pumasi-scim-wrong' "$PUMASI_URL/scim/v2/Users")" = 401 -->
+
+`/Users` and `/Groups` take `GET` (with `filter=userName eq "..."`,
+`startIndex`, `count`), `POST`, `PUT`, `PATCH` and `DELETE`.
+Deactivating or deleting a person revokes their SSO tickets and ends
+their dashboard sessions; leaving a group a sign-in rule names ends
+them too. docs/operations.md, "SCIM provisioning", has the setup.
+
 ### Placement, CPU quotas and checkpoints (1.9)
 
 A job's placement (`gang`, `spread`, `affinity`, `checkpoint` from its
@@ -648,7 +673,8 @@ Some clients reach the internet only through an HTTPS proxy: a Claude
 Code cloud session, many company networks. That is all this API needs
 (one HTTPS host and a bearer header). The CLI needs more: it speaks iroh,
 QUIC over UDP directly or through relays over WebSocket, and such
-proxies usually pass neither (see the end of this section).
+proxies usually pass neither (see the end of this section; 1.12 sends
+relay connections through a proxy that does).
 
 ### pumasi-remote
 
@@ -761,15 +787,20 @@ Things to know:
   (`PUMASI_WAIT`, at most 90). How long the session proxy keeps a quiet
   request open is not documented; lower it if waits end with errors.
 
-### Why the CLI does not go through the proxy
+### The CLI behind a company proxy (1.12)
 
-iroh 1.x can take an HTTP proxy (`HTTPS_PROXY`, CONNECT) and extra CA
-roots for its relay connections, so the CLI could in principle reach a
-relay from behind a company proxy. It would not help in a Claude Code
-cloud session: relays speak WebSocket after the TLS handshake and that
-proxy does not pass WebSocket upgrades, the relay host would have to be
-allowed, and the CLI keeps its ticket in a file in the session, which
-network secrets exist to avoid. The HTTP API is the way in from there.
+Since 1.12 the CLI, agents and control planes send their relay
+connections through `HTTPS_PROXY` (or `PUMASI_PROXY`, which wins;
+`PUMASI_PROXY=off` turns it off) with HTTP CONNECT, and trust the
+system's CA roots plus the PEM file in `PUMASI_CA_FILE` for a proxy that
+re-signs TLS. docs/operations.md, "Behind an HTTPS proxy", has the
+details.
+
+It still does not help in a Claude Code cloud session: relays speak
+WebSocket after the TLS handshake and that proxy does not pass WebSocket
+upgrades, the relay host would have to be allowed, and the CLI keeps its
+ticket in a file in the session, which network secrets exist to avoid.
+The HTTP API is the way in from there.
 
 ## GPU drawing (EEVEE, OpenGL, Vulkan)
 

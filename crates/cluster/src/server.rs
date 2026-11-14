@@ -94,6 +94,13 @@ pub struct ClusterConfig {
     pub mirror_every: Duration,
     /// How long finished jobs are kept (zero: forever).
     pub keep_jobs: Duration,
+    /// How long audit entries are kept before they are pruned behind a
+    /// signed checkpoint (zero: forever, the default; 1.12).
+    pub keep_audit: Duration,
+    /// Sign-in calls without a ticket one peer may make per minute (and in
+    /// a burst); 1.12. Tests that sign many people in from one client
+    /// raise it.
+    pub sign_in_per_min: f64,
     /// Accept the test stand-in for a TEE, so confidential jobs run on
     /// machines without SEV-SNP or TDX (tests only: nothing is protected).
     pub insecure_test_tee: bool,
@@ -136,6 +143,8 @@ impl ClusterConfig {
             metrics_token: None,
             metrics_retention: Duration::from_secs(7 * 86_400),
             keep_jobs: crate::retention::DEFAULT_KEEP_JOBS,
+            keep_audit: Duration::ZERO,
+            sign_in_per_min: crate::limits::PEER_PER_MIN,
             mirror_every: Duration::from_secs(30),
             insecure_test_tee: false,
             release_source: pumasi_proto::release::DEFAULT_RELEASE_SOURCE.into(),
@@ -258,6 +267,8 @@ pub(crate) struct Inner {
     stopped: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     metrics_addr: Option<SocketAddr>,
+    /// Sign-in limits and the counts dashboards share (1.12).
+    limits: crate::limits::Limits,
 }
 
 impl std::ops::Deref for Inner {
@@ -274,6 +285,15 @@ impl Inner {
 
     pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("state lock poisoned")
+    }
+
+    /// Whether `secret` is the admin ticket's or an admin access ticket's.
+    fn is_admin(&self, secret: &Secret) -> bool {
+        secrets_eq(secret, &self.admin_secret())
+            || matches!(
+                self.state().access_caller(secret),
+                Some(Caller::Admin { .. })
+            )
     }
 
     fn ticket_addrs(&self) -> (EndpointAddr, Vec<EndpointAddr>) {
@@ -360,6 +380,7 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
         stopped,
         tasks: Mutex::new(Vec::new()),
         metrics_addr: prometheus.as_ref().map(|(_, a)| *a),
+        limits: crate::limits::Limits::new(config.sign_in_per_min),
     });
 
     let mut tasks = Vec::new();
@@ -369,6 +390,7 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
         .attach_store(store_tx, config.disk_class, config.storage_bill_every);
     tasks.push(tokio::spawn(store_worker(inner.clone(), store_rx)));
     tasks.push(tokio::spawn(replica_worker(inner.clone())));
+    tasks.push(tokio::spawn(push_reads(inner.clone())));
     let (hook_tx, hook_rx) = mpsc::unbounded_channel();
     inner.state().attach_webhooks(hook_tx);
     tasks.push(tokio::spawn(crate::prometheus::webhook_worker(
@@ -404,6 +426,12 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
                     inner
                         .state()
                         .expire_jobs(inner.config.keep_jobs, crate::state::now_unix());
+                }
+                // Old audit entries, hourly when asked for (1.12).
+                if ticks % 7200 == 240 && !inner.config.keep_audit.is_zero() {
+                    inner
+                        .state()
+                        .audit_prune_older(inner.config.keep_audit, crate::state::now_unix());
                 }
                 ticks += 1;
                 inner.state().tick(inner.config.node_timeout);
@@ -1547,6 +1575,18 @@ impl ProtocolHandler for AdminHandler {
                         return Ok(());
                     };
                     let Some(inner) = shared.active() else {
+                        // A read a follower may answer, from what the
+                        // leader handed it a moment ago (1.12).
+                        if let AdminOp::FollowerRead(op) = &req.op
+                            && op.follower_may_answer()
+                            && let Some(cache) = shared.ha().and_then(|h| h.fresh_reads())
+                            && let Some(resp) =
+                                follower_answer(&shared.store, &req.secret, op, &cache)
+                        {
+                            write_msg(&mut send, &resp).await?;
+                            send.finish()?;
+                            return Ok(());
+                        }
                         // Nothing done: the client asks the leader instead.
                         write_msg(
                             &mut send,
@@ -1558,8 +1598,25 @@ impl ProtocolHandler for AdminHandler {
                         send.finish()?;
                         return Ok(());
                     };
-                    let resp = if req.op.is_sign_in() {
-                        handle_sign_in(&inner, req.op, &peer).await
+                    let resp = if req.op.is_scim() {
+                        let dashboard = inner.is_admin(&req.secret);
+                        handle_scim(&inner, req.op, &peer, dashboard)
+                    } else if req.op.is_sign_in() {
+                        // A dashboard signs people in with its admin
+                        // ticket and limits each browser itself; anyone
+                        // else is limited per peer (1.12).
+                        let limited = if inner.is_admin(&req.secret) {
+                            Ok(())
+                        } else {
+                            inner.limits.sign_in(&peer, &req.op)
+                        };
+                        match limited {
+                            Ok(()) => handle_sign_in(&inner, req.op, &peer).await,
+                            Err(wait) => AdminResponse::Error(format!(
+                                "too many sign-in attempts from this machine; try again in {} s",
+                                wait.as_secs().max(1)
+                            )),
+                        }
                     } else {
                         admin_call(&inner, &req.secret, req.op, &peer).await
                     };
@@ -1581,7 +1638,14 @@ impl ProtocolHandler for AdminHandler {
 async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str) -> AdminResponse {
     // 1.9 carries placements, time zones and CPU quotas beside the old
     // calls; from here on they are the old calls with those filled in.
-    let op = op.joined();
+    let op = match op.joined() {
+        // The leader answers a follower read itself (1.12).
+        AdminOp::FollowerRead(inner) if inner.follower_may_answer() => *inner,
+        AdminOp::FollowerRead(_) => {
+            return AdminResponse::Error("not a read a follower may answer".into());
+        }
+        op => op,
+    };
     let admin = inner.admin_secret();
     let by_ticket = |st: &crate::state::State, secret: &Secret| {
         if secrets_eq(secret, &admin) {
@@ -1816,6 +1880,184 @@ fn session_call(
         _ => Err(anyhow::anyhow!("not a session call")),
     };
     res.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))
+}
+
+/// How often the leader hands its followers what they answer reads with.
+const PUSH_READS_EVERY: Duration = Duration::from_secs(2);
+
+/// On the leader with replicas: sends the followers the status, the
+/// newest events and the latest metrics every couple of seconds, so they
+/// can answer those reads themselves (1.12).
+async fn push_reads(inner: Arc<Inner>) {
+    let mut conns = std::collections::HashMap::new();
+    let mut tick = tokio::time::interval(PUSH_READS_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(ha) = inner.ha() else { continue };
+        if ha.members().len() < 2 {
+            continue;
+        }
+        let cache = {
+            let st = inner.state();
+            let mut events = st.events(0, 0, pumasi_proto::ha::READ_CACHE_EVENTS as u32 + 1);
+            let events_cut = events.len() > pumasi_proto::ha::READ_CACHE_EVENTS;
+            if events_cut {
+                events.remove(0);
+            }
+            let Ok(metrics) = st.metrics_view(None, 0) else {
+                continue;
+            };
+            pumasi_proto::ha::ReadCache {
+                at_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64),
+                status: st.status_for(Some(pumasi_proto::msg::OWNER_ACCOUNT)),
+                events,
+                events_cut,
+                metrics,
+            }
+        };
+        ha.push_reads(cache, &mut conns).await;
+    }
+}
+
+/// Who a secret is, read from this replica's copy of the state (a
+/// follower has no state machine running): the admin ticket, a live
+/// access ticket, or a dashboard session of either.
+fn follower_caller(store: &Store, secret: &Secret) -> Option<Caller> {
+    let admin: Option<Secret> = store
+        .get_meta(ADMIN_SECRET_META)
+        .ok()
+        .flatten()
+        .and_then(|b| b.try_into().ok());
+    let by_ticket = |s: &Secret| -> Option<Caller> {
+        if admin.as_ref().is_some_and(|a| secrets_eq(a, s)) {
+            return Some(Caller::Admin {
+                name: "cluster admin".into(),
+            });
+        }
+        let r = store.access_record(s).ok().flatten()?;
+        if !r.live(crate::state::now_unix()) {
+            return None;
+        }
+        Some(match r.role {
+            pumasi_proto::manage::AccessRole::Admin => Caller::Admin { name: r.name },
+            pumasi_proto::manage::AccessRole::Viewer => Caller::Viewer { name: r.name },
+            pumasi_proto::manage::AccessRole::Submitter { account } => Caller::Submitter {
+                name: r.name,
+                account,
+            },
+        })
+    };
+    if let Some(c) = by_ticket(secret) {
+        return Some(c);
+    }
+    let session = store
+        .ui_session(&pumasi_proto::ui::session_hash(secret))
+        .ok()
+        .flatten()?;
+    let idle = crate::state::now_unix().saturating_sub(session.last_used_unix)
+        >= pumasi_proto::ui::SESSION_IDLE_SECS;
+    if idle {
+        return None;
+    }
+    by_ticket(&session.parent)
+}
+
+/// A follower's answer to a [`AdminOp::FollowerRead`] from the leader's
+/// cache; `None` sends the caller to the leader (a submitter, whose view
+/// differs, or a read the cache cannot answer in full).
+fn follower_answer(
+    store: &Store,
+    secret: &Secret,
+    op: &AdminOp,
+    cache: &pumasi_proto::ha::ReadCache,
+) -> Option<AdminResponse> {
+    let caller = follower_caller(store, secret)?;
+    if matches!(caller, Caller::Submitter { .. }) {
+        return None;
+    }
+    match op {
+        AdminOp::Status => Some(AdminResponse::Status(cache.status.clone())),
+        AdminOp::Events {
+            after,
+            since_unix,
+            limit,
+        } => {
+            let limit = (*limit).max(1) as usize;
+            let all: Vec<&pumasi_proto::monitor::EventView> = cache
+                .events
+                .iter()
+                .filter(|e| e.seq > *after && e.unix >= *since_unix)
+                .collect();
+            let first = cache.events.first().map_or(u64::MAX, |e| e.seq);
+            if *after == 0 {
+                // The newest: complete when the cache holds that many or
+                // everything since `since_unix`.
+                if all.len() < limit
+                    && cache.events_cut
+                    && cache.events.first().is_none_or(|e| e.unix >= *since_unix)
+                {
+                    return None;
+                }
+                let skip = all.len().saturating_sub(limit);
+                Some(AdminResponse::Events(
+                    all[skip..].iter().map(|e| (*e).clone()).collect(),
+                ))
+            } else {
+                // From `after` on: only when nothing between is missing.
+                if cache.events_cut && *after + 1 < first {
+                    return None;
+                }
+                Some(AdminResponse::Events(
+                    all.into_iter().take(limit).cloned().collect(),
+                ))
+            }
+        }
+        AdminOp::Metrics {
+            node,
+            since_secs: 0,
+        } => {
+            let mut m = cache.metrics.clone();
+            if let Some(n) = node {
+                let hits: Vec<usize> = (0..m.nodes.len())
+                    .filter(|&i| m.nodes[i].id.starts_with(n.as_str()) || m.nodes[i].name == *n)
+                    .collect();
+                // Unknown or ambiguous: the leader says why.
+                let [i] = hits.as_slice() else {
+                    return None;
+                };
+                let one = m.nodes.swap_remove(*i);
+                m.nodes = vec![one];
+            }
+            Some(AdminResponse::Metrics(Box::new(m)))
+        }
+        _ => None,
+    }
+}
+
+/// A SCIM request (1.12): checked against the SCIM tokens, not tickets.
+/// A wrong token costs the peer like a failed sign-in, unless the peer is
+/// a dashboard with the admin secret: it counts wrong tokens per client
+/// address itself, and charging its endpoint would let anyone shut the
+/// identity provider out through it.
+fn handle_scim(inner: &Arc<Inner>, op: AdminOp, peer: &str, dashboard: bool) -> AdminResponse {
+    let AdminOp::Scim(req) = op else {
+        return AdminResponse::Error("not a SCIM call".into());
+    };
+    let res = inner.state().scim_request(&req, peer);
+    match res {
+        Ok(r) => AdminResponse::Scim(Box::new(r)),
+        Err(r) if dashboard => AdminResponse::Scim(Box::new(r)),
+        Err(r) => match inner.limits.wrong_credential(peer) {
+            Ok(()) => AdminResponse::Scim(Box::new(r)),
+            Err(wait) => AdminResponse::Error(format!(
+                "too many wrong SCIM tokens from this machine; try again in {} s",
+                wait.as_secs().max(1)
+            )),
+        },
+    }
 }
 
 /// Sign-in calls (phase 17), which need no ticket: the control plane
@@ -3018,6 +3260,28 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
                 ticket: ticket.to_string(),
             })
         }
+        AdminOp::AuditFrom { from, limit } => {
+            Ok(AdminResponse::Audit(inner.state().audit_from(from, limit)?))
+        }
+        AdminOp::AuditCheckpoint => Ok(AdminResponse::AuditCheckpoint(
+            inner.state().audit_checkpoint().map(Box::new),
+        )),
+        AdminOp::AuditPrune { through, hash } => {
+            let who = crate::audit::Actor::caller(caller, "");
+            let (cp, _) = inner.state().audit_prune(through, Some(hash), &who)?;
+            Ok(AdminResponse::AuditCheckpoint(Some(Box::new(cp))))
+        }
+        AdminOp::Limit(op) => Ok(AdminResponse::Limit(Box::new(inner.limits.call(*op)?))),
+        AdminOp::ScimTokenCreate { label } => {
+            let (token, view) = inner.state().scim_token_create(&label)?;
+            Ok(AdminResponse::ScimToken { token, view })
+        }
+        AdminOp::ScimTokenRevoke { id } => {
+            let mut st = inner.state();
+            st.scim_token_revoke(&id)?;
+            Ok(AdminResponse::ScimView(Box::new(st.scim_view())))
+        }
+        AdminOp::ScimView => Ok(AdminResponse::ScimView(Box::new(inner.state().scim_view()))),
         AdminOp::SsoGet => Ok(AdminResponse::Sso(Box::new(inner.state().sso_view()))),
         AdminOp::SsoSet(u) => Ok(AdminResponse::Sso(Box::new(inner.state().sso_update(*u)?))),
         other => anyhow::bail!(
@@ -3046,6 +3310,16 @@ pub struct AdminClient {
     pub(crate) cluster: EndpointAddr,
     /// Every address worth trying, newest knowledge first.
     candidates: Arc<Mutex<Vec<EndpointAddr>>>,
+    /// A connection to a follower for [`AdminClient::read`] (1.12).
+    reader: Arc<Reader>,
+}
+
+/// The follower [`AdminClient::read`] asks, and when not to.
+#[derive(Default)]
+struct Reader {
+    conn: tokio::sync::Mutex<Option<Connection>>,
+    /// Reads go to the leader until then (no follower answered).
+    off_until: Mutex<Option<Instant>>,
 }
 
 /// Connects to the first of `candidates` that answers on the admin ALPN.
@@ -3137,6 +3411,7 @@ impl AdminClient {
             secret: ticket.secret,
             cluster: ticket.cluster.clone(),
             candidates: Arc::new(Mutex::new(candidates)),
+            reader: Arc::default(),
         })
     }
 
@@ -3150,6 +3425,7 @@ impl AdminClient {
             secret,
             cluster: self.cluster.clone(),
             candidates: self.candidates.clone(),
+            reader: self.reader.clone(),
         }
     }
 
@@ -3173,10 +3449,16 @@ impl AdminClient {
             secret: self.secret,
             cluster: self.cluster.clone(),
             candidates: self.candidates.clone(),
+            reader: self.reader.clone(),
         })
     }
 
     /// The cluster's id (its key), whichever replica answers.
+    /// The replica the main connection is to now.
+    pub fn connected_to(&self) -> iroh::EndpointId {
+        self.conn().remote_id()
+    }
+
     pub fn cluster_id(&self) -> iroh::EndpointId {
         self.cluster.id
     }
@@ -3215,6 +3497,84 @@ impl AdminClient {
             old.close(0u32.into(), b"moved to the leader");
         }
         Ok(())
+    }
+
+    /// A read that a follower may answer ([`AdminOp::follower_may_answer`]),
+    /// a couple of seconds behind the leader: asked of a follower when the
+    /// cluster has replicas, so a busy leader does less (1.12). Falls back
+    /// to [`Self::call`] when no follower can answer.
+    pub async fn read(&self, op: AdminOp) -> Result<AdminResponse> {
+        if !op.follower_may_answer() || self.candidates.lock().unwrap().len() < 2 {
+            return self.call(op).await;
+        }
+        let off = self
+            .reader
+            .off_until
+            .lock()
+            .unwrap()
+            .is_some_and(|t| Instant::now() < t);
+        if !off {
+            match self.follower_read(&op).await {
+                Some(AdminResponse::Error(e)) => anyhow::bail!(e),
+                Some(resp) => return Ok(resp),
+                None => {
+                    *self.reader.off_until.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_secs(30));
+                }
+            }
+        }
+        self.call(op).await
+    }
+
+    /// Asks a follower; `None` when none answers for itself.
+    async fn follower_read(&self, op: &AdminOp) -> Option<AdminResponse> {
+        let req = AdminRequest {
+            secret: self.secret,
+            op: AdminOp::FollowerRead(Box::new(op.clone())),
+        };
+        let mut guard = self.reader.conn.lock().await;
+        for attempt in 0..2 {
+            let conn = match guard.as_ref().filter(|c| c.close_reason().is_none()) {
+                Some(c) => c.clone(),
+                None => {
+                    let leader = self.conn().remote_id();
+                    let others: Vec<EndpointAddr> = self
+                        .candidates
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|a| a.id != leader)
+                        .cloned()
+                        .collect();
+                    let mut found = None;
+                    for addr in others {
+                        if let Ok(Ok(c)) = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            self.endpoint.connect(addr, ADMIN_ALPN),
+                        )
+                        .await
+                        {
+                            found = Some(c);
+                            break;
+                        }
+                    }
+                    let c = found?;
+                    *guard = Some(c.clone());
+                    c
+                }
+            };
+            match send_call(&conn, &req).await {
+                // The leader moved here: the main connection follows on
+                // its next call; reads go to whoever this is now.
+                Sent::Answered(AdminResponse::NotLeader { .. }) => return None,
+                Sent::Answered(resp) => return Some(resp),
+                Sent::Unsent(_) | Sent::Lost(_) if attempt == 0 => {
+                    *guard = None;
+                }
+                Sent::Unsent(_) | Sent::Lost(_) => return None,
+            }
+        }
+        None
     }
 
     pub async fn call(&self, op: AdminOp) -> Result<AdminResponse> {

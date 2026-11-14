@@ -36,6 +36,8 @@ ldap3.workspace = true
 rustls.workspace = true
 
 [dev-dependencies]
+iroh-relay.workspace = true
+rcgen.workspace = true
 pumasi-agent.workspace = true
 axum.workspace = true
 ldap3_proto.workspace = true

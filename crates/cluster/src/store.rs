@@ -117,6 +117,10 @@ const TRUSTED_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("truste
 /// Self-hosting 1.0 (phase 17). The audit log, a hash chain, by sequence
 /// number.
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
+/// Meta key of the latest audit prune's checkpoint (1.12).
+const AUDIT_CHECKPOINT_META: &str = "audit_checkpoint";
+/// Audit rows removed per transaction (and Raft entry) when pruning.
+const AUDIT_PRUNE_CHUNK: usize = 50_000;
 /// 1.4. How long the parts of a task's run took, by (job id, task index).
 const TASK_TIMES: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_times");
 /// The executor an `executor = "image"` task's run was placed with (1.5).
@@ -149,6 +153,11 @@ const JOB_GPU_EXT: TableDefinition<u128, &[u8]> = TableDefinition::new("job_gpu_
 /// What a node's WebGPU adapters have beyond its profile (1.10), by node.
 const MEMBER_WEBGPU_EXTRA: TableDefinition<&str, &[u8]> =
     TableDefinition::new("member_webgpu_extra");
+/// SCIM users and groups (1.12), by id.
+const SCIM_USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("scim_users");
+const SCIM_GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("scim_groups");
+/// Meta key of the SCIM tokens (their hashes).
+const SCIM_TOKENS_META: &str = "scim_tokens";
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -221,7 +230,9 @@ macro_rules! tables {
             ACCOUNT_RESOURCES,
             SCHEDULE_EXT,
             JOB_GPU_EXT,
-            MEMBER_WEBGPU_EXTRA
+            MEMBER_WEBGPU_EXTRA,
+            SCIM_USERS,
+            SCIM_GROUPS
         )
     };
 }
@@ -636,6 +647,8 @@ impl Store {
         tx.open_table(SCHEDULE_EXT)?;
         tx.open_table(JOB_GPU_EXT)?;
         tx.open_table(MEMBER_WEBGPU_EXTRA)?;
+        tx.open_table(SCIM_USERS)?;
+        tx.open_table(SCIM_GROUPS)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1443,6 +1456,22 @@ impl Store {
 
     // -- dashboard sessions (1.7) ------------------------------------------
 
+    /// One access ticket by its secret (a follower's check, 1.12).
+    pub fn access_record(&self, secret: &Secret) -> Result<Option<crate::manage::AccessRecord>> {
+        let tx = self.read()?;
+        let t = tx.open_table(ACCESS)?;
+        t.get(secret.as_slice())?
+            .map(|v| dec(v.value()))
+            .transpose()
+    }
+
+    /// One dashboard session by its hash (a follower's check, 1.12).
+    pub fn ui_session(&self, hash: &[u8; 32]) -> Result<Option<crate::sessions::SessionRecord>> {
+        let tx = self.read()?;
+        let t = tx.open_table(UI_SESSIONS)?;
+        t.get(hash.as_slice())?.map(|v| dec(v.value())).transpose()
+    }
+
     pub fn ui_sessions(&self) -> Result<Vec<crate::sessions::SessionRecord>> {
         let tx = self.read()?;
         let mut out = Vec::new();
@@ -1864,32 +1893,152 @@ impl Store {
     }
 
     /// Up to `limit` audit entries after `after`, oldest first; with
-    /// `after` 0, the newest `limit`.
-    pub fn audit(&self, after: u64, limit: usize) -> Result<Vec<AuditEntry>> {
+    /// `after` 0, the newest `limit`. Entries up to `floor` (a prune's
+    /// checkpoint) are not read.
+    pub fn audit(&self, after: u64, limit: usize, floor: u64) -> Result<Vec<AuditEntry>> {
         let tx = self.read()?;
         let t = tx.open_table(AUDIT)?;
         let mut out = Vec::new();
         if after == 0 {
-            for row in t.iter()?.rev().take(limit) {
+            for row in t.range(floor.saturating_add(1)..)?.rev().take(limit) {
                 out.push(dec(row?.1.value())?);
             }
             out.reverse();
         } else {
-            for row in t.range(after + 1..)?.take(limit) {
+            for row in t.range(after.max(floor).saturating_add(1)..)?.take(limit) {
                 out.push(dec(row?.1.value())?);
             }
         }
         Ok(out)
     }
 
-    /// Walks every audit entry in order, in one read transaction.
-    pub fn each_audit(&self, mut f: impl FnMut(AuditEntry) -> Result<()>) -> Result<()> {
+    /// Walks every audit entry after `after` in order, in one read
+    /// transaction.
+    pub fn each_audit(
+        &self,
+        after: u64,
+        mut f: impl FnMut(AuditEntry) -> Result<()>,
+    ) -> Result<()> {
         let tx = self.read()?;
         let t = tx.open_table(AUDIT)?;
-        for row in t.iter()? {
+        for row in t.range(after.saturating_add(1)..)? {
             f(dec(row?.1.value())?)?;
         }
         Ok(())
+    }
+
+    /// Up to `limit` audit entries after `after`, oldest first.
+    pub fn each_audit_limited(
+        &self,
+        after: u64,
+        limit: usize,
+        out: &mut Vec<AuditEntry>,
+    ) -> Result<()> {
+        let tx = self.read()?;
+        let t = tx.open_table(AUDIT)?;
+        for row in t.range(after.saturating_add(1)..)?.take(limit) {
+            out.push(dec(row?.1.value())?);
+        }
+        Ok(())
+    }
+
+    /// One audit entry.
+    pub fn audit_entry(&self, seq: u64) -> Result<Option<AuditEntry>> {
+        let tx = self.read()?;
+        let t = tx.open_table(AUDIT)?;
+        t.get(seq)?.map(|v| dec(v.value())).transpose()
+    }
+
+    /// The latest prune's checkpoint (1.12).
+    pub fn audit_checkpoint(&self) -> Result<Option<pumasi_proto::audit::AuditCheckpoint>> {
+        self.meta_record(AUDIT_CHECKPOINT_META)
+    }
+
+    /// Records a checkpoint and removes the entries up to it. The
+    /// checkpoint goes first, with the first rows: every reader starts
+    /// after it, so rows a crash leaves behind are skipped, and the next
+    /// prune removes them.
+    pub fn prune_audit(&self, cp: &pumasi_proto::audit::AuditCheckpoint) -> Result<u64> {
+        let keys: Vec<u64> = {
+            let tx = self.read()?;
+            let t = tx.open_table(AUDIT)?;
+            let mut keys = Vec::new();
+            for row in t.range(..=cp.seq)? {
+                keys.push(row?.0.value());
+            }
+            keys
+        };
+        let mut first = true;
+        let mut chunks = keys.chunks(AUDIT_PRUNE_CHUNK).peekable();
+        if chunks.peek().is_none() {
+            let mut b = Batch::default();
+            b.put(META, AUDIT_CHECKPOINT_META, enc(cp).as_slice());
+            return self.commit(b).map(|_| 0);
+        }
+        for chunk in chunks {
+            let mut b = Batch::default();
+            if first {
+                b.put(META, AUDIT_CHECKPOINT_META, enc(cp).as_slice());
+                first = false;
+            }
+            for k in chunk {
+                b.del(AUDIT, *k);
+            }
+            self.commit(b)?;
+        }
+        Ok(keys.len() as u64)
+    }
+
+    // -- SCIM (1.12) ---------------------------------------------------------
+
+    pub fn scim_tokens(&self) -> Result<Vec<crate::scim::ScimTokenRecord>> {
+        Ok(self.meta_record(SCIM_TOKENS_META)?.unwrap_or_default())
+    }
+
+    pub fn put_scim_tokens(&self, t: &[crate::scim::ScimTokenRecord]) -> Result<()> {
+        self.put_meta_record(SCIM_TOKENS_META, &t.to_vec())
+    }
+
+    pub fn scim_users(&self) -> Result<Vec<crate::scim::ScimUser>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(SCIM_USERS)?.iter()? {
+            out.push(dec(row?.1.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn put_scim_user(&self, u: &crate::scim::ScimUser) -> Result<()> {
+        let mut b = Batch::default();
+        b.put(SCIM_USERS, u.id.as_str(), enc(u).as_slice());
+        self.commit(b)
+    }
+
+    pub fn delete_scim_user(&self, id: &str) -> Result<()> {
+        let mut b = Batch::default();
+        b.del(SCIM_USERS, id);
+        self.commit(b)
+    }
+
+    pub fn scim_groups(&self) -> Result<Vec<crate::scim::ScimGroup>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(SCIM_GROUPS)?.iter()? {
+            out.push(dec(row?.1.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn put_scim_group(&self, g: &crate::scim::ScimGroup) -> Result<()> {
+        let mut b = Batch::default();
+        b.put(SCIM_GROUPS, g.id.as_str(), enc(g).as_slice());
+        self.commit(b)
+    }
+
+    pub fn delete_scim_group(&self, id: &str) -> Result<()> {
+        let mut b = Batch::default();
+        b.del(SCIM_GROUPS, id);
+        self.commit(b)
     }
 
     pub fn sso(&self) -> Result<Option<crate::sso::SsoConfig>> {

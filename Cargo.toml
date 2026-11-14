@@ -5,7 +5,7 @@ members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "cr
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "1.11.0"
+version = "1.12.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/syang0531/pumasi"
@@ -28,6 +28,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 iroh = "1.4"
+# Proxy URLs for relay connections (1.12).
+url = "2.5"
 iroh-blobs = { version = "0.104", default-features = false, features = ["fs-store"] }
 n0-future = "0.3"
 tokio-util = { version = "0.7", features = ["io-util"] }
@@ -79,6 +81,8 @@ ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ri
 # Tests: a stand-in OpenID provider and LDAP directory.
 ldap3_proto = { version = "0.9", default-features = false }
 ring = "0.17"
+# Tests: a local relay for the CLI behind a proxy (1.12).
+iroh-relay = { version = "1.4", default-features = false, features = ["server", "tls-ring"] }
 futures = "0.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "form", "json", "multipart"] }
 # Control plane high availability (phase 13).

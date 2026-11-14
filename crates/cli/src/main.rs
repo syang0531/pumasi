@@ -999,6 +999,12 @@ struct MetricsArgs {
     /// and small outputs; receipts and the audit log stay.
     #[arg(long, default_value = "30d")]
     keep_jobs: String,
+    /// Prune audit entries older than this (e.g. 365d) behind a checkpoint
+    /// signed by the cluster key, so `pumasi audit verify` still proves the
+    /// rest was not changed. Export them first (`pumasi audit export`).
+    /// Default 0: keep them forever.
+    #[arg(long, default_value = "0")]
+    keep_audit: String,
     /// Wake a sleeping node (one started with --wake-on-lan) for work
     /// that has waited this long for a busy node, e.g. 10m; `never` wakes
     /// nodes only for work that no online node can run at all.
@@ -2100,6 +2106,8 @@ async fn cluster_start(
     config.metrics_retention =
         Duration::from_millis(parse_duration_ms(&metrics.metrics_retention)?);
     config.keep_jobs = Duration::from_millis(parse_duration_ms(&metrics.keep_jobs)?);
+    config.keep_audit =
+        Duration::from_millis(parse_duration_ms(&metrics.keep_audit).context("--keep-audit")?);
     config.wake_after = match metrics.wake_after.trim() {
         "never" => None,
         d => Some(Duration::from_millis(

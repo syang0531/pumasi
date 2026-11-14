@@ -47,7 +47,11 @@ pub struct CallbackQuery {
 
 /// What sign-in methods the cluster offers (nothing, if it cannot say).
 async fn sso_info(st: &St) -> SsoInfo {
-    match st.backend.call([0; 32], AdminOp::SsoInfo).await {
+    match st
+        .backend
+        .call(st.backend.own_secret(), AdminOp::SsoInfo)
+        .await
+    {
         Ok(AdminResponse::SsoInfo(i)) => i,
         _ => SsoInfo::default(),
     }
@@ -72,18 +76,26 @@ pub async fn sso_start(
     headers: HeaderMap,
 ) -> Response {
     let l = Lang::from_headers(&headers);
-    if let Some(ip) = ip
-        && let Err(wait) = st.sign_ins.take(&ip)
-    {
-        return crate::limit::slow_down(
-            wait,
-            "too many sign-ins from this address; try again later",
-        );
+    if let Some(ip) = ip {
+        let wait = match st
+            .shared_take(pumasi_proto::limit::Bucket::SignIn, ip.to_string(), 1)
+            .await
+        {
+            crate::limit::Shared::Allowed => None,
+            crate::limit::Shared::Wait(w) => Some(w),
+            crate::limit::Shared::Local => st.sign_ins.take(&ip).err(),
+        };
+        if let Some(wait) = wait {
+            return crate::limit::slow_down(
+                wait,
+                "too many sign-ins from this address; try again later",
+            );
+        }
     }
     let redirect_uri = format!("{}/sso/callback", st.public_url);
     match st
         .backend
-        .call([0; 32], AdminOp::SsoStart { redirect_uri })
+        .call(st.backend.own_secret(), AdminOp::SsoStart { redirect_uri })
         .await
     {
         Ok(AdminResponse::SsoRedirect { url, state }) => (
@@ -145,7 +157,7 @@ pub async fn sso_callback(
     let res = async {
         match st
             .backend
-            .call([0; 32], AdminOp::SsoFinish { state, code })
+            .call(st.backend.own_secret(), AdminOp::SsoFinish { state, code })
             .await?
         {
             AdminResponse::AccessTicket { ticket, .. } => {
@@ -213,7 +225,7 @@ pub async fn ldap(
         match st
             .backend
             .call(
-                [0; 32],
+                st.backend.own_secret(),
                 AdminOp::LdapLogin {
                     user: f.user,
                     password: Hidden(f.password),

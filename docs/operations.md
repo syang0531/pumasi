@@ -110,6 +110,33 @@ client and not to the proxy; when the proxy runs on another machine, also
 on connections from this machine). `pumasi ui --api-only` serves only
 the JSON API for scripts.
 
+Several dashboards may serve the same cluster (one per site, or two
+behind a load balancer). Since 1.12, those that run with the admin
+ticket share their limits through the control plane: a client that
+fails ten sign-ins across them is blocked on all of them, and a ticket's
+request budget is one budget. A dashboard started with any other ticket
+keeps its own limits, as before.
+
+### Behind an HTTPS proxy
+
+On a network that reaches the internet only through a proxy, `pumasi`
+(the CLI, agents and control planes, `--net public`) sends its relay
+connections through it with HTTP CONNECT (1.12):
+
+| Variable | Meaning |
+| --- | --- |
+| `PUMASI_PROXY` | The proxy, `http://[user:pass@]host:port` or `https://...`. Wins over the others; `off` (or empty) goes direct even if `HTTPS_PROXY` is set. |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` | Read in that order (lower case too) when `PUMASI_PROXY` is unset. A value that is not an `http(s)://` URL is skipped with a warning. |
+| `PUMASI_CA_FILE` | PEM certificates to trust beside the built-in roots, for a proxy that re-signs TLS. With a proxy set, the system's roots (and `SSL_CERT_FILE`) are trusted too. |
+
+Only relay traffic goes through the proxy: direct QUIC paths need UDP,
+which such proxies do not pass, so every byte goes through the relay.
+That is slower than a direct path but works; `pumasi net` shows the
+path. The relay must be reachable from the proxy (its host allowed),
+and a proxy that refuses WebSocket upgrades after CONNECT cannot be
+used. Pass `PUMASI_PROXY=off` to a service that should ignore a
+machine-wide `HTTPS_PROXY`.
+
 ## 2. Sign people in
 
 Give each person their own access: an SSO account mapped to a role, or an
@@ -193,6 +220,43 @@ can start a device sign-in and send its code to a member; a member who
 enters it at the provider signs that person in with their own role. Turn
 it on only if people need it and know to enter only codes they asked for
 themselves; the browser sign-in and `--ldap` do not have this problem.
+
+### SCIM provisioning
+
+With SCIM (1.12) the identity provider tells Pumasi when someone leaves
+or changes groups, instead of waiting for their session to run out.
+The dashboard answers SCIM 2.0 at `https://pumasi.example.com/scim/v2`
+(its `--public-url` plus `/scim/v2`; also with `--api-only`):
+
+```sh
+pumasi sso scim token entra   # prints the token once
+pumasi sso scim status        # tokens, people and groups the provider sent
+pumasi sso scim revoke ID
+```
+
+| Provider | Where |
+| --- | --- |
+| Microsoft Entra ID | Enterprise application → Provisioning → Automatic: Tenant URL the address above, Secret Token the token. Map `userPrincipalName` (or `mail`) to `userName`, matching what the OIDC sign-in uses. |
+| Okta | App → General → Provisioning: SCIM; base URL the address above, unique identifier `userName`, "Push New Users", "Push Profile Updates", "Push Groups", authentication "HTTP Header" with the token. |
+| Keycloak, others | Keycloak has no SCIM client of its own; an extension or a script can send the same requests. `scripts/sso-e2e.sh` does it with curl. |
+
+What it changes:
+
+- Someone set inactive (`active: false`) or deleted loses every SSO
+  ticket named after them (their `userName`, their e-mail addresses,
+  and the LDAP name) and every dashboard session, at once, and cannot
+  sign in again until set active.
+- Someone removed from a group a `pumasi sso map group:...` rule names
+  (by its display name, id or external id), or in a group that is
+  deleted, has their sessions ended; their next sign-in gets the role
+  the rules give them then.
+- SCIM never creates access by itself: people still need a rule, and
+  sign in as before. Every change is in the audit log as `scim.*` with
+  the token's label.
+
+Tokens are kept as hashes; a wrong token answers 401 and counts toward
+the address's failed attempts. Filters support `eq` joined by `and`,
+which is what the providers send.
 
 ## 3. Upgrade
 
@@ -349,6 +413,13 @@ the file store is acknowledged once the replicas have it too (they also
 catch up every 30 seconds), and release binaries uploaded for a rollout
 are copied to every replica, so a failover loses neither.
 
+Since 1.12 followers answer the dashboard's reads (status, events and
+node metrics) for admins and viewers from a copy the leader sends every
+2 seconds, so a busy dashboard does not load the leader; anything older
+than 6 seconds, any write, and any other caller go to the leader as
+before. Rate limits shared between dashboards live in the leader's
+memory, so a failover starts them afresh.
+
 ## 6. Watch it
 
 - Alerts: `pumasi alert set --defaults` and a webhook (`pumasi webhook add
@@ -361,8 +432,8 @@ are copied to every replica, so a failover loses neither.
   that comes and goes can have the offline rule off for good:
   `pumasi alert set --on laptop --node-offline off`.
 - Disk: the control plane's database grows with jobs (bounded by
-  `--keep-jobs`) and the audit log (kept forever); the file store with
-  datasets (bounded by quotas).
+  `--keep-jobs`) and the audit log (kept forever unless pruned, below);
+  the file store with datasets (bounded by quotas).
 
 ### The audit log
 
@@ -391,6 +462,25 @@ pumasi audit verify --against /secure/audit-head-2026-11-01.json
 `verify` walks the whole hash chain; `--against` also checks that the log
 still contains a head saved earlier, which catches a log rewritten by
 someone with the database.
+
+The log grows forever unless you prune it (1.12). Pruning first checks
+the whole chain, then replaces the old entries with a **checkpoint**
+signed by the cluster key (the last pruned entry's number and hash), so
+`verify` still proves that nothing after it changed:
+
+```sh
+pumasi audit prune --before 365d --save /secure/audit-2025.jsonl         # says what would go
+pumasi audit prune --before 365d --save /secure/audit-2025.jsonl --yes   # prunes
+pumasi audit verify --against /secure/audit-head-2025-06-01.json --pruned /secure/audit-2025.jsonl
+```
+
+`--save` keeps the removed entries (one JSON object per line) and the
+checkpoint beside them, so a head saved before the prune can still be
+checked with `--pruned`. Export them to your SIEM first anyway. The
+newest entry is never pruned, and the prune itself is logged
+(`audit.prune`). `pumasi cluster start --keep-audit 400d` prunes hourly
+without saving: use it only when `audit export --follow` already keeps a
+copy.
 
 ## 7. When something goes wrong
 

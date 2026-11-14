@@ -1142,6 +1142,45 @@ pub enum AdminOp {
         ext: Box<crate::job::JobExt>,
         upload_bytes: u64,
     },
+    // 1.12 from here.
+    /// Removes the audit entries up to and including `through`, behind a
+    /// checkpoint signed by the cluster key, after checking the whole
+    /// chain. `hash` must be entry `through`'s hash (what the caller saved
+    /// is what goes). Answers with the new checkpoint.
+    AuditPrune {
+        through: u64,
+        hash: [u8; 32],
+    },
+    /// Where the audit log starts: the latest prune's checkpoint, if any.
+    AuditCheckpoint,
+    /// Up to `limit` audit entries from number `from` on (unlike
+    /// [`AdminOp::Audit`], whose `after: 0` means the newest).
+    AuditFrom {
+        from: u64,
+        limit: u32,
+    },
+    /// The request limits that every `pumasi ui` process shares (admin
+    /// tickets only: the dashboard's own).
+    Limit(Box<crate::limit::LimitOp>),
+    /// A SCIM request passed on by a dashboard; needs no ticket (the SCIM
+    /// token inside is checked instead).
+    Scim(Box<crate::scim::ScimRequest>),
+    /// A new SCIM token for an identity provider.
+    ScimTokenCreate {
+        label: String,
+    },
+    /// Revokes a SCIM token (id or unique prefix); answers like
+    /// [`AdminOp::Scim`]'s listing ([`AdminResponse::ScimView`]).
+    ScimTokenRevoke {
+        id: String,
+    },
+    /// The SCIM tokens and the provisioned people and groups.
+    ScimView,
+    /// A read that a follower may answer from what the leader handed it a
+    /// moment ago ([`crate::ha::ReadCache`]): [`AdminOp::Status`],
+    /// [`AdminOp::Events`] and [`AdminOp::Metrics`] with `since_secs` 0.
+    /// The leader answers it like the call inside.
+    FollowerRead(Box<AdminOp>),
 }
 
 impl AdminOp {
@@ -1269,6 +1308,19 @@ impl AdminOp {
                 | AdminOp::SsoDevicePoll { .. }
                 | AdminOp::LdapLogin { .. }
         )
+    }
+
+    /// Whether a follower may answer this call ([`AdminOp::FollowerRead`]).
+    pub fn follower_may_answer(&self) -> bool {
+        matches!(
+            self,
+            AdminOp::Status | AdminOp::Events { .. } | AdminOp::Metrics { since_secs: 0, .. }
+        )
+    }
+
+    /// Calls that carry their own credential instead of a ticket (1.12).
+    pub fn is_scim(&self) -> bool {
+        matches!(self, AdminOp::Scim(_))
     }
 }
 
@@ -1431,6 +1483,16 @@ pub enum AdminResponse {
     // 1.9 from here.
     Resources(Vec<crate::sched::ResourceView>),
     Placement(Box<crate::sched::PlacementView>),
+    // 1.12 from here.
+    AuditCheckpoint(Option<Box<crate::audit::AuditCheckpoint>>),
+    Limit(Box<crate::limit::LimitReply>),
+    Scim(Box<crate::scim::ScimResponse>),
+    /// A new SCIM token; its value is shown only here.
+    ScimToken {
+        token: String,
+        view: crate::scim::ScimTokenView,
+    },
+    ScimView(Box<crate::scim::ScimView>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

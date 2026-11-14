@@ -92,6 +92,7 @@ reachable by anyone, with scripts elsewhere holding submitter tickets
 | Threat | What answers it | Left over |
 | --- | --- | --- |
 | A submitter or viewer ticket leaks | Tickets carry an expiry (`--ttl`, 30 days by default) and the role and account they were made for. `pumasi access revoke ID\|NAME` stops it at once: every request is checked against the `access` table, and `pumasi ui` keeps no session of its own for bearer tickets. The audit log records every call with the ticket's name and the iroh peer that made it (`pumasi audit ls`), so what the ticket did can be traced. | Until revoked, the holder can do what the role and the account's job policy allow. Narrow policies (pinned images, no network, short `--max-timeout`) limit the damage. |
+| A SCIM token leaks (1.12) | SCIM can only take access away: it records people and groups, revokes the SSO tickets and sessions of people it deactivates, and refuses their sign-ins; it never creates a ticket or changes a role. Tokens are stored as BLAKE3 hashes, shown once, revocable (`pumasi sso scim revoke ID`), and every change is audited as `scim.*` with the token's label. | Until revoked, the holder can sign anyone out and keep named people from signing in (a denial of service, not a way in). |
 | The admin ticket leaks | `pumasi admin rotate` replaces the admin secret: every copy of the old admin ticket stops working, access tickets and SSO sessions keep working, and the rotation itself is audited (`admin.rotate`). | The holder could already have rolled out a binary to the nodes (`upgrade.rollout` is audited) or read confidential jobs. Treat it as a compromise of every node that auto-upgrades: see [operations.md](operations.md#a-leaked-admin-ticket). |
 | A browser session is stolen | Dashboard sessions are `HttpOnly`, `SameSite=Strict` cookies holding a random session id kept in the `pumasi ui` process, `Secure` when the dashboard is served over HTTPS or its `--public-url` is HTTPS (added in phase 17); SSO sessions are access tickets with a length (12 h by default, at most 30 days; `pumasi sso session`) and revocable like any other (`pumasi access revoke <name>` revokes every session of that person). | Restarting `pumasi ui` signs everyone out of the browser, but the underlying session ticket stays valid until it expires or is revoked. |
 | A ticket is guessed | Secrets are 32 random bytes (`new_secret`); comparisons are constant-time (`secrets_eq`). | None. |
@@ -111,12 +112,12 @@ reachable by anyone, with scripts elsewhere holding submitter tickets
 
 | Threat | What answers it | Left over |
 | --- | --- | --- |
-| Password and ticket guessing | Wrong tickets and failed sign-ins are limited per client address in `pumasi ui` (10 attempts, then 10 a minute; `--real-ip-header` behind a proxy, believed only from this machine and from `--trusted-proxy` addresses, of which only the last address of a list counts, the one the proxy added). LDAP: 5 wrong passwords per user name (whatever its capitalization) in 5 minutes, then that user is refused without asking the directory; at most 4 directory binds at once. | Limits live in each `pumasi ui` process; an attacker with many addresses gets more attempts (each still has to guess 32 random bytes). LDAP per-user lockout lets a stranger lock a known user out for 5 minutes. |
-| Floods of valid requests from one ticket | A token bucket per ticket in `pumasi ui` (120 requests at once, then 20 per second), answered with `429` and `Retry-After`; at most 8 `?wait=` long polls per ticket at a time. | A leaked ticket can still use its share. |
+| Password and ticket guessing | Wrong tickets and failed sign-ins are limited per client address in `pumasi ui` (10 attempts, then 10 a minute; `--real-ip-header` behind a proxy, believed only from this machine and from `--trusted-proxy` addresses, of which only the last address of a list counts, the one the proxy added). LDAP: 5 wrong passwords per user name (whatever its capitalization) in 5 minutes, then that user is refused without asking the directory; at most 4 directory binds at once. | Since 1.12, dashboards run with the admin ticket share these counts through the leader (a block on one is a block on all); others keep their own. The counts live in the leader's memory and reset on a failover or restart. An attacker with many addresses gets more attempts (each still has to guess 32 random bytes). LDAP per-user lockout lets a stranger lock a known user out for 5 minutes. |
+| Floods of valid requests from one ticket | A token bucket per ticket in `pumasi ui` (120 requests at once, then 20 per second; shared by every dashboard run with the admin ticket since 1.12), answered with `429` and `Retry-After`; at most 8 `?wait=` long polls per ticket at a time. | A leaked ticket can still use its share. |
 | Huge request bodies | Body limits per route: 1 MiB by default (including the unauthenticated sign-in forms), 32 MiB for `/api/v1/op`, and `--max-upload` (4 GiB by default) only on job submission and file store uploads, which require a valid ticket. | Before phase 17 the upload limit applied to every route, including `/login`: fixed. |
-| Floods of sign-in calls straight at the control plane | Sign-in calls take no secret, so anyone who knows the endpoint id can send them. Pending OIDC logins are capped (1000, 10 minutes each), device flows too, LDAP binds are limited as above, and unknown secrets are refused before anything is stored or audited. | No per-peer rate limit on the control plane itself (iroh endpoint ids are free to make); a stranger can keep the pending-login table full, which blocks new SSO sign-ins until entries expire. Keep the control plane's endpoint id to yourself (it is in tickets) and put `pumasi ui` in front of it. |
+| Floods of sign-in calls straight at the control plane | Sign-in calls take no secret, so anyone who knows the endpoint id can send them. Pending OIDC logins are capped (1000, 10 minutes each), device flows too, LDAP binds are limited as above, and unknown secrets are refused before anything is stored or audited. Since 1.12 each iroh peer may make 10 sign-in calls, then 10 a minute (device-flow polls 20 a minute), and all peers together 120 a minute; a dashboard with the admin ticket is exempt, as it limits each browser itself. Wrong SCIM tokens count the same way. | iroh endpoint ids are free to make, so the shared budget is what holds a determined stranger back, and filling it blocks other people's direct sign-ins (`pumasi login --sso`/`--ldap`) for a while; sign-ins through the dashboard are unaffected. Keep the control plane's endpoint id to yourself (it is in tickets) and put `pumasi ui` in front of it. |
 | TLS handshake and connection floods | Behind Cloudflare Tunnel or a reverse proxy, the tunnel or proxy absorbs them. | No connection limit or handshake timeout of its own inside `pumasi ui`; with `--tls-cert` directly on the internet, put a proxy or firewall rate limit in front. |
-| Audit log growth | Unknown secrets are not audited, so a stranger cannot write to the log. Failed LDAP passwords are audited only for users that exist, within the per-user limit. | A member with a valid ticket can add refused calls to the log; the log is kept forever (no pruning yet). |
+| Audit log growth | Unknown secrets are not audited, so a stranger cannot write to the log. Failed LDAP passwords are audited only for users that exist, within the per-user limit. | A member with a valid ticket can add refused calls to the log. Since 1.12 `pumasi audit prune` (or `--keep-audit`) removes old entries behind a checkpoint the cluster key signs. |
 | Unbounded state from jobs | Finished jobs are deleted after `--keep-jobs` (30 days by default) with their logs and modules nothing else uses. Before phase 17 every job stayed in memory forever: fixed. | Quotas (`--slots`, `--cu-per-day`, `--storage`) limit how fast one account can fill the cluster. |
 
 ## The rest of the system (STRIDE)
@@ -132,7 +133,12 @@ reachable by anyone, with scripts elsewhere holding submitter tickets
   with the cluster key. Keep heads outside the cluster (`audit verify
   --json > head.json`, then `--against head.json` later): a log rewritten
   by someone with the database no longer reaches the saved head. Exports
-  to syslog put a copy beyond the cluster's reach.
+  to syslog put a copy beyond the cluster's reach. A prune (1.12) leaves a
+  checkpoint signed with the cluster key in place of the old entries;
+  `verify` starts from it, and `--pruned` checks a head saved before the
+  prune against the entries `prune --save` kept. Someone with the cluster
+  key and the database could prune and sign a false checkpoint, which is
+  why saved heads and exports matter.
 - **Repudiation.** Every mutating call, refusal, node join, sign-in,
   secret access, rotation and job expiry is audited with the ticket's
   name, role and the iroh peer.
@@ -192,14 +198,15 @@ mismatch; three strikes suspend it. Providers never settle a check.
    rollouts). Rotate on any suspicion; consider `--no-auto-upgrade` on
    machines you do not want the admin to reach.
 2. **The control plane can read confidential jobs.** It holds the keys.
-3. **No per-peer limit on unauthenticated sign-in calls at the control
-   plane**, so a stranger who knows the endpoint id can fill the pending
-   SSO table (blocking new SSO sign-ins for up to 10 minutes at a time) or
-   lock known LDAP users out for 5 minutes.
-4. **Rate limits are per `pumasi ui` process** and reset when it restarts.
-5. **The audit log is kept forever** and anyone with a valid ticket can
-   add refused calls to it. Pruning behind a signed checkpoint is future
-   work.
+3. **Sign-in calls at the control plane are limited per peer, but peers
+   are free to make** (1.12): a stranger who knows the endpoint id can use
+   up the shared budget, holding up direct CLI sign-ins (not the
+   dashboard's) for a minute or two, or lock known LDAP users out for 5
+   minutes.
+4. **Rate limits live in memory**: a dashboard run without the admin
+   ticket keeps its own, and the shared ones reset on a failover (1.12).
+5. **Anyone with a valid ticket can add refused calls to the audit log**;
+   since 1.12 old entries can be pruned behind a signed checkpoint.
 6. **Docker jobs share the host kernel**; only allow them for accounts you
    trust.
 7. **Results from providers are checked statistically**, not proven.

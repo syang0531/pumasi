@@ -1000,6 +1000,12 @@ impl Ha {
                 .await
             {
                 Ok(_) => break,
+                // Shut down (a crash or a stop): nothing more to add, and
+                // this task must let go of the endpoint.
+                Err(RaftError::Fatal(e)) => {
+                    debug!(replica = %peer.fmt_short(), "not adding the replica: {e}");
+                    return;
+                }
                 Err(e) if Instant::now() < deadline => {
                     debug!(replica = %peer.fmt_short(), "adding a learner: {e}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1021,6 +1027,10 @@ impl Ha {
             {
                 Ok(_) => {
                     info!(replica = %peer.fmt_short(), "a control plane replica joined");
+                    break;
+                }
+                Err(RaftError::Fatal(e)) => {
+                    debug!(replica = %peer.fmt_short(), "not making the replica a voter: {e}");
                     break;
                 }
                 Err(e) if Instant::now() < deadline => {

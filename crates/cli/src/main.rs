@@ -2969,7 +2969,7 @@ fn print_status(s: &ClusterStatus, power: &[pumasi_proto::power::NodePowerView])
     println!("cluster {} ({})", s.cluster_name, short(&s.cluster_id));
     println!();
     println!(
-        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
+        "{:<12} {:<16} {:<9} {:<18} {:<14} {:<16} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
         "NODE",
         "NAME",
         "STATE",
@@ -3024,13 +3024,13 @@ fn print_status(s: &ClusterStatus, power: &[pumasi_proto::power::NodePowerView])
             if n.perf_note.is_some() { "*" } else { "" }
         );
         println!(
-            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<12} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
+            "{:<12} {:<16} {:<9} {:<18} {:<14} {:<16} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
             short(&n.id),
             truncate(&n.info.name, 16),
             state,
             truncate(&role, 18),
             format!("{}/{}", n.info.os, n.info.arch),
-            truncate(&n.info.agent_version, 12),
+            truncate(&n.info.agent_version, 16),
             executor_list(&n.executors),
             n.info.slots,
             n.running,

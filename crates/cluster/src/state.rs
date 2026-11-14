@@ -481,6 +481,8 @@ pub struct State {
     /// Canary rollouts and node settings (1.7).
     pub(crate) canary: Option<crate::canary::CanaryRecord>,
     pub(crate) settings: crate::canary::SettingsState,
+    /// Replicas of datasets on nodes and S3 keys (1.8).
+    pub(crate) reps: crate::replicas::RepState,
 }
 
 /// The seed a deterministic task runs with. The same for every run of the
@@ -565,6 +567,7 @@ impl State {
             ui: Default::default(),
             canary: None,
             settings: Default::default(),
+            reps: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -668,6 +671,7 @@ impl State {
         state.load_monitor(Duration::from_secs(7 * 86_400))?;
         state.load_net()?;
         state.load_sessions()?;
+        state.load_replicas()?;
         state.canary = state.load_canary()?;
         state.load_conf(snap.measurements, snap.trusted_nodes);
         state.load_audit()?;
@@ -1054,6 +1058,7 @@ impl State {
             let _ = kill.send(());
         }
         let lost: Vec<TaskRef> = node.running.drain().map(|(t, _)| t).collect();
+        self.forget_replicas_sent(id);
         if !lost.is_empty() {
             warn!(node = %id, tasks = lost.len(), "node lost; rescheduling its tasks");
         }
@@ -1160,6 +1165,7 @@ impl State {
         self.tick_schedules(now_unix());
         self.tick_queue_timeouts();
         self.tick_files();
+        self.tick_replicas();
         self.tick_wake();
         self.tick_net();
         self.expire_upgrades();
@@ -2251,9 +2257,19 @@ impl State {
         });
         let mut roots: Vec<BlobHash> = mounts.iter().map(|m| m.root).collect();
         roots.extend(image.as_ref().map(|i| i.root));
-        let peers = crate::datasets::peers_for(&self.files.caches, node_id, &roots, |p| {
+        let mut peers = crate::datasets::peers_for(&self.files.caches, node_id, &roots, |p| {
             self.net.rtt_between(node_id, p)
         });
+        // Nodes holding replicas serve them too (1.8), which matters when
+        // the leader is still fetching a version back.
+        for p in crate::replicas::replica_peers(&self.reps, &self.files.caches, node_id, &roots) {
+            if peers.len() >= 8 {
+                break;
+            }
+            if !peers.iter().any(|q| q.id == p.id) {
+                peers.push(p);
+            }
+        }
         let output = if !speaks_store {
             OutputMode::Inline
         } else if job.meta.ext.output_dataset.is_some() {

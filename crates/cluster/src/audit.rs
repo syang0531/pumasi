@@ -323,6 +323,33 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
                 None => "back to the agent's name".into(),
             },
         ),
+        SetReplication { name, factor } => (
+            "store.replication",
+            name.clone().unwrap_or_else(|| "(default)".into()),
+            factor.map_or("the default".into(), |f| format!("{f} copies")),
+        ),
+        Scrub { node } => (
+            "store.scrub",
+            node.clone().unwrap_or_else(|| "control plane".into()),
+            none(),
+        ),
+        S3Commit {
+            name, account, meta, ..
+        } => (
+            "s3.write",
+            name.clone(),
+            format!(
+                "account {}, {}",
+                account.as_deref().unwrap_or(OWNER_ACCOUNT),
+                meta.iter()
+                    .take(8)
+                    .map(|(p, m)| format!("{}{p}", if m.is_some() { "+" } else { "-" }))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ),
+        // S3 keys log themselves in `server::s3_key_call`.
+        S3KeyCreate { .. } | S3KeyRevoke { .. } | S3Auth { .. } => return None,
         StoreCommit { name, account, .. } => (
             "store.commit",
             name.clone().unwrap_or_else(|| "(job input)".into()),
@@ -489,6 +516,9 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | Sessions
         | NodeSettings { .. }
         | Canary
+        | Replication { .. }
+        | StoreFiles { .. }
+        | S3Keys
         | CheckJob { .. }
         | Accounts
         | Ledger { .. }

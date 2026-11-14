@@ -106,6 +106,17 @@ pub struct ClusterConfig {
     /// Ask an agent to measure the network to another this often (1.6;
     /// `None`: never).
     pub probe_every: Option<Duration>,
+    /// How long a storage node may stay offline before its replicas are
+    /// placed on other nodes (1.8).
+    pub replica_repair_after: Duration,
+    /// Time between scrubs of each store (1.8).
+    pub scrub_every: Duration,
+    /// How often the leader checks that its store has every dataset
+    /// version, fetching what it lacks from node replicas (1.8).
+    pub repair_every: Duration,
+    /// The longest a write waits for its copies before it is acknowledged
+    /// anyway (1.8).
+    pub replica_ack_timeout: Duration,
 }
 
 impl ClusterConfig {
@@ -130,6 +141,10 @@ impl ClusterConfig {
             release_source: pumasi_proto::release::DEFAULT_RELEASE_SOURCE.into(),
             wake_after: Some(Duration::from_secs(600)),
             probe_every: Some(crate::net::DEFAULT_PROBE_EVERY),
+            replica_repair_after: crate::replicas::DEFAULT_REPAIR_AFTER,
+            scrub_every: crate::replicas::DEFAULT_SCRUB_EVERY,
+            repair_every: Duration::from_secs(60),
+            replica_ack_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -311,6 +326,7 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
     state.set_metrics_retention(config.metrics_retention);
     state.power.wake_after = config.wake_after;
     state.set_probe_every(config.probe_every);
+    state.set_replica_timing(config.replica_repair_after, config.scrub_every);
     if config.insecure_test_tee {
         warn!(
             "--insecure-test-tee: confidential tasks may run without a TEE; nothing they hold is protected"
@@ -352,6 +368,7 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
         .state()
         .attach_store(store_tx, config.disk_class, config.storage_bill_every);
     tasks.push(tokio::spawn(store_worker(inner.clone(), store_rx)));
+    tasks.push(tokio::spawn(replica_worker(inner.clone())));
     let (hook_tx, hook_rx) = mpsc::unbounded_channel();
     inner.state().attach_webhooks(hook_tx);
     tasks.push(tokio::spawn(crate::prometheus::webhook_worker(
@@ -931,10 +948,17 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
                     last_mirror = Some(Instant::now());
                     let shared = shared.clone();
                     tokio::spawn(async move {
-                        match ha::mirror::sync(&shared.endpoint, &shared.files, leader).await {
+                        match ha::mirror::sync(&shared.endpoint, &shared.files, leader.clone()).await {
                             Ok(0) => {}
                             Ok(n) => info!(collections = n, "copied from the leader's file store"),
                             Err(e) => debug!("copying the leader's file store: {e:#}"),
+                        }
+                        match ha::mirror::sync_releases(&shared.endpoint, &shared.releases, leader)
+                            .await
+                        {
+                            Ok(0) => {}
+                            Ok(n) => info!(binaries = n, "copied the leader's release binaries"),
+                            Err(e) => debug!("copying the leader's release binaries: {e:#}"),
                         }
                         // Keep a local admin ticket that works with any
                         // replica once the state has the admin secret.
@@ -961,6 +985,28 @@ struct Tags(Arc<Shared>);
 impl ha::AsyncTags for Tags {
     async fn list(&self) -> Result<Vec<(String, BlobHash)>> {
         self.0.files.tags().await
+    }
+
+    async fn mirror(&self, leader: EndpointAddr) -> Result<usize> {
+        let shared = &self.0;
+        let n = ha::mirror::sync(&shared.endpoint, &shared.files, leader.clone()).await?;
+        if let Err(e) = ha::mirror::sync_releases(&shared.endpoint, &shared.releases, leader).await {
+            debug!("copying the leader's release binaries: {e:#}");
+        }
+        Ok(n)
+    }
+
+    fn releases(&self) -> Result<Vec<([u8; 32], u64)>> {
+        let inner = self.0.active().context("not leading")?;
+        let files = inner.state().rollout_files();
+        Ok(files
+            .into_iter()
+            .filter(|(sha, size)| self.0.releases.has(sha, *size))
+            .collect())
+    }
+
+    fn release_chunk(&self, sha256: &[u8; 32], offset: u64) -> Result<Vec<u8>> {
+        self.0.releases.read(sha256, offset, 4 << 20)
     }
 }
 
@@ -1243,6 +1289,11 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                         }
                     }
                 }
+                Ok(Some(FromAgent::Held { roots, failed, scrub })) => {
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    st.on_held(&node_id, generation, roots, failed, scrub);
+                }
                 Ok(Some(FromAgent::StoreState { addr, full, added, removed })) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
@@ -1499,20 +1550,24 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
             st.access_caller(secret)
         }
     };
-    // A dashboard session (1.7) acts as the ticket it signed in with.
-    let (caller, session) = {
+    // A dashboard session (1.7) acts as the ticket it signed in with, and
+    // so does the credential of a checked S3 signature (1.8).
+    let (caller, session, s3) = {
         let mut st = inner.state();
         match by_ticket(&st, secret) {
-            Some(c) => (Some(c), None),
+            Some(c) => (Some(c), None, false),
             None => match st.find_session(secret) {
                 Some(found) => match by_ticket(&st, &found.parent) {
-                    Some(c) => (Some(c), Some(found)),
+                    Some(c) => (Some(c), Some(found), false),
                     None => {
                         st.end_sessions(&[found.hash], "its ticket is gone");
-                        (None, None)
+                        (None, None, false)
                     }
                 },
-                None => (None, None),
+                None => match st.find_s3_token(secret) {
+                    Some(parent) => (by_ticket(&st, &parent), None, true),
+                    None => (None, None, false),
+                },
             },
         }
     };
@@ -1530,6 +1585,19 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
             | AdminOp::EndSession
     ) {
         return session_call(inner, secret, &caller, session, op, &who);
+    }
+    if matches!(
+        op,
+        AdminOp::S3KeyCreate { .. }
+            | AdminOp::S3Keys
+            | AdminOp::S3KeyRevoke { .. }
+            | AdminOp::S3Auth { .. }
+    ) {
+        if s3 {
+            return AdminResponse::Error("an S3 credential cannot manage S3 keys".into());
+        }
+        let parent = session.as_ref().map_or(*secret, |s| s.parent);
+        return s3_key_call(inner, &parent, &caller, op, &who);
     }
     let admitted = {
         let st = inner.state();
@@ -1570,6 +1638,64 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
         }
     };
     access::scope(&caller, resp)
+}
+
+/// The S3 key calls (1.8): any ticket makes keys that act as itself and
+/// sees and revokes its own; an admin sees and revokes every one. Any
+/// caller may have a signature checked: the signature is the proof.
+fn s3_key_call(
+    inner: &Arc<Inner>,
+    parent: &Secret,
+    caller: &Caller,
+    op: AdminOp,
+    who: &crate::audit::Actor,
+) -> AdminResponse {
+    let of = (!matches!(caller, Caller::Admin { .. })).then_some(parent);
+    let admin = inner.admin_secret();
+    let mut st = inner.state();
+    let res: Result<AdminResponse> = match op {
+        AdminOp::S3KeyCreate { label } => st.create_s3_key(*parent, &label).map(|(secret, view)| {
+            st.audit(who, "s3.key.create", view.id.clone(), view.label.clone(), true);
+            AdminResponse::S3Key { secret, view }
+        }),
+        AdminOp::S3Keys => Ok(AdminResponse::S3Keys(st.list_s3_keys(of))),
+        AdminOp::S3KeyRevoke { id } => match st.revoke_s3_key(&id, of) {
+            Ok(v) => {
+                st.audit(who, "s3.key.revoke", v.id.clone(), v.name.clone(), true);
+                Ok(AdminResponse::S3Keys(st.list_s3_keys(of)))
+            }
+            Err(e) => {
+                st.audit(who, "s3.key.revoke", id.clone(), format!("{e:#}"), false);
+                Err(e)
+            }
+        },
+        AdminOp::S3Auth {
+            key,
+            date,
+            region,
+            string_to_sign,
+            signature,
+        } => st
+            .s3_auth(&key, &date, &region, &string_to_sign, &signature)
+            .and_then(|(token, signing_key, parent)| {
+                let c = if secrets_eq(&parent, &admin) {
+                    Some(Caller::Admin {
+                        name: "cluster admin".into(),
+                    })
+                } else {
+                    st.access_caller(&parent)
+                };
+                let c = c.context("InvalidAccessKeyId: the key's ticket is gone")?;
+                Ok(AdminResponse::S3Auth {
+                    token,
+                    signing_key,
+                    name: c.name().to_string(),
+                    role: c.role(),
+                })
+            }),
+        _ => Err(anyhow::anyhow!("not an S3 key call")),
+    };
+    res.unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}")))
 }
 
 /// The session calls (1.7): any ticket starts sessions for itself and
@@ -1833,6 +1959,193 @@ async fn store_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<StoreCm
             warn!("file store: {e:#}");
         }
     }
+}
+
+/// Waits until a new dataset version is on as many copies as it can have
+/// now (1.8): control plane replicas asked to copy it, node replicas
+/// reported complete, or [`ClusterConfig::replica_ack_timeout`].
+async fn wait_copies(inner: &Arc<Inner>, v: &pumasi_proto::store::DatasetView) {
+    let timeout = inner.config.replica_ack_timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
+    // Followers copy what the leader's tags name: tag it now, not when the
+    // store worker gets to it.
+    if let Err(e) = inner
+        .files
+        .tag(&crate::files::ds_tag(&v.name, v.version), blobs::to_hash(&v.root))
+        .await
+    {
+        warn!("tag {}@{}: {e:#}", v.name, v.version);
+    }
+    let cps = match inner.ha() {
+        Some(ha) if ha.is_leader() => {
+            1 + ha.mirror_followers(timeout.min(Duration::from_secs(120))).await as u8
+        }
+        _ => 1,
+    };
+    loop {
+        let (have, can) = inner.state().copies_of(&v.root, cps);
+        if have >= can {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                dataset = %format!("{}@{}", v.name, v.version),
+                copies = have,
+                "acknowledging a write on fewer copies than it can have"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The leader's replica housekeeping (1.8): counts control plane replicas,
+/// ends S3 keys of gone tickets, fetches dataset versions its store lacks
+/// from node replicas, and scrubs its store every `scrub_every`.
+async fn replica_worker(inner: Arc<Inner>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_repair: Option<Instant> = None;
+    let mut ticks: u64 = 0;
+    // The first check a few seconds in, once nodes reconnected.
+    let started = Instant::now();
+    loop {
+        tick.tick().await;
+        ticks += 1;
+        let cps = inner.ha().map_or(1, |h| h.members().len().clamp(1, 255)) as u8;
+        inner.state().set_control_planes(cps);
+        if ticks.is_multiple_of(5) {
+            let admin = inner.admin_secret();
+            inner.state().tick_s3_keys(&admin);
+        }
+        let due = match last_repair {
+            None => started.elapsed() >= Duration::from_secs(3),
+            Some(t) => t.elapsed() >= inner.config.repair_every,
+        };
+        if due {
+            last_repair = Some(Instant::now());
+            repair_leader(&inner).await;
+        }
+        let scrub_due = {
+            let st = inner.state();
+            let every = st.reps.scrub_every.as_secs();
+            let last = st.reps.leader_scrub.map_or(st.monitor.started_unix, |s| s.0);
+            crate::state::now_unix().saturating_sub(last) >= every
+        };
+        if scrub_due {
+            scrub_leader(&inner).await;
+        }
+    }
+}
+
+/// Fetches the dataset versions the leader's store lacks from the nodes
+/// that hold them.
+async fn repair_leader(inner: &Arc<Inner>) {
+    let sources = inner.state().repair_sources();
+    let files = &inner.files;
+    let mut missing = std::collections::HashSet::new();
+    let mut fetched = Vec::new();
+    for (root, addrs) in sources {
+        let hash = blobs::to_hash(&root);
+        match blobs::missing(files.api(), hash).await {
+            Ok((_, true)) => continue,
+            Ok((_, false)) => {}
+            Err(e) => {
+                debug!("check {}: {e:#}", hash.fmt_short());
+                continue;
+            }
+        }
+        let mut done = false;
+        for addr in addrs {
+            let from = addr.id;
+            let got: Result<()> = async {
+                let conn = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    inner.endpoint.connect(addr, BLOBS_ALPN),
+                )
+                .await
+                .context("timed out")??;
+                let r = blobs::fetch(files.api(), conn.clone(), hash).await;
+                conn.close(0u32.into(), b"done");
+                r.map(|_| ())
+            }
+            .await;
+            match got {
+                Ok(()) => {}
+                Err(e) => debug!(from = %from.fmt_short(), "fetch {} back: {e:#}", hash.fmt_short()),
+            }
+            if matches!(blobs::missing(files.api(), hash).await, Ok((_, true))) {
+                done = true;
+                fetched.push((root, from.to_string()));
+                break;
+            }
+        }
+        if !done {
+            missing.insert(root);
+        }
+    }
+    let mut st = inner.state();
+    for (root, node) in fetched {
+        let label = st
+            .files
+            .datasets
+            .values()
+            .filter(|d| d.root == root)
+            .map(|d| format!("{}@{}", d.name, d.version))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let name = st.node_name(&node);
+        st.event(
+            pumasi_proto::monitor::EventLevel::Info,
+            "store.repaired",
+            Some(&node),
+            None,
+            format!("the control plane fetched {label} back from {name}"),
+        );
+    }
+    if !missing.is_empty() && st.reps.leader_missing.is_empty() {
+        st.event(
+            pumasi_proto::monitor::EventLevel::Critical,
+            "store.missing",
+            None,
+            None,
+            format!(
+                "the control plane's store lacks {} dataset versions and no online node has them",
+                missing.len()
+            ),
+        );
+    }
+    st.reps.leader_missing = missing;
+}
+
+/// Reads back every dataset version the leader has against its hashes.
+async fn scrub_leader(inner: &Arc<Inner>) {
+    let roots: Vec<BlobHash> = inner
+        .state()
+        .repair_sources()
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect();
+    let files = &inner.files;
+    let mut report = pumasi_proto::replica::ScrubReport::default();
+    for root in roots {
+        let hash = blobs::to_hash(&root);
+        if !matches!(blobs::missing(files.api(), hash).await, Ok((_, true))) {
+            continue;
+        }
+        match blobs::verify(files.api(), hash).await {
+            Ok(b) => {
+                report.checked += 1;
+                report.bytes += b;
+            }
+            Err(e) => {
+                warn!("scrub: {e:#}");
+                report.checked += 1;
+                report.bad.push(root);
+            }
+        }
+    }
+    inner.state().on_leader_scrub(report);
 }
 
 fn endpoint_id(bytes: &[u8; 32]) -> Result<iroh::EndpointId> {
@@ -2100,11 +2413,80 @@ async fn handle_store_admin(
                 let stored = files.stored(&root).await?;
                 let view = inner.state().commit_upload(stored, name, account)?;
                 Ok(match view {
-                    Some(v) => AdminResponse::Datasets(vec![v]),
+                    Some(v) => {
+                        wait_copies(inner, &v).await;
+                        AdminResponse::Datasets(vec![v])
+                    }
                     None => AdminResponse::Ok,
                 })
             }
             .await
+        }
+        AdminOp::S3Commit {
+            name,
+            base,
+            root,
+            account,
+            meta,
+        } => {
+            async {
+                let stored = files.stored(&root).await?;
+                let v = inner.state().s3_commit(stored, &name, base, account, meta)?;
+                wait_copies(inner, &v).await;
+                Ok(AdminResponse::Datasets(vec![v]))
+            }
+            .await
+        }
+        AdminOp::StoreFiles { name, version } => {
+            async {
+                let (d, s3) = {
+                    let st = inner.state();
+                    let d = st.dataset(&name, version)?.view();
+                    (d, st.s3_meta_of(&name))
+                };
+                let entries = files.entries(&d.root).await?;
+                let hashes: std::collections::HashMap<&str, BlobHash> = entries
+                    .iter()
+                    .map(|e| (e.name.as_str(), blobs::from_hash(e.hash)))
+                    .collect();
+                let s3 = s3
+                    .into_iter()
+                    .filter(|(p, m)| hashes.get(p.as_str()) == Some(&m.hash))
+                    .collect();
+                let files = entries
+                    .iter()
+                    .map(|e| pumasi_proto::replica::FileView {
+                        path: e.name.clone(),
+                        size: e.size,
+                        hash: blobs::from_hash(e.hash),
+                    })
+                    .collect();
+                Ok(AdminResponse::StoreFiles {
+                    dataset: d,
+                    files,
+                    s3,
+                })
+            }
+            .await
+        }
+        AdminOp::Replication { name } => inner
+            .state()
+            .replication_view(name.as_deref())
+            .map(|v| AdminResponse::Replication(Box::new(v))),
+        AdminOp::SetReplication { name, factor } => {
+            let mut st = inner.state();
+            st.set_replication(name.as_deref(), factor).and_then(|()| {
+                st.replication_view(name.as_deref())
+                    .map(|v| AdminResponse::Replication(Box::new(v)))
+            })
+        }
+        AdminOp::Scrub { node } => {
+            let asked = inner.state().scrub_now(node.as_deref());
+            if node.is_none() {
+                let inner = inner.clone();
+                tokio::spawn(async move { scrub_leader(&inner).await });
+            }
+            asked.map(|_| AdminResponse::Ok)
         }
         AdminOp::StoreList { name } => Ok(AdminResponse::Datasets(
             inner.state().list_datasets(name.as_deref()),

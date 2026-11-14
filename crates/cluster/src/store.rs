@@ -36,6 +36,7 @@ use crate::{
     state::{DatasetRecord, Hold, JobExt, JobMeta, Member, TaskExt, TaskRecord, TokenRecord},
 };
 use pumasi_proto::audit::AuditEntry;
+use pumasi_proto::store::BlobHash;
 use pumasi_proto::manage::{AccountPolicy, AccountQuota, NodeConfig};
 use pumasi_proto::monitor::{AlertPolicy, EventView, MetricPoint, WebhookSpec};
 
@@ -122,6 +123,15 @@ const TASK_TIMES: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("ta
 const TASK_EXEC: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_exec");
 /// Dashboard sessions (1.7), by the hash of their secret.
 const UI_SESSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ui_sessions");
+/// Replicas of dataset versions on nodes (1.8), by collection root (32
+/// bytes) followed by the node id.
+const REPLICAS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replicas");
+/// Datasets with their own number of copies (1.8), by name.
+const DS_REPLICATION: TableDefinition<&str, u8> = TableDefinition::new("ds_replication");
+/// S3 access keys (1.8), by key id.
+const S3_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("s3_keys");
+/// What the S3 gateway keeps about objects (1.8), by (dataset, path).
+const S3_META: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("s3_meta");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -183,7 +193,11 @@ macro_rules! tables {
             AUDIT,
             TASK_TIMES,
             TASK_EXEC,
-            UI_SESSIONS
+            UI_SESSIONS,
+            REPLICAS,
+            DS_REPLICATION,
+            S3_KEYS,
+            S3_META
         )
     };
 }
@@ -582,6 +596,10 @@ impl Store {
         tx.open_table(TASK_TIMES)?;
         tx.open_table(TASK_EXEC)?;
         tx.open_table(UI_SESSIONS)?;
+        tx.open_table(REPLICAS)?;
+        tx.open_table(DS_REPLICATION)?;
+        tx.open_table(S3_KEYS)?;
+        tx.open_table(S3_META)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1325,6 +1343,130 @@ impl Store {
         }
         for h in gone {
             b.del(UI_SESSIONS, h.as_slice());
+        }
+        self.commit(b)
+    }
+
+    // -- replicas and the S3 gateway (1.8) ---------------------------------
+
+    pub fn replicas(&self) -> Result<Vec<(BlobHash, String, crate::replicas::ReplicaRecord)>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(REPLICAS)?.iter()? {
+            let (k, v) = row?;
+            let k = k.value();
+            if k.len() < 32 {
+                continue;
+            }
+            let root: BlobHash = k[..32].try_into().expect("checked");
+            let node = String::from_utf8_lossy(&k[32..]).into_owned();
+            out.push((root, node, dec(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Writes these replicas and deletes the ones in `gone`, in one batch.
+    pub fn put_replicas(
+        &self,
+        put: &[(BlobHash, String, crate::replicas::ReplicaRecord)],
+        gone: &[(BlobHash, String)],
+    ) -> Result<()> {
+        if put.is_empty() && gone.is_empty() {
+            return Ok(());
+        }
+        let key = |root: &BlobHash, node: &str| {
+            let mut k = root.to_vec();
+            k.extend_from_slice(node.as_bytes());
+            k
+        };
+        let mut b = Batch::default();
+        for (root, node, r) in put {
+            b.put(REPLICAS, key(root, node).as_slice(), enc(r).as_slice());
+        }
+        for (root, node) in gone {
+            b.del(REPLICAS, key(root, node).as_slice());
+        }
+        self.commit(b)
+    }
+
+    pub fn ds_replication(&self) -> Result<Vec<(String, u8)>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(DS_REPLICATION)?.iter()? {
+            let (k, v) = row?;
+            out.push((k.value().to_string(), v.value()));
+        }
+        Ok(out)
+    }
+
+    pub fn put_ds_replication(&self, name: &str, factor: Option<u8>) -> Result<()> {
+        let mut b = Batch::default();
+        match factor {
+            Some(f) => b.put(DS_REPLICATION, name, f),
+            None => b.del(DS_REPLICATION, name),
+        }
+        self.commit(b)
+    }
+
+    pub fn s3_keys(&self) -> Result<Vec<crate::replicas::S3KeyRecord>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(S3_KEYS)?.iter()? {
+            let (_, v) = row?;
+            out.push(dec(v.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn put_s3_key(&self, id: &str, r: Option<&crate::replicas::S3KeyRecord>) -> Result<()> {
+        let mut b = Batch::default();
+        match r {
+            Some(r) => b.put(S3_KEYS, id, enc(r).as_slice()),
+            None => b.del(S3_KEYS, id),
+        }
+        self.commit(b)
+    }
+
+    /// What the S3 gateway keeps about the objects of dataset `name`.
+    pub fn s3_meta(&self, name: &str) -> Result<Vec<(String, pumasi_proto::replica::S3Meta)>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        let t = tx.open_table(S3_META)?;
+        for row in t.range((name, "")..)? {
+            let (k, v) = row?;
+            let (n, path) = k.value();
+            if n != name {
+                break;
+            }
+            out.push((path.to_string(), dec(v.value())?));
+        }
+        Ok(out)
+    }
+
+    pub fn put_s3_meta(
+        &self,
+        name: &str,
+        changes: &[(String, Option<pumasi_proto::replica::S3Meta>)],
+    ) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut b = Batch::default();
+        for (path, m) in changes {
+            match m {
+                Some(m) => b.put(S3_META, (name, path.as_str()), enc(m).as_slice()),
+                None => b.del(S3_META, (name, path.as_str())),
+            }
+        }
+        self.commit(b)
+    }
+
+    /// Forgets what the S3 gateway kept about a removed dataset.
+    pub fn remove_s3_meta(&self, name: &str) -> Result<()> {
+        let paths: Vec<String> = self.s3_meta(name)?.into_iter().map(|(p, _)| p).collect();
+        let mut b = Batch::default();
+        for p in &paths {
+            b.del(S3_META, (name, p.as_str()));
         }
         self.commit(b)
     }

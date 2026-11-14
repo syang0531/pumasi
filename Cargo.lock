@@ -4692,6 +4692,7 @@ dependencies = [
  "blake3",
  "chrono",
  "data-encoding",
+ "hmac",
  "iroh",
  "iroh-blobs",
  "n0-future",

@@ -505,6 +505,13 @@ impl State {
         m.pending_events.push(e);
     }
 
+    /// A node's disk (total, used bytes) from its latest fresh sample.
+    pub(crate) fn latest_disk(&self, id: &str) -> Option<(u64, u64)> {
+        let (unix, m) = self.monitor.series.get(id)?.latest.as_ref()?;
+        (now_unix().saturating_sub(*unix) < FRESH_SECS && m.disk_total > 0)
+            .then_some((m.disk_total, m.disk_used))
+    }
+
     /// A node's name, or the start of its id.
     pub(crate) fn node_name(&self, id: &str) -> String {
         self.members

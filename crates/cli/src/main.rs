@@ -3023,7 +3023,12 @@ fn print_status(s: &ClusterStatus, power: &[pumasi_proto::power::NodePowerView])
             n.cpu_score,
             if n.perf_note.is_some() { "*" } else { "" }
         );
-        println!(
+        // Written to stdout directly: the row names the provider's account,
+        // which is the point of the table, not something to keep out of a
+        // log.
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
             "{:<12} {:<16} {:<9} {:<18} {:<14} {:<16} {:<12} {:>5} {:>8} {:>10} {:>8} {:>6} {:<7} {:>8}",
             short(&n.id),
             truncate(&n.info.name, 16),

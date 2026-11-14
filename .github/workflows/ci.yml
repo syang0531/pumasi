@@ -787,6 +787,8 @@ jobs:
         timeout-minutes: 45
         run: |
           set +e
+          # Task Scheduler's own events, to say why a task did not start.
+          wevtutil sl Microsoft-Windows-TaskScheduler/Operational //e:true
           ./target/debug/pumasi docker setup --no-wait 2>&1 | tee setup.txt
           code=${PIPESTATUS[0]}
           echo "setup exited $code"
@@ -811,12 +813,20 @@ jobs:
             if ./target/debug/pumasi docker status > status.txt 2>&1; then
               echo "answer=yes" >> "$GITHUB_OUTPUT"; break
             fi
-            if [ "$(grep -c 'error:' "$log" 2>/dev/null)" -ge 2 ]; then break; fi
+            errors=$(grep -c 'error:' "$log" 2>/dev/null || true)
+            if [ "${errors:-0}" -ge 2 ]; then break; fi
+            # Two minutes without a log: the task did not start.
+            if [ "$i" -ge 12 ] && [ ! -f "$log" ]; then break; fi
             sleep 10
           done
           cat status.txt || true
           echo "=== task log"; cat "$log" || true
-          grep -q "starts the pumasi-docker distro as pumasi-wsl" "$log" || { echo "the task did not run as pumasi-wsl"; exit 1; }
+          if ! grep -q "starts the pumasi-docker distro as pumasi-wsl" "$log" 2>/dev/null; then
+            echo "the task did not run as pumasi-wsl"
+            echo "=== Task Scheduler events"
+            wevtutil qe Microsoft-Windows-TaskScheduler/Operational //c:40 //rd:true //f:text | grep -i -B2 -A12 "pumasi" | head -200 || true
+            exit 1
+          fi
           if ! grep -q "answer=yes" "$GITHUB_OUTPUT"; then
             echo "::notice::WSL 2 did not start a distro on this runner (nested virtualization); checked up to the task"
           fi

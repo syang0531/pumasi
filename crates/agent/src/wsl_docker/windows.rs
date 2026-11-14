@@ -166,6 +166,105 @@ fn ensure_account(password: &str) -> Result<bool> {
     Ok(created)
 }
 
+/// The SID of [`ACCOUNT`], when it exists.
+fn account_sid() -> Option<Vec<u8>> {
+    use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
+    let name = wide(ACCOUNT);
+    let (mut sid_len, mut dom_len, mut kind) = (0u32, 0u32, 0 as SID_NAME_USE);
+    // SAFETY: the first call only asks for the sizes.
+    unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut sid_len,
+            std::ptr::null_mut(),
+            &mut dom_len,
+            &mut kind,
+        )
+    };
+    if sid_len == 0 {
+        return None;
+    }
+    let mut sid = vec![0u8; sid_len as usize];
+    let mut dom = vec![0u16; dom_len.max(1) as usize];
+    // SAFETY: buffers of the sizes the first call gave.
+    let ok = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            dom.as_mut_ptr(),
+            &mut dom_len,
+            &mut kind,
+        )
+    };
+    (ok != 0).then_some(sid)
+}
+
+/// Gives [`ACCOUNT`] "Log on as a batch job", which a task that logs on
+/// with a stored password needs (Task Scheduler does not start it
+/// otherwise), or takes it back.
+fn batch_logon(grant: bool) -> Result<()> {
+    use windows_sys::Win32::Security::Authentication::Identity::{
+        LSA_HANDLE, LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose,
+        LsaNtStatusToWinError, LsaOpenPolicy, LsaRemoveAccountRights, POLICY_CREATE_ACCOUNT,
+        POLICY_LOOKUP_NAMES,
+    };
+    let Some(mut sid) = account_sid() else {
+        ensure!(!grant, "the local account {ACCOUNT} is missing");
+        return Ok(());
+    };
+    let attrs = LSA_OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<LSA_OBJECT_ATTRIBUTES>() as u32,
+        ..Default::default()
+    };
+    let mut policy: LSA_HANDLE = 0;
+    // SAFETY: zeroed attributes, as LsaOpenPolicy wants them.
+    let status = unsafe {
+        LsaOpenPolicy(
+            std::ptr::null(),
+            &attrs,
+            (POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES) as u32,
+            &mut policy,
+        )
+    };
+    // SAFETY: plain conversion.
+    let err = |status| unsafe { LsaNtStatusToWinError(status) };
+    ensure!(
+        status == 0,
+        "could not open the local security policy (error {})",
+        err(status)
+    );
+    let mut right = "SeBatchLogonRight".encode_utf16().collect::<Vec<u16>>();
+    let bytes = (right.len() * 2) as u16;
+    let rights = LSA_UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: right.as_mut_ptr(),
+    };
+    // SAFETY: `sid` came from LookupAccountNameW, `rights` points at
+    // `right`; both outlive the calls.
+    let status = unsafe {
+        let status = if grant {
+            LsaAddAccountRights(policy, sid.as_mut_ptr().cast(), &rights, 1)
+        } else {
+            LsaRemoveAccountRights(policy, sid.as_mut_ptr().cast(), false, &rights, 1)
+        };
+        LsaClose(policy);
+        status
+    };
+    // ERROR_FILE_NOT_FOUND: the account held no rights to take back.
+    let code = err(status);
+    ensure!(
+        status == 0 || (!grant && code == 2),
+        "could not {} \"Log on as a batch job\" for {ACCOUNT} (error {code})",
+        if grant { "grant" } else { "revoke" }
+    );
+    Ok(())
+}
+
 fn delete_account() -> Result<bool> {
     use windows_sys::Win32::NetworkManagement::NetManagement::{NERR_UserNotFound, NetUserDel};
     let name = wide(ACCOUNT);
@@ -373,6 +472,7 @@ pub async fn setup(opts: SetupOptions) -> Result<i32> {
     } else {
         println!("reset the password of the local account {ACCOUNT}");
     }
+    batch_logon(true)?;
     tool(
         "reg.exe",
         &[
@@ -592,6 +692,9 @@ pub async fn remove() -> Result<i32> {
         println!(
             "could not remove the profile of {ACCOUNT} yet (it is in use); restart Windows and run `pumasi docker remove` again to finish"
         );
+    }
+    if let Err(e) = batch_logon(false) {
+        println!("{e:#}");
     }
     if delete_account()? {
         println!("deleted the local account {ACCOUNT}");

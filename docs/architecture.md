@@ -2745,7 +2745,9 @@ administrator terminal) therefore makes:
 - a local account, `pumasi-wsl`: a standard user whose password is random,
   never expires and is kept only by Task Scheduler (setup forgets it; a
   new run sets a new one), hidden from the sign-in screen
-  (`SpecialAccounts\UserList`);
+  (`SpecialAccounts\UserList`), with "Log on as a batch job"
+  (`SeBatchLogonRight`, which a task that logs on with a stored password
+  needs; `remove` takes it back before deleting the account);
 - `%ProgramData%\Pumasi\wsl-docker`, with the `Pumasi` parent owned by
   Administrators so no user who created it first can swap what is inside.
   SYSTEM and Administrators have full control; `pumasi-wsl` may read, and

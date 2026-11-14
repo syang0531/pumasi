@@ -355,6 +355,17 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// `16G`, `512M`, `1536K`, `100`: the largest unit that is exact, in the
+/// form [`parse_size`] reads back.
+pub fn format_size_short(bytes: u64) -> String {
+    for (unit, shift) in [("T", 40), ("G", 30), ("M", 20), ("K", 10)] {
+        if bytes >= 1 << shift && bytes.is_multiple_of(1 << shift) {
+            return format!("{}{unit}", bytes >> shift);
+        }
+    }
+    bytes.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Private images in the store
 // ---------------------------------------------------------------------------

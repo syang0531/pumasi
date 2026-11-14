@@ -135,6 +135,15 @@ const S3_META: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("s3_m
 /// The dataset version the S3 gateway wrote last (1.8), by dataset: the
 /// gateway's next write replaces it.
 const S3_VERSIONS: TableDefinition<&str, u32> = TableDefinition::new("s3_versions");
+/// A job's placement (1.9): gang, spreading, affinity, checkpoints, by
+/// job id.
+const JOB_PLACE: TableDefinition<u128, &[u8]> = TableDefinition::new("job_place");
+/// A task's latest checkpoint (1.9), by (job id, task index).
+const CHECKPOINTS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("checkpoints");
+/// An account's CPU and memory quota (1.9), by account.
+const ACCOUNT_RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("account_resources");
+/// A schedule's time zone and its job's placement (1.9), by name.
+const SCHEDULE_EXT: TableDefinition<&str, &[u8]> = TableDefinition::new("schedule_ext");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -201,7 +210,11 @@ macro_rules! tables {
             DS_REPLICATION,
             S3_KEYS,
             S3_META,
-            S3_VERSIONS
+            S3_VERSIONS,
+            JOB_PLACE,
+            CHECKPOINTS,
+            ACCOUNT_RESOURCES,
+            SCHEDULE_EXT
         )
     };
 }
@@ -461,6 +474,9 @@ pub struct Snapshot {
     pub schedules: Vec<ScheduleRecord>,
     pub account_policies: Vec<(String, AccountPolicy)>,
     pub job_origin: Vec<(u128, JobOrigin)>,
+    pub job_place: Vec<(u128, pumasi_proto::sched::Placement)>,
+    pub checkpoints: Vec<((u128, u32), crate::sched::CheckpointRecord)>,
+    pub account_resources: Vec<(String, pumasi_proto::sched::ResourceQuota)>,
     pub measurements: Vec<(String, crate::confidential::MeasurementRecord)>,
     pub trusted_nodes: Vec<String>,
     pub members: Vec<Member>,
@@ -605,6 +621,10 @@ impl Store {
         tx.open_table(S3_KEYS)?;
         tx.open_table(S3_META)?;
         tx.open_table(S3_VERSIONS)?;
+        tx.open_table(JOB_PLACE)?;
+        tx.open_table(CHECKPOINTS)?;
+        tx.open_table(ACCOUNT_RESOURCES)?;
+        tx.open_table(SCHEDULE_EXT)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1081,9 +1101,32 @@ impl Store {
             let (_, v) = row?;
             snap.access.push(dec(v.value())?);
         }
+        let mut exts: std::collections::HashMap<String, pumasi_proto::sched::ScheduleExt> =
+            std::collections::HashMap::new();
+        for row in tx.open_table(SCHEDULE_EXT)?.iter()? {
+            let (k, v) = row?;
+            exts.insert(k.value().to_string(), dec(v.value())?);
+        }
         for row in tx.open_table(SCHEDULES)?.iter()? {
             let (_, v) = row?;
-            snap.schedules.push(dec(v.value())?);
+            let mut r: ScheduleRecord = dec(v.value())?;
+            if let Some(e) = exts.remove(&r.spec.name) {
+                r.spec.set_ext(e);
+            }
+            snap.schedules.push(r);
+        }
+        for row in tx.open_table(JOB_PLACE)?.iter()? {
+            let (k, v) = row?;
+            snap.job_place.push((k.value(), dec(v.value())?));
+        }
+        for row in tx.open_table(CHECKPOINTS)?.iter()? {
+            let (k, v) = row?;
+            snap.checkpoints.push((k.value(), dec(v.value())?));
+        }
+        for row in tx.open_table(ACCOUNT_RESOURCES)?.iter()? {
+            let (k, v) = row?;
+            snap.account_resources
+                .push((k.value().to_string(), dec(v.value())?));
         }
         for row in tx.open_table(ACCOUNT_POLICIES)?.iter()? {
             let (k, v) = row?;
@@ -1182,6 +1225,9 @@ impl Store {
         if !meta.origin.is_empty() {
             b.put(JOB_ORIGIN, meta.id.0, enc(&meta.origin).as_slice());
         }
+        if !meta.place.is_empty() {
+            b.put(JOB_PLACE, meta.id.0, enc(&meta.place).as_slice());
+        }
         for (i, task) in tasks.iter().enumerate() {
             b.put(TASKS, (meta.id.0, i as u32), enc(task).as_slice());
             if !task.ext.is_empty() {
@@ -1205,7 +1251,9 @@ impl Store {
             b.del(JOB_GPU, job);
             b.del(JOB_SCHED, job);
             b.del(JOB_ORIGIN, job);
+            b.del(JOB_PLACE, job);
             for i in 0..tasks {
+                b.del(CHECKPOINTS, (job, i));
                 b.del(TASKS, (job, i));
                 b.del(TASK_EXT, (job, i));
                 b.del(TASK_TIMES, (job, i));
@@ -1299,8 +1347,49 @@ impl Store {
         self.commit(b)
     }
 
+    /// Writes (or with `None` deletes) a schedule, its 1.9 settings in
+    /// their own table.
     pub fn put_schedule(&self, name: &str, r: Option<&ScheduleRecord>) -> Result<()> {
-        self.put_str_row(SCHEDULES, name, r.map(enc))
+        let mut b = Batch::default();
+        match r {
+            Some(r) => {
+                b.put(SCHEDULES, name, enc(r).as_slice());
+                let ext = r.spec.ext();
+                if ext.is_empty() {
+                    b.del(SCHEDULE_EXT, name);
+                } else {
+                    b.put(SCHEDULE_EXT, name, enc(&ext).as_slice());
+                }
+            }
+            None => {
+                b.del(SCHEDULES, name);
+                b.del(SCHEDULE_EXT, name);
+            }
+        }
+        self.commit(b)
+    }
+
+    pub fn put_account_resources(
+        &self,
+        account: &str,
+        q: Option<&pumasi_proto::sched::ResourceQuota>,
+    ) -> Result<()> {
+        self.put_str_row(ACCOUNT_RESOURCES, account, q.map(enc))
+    }
+
+    /// Writes (or with `None` deletes) a task's checkpoint record.
+    pub fn put_checkpoint(
+        &self,
+        job: u128,
+        index: u32,
+        r: Option<&crate::sched::CheckpointRecord>,
+    ) -> Result<()> {
+        let mut b = Batch::default();
+        match r {
+            Some(r) => b.put(CHECKPOINTS, (job, index), enc(r).as_slice()),
+            None => b.del(CHECKPOINTS, (job, index)),
+        }
+        self.commit(b)
     }
 
     pub fn put_preempted(&self, key: (u128, u32, bool), count: u32) -> Result<()> {
@@ -2134,6 +2223,7 @@ pub(crate) mod legacy {
                 gpu: None,
                 sched: Default::default(),
                 origin: Default::default(),
+                place: Default::default(),
             }
         }
     }
@@ -2221,9 +2311,11 @@ pub(crate) mod legacy {
             let j = r.spec.job;
             Self {
                 spec: pumasi_proto::manage::ScheduleSpec {
+                    tz: None,
                     name: r.spec.name,
                     cron: r.spec.cron,
                     job: pumasi_proto::job::JobSubmission {
+                        placement: Default::default(),
                         name: j.name,
                         executor: j.executor,
                         module: j.module,
@@ -2329,9 +2421,11 @@ mod tests {
             std::env::temp_dir().join(format!("pumasi-store-{}.redb", rand::random::<u64>()));
         let r = crate::manage::ScheduleRecord {
             spec: pumasi_proto::manage::ScheduleSpec {
+                tz: None,
                 name: "nightly".into(),
                 cron: "@daily".into(),
                 job: JobSubmission {
+                    placement: Default::default(),
                     name: "report".into(),
                     executor: Executor::Wasm,
                     module: b"\0asm\x01\0\0\0".to_vec(),

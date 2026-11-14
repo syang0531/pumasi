@@ -17,8 +17,29 @@ use pumasi_proto::{
 };
 use serde::Deserialize;
 
+use pumasi_proto::msg::{AdminOp, AdminResponse};
+use pumasi_proto::sched::{ResourceQuota, ResourceView};
+
 use super::{Ctx, Nav, encode, hx, table, tile};
 use crate::accounts::{self, QuotaPatch};
+
+/// The account's CPU and memory quota and use (1.9); `None` from an older
+/// control plane.
+async fn resources(ctx: &Ctx, name: &str) -> Option<ResourceView> {
+    match ctx.call(AdminOp::Resources).await {
+        Ok(AdminResponse::Resources(v)) => Some(
+            v.into_iter()
+                .find(|r| r.account == name)
+                .unwrap_or_else(|| ResourceView {
+                    account: name.to_string(),
+                    quota: Default::default(),
+                    used: Default::default(),
+                    labels_used: Vec::new(),
+                }),
+        ),
+        _ => None,
+    }
+}
 
 /// `used / limit`, or only what is used when there is no limit.
 fn of(used: String, limit: Option<String>) -> String {
@@ -124,6 +145,7 @@ async fn render(ctx: &Ctx, name: &str) -> anyhow::Result<Response> {
         None if admin => accounts::blank(name),
         None => anyhow::bail!("no such account: {name}"),
     };
+    let res = resources(ctx, name).await;
     let q = &v.quota;
     let p = &v.policy;
     let has = |e: Executor| p.executors.contains(&e);
@@ -151,6 +173,22 @@ async fn render(ctx: &Ctx, name: &str) -> anyhow::Result<Response> {
             (tile(l.t("Queued", "대기"), v.queued.to_string(), None))
             (tile(l.t("CU in 24h", "24시간 CU"), of(format_cu(v.spent_day), q.cu_per_day.map(format_cu)), None))
             (tile(l.t("Storage", "저장소"), of(format_size(v.storage_bytes), q.storage_bytes.map(format_size)), None))
+            @if let Some(r) = &res {
+                (tile("CPU", of(r.used.cpus.to_string(), r.quota.cpus.map(|c| c.to_string())), None))
+                (tile(l.t("Memory", "메모리"), of(format_size(r.used.memory_bytes), r.quota.memory_bytes.map(format_size)), None))
+            }
+        }
+        @if let Some(r) = res.as_ref().filter(|r| !r.quota.labels.is_empty()) {
+            (table(&[l.t("Nodes", "노드"), l.t("Runs", "실행"), "CPU", l.t("Memory", "메모리"), "GPU"],
+                r.quota.labels.iter().zip(&r.labels_used).map(|(lq, u)| html! {
+                    tr {
+                        td { code { (lq.selector.to_string()) } }
+                        td { (of(u.runs.to_string(), lq.slots.map(|x| x.to_string()))) }
+                        td { (of(u.cpus.to_string(), lq.cpus.map(|x| x.to_string()))) }
+                        td { (of(format_size(u.memory_bytes), lq.memory_bytes.map(format_size))) }
+                        td { (of(u.gpus.to_string(), lq.gpus.map(|x| x.to_string()))) }
+                    }
+                }).collect(), ""))
         }
     };
     let form = html! {
@@ -241,6 +279,33 @@ async fn render(ctx: &Ctx, name: &str) -> anyhow::Result<Response> {
                     }
                 }
             }
+            @if let Some(r) = &res {
+                fieldset disabled[!admin] {
+                    legend { (l.t("CPU and memory", "CPU와 메모리")) }
+                    p class="dim" { (l.t(
+                        "What the account's running tasks hold at once (a WASM task holds one CPU). Empty: no limit.",
+                        "이 계정의 실행 중인 태스크가 한꺼번에 차지하는 양입니다(WASM 태스크는 CPU 1개). 비우면 한도가 없습니다."
+                    )) }
+                    div class="row" {
+                        div {
+                            label for="cpus" { "CPU" }
+                            input #cpus name="cpus" type="number" min="0" value=(num(r.quota.cpus.map(|c| c.to_string())));
+                        }
+                        div {
+                            label for="memory" { (l.t("Memory", "메모리")) }
+                            input #memory name="memory" size="8" placeholder="64G" value=(num(r.quota.memory_bytes.map(format_size)));
+                        }
+                    }
+                    label for="label_quotas" { (l.t("On the nodes a label picks", "라벨로 고른 노드에서")) }
+                    p class="dim" { (l.t(
+                        "One per line: a selector, then slots, cpus, memory and gpus, e.g. zone=office slots=4 cpus=8 memory=16G",
+                        "한 줄에 하나씩: 셀렉터 다음에 slots, cpus, memory, gpus. 예: zone=office slots=4 cpus=8 memory=16G"
+                    )) }
+                    textarea #label_quotas name="label_quotas" rows="3" spellcheck="false" {
+                        (r.quota.labels.iter().map(|q| q.to_string()).collect::<Vec<_>>().join("\n"))
+                    }
+                }
+            }
             @if admin {
                 div class="row" { button type="submit" { (l.t("Save", "저장")) } }
             } @else {
@@ -276,6 +341,9 @@ pub struct AccountForm {
     cu_per_day: Option<String>,
     max_priority: Option<String>,
     storage: Option<String>,
+    cpus: Option<String>,
+    memory: Option<String>,
+    label_quotas: Option<String>,
 }
 
 fn opt(s: &Option<String>) -> Option<&str> {
@@ -349,6 +417,33 @@ impl AccountForm {
         };
         Ok((policy, quota))
     }
+
+    /// The CPU and memory quota (1.9), when the form had those fields.
+    fn resources(&self) -> anyhow::Result<Option<ResourceQuota>> {
+        if self.cpus.is_none() && self.memory.is_none() && self.label_quotas.is_none() {
+            return Ok(None);
+        }
+        let q = ResourceQuota {
+            cpus: opt(&self.cpus)
+                .map(|v| {
+                    v.parse::<u32>()
+                        .map_err(|_| anyhow::anyhow!("CPUs: a whole number, or empty"))
+                })
+                .transpose()?,
+            memory_bytes: opt(&self.memory).map(parse_size).transpose()?,
+            labels: self
+                .label_quotas
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|l| l.parse())
+                .collect::<anyhow::Result<_>>()?,
+        };
+        q.validate()?;
+        Ok(Some(q))
+    }
 }
 
 pub async fn save(
@@ -361,7 +456,17 @@ pub async fn save(
     let res: anyhow::Result<QuotaView> = async {
         validate_account(&name)?;
         let (policy, quota) = f.patches()?;
-        accounts::patch(&ctx.st, ctx.me.secret, &ctx.me.role, &name, &policy, &quota).await
+        let res = f.resources()?;
+        let v =
+            accounts::patch(&ctx.st, ctx.me.secret, &ctx.me.role, &name, &policy, &quota).await?;
+        if let Some(q) = res {
+            ctx.call(AdminOp::SetResources {
+                account: name.clone(),
+                quota: Box::new(q),
+            })
+            .await?;
+        }
+        Ok(v)
     }
     .await;
     match res {

@@ -991,13 +991,45 @@ unless its account's `max_priority` allows more. `pumasi whoami` (and
 `GET /api/v1/whoami`) shows a submitter its account's quota and job
 policy, so it can see which images and executors it may use.
 
+**Gangs, spreading and affinity (1.9).** In job.toml, `gang = true` starts
+all of a job's tasks together or none (when one has to move, the others
+stop too and they start again together), `spread` puts tasks on
+different nodes or label values, and `affinity` keeps them next to or away
+from another job of the same account:
+
+```toml
+gang = true
+spread = { by = "zone", max = 2 }             # or spread = "node": prefer, don't cap
+affinity = { near = ["db"], away = ["batch"], by = "node" }
+```
+
+`pumasi job ID` and the job's page say why such a job waits.
+
+**CPU and memory quotas (1.9).** Besides task counts, an account can be
+capped in the whole CPUs and memory its running tasks hold (a WASM task
+holds one CPU), and in what it holds on the nodes a label selector picks:
+
+```sh
+pumasi quota alice --cpus 16 --memory 64G --label-quota "zone=office slots=4 cpus=8 memory=16G"
+```
+
+**Checkpoints (1.9).** With `checkpoint = true` (or `{ grace = "1m" }`),
+a task that has to move (preemption, `pumasi drain`, a machine paused
+with `--on-pause requeue`, a machine going to sleep) gets SIGTERM and its
+grace period (30 s by default) instead of being killed. Whatever it wrote
+to `/checkpoint` (`$PUMASI_CHECKPOINT`) goes to the file store, and its
+next run, on any node, starts with it there. Docker and WASM tasks can
+checkpoint (a WASM task is stopped at once with what it saved so far);
+[`examples/checkpoint`](examples/checkpoint) resumes a long computation.
+
 **Schedules and dependencies.** A job can run on a cron schedule, in the
-control plane's local time, and skips a run while the previous one is
+control plane's local time or in any time zone (`--tz Asia/Seoul`, or
+`tz` in cluster.toml), and skips a run while the previous one is
 still going (`--overlap` allows it). `after` holds a job until the jobs it
 names have succeeded, and fails it if one of them fails.
 
 ```sh
-pumasi schedule add nightly job.toml --cron "0 3 * * *" --account alice
+pumasi schedule add nightly job.toml --cron "0 3 * * *" --tz Asia/Seoul --account alice
 pumasi schedule ls
 pumasi run merge.toml --after JOB_ID      # or after = ["JOB_ID"] in job.toml
 ```
@@ -1715,12 +1747,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring and phase 23 (1.7) the dashboard; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store and phase 25 (1.9) scheduling; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1747,7 +1779,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 22 | Monitoring: live microVM output, Windows temperatures, GPU metrics for Intel, AMD and Apple, the last hour kept across restarts, node-to-node latency and bandwidth, alert silences and per-label thresholds | done (1.6) |
 | 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | done (1.7) |
 | 24 | File store on several machines: replicas on owner nodes labelled for storage with repair and scrubbing, writes acknowledged on enough copies, release binaries on every control plane, an S3-compatible gateway in `pumasi ui` | done (1.8) |
-| 25 | Scheduling: gangs, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption and drain, schedule time zones | planned (1.9) |
+| 25 | Scheduling: gangs, spreading, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption, drain, pauses and sleep (Docker and WASM), schedule time zones | done (1.9) |
 | 26 | GPUs: WebGPU timeouts and GPU challenge, AMD benchmark and Docker jobs, shared GPUs (fractions, MIG) | planned (1.10) |
 | 27 | Windows: Docker in a Pumasi-managed WSL distro (no Docker Desktop, no sign-in), ARM64 microVMs, an HCS backend if clearly faster | planned (1.11) |
 | 28 | Operations: shared and per-peer request limits, audit log pruning behind a signed checkpoint, SCIM, the CLI behind an HTTPS proxy, follower reads | planned (1.12) |

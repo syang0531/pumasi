@@ -22,6 +22,7 @@ pub mod registry;
 pub mod release;
 pub mod replica;
 pub mod s3;
+pub mod sched;
 pub mod sso;
 pub mod store;
 pub mod ticket;
@@ -77,7 +78,7 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 4;
+pub const PROTOCOL_MINOR: u32 = 5;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
@@ -97,6 +98,11 @@ pub const SETTINGS_MINOR: u32 = 3;
 /// versions it is told to ([`msg::ToAgent::Hold`]), checks them when asked
 /// ([`msg::ToAgent::Scrub`]) and says what it has ([`msg::FromAgent::Held`]).
 pub const REPLICA_MINOR: u32 = 4;
+/// The first minor with checkpoints (1.9): the agent runs checkpointing
+/// tasks ([`msg::TaskAssignment::checkpoint`]), stops them with a grace
+/// period when asked ([`msg::ToAgent::Stop`]) or before its machine
+/// sleeps, and answers with their checkpoint ([`msg::FromAgent::Stopped`]).
+pub const CHECKPOINT_MINOR: u32 = 5;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

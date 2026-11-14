@@ -63,8 +63,8 @@ pub async fn page(ctx: Ctx) -> Response {
     let top = html! {
         div class="page-head" { h1 { (l.t("Schedules", "예약 작업")) } }
         p class="dim" { (l.t(
-            "Jobs submitted on a cron schedule, in the control plane's local time; each run's account pays.",
-            "cron 일정에 따라 제출되는 작업입니다. 시간은 컨트롤 플레인의 현지 시각이고, 실행마다 그 계정이 냅니다."
+            "Jobs submitted on a cron schedule, in the control plane's local time or the time zone shown with it; each run's account pays.",
+            "cron 일정에 따라 제출되는 작업입니다. 시간은 컨트롤 플레인의 현지 시각(또는 함께 적힌 시간대)이고, 실행마다 그 계정이 냅니다."
         )) }
     };
     let live = table(
@@ -91,7 +91,9 @@ pub async fn page(ctx: Ctx) -> Response {
                     div class="row" {
                         div { label for="s-name" { (l.t("Name", "이름")) } input #s-name name="name" required placeholder="nightly" pattern="[a-z0-9._-]{1,64}"; }
                         div { label for="s-cron" { "cron" } input #s-cron name="cron" required placeholder="0 3 * * *" value="@daily"; }
+                        div { label for="s-tz" { (l.t("Time zone", "시간대")) } input #s-tz name="tz" placeholder=(l.t("control plane's local time", "컨트롤 플레인 현지 시각")) list="tz-list"; }
                     }
+                    datalist #tz-list { option value="Asia/Seoul"; option value="UTC"; option value="America/New_York"; option value="Europe/London"; }
                     p class="dim" { (l.t("minute hour day month weekday, or @hourly, @daily, @weekly, @monthly.",
                         "분 시 일 월 요일, 또는 @hourly, @daily, @weekly, @monthly.")) }
                     label for="s-job" { "job.toml" }
@@ -124,6 +126,11 @@ pub async fn add(ctx: Ctx, headers: HeaderMap, form: Multipart) -> Response {
         let up = uploads::receive(form, "schedule").await?;
         let name = up.field("name").unwrap_or_default().to_string();
         let cron = up.field("cron").unwrap_or_default().to_string();
+        let tz = up
+            .field("tz")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
         let overlap = up.field("overlap").is_some();
         let (job, upload) = super::jobs::load_upload(&up).await?;
         anyhow::ensure!(
@@ -131,13 +138,14 @@ pub async fn add(ctx: Ctx, headers: HeaderMap, form: Multipart) -> Response {
             "the job's input files are too large to keep with a schedule; put them in the file store and mount them with `store:NAME`"
         );
         let spec = ScheduleSpec {
+            tz,
             name: name.clone(),
             cron,
             job,
             overlap,
         };
         spec.validate()?;
-        ctx.call(AdminOp::SetSchedule(Box::new(spec))).await?;
+        ctx.call(AdminOp::set_schedule(spec)).await?;
         anyhow::Ok(name)
     }
     .await;

@@ -88,6 +88,10 @@ impl State {
         self.mgmt
             .preempted
             .retain(|(job, _, _), _| !gone.contains(job));
+        self.sched
+            .checkpoints
+            .retain(|(job, _), _| !gone.contains(job));
+        self.sched.waiting.retain(|job, _| !gone.contains(job));
         for h in &blobs {
             self.modules.remove(h);
         }

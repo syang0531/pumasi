@@ -93,6 +93,65 @@ pub struct TaskIo {
     /// How long getting the image ready took, which the executor writes
     /// for the task's timings (1.4).
     pub pull: PullTime,
+    /// A checkpointing run's `/checkpoint` and how it is asked to stop
+    /// (1.9).
+    pub checkpoint: Option<CheckpointIo>,
+}
+
+/// A checkpointing run's `/checkpoint`: a directory on this machine that
+/// holds the task's last checkpoint when the run starts and what the run
+/// saved when it stops.
+#[derive(Debug, Clone)]
+pub struct CheckpointIo {
+    pub dir: PathBuf,
+    pub stop: Arc<StopSignal>,
+}
+
+/// How the agent asks a checkpointing run to stop: the executor sends the
+/// run a stop signal and kills it after the grace period (Docker), or
+/// stops it at once (WASM, whose cancel flag the agent sets too).
+#[derive(Debug, Default)]
+pub struct StopSignal {
+    /// The run stops at once (WASM).
+    immediate: bool,
+    requested: AtomicBool,
+    delivered: AtomicBool,
+    grace_ms: std::sync::atomic::AtomicU64,
+}
+
+impl StopSignal {
+    pub fn new(immediate: bool) -> Self {
+        Self {
+            immediate,
+            ..Default::default()
+        }
+    }
+
+    pub fn immediate(&self) -> bool {
+        self.immediate
+    }
+
+    pub fn request(&self, grace_ms: u64) {
+        self.grace_ms.store(grace_ms, Ordering::Relaxed);
+        self.requested.store(true, Ordering::Relaxed);
+    }
+
+    /// The grace period, once a stop is asked for.
+    pub fn requested(&self) -> Option<Duration> {
+        self.requested
+            .load(Ordering::Relaxed)
+            .then(|| Duration::from_millis(self.grace_ms.load(Ordering::Relaxed)))
+    }
+
+    /// The run was told to stop while it ran: its result does not count,
+    /// its checkpoint does.
+    pub fn deliver(&self) {
+        self.delivered.store(true, Ordering::Relaxed);
+    }
+
+    pub fn delivered(&self) -> bool {
+        self.delivered.load(Ordering::Relaxed)
+    }
 }
 
 /// The time one run spent getting its image ready: pulling it, building a
@@ -555,6 +614,14 @@ impl WasmExecutor {
         let preopened = builder
             .preopened_dir(&in_dir, INPUT_DIR, FsPerms::ReadOnly)
             .and_then(|b| b.preopened_dir(&out_dir, OUTPUT_DIR, FsPerms::ReadWrite))
+            .and_then(|b| match &io.checkpoint {
+                Some(c) => b.preopened_dir(
+                    &c.dir,
+                    pumasi_proto::sched::CHECKPOINT_DIR,
+                    FsPerms::ReadWrite,
+                ),
+                None => Ok(b),
+            })
             .map(|_| ());
         if let Err(e) = preopened {
             return RunResult::error(&format!("preopen directories: {e}"), start);

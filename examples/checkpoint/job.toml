@@ -1,0 +1,24 @@
+# A long computation that survives being moved: it keeps its progress in
+# /checkpoint, and when the cluster has to move it (preemption, a drain,
+# a paused machine with `--on-pause requeue`, a machine going to sleep) it
+# gets SIGTERM, saves, and exits. The next run, on another machine, starts
+# from the saved state instead of from zero.
+#
+#   pumasi run examples/checkpoint/job.toml
+#   pumasi drain <the node it runs on>      # while it runs
+#   pumasi job <id>                          # "checkpoint of task 0 ... resumed 1 time(s)"
+#
+# Needs agents started with `--allow-docker` (a WASM module may checkpoint
+# the same way through /checkpoint; microVMs cannot yet).
+name = "pi-checkpoint"
+image = "python:3.12-slim"
+command = ["python", "/input/pi.py"]
+files = ["pi.py"]
+
+# Up to 30 s from SIGTERM to the kill, to write the checkpoint.
+checkpoint = { grace = "30s" }
+
+[resources]
+memory_mb = 256
+cpus = 1
+timeout = "1h"

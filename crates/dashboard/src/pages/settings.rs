@@ -221,7 +221,7 @@ pub async fn apply(ctx: Ctx, headers: HeaderMap, Form(f): Form<ApplyForm>) -> Re
     let dry_run = f.mode.as_deref() != Some("apply");
     let res = async {
         let spec = apply_spec(&f.text, dry_run)?;
-        match ctx.call(AdminOp::Apply(Box::new(spec))).await? {
+        match ctx.call(AdminOp::apply(spec)).await? {
             AdminResponse::Applied(c) => Ok(c),
             _ => anyhow::bail!("unexpected response"),
         }

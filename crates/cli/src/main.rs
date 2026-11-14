@@ -318,6 +318,8 @@ enum Cmd {
         #[command(flatten)]
         policy: Box<manage::PolicyArgs>,
         #[command(flatten)]
+        resources: Box<manage::ResourceArgs>,
+        #[command(flatten)]
         admin: AdminArgs,
     },
     /// Access tickets with a role: admin, submitter (one account) or
@@ -1800,6 +1802,9 @@ async fn run(cli: Cli) -> Result<i32> {
             let view = wait_for_job(&client, id).await?;
             let ran = task_executors(&client, &view).await;
             print_job(&view, &task_details(&client, id).await, &ran, output);
+            if let Ok(AdminResponse::Placement(p)) = client.call(AdminOp::Placement { id }).await {
+                print_placement(&p);
+            }
             let dir = out.unwrap_or_else(|| PathBuf::from("pumasi-out").join(id.to_string()));
             download_outputs(&client, &view, &dir, false).await?;
             client.close().await;
@@ -1918,6 +1923,7 @@ async fn run(cli: Cli) -> Result<i32> {
             storage,
             clear,
             policy,
+            resources,
             admin,
         } => {
             manage::quota(
@@ -1931,6 +1937,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 storage,
                 clear,
                 *policy,
+                *resources,
             )
             .await
         }
@@ -3175,6 +3182,34 @@ async fn task_executors(client: &AdminClient, v: &JobView) -> Vec<Option<Executo
     {
         Ok(AdminResponse::TaskExecutors(e)) => e,
         _ => Vec::new(),
+    }
+}
+
+/// A job's placement, its runs stopping now and its checkpoints (1.9).
+fn print_placement(p: &pumasi_proto::sched::PlacementView) {
+    if !p.placement.is_empty() {
+        println!("placement: {}", p.placement.describe());
+    }
+    if let Some(w) = &p.waiting {
+        println!("  waiting: {w}");
+    }
+    if !p.stopping.is_empty() {
+        let v: Vec<String> = p.stopping.iter().map(|i| i.to_string()).collect();
+        println!("  stopping to save a checkpoint: task {}", v.join(", "));
+    }
+    for c in &p.checkpoints {
+        println!(
+            "  checkpoint of task {}: {} files, {}, saved on {} at {} UTC{}",
+            c.index,
+            c.files,
+            format_size(c.size),
+            c.node,
+            utc(c.saved_unix),
+            match c.resumed {
+                0 => String::new(),
+                n => format!(", resumed {n} time(s)"),
+            }
+        );
     }
 }
 

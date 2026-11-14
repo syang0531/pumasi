@@ -2041,6 +2041,164 @@
           }
         }
       }
+    },
+    "/api/v1/jobs/{id}/placement": {
+      "get": {
+        "summary": "A job's placement, its runs stopping now and its checkpoints (1.9)",
+        "tags": [
+          "jobs"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "`placement` is what job.toml asked for (gang, spread, affinity, checkpoint); `waiting` says why a gang or a placement holds the job back; `stopping` lists tasks saving a checkpoint before they move; `checkpoints` the last checkpoint of each task and how often a run resumed from it.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Job id (hex, as `pumasi status` shows it)"
+          }
+        ]
+      }
+    },
+    "/api/v1/resources": {
+      "get": {
+        "summary": "CPU and memory quotas and what each account holds (1.9)",
+        "tags": [
+          "cu"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Per account: `quota` (`cpus`, `memory_bytes`, `labels`: quotas on the nodes a label selector picks), `used` (runs, whole CPUs, memory and GPUs its running tasks hold) and `labels_used` (the same on each label quota's nodes). A submitter sees its own account."
+      }
+    },
+    "/api/v1/accounts/{name}/resources": {
+      "put": {
+        "summary": "Set an account's CPU and memory quota (1.9)",
+        "tags": [
+          "cu"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Admin only. Replaces the whole CPU and memory quota; an empty body object removes it.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Account name"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "cpus": {
+                    "type": "integer",
+                    "description": "Whole CPUs its running tasks hold at once (a WASM task holds one)"
+                  },
+                  "memory": {
+                    "type": "string",
+                    "description": "Memory its running tasks hold at once, e.g. 64G"
+                  },
+                  "label_quotas": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Quotas on the nodes a label selector picks, e.g. \"zone=office slots=4 cpus=8 memory=16G gpus=1\""
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

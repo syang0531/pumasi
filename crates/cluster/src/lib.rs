@@ -24,6 +24,7 @@ pub mod remote;
 pub mod replicas;
 pub mod retention;
 pub mod rollout;
+pub mod sched;
 pub mod server;
 pub mod sessions;
 pub mod sso;

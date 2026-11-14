@@ -12,7 +12,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use pumasi_proto::manage::AccessRole;
 use pumasi_proto::{
@@ -52,6 +52,7 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/jobs/{id}/receipts", get(receipts))
+        .route("/jobs/{id}/placement", get(placement))
         .route("/jobs/{id}/outputs.zip", get(outputs_zip))
         .route("/jobs/{id}/tasks/{index}/logs", get(logs))
         .route("/nodes/{node}/rename", post(rename_node))
@@ -68,6 +69,8 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
         .route("/apply", post(apply))
         .route("/accounts", get(accounts))
         .route("/accounts/{name}/policy", policy)
+        .route("/accounts/{name}/resources", put(set_resources))
+        .route("/resources", get(resources))
         .route("/ledger", get(ledger))
         .route("/datasets", get(datasets))
         .route("/storage", get(storage))
@@ -726,7 +729,69 @@ struct ApplyBody {
 /// says what would change.
 async fn apply(axum::extract::State(st): S, a: Api, Json(b): Json<ApplyBody>) -> Response {
     match pages::settings::apply_spec(&b.file, b.dry_run) {
-        Ok(spec) => simple(st, a, AdminOp::Apply(Box::new(spec))).await,
+        Ok(spec) => simple(st, a, AdminOp::apply(spec)).await,
+        Err(e) => error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
+}
+
+async fn placement(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -> Response {
+    match job_id(&id) {
+        Ok(id) => simple(st, a, AdminOp::Placement { id }).await,
+        Err(r) => r,
+    }
+}
+
+async fn resources(axum::extract::State(st): S, a: Api) -> Response {
+    simple(st, a, AdminOp::Resources).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourcesBody {
+    cpus: Option<u32>,
+    memory: Option<String>,
+    #[serde(default)]
+    label_quotas: Vec<String>,
+}
+
+/// Replaces an account's CPU and memory quota (1.9).
+async fn set_resources(
+    axum::extract::State(st): S,
+    a: Api,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let quota = (|| -> anyhow::Result<pumasi_proto::sched::ResourceQuota> {
+        pumasi_proto::economy::validate_account(&name)?;
+        let b: ResourcesBody = serde_json::from_slice(&body)?;
+        let q = pumasi_proto::sched::ResourceQuota {
+            cpus: b.cpus,
+            memory_bytes: b
+                .memory
+                .as_deref()
+                .map(pumasi_proto::store::parse_size)
+                .transpose()?,
+            labels: b
+                .label_quotas
+                .iter()
+                .map(|l| l.parse())
+                .collect::<anyhow::Result<_>>()?,
+        };
+        q.validate()?;
+        Ok(q)
+    })();
+    match quota {
+        Ok(q) => {
+            simple(
+                st,
+                a,
+                AdminOp::SetResources {
+                    account: name,
+                    quota: Box::new(q),
+                },
+            )
+            .await
+        }
         Err(e) => error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
     }
 }

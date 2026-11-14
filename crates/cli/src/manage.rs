@@ -1,7 +1,10 @@
 //! Cluster management commands (phase 10): cordon, drain, labels, taints,
 //! quotas, access tickets, schedules, `apply`, `get` and `describe`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Subcommand, ValueEnum};
@@ -531,7 +534,7 @@ pub async fn quota(
         client.close().await;
         print_quotas(&list?);
         if let Some(cpu) = cpu {
-            print_resources(&cpu);
+            print_resources(&cpu)?;
         }
         return Ok(0);
     };
@@ -627,29 +630,36 @@ pub async fn quota(
     let (q, p, r) = r?;
     eprintln!("quota of {account}: {}", q.describe());
     if let Some(r) = r {
-        eprintln!("CPU and memory quota of {account}: {}", r.describe());
+        // Written to the terminal, not logged (an account name is no secret).
+        let mut err = std::io::stderr().lock();
+        writeln!(err, "CPU and memory quota of {account}: {}", r.describe())?;
     }
     eprintln!("job policy of {account}: {}", p.describe());
     Ok(0)
 }
 
 /// CPU and memory quotas, for accounts that have one or hold something.
-fn print_resources(list: &[pumasi_proto::sched::ResourceView]) {
+fn print_resources(list: &[pumasi_proto::sched::ResourceView]) -> Result<()> {
+    // Written to the terminal, not logged (account names are no secret).
+    let mut out = std::io::stdout().lock();
     for v in list {
         let lines = pumasi_proto::sched::usage_lines(v);
         if lines.is_empty() {
             if v.used.cpus > 0 {
-                println!(
+                writeln!(
+                    out,
                     "{}: {} CPUs, {} of memory (no CPU or memory quota)",
                     v.account,
                     v.used.cpus,
                     format_size(v.used.memory_bytes)
-                );
+                )?;
             }
             continue;
         }
-        println!("{}: {}", v.account, lines.join(", "));
+        writeln!(out, "{}: {}", v.account, lines.join(", "))?;
     }
+    out.flush()?;
+    Ok(())
 }
 
 fn print_quotas(list: &[QuotaView]) {

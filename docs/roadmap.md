@@ -24,7 +24,7 @@ on real machines.
 | 23 | 1.7 | Dashboard: change settings in the browser, sessions that survive restarts, canary rollouts | done |
 | 24 | 1.8 | File store on several machines and an S3-compatible gateway | done |
 | 25 | 1.9 | Scheduling: gangs, affinity, CPU and memory quotas, checkpoints | done |
-| 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | planned |
+| 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | done |
 | 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | planned |
 | 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | planned |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
@@ -259,6 +259,16 @@ Gate: end-to-end tests for each, including a checkpointed task moved off
 a drained node that finishes without starting over.
 
 ## 26. GPUs: WebGPU timeouts and checks, AMD, shared GPUs (1.10)
+
+Done in 1.10.0 ([release notes](releases/v1.10.0.md)). What differs from
+the plan below: the timeout kills a worker process that holds the task's
+device (dispatches are the bounded pieces, at most 16 queued), rather
+than dropping the device inside the agent; AMD GPUs (and every other GPU
+the CUDA benchmark cannot run on) are benchmarked and challenged over
+WebGPU rather than with ROCm; parts of GPUs are Docker-only, in
+hundredths of one GPU, share memory on trust, and can be turned off per
+node (`gpu.share=off`); MIG slices are estimated, not benchmarked
+([details](architecture.md#phase-26-gpus-110)).
 
 - **WebGPU:** the job's timeout stops a runaway shader (work is split into
   bounded submissions and the device is dropped on timeout), a GPU

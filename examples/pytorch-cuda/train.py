@@ -18,6 +18,12 @@ if not torch.cuda.is_available():
 device = torch.device("cuda")
 torch.manual_seed(1000 + shard)
 name = torch.cuda.get_device_name(0)
+# A run that holds part of the GPU (`gpus = 0.5`) keeps to its part of
+# the memory, so the runs it shares the GPU with have theirs.
+fraction = os.environ.get("PUMASI_GPU_FRACTION")
+if fraction:
+    torch.cuda.set_per_process_memory_fraction(float(fraction), 0)
+    name += f" ({fraction} GPU)"
 print(f"shard {shard}/{shards} on {name}", flush=True)
 
 

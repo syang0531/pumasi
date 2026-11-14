@@ -150,6 +150,28 @@ jobs:
           cp out/matmul.json "report/matmul-${{ matrix.os }}.json"
           grep "^adapter: " matmul.txt | head -n1 > "report/adapter-${{ matrix.os }}.txt"
           grep "^blur " blur.txt > "report/blur-${{ matrix.os }}.txt"
+      # 1.10: the task's timeout stops a shader that never ends (the GPU
+      # work runs in a worker process the agent kills), on each OS's API.
+      - name: A shader that never ends stops at the task's timeout
+        if: env.HAS_GPU == 'true'
+        shell: bash
+        run: |
+          bin=target/release/pumasi
+          mods=examples/webgpu/target/wasm32-wasip1/release
+          start=$(date +%s)
+          set +e
+          "$bin" exec --gpu --webgpu-software --timeout 5s --out out "$mods/forever.wasm" > forever.txt 2>&1
+          code=$?
+          set -e
+          took=$(( $(date +%s) - start ))
+          cat forever.txt
+          echo "exit $code after ${took}s"
+          test "$code" -ne 0
+          grep -qi "timeout\|timed out" forever.txt
+          grep -q "stopped at the task's end" forever.txt
+          test "$took" -lt 60
+          # The adapter still works after the kill.
+          "$bin" exec --gpu --webgpu-software --memory-mb 512 --out out "$mods/matmul.wasm" 128 | grep -q ": ok$"
       - uses: actions/upload-artifact@v4
         if: env.HAS_GPU == 'true'
         with:

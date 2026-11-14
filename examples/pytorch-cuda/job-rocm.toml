@@ -1,0 +1,24 @@
+# The same training on an AMD GPU with PyTorch for ROCm (1.10).
+#
+# Needs a Linux agent with an AMD GPU that the ROCm driver (amdgpu) runs,
+# Docker, and `--allow-docker`. The container gets /dev/kfd and the GPU's
+# render node (/dev/dri/renderD*) with the groups that may open them;
+# PyTorch's ROCm build answers to the same `torch.cuda` calls. Without a
+# CUDA benchmark the agent measures AMD GPUs over WebGPU (Vulkan), which
+# is also how the cluster times a provider's AMD GPU.
+#
+#   pumasi run examples/pytorch-cuda/job-rocm.toml
+name = "pytorch-rocm"
+image = "rocm/pytorch:rocm6.2_ubuntu22.04_py3.10_pytorch_release_2.3.0"
+command = ["python", "/input/train.py", "{shard}", "{shards}"]
+files = ["train.py"]
+shards = 2
+
+[gpu]
+vendor = "amd"
+min_vram_gb = 4
+
+[resources]
+memory_mb = 8192
+cpus = 2
+timeout = "30m"

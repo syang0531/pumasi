@@ -275,9 +275,11 @@ pumasi run examples/pytorch-cuda/job.toml --output
   bandwidth, and a hash rate for the cluster's GPU check). Docker jobs get
   them with `--gpus device=...`, which needs the NVIDIA Container Toolkit on
   Linux; Docker Desktop on Windows has it built in (WSL 2).
-- **AMD** (Linux): found in sysfs; FP32 is estimated from the compute
-  units and clock. Docker jobs get `/dev/kfd` and the GPU's render node
-  (ROCm images).
+- **AMD** (Linux): found in sysfs and benchmarked over WebGPU (Vulkan)
+  since 1.10: FP32, memory bandwidth and the hash rate for the GPU check;
+  without a Vulkan driver FP32 is estimated from the compute units and
+  clock. Docker jobs get `/dev/kfd` and the GPU's render node (ROCm
+  images, see `examples/pytorch-cuda/job-rocm.toml`).
 - **Intel and Apple GPUs**, and any GPU without CUDA, are used by wasm jobs
   through WebGPU (below).
 - **MicroVMs (experimental)**: a GPU bound to `vfio-pci` on Linux, with a
@@ -292,12 +294,25 @@ plus `gpu-vram-gib-hour` (0.3 CU per GiB of GPU memory per hour) on top of
 CPU and memory, so a 12 GiB, 12.7 TFLOPS card costs about 4.9 CU an hour.
 Your own machines are billed at what they measured. A provider's GPU is
 timed by the control plane first, with a challenge only that GPU can answer
-quickly; a wrong answer is a strike and bills nothing, a GPU slower than it
-claims is billed at what was timed, and one that cannot take the challenge
-(no CUDA) is billed at 10 TFLOPS at most. Checks are repeated at the result
-check rate. GPU results themselves are not deterministic, so they are not
-re-run. `pumasi node <id>` shows each GPU and what it is billed at;
-`--no-gpus` keeps an agent's GPUs out of the cluster.
+quickly (with CUDA, or over WebGPU for GPUs without it); a wrong answer is
+a strike and bills nothing, a GPU slower than it claims is billed at what
+was timed, and one that cannot take the challenge is billed at 10 TFLOPS
+at most. Checks are repeated at the result check rate. GPU results
+themselves are not deterministic, so they are not re-run. `pumasi node
+<id>` shows each GPU and what it is billed at; `--no-gpus` keeps an
+agent's GPUs out of the cluster.
+
+**Parts of a GPU (1.10).** `gpus = 0.5` (any hundredth up to 0.99) gives
+a Docker task part of one GPU: tasks share it, time-sliced by the driver,
+while their parts add up to at most one, and each pays for its part (the
+receipt says `RTX 3080 (0.5 GPU)`). The task gets `PUMASI_GPU_FRACTION`
+and the settings that keep TensorFlow and JAX to their part of the memory;
+memory is shared on trust, so PyTorch code should call
+`torch.cuda.set_per_process_memory_fraction` as
+`examples/pytorch-cuda/train.py` does. A whole-GPU task waits for a GPU no
+part is on, and `pumasi label NODE gpu.share=off` keeps a node's GPUs
+whole. An NVIDIA GPU in MIG mode is listed as its slices, each a GPU of
+its own with its own memory.
 
 ### WebGPU: any GPU from a wasm job (experimental)
 
@@ -350,12 +365,17 @@ checks every access, as browsers do, but it still reaches the GPU driver).
 An adapter that is one of the node's listed GPUs shares its slot, so a
 Docker job and a WebGPU job never use the same GPU at once. Its time is
 billed like any GPU's, at the FP32 rate the agent measured with a WGSL
-shader; there is no GPU challenge over WebGPU yet, so a provider's
-adapter is billed at 1 TFLOPS at most unless it is a CUDA GPU the cluster
-already timed. GPU results differ slightly from GPU to GPU, so these jobs
-are not deterministic and are never re-run to check them. CI runs both
-examples on Linux (lavapipe, a software Vulkan driver), Windows and macOS
-and compares the results across them; real GPUs are checked by hand.
+shader; since 1.10 the cluster times a provider's adapter with the GPU
+challenge over WebGPU (until then it is billed at 1 TFLOPS at most). The
+job's timeout covers shaders too: the GPU work runs in a worker process
+that the agent ends at the timeout, so a shader that never ends stops
+there (`examples/webgpu/forever.toml`). Devices are opened with
+`shader-f16` and subgroups where the adapter has them, and
+`gpu = { features = ["shader-f16"] }` sends a job only to such adapters.
+GPU results differ slightly from GPU to GPU, so these jobs are not
+deterministic and are never re-run to check them. CI runs the examples on
+Linux (lavapipe, a software Vulkan driver), Windows and macOS and compares
+the results across them; real GPUs are checked by hand.
 
 ### Windows
 
@@ -1502,7 +1522,7 @@ A job runs on one of three executors with the same file format and commands:
 | Where | every node | only nodes started with `--allow-docker` (providers also need an invite with `--allow-docker`) | nodes started with `--allow-microvm`, providers included |
 | Isolation | Wasmtime sandbox, safe for untrusted code | container, only for machines and people you trust | a VM with its own kernel per task |
 | Network | never | off by default, `network = true` to allow | off by default, `network = true` reaches public addresses only |
-| GPUs | `gpus = 1`: any GPU through WebGPU (nodes with `--allow-webgpu`, experimental) | `gpus = N` or `gpu = {...}` (NVIDIA, AMD on Linux) | `gpus = N`, passed through with VFIO (Linux, experimental) |
+| GPUs | `gpus = 1`: any GPU through WebGPU (nodes with `--allow-webgpu`, experimental) | `gpus = N`, `gpus = 0.5` (part of one) or `gpu = {...}` (NVIDIA, AMD on Linux) | `gpus = N`, passed through with VFIO (Linux, experimental) |
 | Files | `/input`, `/output` | `/input`, `/output` | `/input`, `/output` |
 
 WASM job:
@@ -1518,6 +1538,7 @@ files = ["data/", "lookup.csv"]       # optional, appear under /input; "store:NA
 max_attempts = 3                      # placements before giving up on lost nodes
 deterministic = true                  # default (off with gpus): virtual clock + seeded random, so results can be checked
 # gpus = 1                            # one GPU through WebGPU (the pumasi_webgpu imports)
+# gpu = { features = ["shader-f16"] } # only adapters with these WebGPU features (shader-f16, subgroups)
 priority = 0                          # -1000..1000; higher runs first and may preempt lower
 after = []                            # job ids that must succeed before this job starts
 tolerations = []                      # taints of nodes it may run on, e.g. ["gpu-only"]
@@ -1542,6 +1563,7 @@ files = ["count.py", "texts/"]        # copied into /input of every task
 shards = 4
 network = false                       # default; true allows outbound network
 # gpus = 1                            # GPUs per task ("all": every GPU of the node)
+# gpus = 0.5                          # part of one GPU, shared with other tasks (0.01 to 0.99)
 # gpu = { vendor = "nvidia", min_vram_gb = 16 }  # which GPUs (vendor: nvidia, amd, any)
 # gpu = { vendor = "nvidia", capabilities = ["graphics"] }  # drawing (EGL, OpenGL, Vulkan) or "video" (NVENC)
 
@@ -1747,12 +1769,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store and phase 25 (1.9) scheduling; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling and phase 26 (1.10) GPUs; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1780,7 +1802,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 23 | Dashboard: sessions that survive restarts, editing alerts, webhooks, prices, schedules, labels and node availability in the browser, canary rollouts, streaming charts, phone layout | done (1.7) |
 | 24 | File store on several machines: replicas on owner nodes labelled for storage with repair and scrubbing, writes acknowledged on enough copies, release binaries on every control plane, an S3-compatible gateway in `pumasi ui` | done (1.8) |
 | 25 | Scheduling: gangs, spreading, affinity and anti-affinity, CPU and memory quotas, per-label quotas, checkpoints kept across preemption, drain, pauses and sleep (Docker and WASM), schedule time zones | done (1.9) |
-| 26 | GPUs: WebGPU timeouts and GPU challenge, AMD benchmark and Docker jobs, shared GPUs (fractions, MIG) | planned (1.10) |
+| 26 | GPUs: WebGPU shaders stopped at the job's timeout (worker process), the GPU challenge over WebGPU, `shader-f16` and subgroups, AMD and other CUDA-less GPUs benchmarked and checked over WebGPU, ROCm Docker jobs, parts of GPUs (`gpus = 0.5`), MIG slices as GPUs | done (1.10) |
 | 27 | Windows: Docker in a Pumasi-managed WSL distro (no Docker Desktop, no sign-in), ARM64 microVMs, an HCS backend if clearly faster | planned (1.11) |
 | 28 | Operations: shared and per-peer request limits, audit log pruning behind a signed checkpoint, SCIM, the CLI behind an HTTPS proxy, follower reads | planned (1.12) |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | on hold |
@@ -1789,9 +1811,8 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 Known gaps: agents older than the release that added control plane
 replicas follow only the replica they joined. WebGPU is experimental: it is
 checked on software rasterizers in CI and on real GPUs by hand, offers
-compute shaders only (no textures or samplers, one bind group, no f16), a
-runaway shader is stopped by the GPU driver's watchdog rather than the
-job's timeout, and there is no GPU challenge over WebGPU yet. Accounts
+compute shaders only (no textures or samplers, one bind group). Parts of
+GPUs share memory on trust (only MIG slices enforce it). Accounts
 exist only inside one cluster (SSO signs people in, but there is no SCIM
 or SAML, and nobody is removed until their session ends or is revoked), and CU are not connected to real payments. GPUs are checked on real hardware by hand, not in CI (hosted
 runners have none); VFIO passthrough is experimental and NVIDIA-only

@@ -1114,6 +1114,22 @@
                   "force": {
                     "type": "boolean",
                     "description": "Allow binaries of another protocol version than the control plane"
+                  },
+                  "canary": {
+                    "type": "string",
+                    "description": "Canary nodes (1.7): names, comma-separated, or a label selector. They upgrade first; the rest follow once they have run cleanly for canary_soak and canary_tasks tasks each"
+                  },
+                  "canary_soak": {
+                    "type": "string",
+                    "description": "How long the canaries run before the rest follow (default 30m)"
+                  },
+                  "canary_tasks": {
+                    "type": "integer",
+                    "description": "Tasks each canary finishes cleanly first (default 0)"
+                  },
+                  "canary_hold": {
+                    "type": "boolean",
+                    "description": "Wait for POST /api/v1/upgrade/canary/promote instead of following by itself"
                   }
                 }
               }
@@ -1659,6 +1675,369 @@
           },
           "429": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/upgrade/canary": {
+      "get": {
+        "summary": "The current rollout's canary (1.7)",
+        "tags": [
+          "nodes"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Answers `null` when the rollout has no canary, else `{spec, started_unix, phase, canaries, held, waiting_for}`. `phase` is `\"Canary\"`, `{\"Promoted\": {unix, by}}` or `{\"Halted\": {reason}}`; `canaries` lists `{id, name, upgraded_unix, tasks_ok, tasks_failed}`; `held` names the nodes waiting for the canaries."
+      }
+    },
+    "/api/v1/upgrade/canary/promote": {
+      "post": {
+        "summary": "Upgrade the nodes named next, or every node (1.7, admin)",
+        "tags": [
+          "nodes"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "With `nodes`, those nodes join the canaries and upgrade now; without, the canary is promoted and every node gets the release. Also moves a halted canary on.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "nodes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Node names or ids"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "summary": "Browsers signed in (1.7)",
+        "tags": [
+          "access"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Every session for an admin, the caller's own ticket's otherwise: `[{id, name, role, label, created_unix, last_used_unix, current}]`. Sessions live in the control plane's state, so restarting `pumasi ui` keeps them; one ends after 12 hours unused."
+      }
+    },
+    "/api/v1/sessions/{id}": {
+      "delete": {
+        "summary": "Sign a browser out (1.7)",
+        "tags": [
+          "access"
+        ],
+        "responses": {
+          "200": {
+            "description": "The sessions left",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The session's id, or a unique start of it"
+          }
+        ]
+      }
+    },
+    "/api/v1/nodes/{node}/settings": {
+      "get": {
+        "summary": "A node's availability settings (1.7)",
+        "tags": [
+          "nodes"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Answers `{id, name, online, report}`; `report` is `null` for an agent older than 1.7, else `{settings: {slots, max_cpu_percent, only_on_ac, idle_minutes, hours}, file, restarting}`. `file` is `null` when the agent was started by hand and cannot change its options.",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Node name or id"
+          }
+        ]
+      },
+      "put": {
+        "summary": "Change a node's availability settings (1.7, admin)",
+        "tags": [
+          "nodes"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "The agent writes them to its service's options file (agent.toml) and restarts with them once its running tasks end, taking no new tasks meanwhile. Fields left `null` take the default.",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Node name or id"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "slots": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "max_cpu_percent": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "only_on_ac": {
+                    "type": "boolean"
+                  },
+                  "idle_minutes": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "hours": {
+                    "type": "string",
+                    "description": "`22:00-07:00,12:00-13:00`; empty for any time"
+                  }
+                },
+                "required": [
+                  "only_on_ac",
+                  "hours"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/apply": {
+      "post": {
+        "summary": "Make the cluster match a cluster.toml (1.7, admin)",
+        "tags": [
+          "access"
+        ],
+        "responses": {
+          "200": {
+            "description": "The changes, one line each",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Like `pumasi apply`, except that the file may not have schedules (they name job files) or `url_env`, and nothing is pruned. With `dry_run` it only says what would change.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string"
+                  },
+                  "dry_run": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "file"
+                ]
+              }
+            }
           }
         }
       }

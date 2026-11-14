@@ -531,6 +531,55 @@ curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/ne
 {"nodes":["desktop","laptop"],"links":[{"from":"desktop","to":"laptop","rtt_us":1180,"bps":48210000,"direct":true,"unix":1794607297,"error":null}],"every_secs":20}
 ```
 
+### Settings, sessions and canaries (1.7)
+
+A node's availability settings (slots, CPU share, AC power only, idle
+minutes, hours) and whether its agent can change them: `file` is the
+options file of an agent run as a service, `null` for one started by
+hand.
+
+```sh
+curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/nodes/node-a/settings"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/nodes/node-a/settings" | jq -e '.name == "node-a" and .report.settings.slots == 2 and .report.file == null' -->
+
+`PUT` the same object to change them (fields left `null` take the
+default): the agent writes them to its `agent.toml` and restarts with
+them once its running tasks end. node-a here was started by hand, so it
+says why it cannot:
+
+```sh
+curl -sS -X PUT -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' \
+  -d '{"slots": 1, "max_cpu_percent": 50, "only_on_ac": false, "idle_minutes": null, "hours": "22:00-07:00"}' \
+  "$PUMASI_URL/api/v1/nodes/node-a/settings"
+```
+<!-- ci: curl -sS -X PUT -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{"slots": 1, "max_cpu_percent": null, "only_on_ac": false, "idle_minutes": null, "hours": ""}' "$PUMASI_URL/api/v1/nodes/node-a/settings" | grep -q 'by hand' -->
+
+`POST /api/v1/apply` takes a `cluster.toml` as text (no schedules, no
+`url_env`, never pruning) and, with `dry_run`, answers with what would
+change:
+
+```sh
+curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' \
+  -d '{"file": "[nodes.node-a]\nlabels = { room = \"study\" }\n", "dry_run": true}' \
+  "$PUMASI_URL/api/v1/apply"
+```
+<!-- ci: curl -fsS -X POST -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{"file": "[nodes.node-a]\nlabels = { room = \"study\" }\n", "dry_run": true}' "$PUMASI_URL/api/v1/apply" | jq -e 'length == 1 and (.[0] | contains("room"))' -->
+
+`GET /api/v1/sessions` lists the dashboard's signed-in browsers (all of
+them for an admin, the caller's own otherwise) and `DELETE
+/api/v1/sessions/ID` signs one out. `GET /api/v1/upgrade/canary` is the
+current rollout's canary (`null` without one), `POST
+/api/v1/upgrade/canary/promote` with `{"nodes": ["imac"]}` upgrades those
+next (without nodes: every node), and `POST /api/v1/upgrade` takes
+`"canary": "imac"` (with `canary_soak`, `canary_tasks`, `canary_hold`):
+
+```sh
+curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/upgrade/canary"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/upgrade/canary" | jq -e '. == null' -->
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/sessions" | jq -e 'type == "array"' -->
+
 Every route, with its parameters, is in `$PUMASI_URL/api/openapi.json`
 (OpenAPI 3.1), which code generators and tools such as Postman read.
 

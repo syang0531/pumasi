@@ -270,6 +270,51 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
             version.clone().unwrap_or_else(|| "latest".into()),
             if *force { "forced".into() } else { none() },
         ),
+        CanaryRollout {
+            files,
+            force,
+            canary,
+        } => (
+            "rollout.start",
+            none(),
+            format!(
+                "{} file(s){}, canary {} (soak {}s, {} tasks{})",
+                files.len(),
+                if *force { ", forced" } else { "" },
+                canary.nodes,
+                canary.soak_secs,
+                canary.min_tasks,
+                if canary.hold { ", held" } else { "" }
+            ),
+        ),
+        CanaryUpgradeToLatest {
+            version,
+            force,
+            canary,
+        } => (
+            "rollout.latest",
+            version.clone().unwrap_or_else(|| "latest".into()),
+            format!(
+                "{}canary {} (soak {}s, {} tasks{})",
+                if *force { "forced, " } else { "" },
+                canary.nodes,
+                canary.soak_secs,
+                canary.min_tasks,
+                if canary.hold { ", held" } else { "" }
+            ),
+        ),
+        PromoteCanary { nodes } => (
+            "rollout.promote",
+            if nodes.is_empty() {
+                "every node".into()
+            } else {
+                nodes.join(",")
+            },
+            none(),
+        ),
+        SetNodeSettings { node, settings } => ("node.settings", node.clone(), settings.describe()),
+        // Sessions log themselves in `server::session_call`.
+        StartSession { .. } | RevokeSession { .. } | EndSession => return None,
         RenameNode { node, name } => (
             "node.rename",
             node.clone(),
@@ -441,6 +486,9 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | NodePower
         | AlertTuning
         | Net
+        | Sessions
+        | NodeSettings { .. }
+        | Canary
         | CheckJob { .. }
         | Accounts
         | Ledger { .. }

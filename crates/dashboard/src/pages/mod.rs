@@ -11,6 +11,8 @@ pub mod login;
 pub mod nodes;
 pub mod overview;
 pub mod prices;
+pub mod schedules;
+pub mod settings;
 pub mod storage;
 pub mod upgrade;
 
@@ -38,6 +40,8 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
         .route("/", get(overview::page))
         .route("/nodes", get(nodes::list))
         .route("/nodes/{node}", get(nodes::detail))
+        .route("/nodes/{node}/charts", get(nodes::chart_stream))
+        .route("/nodes/{node}/settings", post(nodes::settings))
         .route("/nodes/{node}/{action}", post(nodes::action))
         .route("/jobs", get(jobs::list).post(jobs::submit).layer(uploads))
         .route("/jobs/new", get(jobs::new))
@@ -65,12 +69,28 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
         )
         .route("/access", get(access::page))
         .route("/access/{action}", post(access::action))
-        .route("/prices", get(prices::page))
+        .route("/prices", get(prices::page).post(prices::save))
+        .route(
+            "/schedules",
+            get(schedules::page).post(schedules::add).layer(uploads),
+        )
+        .route("/schedules/{name}/{action}", post(schedules::action))
+        .route("/settings", get(settings::page))
+        .route("/settings/apply", post(settings::apply))
+        .route("/settings/sessions/{id}/revoke", post(settings::revoke))
         .route("/events", get(events::page))
+        .route("/events/alerts", post(events::save_alerts))
+        .route("/events/webhooks", post(events::add_webhook))
+        .route(
+            "/events/webhooks/{name}/remove",
+            post(events::remove_webhook),
+        )
         .route("/events/silences", post(events::silence))
         .route("/events/silences/{id}/end", post(events::unsilence))
         .route("/events/webhooks/{name}/test", post(events::test_webhook))
         .route("/upgrade", get(upgrade::panel).post(upgrade::start))
+        .route("/upgrade/promote", post(upgrade::promote))
+        .route("/upgrade/cancel", post(upgrade::cancel))
 }
 
 /// What every page needs: who is asking, in which language, and where.
@@ -288,7 +308,9 @@ pub enum Nav {
     Accounts,
     Access,
     Prices,
+    Schedules,
     Events,
+    Settings,
 }
 
 impl Nav {
@@ -309,7 +331,9 @@ const NAV: &[(Nav, &str, &str, &str)] = &[
     (Nav::Accounts, "/accounts", "Accounts", "계정"),
     (Nav::Access, "/access", "Invites", "초대"),
     (Nav::Prices, "/prices", "Prices", "요금"),
+    (Nav::Schedules, "/schedules", "Schedules", "예약"),
     (Nav::Events, "/events", "Events", "이벤트"),
+    (Nav::Settings, "/settings", "Settings", "설정"),
 ];
 
 /// A table with a header row; `empty` shows when there are no rows.

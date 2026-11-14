@@ -13,9 +13,10 @@
 //! - Failed sign-ins and wrong bearer tickets count against the client's
 //!   address ([`crate::limit`]).
 //!
-//! Sessions live in memory (a restart signs everyone out) behind an
-//! HttpOnly, SameSite=Strict cookie, and requests that change something
-//! must repeat the session's CSRF token in the `X-Pumasi-CSRF` header.
+//! Sessions live in the control plane since 1.7 (see [`Sessions`]; a
+//! restart of `pumasi ui` signs nobody out) behind an HttpOnly,
+//! SameSite=Strict cookie, and requests that change something must repeat
+//! the session's CSRF token in the `X-Pumasi-CSRF` header.
 
 // Rejections are finished responses.
 #![allow(clippy::result_large_err)]
@@ -72,13 +73,59 @@ impl Identity {
     }
 }
 
+/// Signed-in browsers. Since 1.7 a session lives in the control plane
+/// ([`AdminOp::StartSession`]): the cookie holds the session's own secret
+/// (52 base32 characters), which the control plane takes in place of the
+/// ticket the browser signed in with, so restarting `pumasi ui` signs
+/// nobody out. Here only a cache of who each cookie is stays, checked
+/// again with `WhoAmI` after [`RECHECK`]. Against a control plane older
+/// than 1.7 sessions live in this process's memory as before (a random
+/// 32-character cookie for an [`Identity`] holding the ticket's secret).
+///
+/// [`AdminOp::StartSession`]: pumasi_proto::msg::AdminOp::StartSession
 #[derive(Default)]
 pub struct Sessions {
+    /// Sessions of a control plane before 1.7, by cookie.
     map: Mutex<HashMap<String, (Identity, Instant)>>,
+    /// Control plane sessions seen lately, by cookie, and when checked.
+    known: Mutex<HashMap<String, (Identity, Instant)>>,
+}
+
+/// How long a control plane session is believed without asking again. A
+/// revoked session is refused by the control plane on every call anyway;
+/// this only decides when its pages stop rendering.
+const RECHECK: Duration = Duration::from_secs(30);
+
+/// The CSRF token of a control plane session, derived from its secret
+/// (so any `pumasi ui` process knows it, and it tells nothing about the
+/// secret).
+pub fn csrf_for(secret: &Secret) -> String {
+    let key = blake3::derive_key("pumasi ui csrf v1", secret);
+    data_encoding::BASE32_NOPAD
+        .encode(&key[..20])
+        .to_ascii_lowercase()
+}
+
+/// The secret a control plane session's cookie holds.
+fn cookie_secret(cookie: &str) -> Option<Secret> {
+    if cookie.len() != 52 {
+        return None;
+    }
+    let bytes = data_encoding::BASE32_NOPAD
+        .decode(cookie.to_ascii_uppercase().as_bytes())
+        .ok()?;
+    bytes.try_into().ok()
+}
+
+fn secret_cookie(secret: &Secret) -> String {
+    data_encoding::BASE32_NOPAD
+        .encode(secret)
+        .to_ascii_lowercase()
 }
 
 impl Sessions {
-    /// Starts a session; returns its id for the cookie.
+    /// Starts a session in this process's memory (a control plane before
+    /// 1.7); returns its id for the cookie.
     pub fn create(&self, mut ident: Identity) -> String {
         let id = random_token();
         ident.csrf = random_token();
@@ -117,7 +164,109 @@ impl Sessions {
 
     pub fn remove(&self, id: &str) {
         self.map.lock().unwrap().remove(id);
+        self.known.lock().unwrap().remove(id);
     }
+
+    fn remember(&self, cookie: &str, ident: &Identity) {
+        let mut known = self.known.lock().unwrap();
+        if known.len() >= MAX_SESSIONS {
+            let now = Instant::now();
+            known.retain(|_, (_, at)| now.duration_since(*at) < RECHECK);
+            if known.len() >= MAX_SESSIONS {
+                known.clear();
+            }
+        }
+        known.insert(cookie.to_string(), (ident.clone(), Instant::now()));
+    }
+
+    /// Forgets the control plane sessions with this id (after a revoke).
+    pub fn forget_id(&self, id: &str) {
+        self.known.lock().unwrap().retain(|cookie, _| {
+            cookie_secret(cookie).is_none_or(|s| {
+                pumasi_proto::ui::session_id(&pumasi_proto::ui::session_hash(&s)) != id
+            })
+        });
+    }
+}
+
+/// Signs a browser in as `ident` (just checked with `WhoAmI`): a session
+/// in the control plane when it has them, else one in memory. Returns the
+/// cookie's value.
+pub async fn start_session(st: &St, ident: Identity, label: &str) -> String {
+    let op = pumasi_proto::msg::AdminOp::StartSession {
+        label: label.to_string(),
+    };
+    match st.backend.call(ident.secret, op).await {
+        Ok(pumasi_proto::msg::AdminResponse::Session { secret, .. }) => {
+            let cookie = secret_cookie(&secret);
+            let mut ident = ident;
+            ident.secret = secret;
+            ident.csrf = csrf_for(&secret);
+            st.sessions.remember(&cookie, &ident);
+            cookie
+        }
+        other => {
+            // A control plane before 1.7 closes the stream on the call.
+            if let Err(e) = &other {
+                tracing::debug!("no session in the control plane ({e:#}); keeping it in memory");
+            }
+            st.sessions.create(ident)
+        }
+    }
+}
+
+/// Ends a browser's session (signing out).
+pub async fn end_session(st: &St, cookie: &str) {
+    st.sessions.remove(cookie);
+    if let Some(secret) = cookie_secret(cookie) {
+        let _ = st
+            .backend
+            .call(secret, pumasi_proto::msg::AdminOp::EndSession)
+            .await;
+    }
+}
+
+/// `Chrome on Windows · 192.0.2.7`: the session list's label for a
+/// browser.
+pub fn label(headers: &HeaderMap, ip: Option<std::net::IpAddr>) -> String {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let browser = if ua.contains("Edg/") {
+        "Edge"
+    } else if ua.contains("Firefox/") {
+        "Firefox"
+    } else if ua.contains("Chrome/") || ua.contains("CriOS/") {
+        "Chrome"
+    } else if ua.contains("Safari/") {
+        "Safari"
+    } else if ua.is_empty() {
+        "a browser"
+    } else {
+        "another browser"
+    };
+    let os = if ua.contains("iPhone") || ua.contains("iPad") {
+        Some("iOS")
+    } else if ua.contains("Android") {
+        Some("Android")
+    } else if ua.contains("Windows") {
+        Some("Windows")
+    } else if ua.contains("Mac OS X") || ua.contains("Macintosh") {
+        Some("macOS")
+    } else if ua.contains("Linux") {
+        Some("Linux")
+    } else {
+        None
+    };
+    let mut out = match os {
+        Some(os) => format!("{browser} on {os}"),
+        None => browser.to_string(),
+    };
+    if let Some(ip) = ip {
+        out.push_str(&format!(" · {ip}"));
+    }
+    out
 }
 
 /// 160 random bits as lowercase base32.
@@ -248,9 +397,43 @@ pub async fn identify(st: &St, secret: Secret) -> anyhow::Result<Identity> {
     }
 }
 
-fn session_of(st: &St, parts: &Parts) -> Option<Identity> {
-    let id = cookie(&parts.headers, SESSION_COOKIE)?;
-    st.sessions.get(&id)
+/// Who the browser's session cookie is: `Ok(None)` without a session
+/// (sign in again), an error page when the control plane cannot say.
+async fn session_of(st: &St, parts: &Parts) -> Result<Option<Identity>, Response> {
+    let Some(id) = cookie(&parts.headers, SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    if let Some(ident) = st.sessions.get(&id) {
+        return Ok(Some(ident));
+    }
+    let Some(secret) = cookie_secret(&id) else {
+        return Ok(None);
+    };
+    let cached = st.sessions.known.lock().unwrap().get(&id).cloned();
+    if let Some((ident, at)) = &cached
+        && at.elapsed() < RECHECK
+    {
+        return Ok(Some(ident.clone()));
+    }
+    match identify(st, secret).await {
+        Ok(mut ident) => {
+            ident.csrf = csrf_for(&secret);
+            st.sessions.remember(&id, &ident);
+            Ok(Some(ident))
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if is_bad_credentials(&msg) {
+                st.sessions.remove(&id);
+                Ok(None)
+            } else if let Some((ident, _)) = cached {
+                // The control plane is away for a moment: pages say so.
+                Ok(Some(ident))
+            } else {
+                Err((crate::pages::status_for(&msg), msg).into_response())
+            }
+        }
+    }
 }
 
 fn csrf_ok(parts: &Parts, ident: &Identity) -> bool {
@@ -279,7 +462,7 @@ impl FromRequestParts<St> for Page {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, st: &St) -> Result<Self, Response> {
-        let Some(ident) = session_of(st, parts) else {
+        let Some(ident) = session_of(st, parts).await? else {
             if parts.headers.contains_key("hx-request") {
                 return Err(([("hx-redirect", "/login")], StatusCode::UNAUTHORIZED).into_response());
             }
@@ -318,7 +501,7 @@ impl FromRequestParts<St> for Api {
                 "send Authorization: Bearer <ticket>",
             ));
         }
-        match session_of(st, parts) {
+        match session_of(st, parts).await? {
             Some(ident) if csrf_ok(parts, &ident) => {
                 throttle(st, &ident)?;
                 Ok(Api(ident))

@@ -7,11 +7,14 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
-use maud::html;
+use maud::{Markup, html};
 use pumasi_proto::{
     job::parse_duration_ms,
     manage::Selector,
-    monitor::{ALERT_RULES, AlertTuningView, AlertsView, EventView, SilenceSpec, human_duration},
+    monitor::{
+        ALERT_RULES, AlertPolicy, AlertTuningView, AlertsView, EventView, FailureRate, SilenceSpec,
+        WebhookFormat, WebhookSpec, human_duration, is_off, parse_opt_percent, parse_opt_secs,
+    },
     msg::{AdminOp, AdminResponse},
 };
 use serde::Deserialize;
@@ -117,7 +120,10 @@ pub async fn page(ctx: Ctx, Query(q): Query<EventsQuery>) -> Response {
                         }
                     }
                 }
-                p class="dim" { (l.t("Change them with `pumasi alert set` or `[alerts]` in cluster.toml; `pumasi alert set --on NODE` sets one node's thresholds.", "`pumasi alert set`이나 cluster.toml의 `[alerts]`로 바꿉니다. 노드 하나의 기준은 `pumasi alert set --on 노드`로 바꿉니다.")) }
+                @if admin {
+                    (alerts_form(l, &alerts.policy, tuning.as_ref()))
+                }
+                p class="dim" { (l.t("Also `pumasi alert set` or `[alerts]` in cluster.toml; `pumasi alert set --on NODE` sets one node's thresholds.", "`pumasi alert set`이나 cluster.toml의 `[alerts]`로도 바꿉니다. 노드 하나의 기준은 `pumasi alert set --on 노드`로 바꿉니다.")) }
             }
             @if let Some(t) = &tuning {
                 section {
@@ -150,15 +156,34 @@ pub async fn page(ctx: Ctx, Query(q): Query<EventsQuery>) -> Response {
             }
             section {
                 h2 { (l.t("Webhooks", "웹훅")) }
-                @if alerts.webhooks.is_empty() { p class="empty" { (l.t("None. Add one with `pumasi webhook add`.", "없습니다. `pumasi webhook add`로 추가하세요.")) } }
+                @if alerts.webhooks.is_empty() { p class="empty" { (l.t("None yet.", "아직 없습니다.")) } }
                 ul class="plain" {
                     @for w in &alerts.webhooks {
                         li {
                             strong { (w.name) } " · " code { (w.target) } " · " (format!("{:?}", w.format).to_lowercase())
                             br; span class="dim" { (w.sent) " " (l.t("sent", "전송")) ", " (w.failed) " " (l.t("failed", "실패"))
                                 @if let Some(e) = &w.last_error { " — " (e) } }
-                            @if admin { " " button hx-post={"/events/webhooks/" (w.name) "/test"} hx-target="#flash" { (l.t("Send a test", "테스트 보내기")) } }
+                            @if admin {
+                                " " button hx-post={"/events/webhooks/" (w.name) "/test"} hx-target="#flash" { (l.t("Send a test", "테스트 보내기")) }
+                                " " button class="link danger" hx-post={"/events/webhooks/" (w.name) "/remove"} hx-target="#flash"
+                                    hx-confirm=(l.t("Remove this webhook?", "이 웹훅을 지울까요?")) { (l.t("Remove", "지우기")) }
+                            }
                         }
+                    }
+                }
+                @if admin {
+                    form #webhook-form class="stack" hx-post="/events/webhooks" hx-target="#flash" {
+                        label { (l.t("Name", "이름")) " " input name="name" required placeholder="team-chat" pattern="[a-z0-9._-]{1,64}"; }
+                        label { "URL " input name="url" type="url" required placeholder="https://hooks.slack.com/services/..."; }
+                        label { (l.t("Format", "형식")) " "
+                            select name="format" {
+                                option value="" { (l.t("guess from the URL", "URL로 추측")) }
+                                option value="slack" { "Slack / Mattermost" }
+                                option value="discord" { "Discord" }
+                                option value="json" { "JSON" }
+                            }
+                        }
+                        button { (l.t("Add webhook", "웹훅 추가")) }
                     }
                 }
             }
@@ -264,4 +289,234 @@ fn reload(mut r: Response) -> Response {
     r.headers_mut()
         .insert("hx-refresh", axum::http::HeaderValue::from_static("true"));
     r
+}
+
+/// The alert rules and notice settings, as a form (1.7). Each threshold
+/// is text: empty or `off` turns its rule off.
+fn alerts_form(l: Lang, p: &AlertPolicy, t: Option<&AlertTuningView>) -> Markup {
+    let secs = |s: Option<u64>| s.map(human_duration).unwrap_or_else(|| "off".into());
+    let pct = |v: Option<u8>| v.map(|v| format!("{v}%")).unwrap_or_else(|| "off".into());
+    let f = p.failure_rate;
+    html! {
+        form #alerts-form class="stack settings" hx-post="/events/alerts" hx-target="#flash"
+            hx-confirm=(l.t("Save the alert rules?", "경보 규칙을 저장할까요?")) {
+            p class="dim" { (l.t("Empty or `off` turns a rule off.", "비우거나 `off`로 두면 규칙이 꺼집니다.")) }
+            div class="grid2" {
+                label { (l.t("Node offline for", "노드 오프라인 시간")) input name="node_offline" value=(secs(p.node_offline_secs)); }
+                label { (l.t("Disk fuller than", "디스크 사용률")) input name="disk" value=(pct(p.disk_percent)); }
+                label { (l.t("Failed runs above", "실패율")) input name="failure_rate" value=(f.map(|f| format!("{}%", f.percent)).unwrap_or_else(|| "off".into())); }
+                label { (l.t("… over", "… 기간")) input name="failure_window" value=(human_duration(f.unwrap_or_default().window_secs)); }
+                label { (l.t("… of at least (runs)", "… 최소 실행 수")) input name="failure_min_runs" type="number" min="1" value=(f.unwrap_or_default().min_runs); }
+                label { (l.t("Hotter than (°C)", "온도 (°C)")) input name="temperature" value=(p.temp_c.map(|c| c.to_string()).unwrap_or_else(|| "off".into())); }
+                label { (l.t("Benchmark slower by", "벤치마크 하락")) input name="perf_drop" value=(pct(p.perf_drop_percent)); }
+                @if let Some(t) = t {
+                    label { (l.t("Repeat a notice every", "알림 반복 간격")) input name="repeat" value=(t.tuning.repeat_secs.map(human_duration).unwrap_or_else(|| "off".into())); }
+                }
+            }
+            label class="check" { input type="checkbox" name="smart" value="on" checked[p.smart]; " " (l.t("A drive's SMART health failing", "드라이브 SMART 이상")) }
+            label class="check" { input type="checkbox" name="check_mismatch" value="on" checked[p.check_mismatch]; " " (l.t("A check run disagreeing with a result", "검증 실행이 결과와 다름")) }
+            @if let Some(t) = t {
+                label class="check" { input type="checkbox" name="resolved" value="on" checked[t.tuning.resolved]; " " (l.t("A notice when an alert stops firing", "경보가 그치면 알림")) }
+            }
+            input type="hidden" name="tuning" value=(if t.is_some() { "1" } else { "" });
+            div class="row" { button type="submit" { (l.t("Save rules", "규칙 저장")) } }
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct AlertsForm {
+    node_offline: Option<String>,
+    failure_rate: Option<String>,
+    failure_window: Option<String>,
+    failure_min_runs: Option<String>,
+    disk: Option<String>,
+    temperature: Option<String>,
+    perf_drop: Option<String>,
+    smart: Option<String>,
+    check_mismatch: Option<String>,
+    repeat: Option<String>,
+    resolved: Option<String>,
+    tuning: Option<String>,
+}
+
+fn blank_off(v: &Option<String>) -> String {
+    match v.as_deref().map(str::trim) {
+        None | Some("") => "off".into(),
+        Some(s) => s.to_string(),
+    }
+}
+
+/// The repeat interval and the resolved switch of the alerts form.
+pub type Notices = (Option<u64>, bool);
+
+/// Turns the form into a policy (and, when the form had them, the repeat
+/// and resolved settings).
+pub fn alerts_from(f: &AlertsForm) -> anyhow::Result<(AlertPolicy, Option<Notices>)> {
+    use anyhow::Context as _;
+    let base = FailureRate::default();
+    let failure_rate = parse_opt_percent(&blank_off(&f.failure_rate))
+        .context("failed runs")?
+        .map(|percent| -> anyhow::Result<FailureRate> {
+            Ok(FailureRate {
+                percent,
+                window_secs: parse_opt_secs(&blank_off(&f.failure_window))
+                    .context("failure window")?
+                    .unwrap_or(base.window_secs),
+                min_runs: match f.failure_min_runs.as_deref().map(str::trim) {
+                    None | Some("") => base.min_runs,
+                    Some(n) => n.parse().context("minimum runs: a whole number")?,
+                },
+            })
+        })
+        .transpose()?;
+    let temp = blank_off(&f.temperature);
+    let p = AlertPolicy {
+        node_offline_secs: parse_opt_secs(&blank_off(&f.node_offline)).context("node offline")?,
+        failure_rate,
+        disk_percent: parse_opt_percent(&blank_off(&f.disk)).context("disk")?,
+        temp_c: if is_off(&temp) {
+            None
+        } else {
+            Some(
+                temp.trim_end_matches('C')
+                    .trim_end_matches('°')
+                    .trim()
+                    .parse()
+                    .context("temperature: degrees Celsius")?,
+            )
+        },
+        perf_drop_percent: parse_opt_percent(&blank_off(&f.perf_drop)).context("benchmark drop")?,
+        smart: f.smart.is_some(),
+        check_mismatch: f.check_mismatch.is_some(),
+    };
+    let tuning = if f.tuning.as_deref().is_some_and(|t| !t.is_empty()) {
+        Some((
+            parse_opt_secs(&blank_off(&f.repeat)).context("repeat")?,
+            f.resolved.is_some(),
+        ))
+    } else {
+        None
+    };
+    Ok((p, tuning))
+}
+
+pub async fn save_alerts(ctx: Ctx, headers: HeaderMap, Form(f): Form<AlertsForm>) -> Response {
+    let res = async {
+        let (policy, tuning) = alerts_from(&f)?;
+        ctx.call(AdminOp::SetAlertPolicy(Box::new(policy))).await?;
+        if let Some((repeat_secs, resolved)) = tuning {
+            // Keep the per-node overrides as they are.
+            let mut t = match ctx.call(AdminOp::AlertTuning).await? {
+                AdminResponse::AlertTuning(v) => v.tuning,
+                _ => anyhow::bail!("unexpected response"),
+            };
+            t.repeat_secs = repeat_secs;
+            t.resolved = resolved;
+            ctx.call(AdminOp::SetAlertTuning(Box::new(t))).await?;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    match res {
+        Ok(()) => {
+            let msg = ctx
+                .t("Alert rules saved.", "경보 규칙을 저장했습니다.")
+                .to_string();
+            reload(ctx.done(msg))
+        }
+        Err(e) => ctx.fail(e, hx(&headers)),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct WebhookForm {
+    name: String,
+    url: String,
+    format: Option<String>,
+}
+
+pub async fn add_webhook(ctx: Ctx, headers: HeaderMap, Form(f): Form<WebhookForm>) -> Response {
+    let res = async {
+        let url = f.url.trim().to_string();
+        let format = match f.format.as_deref().map(str::trim) {
+            None | Some("") => WebhookFormat::detect(&url),
+            Some(s) => s.parse()?,
+        };
+        let spec = WebhookSpec {
+            name: f.name.trim().to_string(),
+            url,
+            format,
+        };
+        spec.validate()?;
+        ctx.call(AdminOp::SetWebhook(Box::new(spec))).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    match res {
+        Ok(()) => {
+            let msg = format!(
+                "{} {}",
+                ctx.t("Webhook saved:", "웹훅을 저장했습니다:"),
+                f.name.trim()
+            );
+            reload(ctx.done(msg))
+        }
+        Err(e) => ctx.fail(e, hx(&headers)),
+    }
+}
+
+pub async fn remove_webhook(ctx: Ctx, headers: HeaderMap, Path(name): Path<String>) -> Response {
+    match ctx
+        .call(AdminOp::RemoveWebhook { name: name.clone() })
+        .await
+    {
+        Ok(_) => {
+            let msg = format!("{} {name}", ctx.t("Webhook removed:", "웹훅을 지웠습니다:"));
+            reload(ctx.done(msg))
+        }
+        Err(e) => ctx.fail(e, hx(&headers)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_alerts_form_becomes_a_policy() {
+        let f = AlertsForm {
+            node_offline: Some("2m".into()),
+            failure_rate: Some("30%".into()),
+            failure_window: Some("1h".into()),
+            failure_min_runs: Some("5".into()),
+            disk: Some("".into()),
+            temperature: Some("85°C".into()),
+            perf_drop: Some("off".into()),
+            smart: Some("on".into()),
+            check_mismatch: None,
+            repeat: Some("4h".into()),
+            resolved: Some("on".into()),
+            tuning: Some("1".into()),
+        };
+        let (p, t) = alerts_from(&f).unwrap();
+        assert_eq!(p.node_offline_secs, Some(120));
+        let fr = p.failure_rate.unwrap();
+        assert_eq!((fr.percent, fr.window_secs, fr.min_runs), (30, 3600, 5));
+        assert_eq!(p.disk_percent, None);
+        assert_eq!(p.temp_c, Some(85));
+        assert_eq!(p.perf_drop_percent, None);
+        assert!(p.smart && !p.check_mismatch);
+        assert_eq!(t, Some((Some(4 * 3600), true)));
+
+        // Without the tuning fields (an older control plane) only the
+        // policy changes; nonsense is refused.
+        let (_, t) = alerts_from(&AlertsForm::default()).unwrap();
+        assert_eq!(t, None);
+        let bad = AlertsForm {
+            disk: Some("lots".into()),
+            ..Default::default()
+        };
+        assert!(alerts_from(&bad).is_err());
+    }
 }

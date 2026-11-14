@@ -5,7 +5,7 @@ members = ["crates/proto", "crates/guest", "crates/agent", "crates/cluster", "cr
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/syang0531/pumasi"

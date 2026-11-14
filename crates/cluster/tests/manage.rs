@@ -14,6 +14,7 @@ use pumasi_proto::{
     msg::{AdminOp, AdminResponse, ClusterStatus, JobState, JobView, NodeView, Outcome, TaskState},
     net::NetMode,
     ticket::{AdminTicket, JoinTicket},
+    ui::SessionView,
 };
 use tokio::task::JoinHandle;
 
@@ -739,6 +740,161 @@ async fn policies_queue_timeouts_and_capacity() {
     assert_eq!(view.policy.executors, vec![Executor::Wasm]);
     let view = job(&client, id).await;
     assert_eq!(view.submitted_by, "cluster admin");
+    client.close().await;
+    cluster.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 1.7: dashboard sessions in the control plane's state
+// ---------------------------------------------------------------------------
+
+/// A client that calls with `secret` (a session's, as the dashboard does).
+async fn with_secret(cluster: &Cluster, secret: pumasi_proto::Secret) -> AdminClient {
+    let mut t = cluster.admin_ticket();
+    t.secret = secret;
+    AdminClient::connect(&t, NetMode::Local).await.unwrap()
+}
+
+async fn start_session(client: &AdminClient, label: &str) -> (pumasi_proto::Secret, SessionView) {
+    match client
+        .call(AdminOp::StartSession {
+            label: label.into(),
+        })
+        .await
+        .unwrap()
+    {
+        AdminResponse::Session { secret, view } => (secret, view),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+async fn sessions(client: &AdminClient) -> Vec<SessionView> {
+    match client.call(AdminOp::Sessions).await.unwrap() {
+        AdminResponse::Sessions(s) => s,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sessions_survive_a_restart_and_end_with_their_ticket() {
+    init_tracing();
+    let dir = tempdir("c");
+    let cluster = start_cluster(dir.clone()).await.unwrap();
+    let client = admin(&cluster).await;
+    let AdminResponse::AccessTicket { ticket, .. } = client
+        .call(AdminOp::CreateAccess {
+            name: "ann".into(),
+            role: AccessRole::Viewer,
+            ttl_secs: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ann_ticket: AdminTicket = ticket.parse().unwrap();
+    let ann = AdminClient::connect(&ann_ticket, NetMode::Local)
+        .await
+        .unwrap();
+
+    // The admin signs in twice, ann once.
+    let (admin_secret, admin_view) = start_session(&client, "Firefox on Linux · 10.0.0.2").await;
+    let (_, second) = start_session(&client, "Safari on iPhone").await;
+    let (ann_secret, ann_view) = start_session(&ann, "Chrome on Windows").await;
+    assert_eq!(admin_view.name, "cluster admin");
+    assert_eq!(admin_view.role, AccessRole::Admin);
+    assert_eq!(ann_view.role, AccessRole::Viewer);
+    assert_ne!(admin_secret, cluster.admin_ticket().secret);
+
+    // A session's secret stands for its ticket.
+    let s = with_secret(&cluster, ann_secret).await;
+    let AdminResponse::WhoAmI { name, role } = s.call(AdminOp::WhoAmI).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!((name.as_str(), role), ("ann", AccessRole::Viewer));
+    // It cannot start sessions of its own, or act beyond its role.
+    assert!(
+        s.call(AdminOp::StartSession { label: "x".into() })
+            .await
+            .is_err()
+    );
+    assert!(
+        s.call(AdminOp::RemoveNode { id: "x".into() })
+            .await
+            .is_err()
+    );
+    // Ann sees her own session only, and it is the current one.
+    let mine = sessions(&s).await;
+    assert_eq!(mine.len(), 1);
+    assert!(mine[0].current);
+    assert_eq!(mine[0].label, "Chrome on Windows");
+    // She cannot revoke the admin's.
+    assert!(
+        s.call(AdminOp::RevokeSession {
+            id: admin_view.id.clone()
+        })
+        .await
+        .is_err()
+    );
+    s.close().await;
+    assert_eq!(sessions(&client).await.len(), 3);
+
+    // The secret is not in the state, only its hash.
+    let state = std::fs::read(dir.join("state.redb")).unwrap_or_default();
+    assert!(
+        !state
+            .windows(admin_secret.len())
+            .any(|w| w == admin_secret.as_slice())
+    );
+
+    client.close().await;
+    ann.close().await;
+    cluster.shutdown().await.unwrap();
+
+    // After a restart every session still works.
+    let cluster = start_cluster(dir.clone()).await.unwrap();
+    let a = with_secret(&cluster, admin_secret).await;
+    let AdminResponse::WhoAmI { role, .. } = a.call(AdminOp::WhoAmI).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(role, AccessRole::Admin);
+    let all = sessions(&a).await;
+    assert_eq!(all.len(), 3);
+    assert!(all.iter().any(|v| v.id == admin_view.id && v.current));
+
+    // Revoking one signs that browser out.
+    a.call(AdminOp::RevokeSession {
+        id: second.id[..6].to_string(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(sessions(&a).await.len(), 2);
+
+    // Revoking ann's ticket ends her session.
+    let client = admin(&cluster).await;
+    client
+        .call(AdminOp::RevokeAccess { id: "ann".into() })
+        .await
+        .unwrap();
+    let s = with_secret(&cluster, ann_secret).await;
+    let mut gone = false;
+    for _ in 0..50 {
+        if s.call(AdminOp::WhoAmI).await.is_err() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(gone, "ann's session outlived her ticket");
+    s.close().await;
+
+    // Signing out ends the session making the call.
+    a.call(AdminOp::EndSession).await.unwrap();
+    a.close().await;
+    let a = with_secret(&cluster, admin_secret).await;
+    assert!(a.call(AdminOp::WhoAmI).await.is_err());
+    assert!(sessions(&client).await.is_empty());
+    a.close().await;
     client.close().await;
     cluster.shutdown().await.unwrap();
 }

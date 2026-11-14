@@ -5,6 +5,12 @@ function state() {
   return JSON.parse(fs.readFileSync(path.join(__dirname, "..", ".state.json"), "utf8"));
 }
 
+/// Merges `extra` into the state file (a restarted dashboard, a new node).
+function saveState(extra) {
+  const file = path.join(__dirname, "..", ".state.json");
+  fs.writeFileSync(file, JSON.stringify({ ...state(), ...extra }, null, 2));
+}
+
 /// Opens the sign-in link `pumasi ui` printed.
 async function signIn(page) {
   await page.goto(state().url);
@@ -54,4 +60,4 @@ function zipEntry(buf, name) {
   return null;
 }
 
-module.exports = { state, signIn, submitTicker, zipEntry };
+module.exports = { state, saveState, signIn, submitTicker, zipEntry };

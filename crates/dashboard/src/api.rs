@@ -16,10 +16,12 @@ use axum::{
 };
 use pumasi_proto::manage::AccessRole;
 use pumasi_proto::{
-    job::JobId,
-    manage::NodeEdit,
+    job::{JobId, parse_duration_ms},
+    manage::{NodeEdit, Selector},
     msg::{AdminOp, AdminResponse, Invite},
     receipt::ReceiptRow,
+    release::{CanarySpec, DEFAULT_CANARY_SOAK_SECS},
+    ui::NodeSettings,
 };
 use std::time::Duration;
 
@@ -53,8 +55,17 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
         .route("/jobs/{id}/outputs.zip", get(outputs_zip))
         .route("/jobs/{id}/tasks/{index}/logs", get(logs))
         .route("/nodes/{node}/rename", post(rename_node))
+        .route(
+            "/nodes/{node}/settings",
+            get(node_settings).put(set_node_settings),
+        )
         .route("/nodes/{node}/{action}", post(node_action))
         .route("/upgrade", get(upgrade_status).post(upgrade_latest))
+        .route("/upgrade/canary", get(canary))
+        .route("/upgrade/canary/promote", post(promote_canary))
+        .route("/sessions", get(sessions))
+        .route("/sessions/{id}", delete(revoke_session))
+        .route("/apply", post(apply))
         .route("/accounts", get(accounts))
         .route("/accounts/{name}/policy", policy)
         .route("/ledger", get(ledger))
@@ -590,6 +601,14 @@ struct UpgradeBody {
     version: Option<String>,
     #[serde(default)]
     force: bool,
+    /// Canary nodes (1.7): names, comma-separated, or a label selector.
+    canary: Option<String>,
+    /// How long the canaries run before the rest follow (`30m`).
+    canary_soak: Option<String>,
+    #[serde(default)]
+    canary_tasks: u32,
+    #[serde(default)]
+    canary_hold: bool,
 }
 
 async fn upgrade_latest(
@@ -597,8 +616,119 @@ async fn upgrade_latest(
     a: Api,
     body: Option<Json<UpgradeBody>>,
 ) -> Response {
-    let UpgradeBody { version, force } = body.map(|b| b.0).unwrap_or_default();
-    simple(st, a, AdminOp::UpgradeToLatest { version, force }).await
+    let b = body.map(|b| b.0).unwrap_or_default();
+    let canary = match b.canary.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        None => None,
+        Some(nodes) => {
+            let spec = (|| -> anyhow::Result<CanarySpec> {
+                let spec = CanarySpec {
+                    nodes: Selector::nodes(nodes)?,
+                    soak_secs: match b.canary_soak.as_deref() {
+                        Some(s) => parse_duration_ms(s)? / 1000,
+                        None => DEFAULT_CANARY_SOAK_SECS,
+                    },
+                    min_tasks: b.canary_tasks,
+                    hold: b.canary_hold,
+                };
+                spec.validate()?;
+                Ok(spec)
+            })();
+            match spec {
+                Ok(s) => Some(s),
+                Err(e) => return error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+            }
+        }
+    };
+    let op = match canary {
+        Some(c) => AdminOp::CanaryUpgradeToLatest {
+            version: b.version,
+            force: b.force,
+            canary: Box::new(c),
+        },
+        None => AdminOp::UpgradeToLatest {
+            version: b.version,
+            force: b.force,
+        },
+    };
+    simple(st, a, op).await
+}
+
+/// The current rollout's canary, or `null` (1.7).
+async fn canary(axum::extract::State(st): S, a: Api) -> Response {
+    simple(st, a, AdminOp::Canary).await
+}
+
+#[derive(Deserialize, Default)]
+struct PromoteBody {
+    #[serde(default)]
+    nodes: Vec<String>,
+}
+
+/// Upgrades the nodes named next, or every node when none is (1.7).
+async fn promote_canary(
+    axum::extract::State(st): S,
+    a: Api,
+    body: Option<Json<PromoteBody>>,
+) -> Response {
+    let nodes = body.map(|b| b.0.nodes).unwrap_or_default();
+    simple(st, a, AdminOp::PromoteCanary { nodes }).await
+}
+
+/// Browsers signed in (1.7): every one for an admin, else the caller's.
+async fn sessions(axum::extract::State(st): S, a: Api) -> Response {
+    simple(st, a, AdminOp::Sessions).await
+}
+
+async fn revoke_session(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -> Response {
+    let r = simple(st.clone(), a, AdminOp::RevokeSession { id: id.clone() }).await;
+    if r.status().is_success() {
+        st.sessions.forget_id(&id);
+    }
+    r
+}
+
+/// A node's availability settings (1.7).
+async fn node_settings(axum::extract::State(st): S, a: Api, Path(node): Path<String>) -> Response {
+    simple(st, a, AdminOp::NodeSettings { node }).await
+}
+
+/// Changes a node's availability settings: the agent writes them to its
+/// options file and restarts with them once its tasks end (1.7).
+async fn set_node_settings(
+    axum::extract::State(st): S,
+    a: Api,
+    Path(node): Path<String>,
+    Json(settings): Json<NodeSettings>,
+) -> Response {
+    if let Err(e) = settings.validate() {
+        return error(StatusCode::BAD_REQUEST, &format!("{e:#}"));
+    }
+    simple(
+        st,
+        a,
+        AdminOp::SetNodeSettings {
+            node,
+            settings: Box::new(settings),
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct ApplyBody {
+    /// A `cluster.toml`, without schedules or `url_env`.
+    file: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Makes the cluster match a `cluster.toml` (1.7); with `dry_run`, only
+/// says what would change.
+async fn apply(axum::extract::State(st): S, a: Api, Json(b): Json<ApplyBody>) -> Response {
+    match pages::settings::apply_spec(&b.file, b.dry_run) {
+        Ok(spec) => simple(st, a, AdminOp::Apply(Box::new(spec))).await,
+        Err(e) => error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
 }
 
 async fn accounts(axum::extract::State(st): S, a: Api) -> Response {
@@ -748,9 +878,12 @@ mod tests {
             doc["paths"].as_object().unwrap().keys().cloned().collect();
         documented.sort();
         let src = include_str!("api.rs");
+        // `.route("...` on one line, or split over two by rustfmt.
         let mut routed: Vec<String> = src
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix(".route(\""))
+            .split(".route(")
+            .skip(1)
+            .filter_map(|l| l.trim_start().strip_prefix('"'))
+            .filter(|l| l.starts_with('/'))
             .map(|l| format!("/api/v1{}", &l[..l.find('"').unwrap()]))
             .collect();
         routed.push("/api/openapi.json".into());

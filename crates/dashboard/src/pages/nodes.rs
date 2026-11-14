@@ -345,14 +345,23 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
     let live = html! {
         (top)
         (info(l, &n, pw.as_ref()))
-        @if let Some(mv) = &mv { (charts(l, mv, since)) }
-        @else { p class="empty" { (l.t("No metrics from this node (agents before protocol 10 send none).", "이 노드의 지표가 없습니다(프로토콜 10 이전 에이전트는 보내지 않습니다).")) } }
+    };
+    // The charts follow new samples as they arrive (server-sent events,
+    // 1.7) instead of reloading with the rest.
+    let stream = format!("/nodes/{}/charts?range={range}", n.id);
+    let settings = match ctx.call(AdminOp::NodeSettings { node: n.id.clone() }).await {
+        Ok(AdminResponse::NodeSettings(v)) => Some(*v),
+        _ => None,
     };
     let bottom = html! {
+        div #charts data-sse=(stream) {
+            (charts_or_empty(l, mv.as_ref(), since))
+        }
         div class="cols" {
             (perf(l, &n))
             (labels(ctx, &n))
         }
+        (availability(ctx, &n, settings.as_ref()))
     };
     Ok(ctx.page(
         &n.info.name,
@@ -443,6 +452,207 @@ fn info(l: Lang, n: &NodeView, pw: Option<&NodePowerView>) -> Markup {
                 }
             }
         } }
+    }
+}
+
+fn charts_or_empty(l: Lang, mv: Option<&NodeMetricsView>, since: u64) -> Markup {
+    match mv {
+        Some(mv) => charts(l, mv, since),
+        None => html! {
+            p class="empty" { (l.t("No metrics from this node (agents before protocol 10 send none).", "이 노드의 지표가 없습니다(프로토콜 10 이전 에이전트는 보내지 않습니다).")) }
+        },
+    }
+}
+
+/// A node's charts as server-sent events: new ones whenever a sample
+/// arrives (agents send one every few seconds), drawn on the server as
+/// before.
+pub async fn chart_stream(
+    ctx: Ctx,
+    Path(node): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> Response {
+    use axum::response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    };
+    let since = range_secs(q.range.as_deref().unwrap_or("1h"));
+    struct S {
+        ctx: Ctx,
+        node: String,
+        since: u64,
+        last: Option<(u64, usize)>,
+        first: bool,
+    }
+    let state = S {
+        ctx,
+        node,
+        since,
+        last: None,
+        first: true,
+    };
+    let events = n0_future::stream::unfold(state, |mut s| async move {
+        loop {
+            if !s.first {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            s.first = false;
+            let m = metrics(&s.ctx, Some(s.node.clone()), s.since).await;
+            let mv = m
+                .nodes
+                .into_iter()
+                .find(|x| x.id == s.node || s.node.is_empty());
+            let key = mv.as_ref().map(|v| (v.latest_unix, v.series.len()));
+            if key.is_some() && key == s.last {
+                continue;
+            }
+            s.last = key;
+            let html = charts_or_empty(s.ctx.l, mv.as_ref(), s.since)
+                .into_string()
+                .replace(['\n', '\r'], " ");
+            let ev = Event::default().event("charts").data(html);
+            return Some((Ok::<_, std::convert::Infallible>(ev), s));
+        }
+    });
+    Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// When the node takes tasks (1.7): its agent's settings, and a form
+/// that changes them in its `agent.toml`.
+fn availability(ctx: &Ctx, n: &NodeView, v: Option<&pumasi_proto::ui::NodeSettingsView>) -> Markup {
+    let l = ctx.l;
+    let report = v.and_then(|v| v.report.as_ref());
+    let s = report.map(|r| r.settings.clone()).unwrap_or_default();
+    let editable = ctx.me.is_admin() && report.is_some_and(|r| r.file.is_some()) && n.online;
+    html! {
+        section #availability {
+            h2 { (l.t("When it takes tasks", "작업을 받는 조건")) }
+            @match report {
+                None => {
+                    p class="dim" { (l.t(
+                        "Its agent has not said (it is offline, or older than 1.7). On that machine: pumasi service set agent -- --slots 2 --hours 22:00-07:00 ...",
+                        "에이전트가 알려 주지 않았습니다(오프라인이거나 1.7 이전 버전). 그 기기에서: pumasi service set agent -- --slots 2 --hours 22:00-07:00 ...")) }
+                }
+                Some(r) => {
+                    p { strong data-settings=(r.settings.describe()) { (r.settings.describe()) } }
+                    @if r.restarting {
+                        p class="flash" data-restarting="true" { (l.t(
+                            "New settings are written; the agent restarts with them once its running tasks end, and takes no new ones meanwhile.",
+                            "새 설정을 저장했습니다. 에이전트는 실행 중인 태스크가 끝나면 새 설정으로 재시작하고, 그때까지 새 태스크를 받지 않습니다.")) }
+                    }
+                    @match &r.file {
+                        Some(f) => { p class="dim" { (l.t("Kept in", "저장 위치:")) " " code { (f) } " " (l.t("on that machine.", "(그 기기)")) } }
+                        None => { p class="dim" { (l.t(
+                            "Its agent was started by hand with options on the command line, so it cannot change them from here: install it as a service (pumasi service install agent).",
+                            "에이전트를 명령줄 옵션으로 직접 실행해서 여기서 바꿀 수 없습니다. 서비스로 설치하세요(pumasi service install agent).")) } }
+                    }
+                }
+            }
+            @if editable {
+                form #node-settings class="stack settings" hx-post={"/nodes/" (n.id) "/settings"} hx-target="#flash"
+                    hx-confirm=(l.t("Change this node's settings? Its agent restarts with them once its running tasks end.",
+                                    "이 노드의 설정을 바꿀까요? 에이전트가 실행 중인 태스크를 마친 뒤 새 설정으로 재시작합니다.")) {
+                    div class="grid2" {
+                    label { (l.t("Slots", "슬롯")) " "
+                        input type="number" name="slots" min="1" max="1024" placeholder=(l.t("default", "기본"))
+                            value=[s.slots]; }
+                    label { (l.t("CPU share (%)", "CPU 비율(%)")) " "
+                        input type="number" name="max_cpu_percent" min="1" max="100" placeholder="100"
+                            value=[s.max_cpu_percent]; }
+                    label { (l.t("Hours (local)", "시간대(현지)")) " "
+                        input name="hours" placeholder=(l.t("any time, or 22:00-07:00", "항상, 또는 22:00-07:00")) value=(s.hours); }
+                    label { (l.t("Idle minutes", "유휴 시간(분)")) " "
+                        input type="number" name="idle_minutes" min="1" max="1440" placeholder=(l.t("off", "끔"))
+                            value=[s.idle_minutes]; }
+                    }
+                    label class="check" {
+                        input type="checkbox" name="only_on_ac" value="on" checked[s.only_on_ac];
+                        " " (l.t("Only on AC power", "전원 연결 시에만"))
+                    }
+                    button type="submit" { (l.t("Save settings", "설정 저장")) }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct SettingsForm {
+    slots: Option<String>,
+    max_cpu_percent: Option<String>,
+    hours: Option<String>,
+    idle_minutes: Option<String>,
+    only_on_ac: Option<String>,
+}
+
+fn opt_num<T: std::str::FromStr>(v: &Option<String>, what: &str) -> anyhow::Result<Option<T>> {
+    match v.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(t) => t
+            .parse()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{what} must be a whole number")),
+    }
+}
+
+impl SettingsForm {
+    pub fn settings(&self) -> anyhow::Result<pumasi_proto::ui::NodeSettings> {
+        let s = pumasi_proto::ui::NodeSettings {
+            slots: opt_num(&self.slots, "slots")?,
+            max_cpu_percent: opt_num(&self.max_cpu_percent, "the CPU share")?,
+            only_on_ac: self.only_on_ac.is_some(),
+            idle_minutes: opt_num(&self.idle_minutes, "idle minutes")?,
+            hours: self.hours.clone().unwrap_or_default().trim().to_string(),
+        };
+        s.validate()?;
+        Ok(s)
+    }
+}
+
+/// Saves a node's settings (1.7).
+pub async fn settings(
+    ctx: Ctx,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+    Form(f): Form<SettingsForm>,
+) -> Response {
+    let res = async {
+        let s = f.settings()?;
+        let desc = s.describe();
+        match ctx
+            .call(AdminOp::SetNodeSettings {
+                node,
+                settings: Box::new(s),
+            })
+            .await?
+        {
+            AdminResponse::NodeSettings(v) => Ok((desc, v.report.is_some_and(|r| r.restarting))),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+    .await;
+    match res {
+        Ok((desc, restarting)) => {
+            let msg = if restarting {
+                format!(
+                    "{} {desc}. {}",
+                    ctx.t("Saved:", "저장했습니다:"),
+                    ctx.t(
+                        "The agent restarts with them once its running tasks end.",
+                        "에이전트가 실행 중인 태스크를 마친 뒤 재시작합니다."
+                    )
+                )
+            } else {
+                format!("{} {desc}", ctx.t("Unchanged:", "바뀐 것 없음:"))
+            };
+            let mut r = ctx.done(msg);
+            r.headers_mut()
+                .insert("hx-refresh", axum::http::HeaderValue::from_static("true"));
+            r
+        }
+        Err(e) => ctx.fail(e, hx(&headers)),
     }
 }
 

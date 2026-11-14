@@ -120,6 +120,8 @@ const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 const TASK_TIMES: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_times");
 /// The executor an `executor = "image"` task's run was placed with (1.5).
 const TASK_EXEC: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_exec");
+/// Dashboard sessions (1.7), by the hash of their secret.
+const UI_SESSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ui_sessions");
 
 const SCHEMA_META: &str = "schema";
 const POLICY_META: &str = "policy";
@@ -180,7 +182,8 @@ macro_rules! tables {
             TRUSTED_NODES,
             AUDIT,
             TASK_TIMES,
-            TASK_EXEC
+            TASK_EXEC,
+            UI_SESSIONS
         )
     };
 }
@@ -578,6 +581,7 @@ impl Store {
         tx.open_table(AUDIT)?;
         tx.open_table(TASK_TIMES)?;
         tx.open_table(TASK_EXEC)?;
+        tx.open_table(UI_SESSIONS)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1291,6 +1295,37 @@ impl Store {
     pub fn remove_access(&self, secret: &Secret) -> Result<()> {
         let mut b = Batch::default();
         b.del(ACCESS, secret.as_slice());
+        self.commit(b)
+    }
+
+    // -- dashboard sessions (1.7) ------------------------------------------
+
+    pub fn ui_sessions(&self) -> Result<Vec<crate::sessions::SessionRecord>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(UI_SESSIONS)?.iter()? {
+            let (_, v) = row?;
+            out.push(dec(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Writes these sessions and deletes the ones in `gone`, in one batch.
+    pub fn put_ui_sessions(
+        &self,
+        put: &[&crate::sessions::SessionRecord],
+        gone: &[[u8; 32]],
+    ) -> Result<()> {
+        if put.is_empty() && gone.is_empty() {
+            return Ok(());
+        }
+        let mut b = Batch::default();
+        for r in put {
+            b.put(UI_SESSIONS, r.hash.as_slice(), enc(*r).as_slice());
+        }
+        for h in gone {
+            b.del(UI_SESSIONS, h.as_slice());
+        }
         self.commit(b)
     }
 

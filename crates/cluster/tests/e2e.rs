@@ -4,19 +4,24 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use pumasi_agent::{Agent, AgentConfig, AgentExit, UpgradeConfig};
+use pumasi_agent::{Agent, AgentConfig, AgentExit, SettingsHook, UpgradeConfig};
 use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
     economy::{CuRates, Metered, Policy},
     job::{DockerSpec, Executor, FileEntry, JobId, JobSubmission, Limits, TaskInput, Tier},
+    manage::Selector,
     msg::{
         AccountView, AdminOp, AdminResponse, Invite, JobState, JobView, LedgerKind,
         NodeUpgradeView, Role, RolloutView, TaskState, UpgradeState, Verification,
     },
     net::NetMode,
     receipt::Receipt,
-    release::{FetchState, Release, ReleaseFile, SignedRelease, Target, hex, sha256},
+    release::{
+        CanaryPhase, CanarySpec, CanaryView, FetchState, Release, ReleaseFile, SignedRelease,
+        Target, hex, sha256,
+    },
     ticket::JoinTicket,
+    ui::{NodeSettings, NodeSettingsView},
 };
 use tokio::task::JoinHandle;
 
@@ -2590,6 +2595,196 @@ async fn rollout_upgrades_opted_in_agents_and_refuses_forged_binaries() {
 // Phase 9: device profiles
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 1.7: canary rollouts
+// ---------------------------------------------------------------------------
+
+async fn canary_view(client: &AdminClient) -> Option<CanaryView> {
+    match client.call(AdminOp::Canary).await.unwrap() {
+        AdminResponse::Canary(c) => c.map(|c| *c),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+fn canary_spec(nodes: &str) -> Box<CanarySpec> {
+    Box::new(CanarySpec {
+        nodes: Selector::nodes(nodes).unwrap(),
+        soak_secs: 0,
+        min_tasks: 0,
+        hold: false,
+    })
+}
+
+#[tokio::test]
+async fn canary_upgrades_first_and_the_rest_follow() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    let bin = tempdir("bin");
+    let old = b"pumasi binary, old build".to_vec();
+    let canary_exe = bin.join("canary-pumasi");
+    let rest_exe = bin.join("rest-pumasi");
+    std::fs::write(&canary_exe, &old).unwrap();
+    std::fs::write(&rest_exe, &old).unwrap();
+
+    let canary_dir = tempdir("a");
+    let canary = upgradable("canary-pc", canary_dir.clone(), canary_exe.clone(), None).await;
+    let canary_id = canary.id().to_string();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let canary_run = spawn_join(canary, ticket.clone());
+    let rest = upgradable("rest-pc", tempdir("b"), rest_exe.clone(), None).await;
+    let rest_id = rest.id().to_string();
+    let rest_run = spawn_join(rest, ticket);
+    wait_online(&cluster, 2).await;
+
+    // A canary that names every node, or none, is refused.
+    let new = b"pumasi binary, new build".to_vec();
+    upload(&client, &new).await;
+    for bad in ["canary-pc,rest-pc", "nobody"] {
+        let err = client
+            .call(AdminOp::CanaryRollout {
+                files: vec![release_file(&new, "9.9.9-test")],
+                force: false,
+                canary: canary_spec(bad),
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("canar"), "{err:#}");
+    }
+
+    client
+        .call(AdminOp::CanaryRollout {
+            files: vec![release_file(&new, "9.9.9-test")],
+            force: false,
+            canary: canary_spec("canary-pc"),
+        })
+        .await
+        .unwrap();
+
+    // The canary installs it; the other node waits.
+    let exit = tokio::time::timeout(Duration::from_secs(30), canary_run.handle)
+        .await
+        .expect("the canary did not upgrade")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exit,
+        AgentExit::Upgraded {
+            version: "9.9.9-test".into()
+        }
+    );
+    canary_run.endpoint.close().await;
+    let c = canary_view(&client).await.unwrap();
+    assert_eq!(c.phase, CanaryPhase::Canary);
+    assert_eq!(c.held, vec!["rest-pc".to_string()]);
+    assert_eq!(c.canaries[0].id, canary_id);
+    wait_upgrade_state(&client, &rest_id, |n| n.state == UpgradeState::Waiting).await;
+    assert_eq!(std::fs::read(&rest_exe).unwrap(), old);
+    assert!(!rest_run.handle.is_finished());
+
+    // Back on the new binary, the canary passes (no soak, no tasks
+    // asked for) and the rest follow.
+    let canary = upgradable("canary-pc", canary_dir.clone(), canary_exe.clone(), None).await;
+    let _canary_run = tokio::spawn(canary.resume());
+    let exit = tokio::time::timeout(Duration::from_secs(30), rest_run.handle)
+        .await
+        .expect("the rest did not follow the canary")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exit,
+        AgentExit::Upgraded {
+            version: "9.9.9-test".into()
+        }
+    );
+    assert_eq!(std::fs::read(&rest_exe).unwrap(), new);
+    let c = canary_view(&client).await.unwrap();
+    assert!(matches!(c.phase, CanaryPhase::Promoted { .. }), "{c:?}");
+    assert!(c.canaries[0].upgraded_unix.is_some());
+    assert!(c.held.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_canary_halts_the_rollout_until_an_admin_moves_it() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    let bin = tempdir("bin");
+    let old = b"pumasi binary, old build".to_vec();
+    let canary_exe = bin.join("canary-pumasi");
+    let rest_exe = bin.join("rest-pumasi");
+    std::fs::write(&canary_exe, &old).unwrap();
+    std::fs::write(&rest_exe, &old).unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let canary = upgradable("canary-pc", tempdir("a"), canary_exe.clone(), None).await;
+    let canary_id = canary.id().to_string();
+    let canary_run = spawn_join(canary, ticket.clone());
+    let rest = upgradable("rest-pc", tempdir("b"), rest_exe.clone(), Some(true)).await;
+    let rest_id = rest.id().to_string();
+    let rest_run = spawn_join(rest, ticket);
+    wait_online(&cluster, 2).await;
+
+    // A release whose stored binary was damaged: the canary refuses it.
+    let new = b"pumasi binary, new build".to_vec();
+    upload(&client, &new).await;
+    let stored = cluster.release_store().path_of(&sha256(&new));
+    let mut damaged = new.clone();
+    damaged[0] ^= 1;
+    std::fs::write(&stored, &damaged).unwrap();
+    client
+        .call(AdminOp::CanaryRollout {
+            files: vec![release_file(&new, "9.9.9-test")],
+            force: false,
+            canary: canary_spec("canary-pc"),
+        })
+        .await
+        .unwrap();
+    wait_upgrade_state(&client, &canary_id, |n| {
+        matches!(n.state, UpgradeState::Failed(_))
+    })
+    .await;
+    let mut halted = None;
+    for _ in 0..100 {
+        let c = canary_view(&client).await.unwrap();
+        if let CanaryPhase::Halted { reason } = &c.phase {
+            halted = Some(reason.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let reason = halted.expect("the canary never halted");
+    assert!(reason.contains("canary-pc"), "{reason}");
+    // The rest stay where they are.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let rest = wait_upgrade_state(&client, &rest_id, |_| true).await;
+    assert_eq!(rest.state, UpgradeState::Waiting);
+    assert_eq!(std::fs::read(&rest_exe).unwrap(), old);
+
+    // The event log says why.
+    let AdminResponse::Events(events) = client
+        .call(AdminOp::Events {
+            after: 0,
+            since_unix: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("unexpected response");
+    };
+    assert!(events.iter().any(|e| e.kind == "rollout.halted"));
+
+    // Cancelling ends the rollout and its canary.
+    client.call(AdminOp::CancelRollout).await.unwrap();
+    assert!(canary_view(&client).await.is_none());
+    assert!(!canary_run.handle.is_finished());
+    assert!(!rest_run.handle.is_finished());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn device_profiles_reach_the_control_plane() {
     init_tracing();
@@ -3235,4 +3430,140 @@ async fn a_control_plane_without_agents_upgrades_itself() {
     assert_eq!(own.file.version, version);
     assert_eq!(std::fs::read(&own.path).unwrap(), good);
     client.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// 1.7: a node's availability settings changed from the dashboard
+// ---------------------------------------------------------------------------
+
+async fn node_settings(client: &AdminClient, node: &str) -> NodeSettingsView {
+    match client
+        .call(AdminOp::NodeSettings { node: node.into() })
+        .await
+        .unwrap()
+    {
+        AdminResponse::NodeSettings(v) => *v,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn node_settings_are_written_and_the_agent_restarts_with_them() {
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+
+    // One agent run as a service (it has an options file), one by hand.
+    let file = tempdir("svc").join("agent.toml");
+    let written = std::sync::Arc::new(std::sync::Mutex::new(None::<NodeSettings>));
+    let w = written.clone();
+    let path = file.clone();
+    let svc = agent("svc-pc", 2, tempdir("a"))
+        .await
+        .with_settings_hook(SettingsHook {
+            file: file.clone(),
+            write: std::sync::Arc::new(move |s: &NodeSettings| {
+                std::fs::write(&path, s.changes().join(" "))?;
+                *w.lock().unwrap() = Some(s.clone());
+                Ok(())
+            }),
+        });
+    let svc_run = spawn_join(svc, ticket.clone());
+    let manual_run = spawn_join(agent("hand-pc", 1, tempdir("b")).await, ticket);
+    wait_online(&cluster, 2).await;
+
+    // Both say what they run with.
+    let mut v = node_settings(&client, "svc-pc").await;
+    for _ in 0..50 {
+        if v.report.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        v = node_settings(&client, "svc-pc").await;
+    }
+    let report = v.report.expect("no settings report");
+    assert_eq!(report.settings.slots, Some(2));
+    assert_eq!(report.file.as_deref(), Some(&*file.display().to_string()));
+    assert!(!report.restarting);
+
+    // Bad settings and an agent started by hand are refused.
+    let bad = NodeSettings {
+        hours: "25:00-07:00".into(),
+        ..Default::default()
+    };
+    assert!(
+        client
+            .call(AdminOp::SetNodeSettings {
+                node: "svc-pc".into(),
+                settings: Box::new(bad),
+            })
+            .await
+            .is_err()
+    );
+    let mut refused = None;
+    for _ in 0..50 {
+        match client
+            .call(AdminOp::SetNodeSettings {
+                node: "hand-pc".into(),
+                settings: Box::new(NodeSettings::default()),
+            })
+            .await
+        {
+            Err(e) => {
+                refused = Some(format!("{e:#}"));
+                if refused.as_deref().is_some_and(|e| e.contains("by hand")) {
+                    break;
+                }
+            }
+            Ok(r) => panic!("a hand-started agent took settings: {r:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(refused.unwrap().contains("by hand"));
+
+    // New settings: written to the file, then the idle agent restarts.
+    let new = NodeSettings {
+        slots: Some(1),
+        max_cpu_percent: Some(50),
+        only_on_ac: true,
+        idle_minutes: Some(5),
+        hours: "22:00-07:00".into(),
+    };
+    client
+        .call(AdminOp::SetNodeSettings {
+            node: "svc-pc".into(),
+            settings: Box::new(new.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(written.lock().unwrap().as_ref(), Some(&new));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("--hours 22:00-07:00"), "{text}");
+    let exit = tokio::time::timeout(Duration::from_secs(30), svc_run.handle)
+        .await
+        .expect("the agent did not restart")
+        .unwrap()
+        .unwrap();
+    assert_eq!(exit, AgentExit::Reconfigured);
+    assert!(!manual_run.handle.is_finished());
+
+    // The audit log and the events say who changed what.
+    let AdminResponse::Events(events) = client
+        .call(AdminOp::Events {
+            after: 0,
+            since_unix: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("unexpected response");
+    };
+    assert!(
+        events.iter().any(|e| e.kind == "node.settings"),
+        "{events:?}"
+    );
 }

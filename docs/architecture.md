@@ -2249,6 +2249,119 @@ unchanged, because an older CLI or dashboard could not decode a longer
 `Net`, appended to the enum. For the same reason overrides and silences
 are not in `cluster.toml` yet.
 
+## Phase 23: the dashboard changes settings (1.7)
+
+Release 1.7 makes `pumasi ui` a place to run the cluster from, not only
+to watch it: sign-ins that outlive the process, forms for what was
+read-only, a node's availability changed from the browser, canary
+rollouts, streaming charts and a layout that works on a phone.
+
+### Sessions in the control plane's state
+
+Before 1.7 a browser's session lived in the `pumasi ui` process, so the
+one-button upgrade (which restarts it) signed everyone out. Now the
+dashboard signs a browser in by calling `AdminOp::StartSession` with the
+ticket it was given; the control plane (`cluster/src/sessions.rs`) makes
+a new 32-byte secret and keeps only its hash (`session_hash`: BLAKE3 with
+a domain prefix), the parent ticket's secret, the browser's label
+("Chrome on Windows · 10.0.0.2"), and when it was made and last used, in
+the `ui_sessions` table. Every admin call resolves its secret as a ticket
+first and as a session second; a session acts with its parent's name and
+role, so roles, policies and the audit log need nothing new. The cookie
+holds the session's secret (base32), and the CSRF token is derived from
+it (`blake3::derive_key("pumasi ui csrf v1", secret)`), so any `pumasi ui`
+in front of the cluster, restarted or not, knows both. The dashboard
+caches who a cookie is for 30 seconds and keeps using that answer while
+the control plane is unreachable.
+
+A session ends after 12 hours unused (`SESSION_IDLE_SECS`), when revoked
+(Settings, `pumasi access sessions --revoke`, `DELETE /api/v1/sessions/ID`),
+when its browser signs out (`EndSession`), or when its ticket is revoked,
+expires or, for the cluster's admin ticket, is rotated (`tick_sessions`
+checks every parent each 10 ticks). Last-used times are written at most
+every 5 minutes and at shutdown, so a busy dashboard does not write the
+state on every click; sessions reach control plane replicas through Raft
+with the rest of the state. At most `MAX_SESSIONS` (10,000) are kept, the
+least recently used going first. A session cannot start another session,
+and a non-admin lists and revokes only its own ticket's sessions. A
+control plane older than 1.7 closes the stream on the unknown op, and the
+dashboard falls back to sessions in its own memory as before.
+
+### Forms for what was read-only
+
+The Events page edits the alert rules (each threshold as text, `off` or
+empty to turn it off) with the repeat interval and resolved notices of
+1.6, and adds and removes webhooks; Prices edits the rates, storage
+prices, ledger mode, hold, check rate and strikes (`SetPolicy`,
+`SetStoragePolicy`); a new Schedules page adds or replaces a cron
+schedule from a job.toml and its files (the same upload code as job
+submission, inputs up to 16 MiB kept with the schedule), runs one now and
+removes one. Settings lists the browsers signed in and, for admins, a
+`cluster.toml` editor prefilled with every node's labels, taints and
+cordon and the alert rules: Preview sends `ApplySpec` with `dry_run` and
+shows the change lines, Apply applies them. The editor refuses schedules
+(they name job files, which would be read on the dashboard's machine) and
+webhook `url_env` (the dashboard's environment), and never prunes, since
+the text need not list every schedule and webhook; `pumasi apply` keeps
+doing all three. Each form posts with htmx and the CSRF header and
+answers in the flash area; the control plane checks roles as for the CLI.
+
+### A node's availability from the browser
+
+`NodeSettings` (slots, CPU share, AC power only, idle minutes, hours) are
+the options of `pumasi agent start` that phase 20's service options file
+(`agent.toml`) keeps. An agent of minor 3 (`SETTINGS_MINOR`) reports them
+after the welcome (`FromAgent::Settings`) with the file it keeps them in,
+or none when it was started by hand. `SetNodeSettings` reaches the agent
+as `ToAgent::Settings`; the CLI's `SettingsHook` merges them into
+`agent.toml` the way `pumasi service set agent -- --slots 2` does
+(`--no-NAME` for what is unset, then checks the result parses), and the
+agent reports `restarting`, pauses itself ("restarting with new settings
+once its tasks end") and, when no task runs, exits with
+`AgentExit::Reconfigured`: on Unix it executes itself again (`service run`
+reads the file anew), on Windows it returns the service's restart code.
+The control plane waits up to 20 seconds for the agent's answer and
+records a `node.settings` event; offline agents, agents older than 1.7
+and agents started by hand are refused with the reason. `pumasi node set
+NODE --slots 2 --hours 22:00-07:00` does the same from the CLI.
+
+### Canary rollouts
+
+`pumasi upgrade rollout|latest --canary NODE|SELECTOR` (and the Upgrade
+panel's checkboxes, and `canary` in `POST /api/v1/upgrade`) attach a
+`CanarySpec` (nodes, soak time, tasks per canary, hold) to the rollout.
+The control plane (`cluster/src/canary.rs`) keeps a `CanaryRecord` in the
+meta key `rollout_canary`, tied to the rollout's binaries, and
+`drive_rollout` offers the release only to the canaries; the other nodes
+show as Waiting. A canary passes once it is back online on the new binary,
+has finished `min_tasks` runs there without a node error, and the soak has
+passed since the last canary came back; then the canary is promoted
+(event `rollout.promoted`) and every node follows as in a plain rollout,
+unless `hold` waits for `pumasi upgrade promote`. A canary that fails to
+install the release or reports a node error (`Outcome::Error`, not a
+program's non-zero exit) halts the rollout (`rollout.halted`); only an
+admin moves it on: `pumasi upgrade promote NODE...` (or the panel's
+"Upgrade checked next") adds nodes to the canaries, `promote` without
+nodes promotes, and `pumasi upgrade cancel` ends the rollout. A canary
+naming no node, or every node, is refused.
+
+### Streaming charts and phones
+
+A node's charts now come over server-sent events (`/nodes/ID/charts`):
+the dashboard polls the control plane's metrics every 2 seconds and sends
+the charts' HTML when a new sample arrives, and `app.js` swaps it in.
+Under 720 px wide, forms stack in one column, inputs are 16 px (no zoom
+on focus), the navigation scrolls sideways and tables scroll in their own
+box; Playwright checks that no page scrolls sideways at 390 px.
+
+### API
+
+`GET /api/v1/sessions`, `DELETE /api/v1/sessions/{id}`, `GET`/`PUT
+/api/v1/nodes/{node}/settings`, `POST /api/v1/apply` (a `cluster.toml`
+with the editor's limits), `GET /api/v1/upgrade/canary` and `POST
+/api/v1/upgrade/canary/promote`; `POST /api/v1/upgrade` takes `canary`,
+`canary_soak`, `canary_tasks` and `canary_hold`.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -2339,6 +2452,12 @@ rows of the 10 s tier in `metrics`, which an older control plane loads
 and prunes like the other tiers (1.5 already read every tier back, it
 only never wrote the first).
 
+Phase 23 (1.7) keeps layout 7 and adds the table `ui_sessions` (by the
+hash of a session's secret, last in `tables!`; postcard `SessionRecord`s
+holding the hash, never the secret) and the meta key `rollout_canary`.
+An older control plane ignores both; its dashboard sessions are in
+memory as before.
+
 `PROTOCOL_VERSION` is 14 (phase 16, above): protocol 5 (phase 4) added `UpgradeHello` and the
 upgrade messages, protocol 6 appends `AgentHello::availability` and
 `FromAgent::Availability`, protocol 7 adds `FromAgent::Perf` and
@@ -2398,11 +2517,14 @@ remotely; install a current binary on them once.
   in ACPI thermal zones); per-node thresholds and silences are not in
   `cluster.toml`; the network is measured between agents, not to the
   control plane's file store.
-- Dashboard: prices, alert rules, webhooks, schedules and rollouts are
-  shown (or left to the CLI) but not edited in the browser (account
-  quotas and job policies are, since 1.4);
-  sessions are in memory only; charts are server-drawn snapshots
-  that refresh every 10 seconds rather than streaming.
+- Dashboard: the `cluster.toml` editor takes no schedules, no
+  `url_env` and never prunes (use `pumasi apply`); per-node alert
+  thresholds and secrets are still CLI-only; the Upgrade panel's canary
+  checkboxes appear only with a published release to upgrade to (canary
+  rollouts of your own binaries are `pumasi upgrade rollout --canary`);
+  node settings need an agent run as a service (1.4 or later) that is
+  online; charts poll the control plane every 2 seconds behind the
+  stream rather than being pushed by it.
 - WebGPU: compute shaders only (no textures, samplers or render
   passes), one bind group, no optional features such as `shader-f16` or
   subgroups, one adapter per task, no GPU challenge over WebGPU (so an
@@ -2415,7 +2537,7 @@ remotely; install a current binary on them once.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Remaining roadmap: phases 21 to 28 ([roadmap.md](roadmap.md)) take
+- Remaining roadmap: phases 24 to 28 ([roadmap.md](roadmap.md)) take
   on many of the gaps in this list, starting with sleeping machines and
   Docker-less nodes (phase 20, the open issues from real use, is done); phases 18 and 19 (the hub and buying CU) are on hold.
 - Phase 17 leftovers: no per-peer limit on unauthenticated sign-in calls

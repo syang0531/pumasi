@@ -796,6 +796,47 @@ enum NodeCmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Show or change when a node takes tasks (1.7): its agent writes the
+    /// change to its service's options file (agent.toml) and restarts with
+    /// it once its running tasks end, taking no new ones meanwhile. Only
+    /// for agents of 1.7 or later run as a service. With no change, shows
+    /// the settings.
+    Set {
+        /// The node: its name or an id prefix.
+        node: String,
+        /// Tasks at once.
+        #[arg(long, conflicts_with = "default_slots")]
+        slots: Option<u32>,
+        /// Go back to the default number of slots.
+        #[arg(long)]
+        default_slots: bool,
+        /// Offer only this share of the CPUs (1-100).
+        #[arg(long, conflicts_with = "all_cpus")]
+        max_cpu_percent: Option<u32>,
+        /// Offer all the CPUs.
+        #[arg(long)]
+        all_cpus: bool,
+        /// Take tasks only on AC power.
+        #[arg(long, conflicts_with = "any_power")]
+        only_on_ac: bool,
+        /// Take tasks on battery too.
+        #[arg(long)]
+        any_power: bool,
+        /// Take tasks only after this many idle minutes.
+        #[arg(long, value_name = "MINUTES", conflicts_with = "no_idle")]
+        idle_minutes: Option<u64>,
+        /// Take tasks while someone uses the machine too.
+        #[arg(long)]
+        no_idle: bool,
+        /// Take tasks only at these local times, e.g. `22:00-07:00`.
+        #[arg(long, value_name = "HH:MM-HH:MM[,...]", conflicts_with = "any_time")]
+        hours: Option<String>,
+        /// Take tasks at any time of day.
+        #[arg(long)]
+        any_time: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1298,6 +1339,7 @@ async fn run(cli: Cli) -> Result<i32> {
     // entry point is taken in `main`.
     #[cfg(not(windows))]
     if let Cmd::Service(service::ServiceCmd::Run { role, args }) = &cli.cmd {
+        note_options_file(*role, &home, args);
         let options = service::run_options(*role, &home, args.clone())?;
         let cmd = parse_service_args(*role, &options)?;
         return Box::pin(run(Cli {
@@ -1500,6 +1542,100 @@ async fn run(cli: Cli) -> Result<i32> {
                 "it takes a machine up to a minute to wake and reconnect; `pumasi status` shows it"
             );
             Ok(0)
+        }
+        Cmd::Node {
+            cmd:
+                Some(NodeCmd::Set {
+                    node,
+                    slots,
+                    default_slots,
+                    max_cpu_percent,
+                    all_cpus,
+                    only_on_ac,
+                    any_power,
+                    idle_minutes,
+                    no_idle,
+                    hours,
+                    any_time,
+                    admin,
+                }),
+            ..
+        } => {
+            let client = connect_admin(&home, &admin).await?;
+            let res = async {
+                let AdminResponse::NodeSettings(view) = client
+                    .call(AdminOp::NodeSettings { node: node.clone() })
+                    .await?
+                else {
+                    bail!("unexpected response");
+                };
+                let Some(report) = view.report.clone() else {
+                    bail!(
+                        "{} has not reported its settings: it is offline, or its agent is older than 1.7",
+                        view.name
+                    );
+                };
+                let mut s = report.settings.clone();
+                let before = s.clone();
+                if let Some(v) = slots {
+                    s.slots = Some(v);
+                }
+                if default_slots {
+                    s.slots = None;
+                }
+                if let Some(v) = max_cpu_percent {
+                    s.max_cpu_percent = Some(v);
+                }
+                if all_cpus {
+                    s.max_cpu_percent = None;
+                }
+                if only_on_ac {
+                    s.only_on_ac = true;
+                }
+                if any_power {
+                    s.only_on_ac = false;
+                }
+                if let Some(v) = idle_minutes {
+                    s.idle_minutes = Some(v);
+                }
+                if no_idle {
+                    s.idle_minutes = None;
+                }
+                if let Some(v) = hours {
+                    s.hours = v;
+                }
+                if any_time {
+                    s.hours.clear();
+                }
+                if s == before {
+                    println!("{}: {}", view.name, report.settings.describe());
+                    match &report.file {
+                        Some(f) => println!("kept in {f} on that machine"),
+                        None => println!("(started by hand: it cannot change them from here)"),
+                    }
+                    if report.restarting {
+                        println!("restarts with them once its running tasks end");
+                    }
+                    return Ok(());
+                }
+                let AdminResponse::NodeSettings(after) = client
+                    .call(AdminOp::SetNodeSettings {
+                        node,
+                        settings: Box::new(s.clone()),
+                    })
+                    .await?
+                else {
+                    bail!("unexpected response");
+                };
+                println!("{}: {}", after.name, s.describe());
+                if after.report.as_ref().is_some_and(|r| r.restarting) {
+                    println!("written; the agent restarts with them once its running tasks end");
+                }
+                Ok(())
+            }
+            .await;
+            client.close().await;
+            res.map(|_| 0)
         }
         Cmd::Node {
             cmd: None,
@@ -2115,7 +2251,14 @@ async fn agent(
         ),
     };
     let exe = config.upgrade.as_ref().map(|u| u.exe.clone());
-    let agent = Agent::new(config).await?;
+    let mut agent = Agent::new(config).await?;
+    if let Some(file) = AGENT_OPTIONS_FILE.get() {
+        let home = home.to_path_buf();
+        agent = agent.with_settings_hook(pumasi_agent::SettingsHook {
+            file: file.clone(),
+            write: std::sync::Arc::new(move |s| write_agent_settings(&home, s)),
+        });
+    }
     eprintln!(
         "agent {} ({}, {} slots, {}) connecting...",
         agent.info().name,
@@ -2144,6 +2287,7 @@ async fn agent(
         AgentExit::RolledBack { reason } => {
             eprintln!("rolled back to the previous binary ({reason}); restarting")
         }
+        AgentExit::Reconfigured => eprintln!("restarting with the new settings"),
     }
     if in_service {
         return Ok(service::RESTART_EXIT_CODE);
@@ -2204,6 +2348,7 @@ async fn run_service(
     args: Vec<String>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<i32> {
+    note_options_file(role, &home, &args);
     let args = service::run_options(role, &home, args)?;
     match parse_service_args(role, &args)? {
         Cmd::Agent(cmd) => agent(&home, cmd, shutdown, true).await,
@@ -2232,6 +2377,31 @@ async fn run_service(
         Cmd::Ui(args) => ui::run_until(&home, args, shutdown, true).await,
         _ => bail!("not {} options", role.as_str()),
     }
+}
+
+/// The options file of an agent run as a service in the 1.4 form (its
+/// options in `agent.toml`, none in the definition): the dashboard may
+/// change its settings there (1.7).
+static AGENT_OPTIONS_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn note_options_file(role: service::Role, home: &Path, inline: &[String]) {
+    if role == service::Role::Agent && inline.is_empty() {
+        let _ = AGENT_OPTIONS_FILE.set(role.options_file(home));
+    }
+}
+
+/// Writes settings from the dashboard into the agent service's options
+/// file, as `pumasi service set agent` would (without the restart, which
+/// the agent does itself once idle).
+fn write_agent_settings(home: &Path, settings: &pumasi_proto::ui::NodeSettings) -> Result<()> {
+    let role = service::Role::Agent;
+    let current = service::read_options(role, home)?.unwrap_or_default();
+    let merged = service::merge_options(&service_command(role), &current, &settings.changes())?;
+    parse_service_args(role, &merged)?;
+    if merged != current {
+        service::write_options(role, home, &merged)?;
+    }
+    Ok(())
 }
 
 /// Parses options meant for the command a service runs (`pumasi agent

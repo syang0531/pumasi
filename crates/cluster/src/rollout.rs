@@ -63,6 +63,17 @@ impl State {
         force: bool,
         uploaded: impl Fn(&ReleaseFile) -> bool,
     ) -> Result<RolloutView> {
+        self.start_rollout_with(files, force, None, uploaded)
+    }
+
+    /// [`Self::start_rollout`], with canaries that go first (1.7).
+    pub fn start_rollout_with(
+        &mut self,
+        files: Vec<ReleaseFile>,
+        force: bool,
+        canary: Option<pumasi_proto::release::CanarySpec>,
+        uploaded: impl Fn(&ReleaseFile) -> bool,
+    ) -> Result<RolloutView> {
         ensure!(!files.is_empty(), "a rollout needs at least one binary");
         let mut targets = std::collections::HashSet::new();
         for f in &files {
@@ -111,6 +122,12 @@ impl State {
             releases,
             started_unix: now,
         };
+        let canary = canary
+            .map(|spec| {
+                let shas = record.releases.iter().map(|r| r.file().sha256).collect();
+                self.new_canary(spec, shas)
+            })
+            .transpose()?;
         self.store.put_meta(
             ROLLOUT_META,
             &postcard::to_stdvec(&record).expect("rollout encodes"),
@@ -118,7 +135,12 @@ impl State {
         for r in &record.releases {
             info!(target = %r.file().target, version = %r.file().version, sha256 = %hex(&r.file().sha256), "rollout started");
         }
+        if let Some(c) = &canary {
+            let names: Vec<String> = c.canaries.iter().map(|n| self.node_name(&n.id)).collect();
+            info!(canaries = %names.join(", "), "the canaries go first");
+        }
         self.rollout = Some(record);
+        self.set_canary(canary);
         self.upgrade_failures.clear();
         self.upgrading.clear();
         for n in self.nodes.values_mut() {
@@ -131,6 +153,7 @@ impl State {
     pub fn cancel_rollout(&mut self) -> Result<()> {
         self.store.delete_meta(ROLLOUT_META)?;
         self.rollout = None;
+        self.set_canary(None);
         self.upgrade_failures.clear();
         self.upgrading.clear();
         for n in self.nodes.values_mut() {
@@ -197,7 +220,7 @@ impl State {
         }
     }
 
-    fn upgrade_state(&self, id: &str, n: &NodeRuntime) -> UpgradeState {
+    pub(crate) fn upgrade_state(&self, id: &str, n: &NodeRuntime) -> UpgradeState {
         let target = Target::new(&n.info.os, &n.info.arch);
         let release = self.rollout.as_ref().and_then(|r| r.release_for(&target));
         if !n.online {
@@ -251,6 +274,10 @@ impl State {
     /// Offers the release to idle nodes that need it and drains one busy
     /// node at a time. Called at the start of every scheduling pass.
     pub(crate) fn drive_rollout(&mut self) {
+        if self.rollout.is_none() {
+            return;
+        }
+        self.drive_canary();
         let Some(rollout) = &self.rollout else {
             return;
         };
@@ -260,6 +287,10 @@ impl State {
         for (id, n) in &self.nodes {
             let state = self.upgrade_state(id, n);
             if !matches!(state, UpgradeState::Waiting | UpgradeState::Draining) {
+                continue;
+            }
+            // Not a canary of a canary rollout that has not passed yet.
+            if self.held_back(id) {
                 continue;
             }
             if n.running.is_empty() {

@@ -358,6 +358,11 @@ pub enum ToAgent {
         addr: EndpointAddr,
         bytes: u32,
     },
+    // Minor 3 (1.7) from here.
+    /// Change the agent's availability settings: write them to its
+    /// service's options file and restart with them once its running
+    /// tasks end. Answered with [`FromAgent::Settings`].
+    Settings(Box<crate::ui::NodeSettings>),
 }
 
 /// How a task ended.
@@ -527,6 +532,14 @@ pub enum FromAgent {
     // Minor 2 (1.6) from here.
     /// What a [`ToAgent::Probe`] measured.
     Probe(Box<crate::monitor::ProbeResult>),
+    // Minor 3 (1.7) from here.
+    /// The agent's availability settings: after the welcome, and in
+    /// answer to [`ToAgent::Settings`] (`error` says why a change was
+    /// not made).
+    Settings {
+        report: Box<crate::ui::SettingsReport>,
+        error: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +918,55 @@ pub enum AdminOp {
     },
     /// What the nodes measured of the network between each other.
     Net,
+    // 1.7 from here.
+    /// Starts a dashboard session for the calling ticket: a new secret
+    /// that acts as that ticket until it ends, is revoked, goes unused for
+    /// [`crate::ui::SESSION_IDLE_SECS`], or the ticket is revoked.
+    /// `label` names the browser for the session list.
+    StartSession {
+        label: String,
+    },
+    /// The signed-in sessions: every one for an admin, the caller's own
+    /// ticket's otherwise.
+    Sessions,
+    /// Ends a session (id or unique prefix); answers like
+    /// [`AdminOp::Sessions`].
+    RevokeSession {
+        id: String,
+    },
+    /// Ends the calling session (signing out).
+    EndSession,
+    /// A node's availability settings (`node`: name or id prefix).
+    NodeSettings {
+        node: String,
+    },
+    /// Changes a node's availability settings: its agent writes them to
+    /// `agent.toml` and restarts with them once idle. Answers when the
+    /// agent has, like [`AdminOp::NodeSettings`].
+    SetNodeSettings {
+        node: String,
+        settings: Box<crate::ui::NodeSettings>,
+    },
+    /// [`AdminOp::Rollout`] with canaries: the nodes `canary` selects
+    /// upgrade first.
+    CanaryRollout {
+        files: Vec<ReleaseFile>,
+        force: bool,
+        canary: Box<crate::release::CanarySpec>,
+    },
+    /// [`AdminOp::UpgradeToLatest`] with canaries.
+    CanaryUpgradeToLatest {
+        version: Option<String>,
+        force: bool,
+        canary: Box<crate::release::CanarySpec>,
+    },
+    /// The canary of the current rollout, if it has one.
+    Canary,
+    /// Lets more nodes have the release now: these nodes (names or id
+    /// prefixes), or with none every node (ends the canary).
+    PromoteCanary {
+        nodes: Vec<String>,
+    },
 }
 
 impl AdminOp {
@@ -1050,6 +1112,15 @@ pub enum AdminResponse {
     // 1.6 from here.
     AlertTuning(Box<crate::monitor::AlertTuningView>),
     Net(Box<crate::monitor::NetView>),
+    // 1.7 from here.
+    /// A new session; its secret is shown only here.
+    Session {
+        secret: crate::Secret,
+        view: crate::ui::SessionView,
+    },
+    Sessions(Vec<crate::ui::SessionView>),
+    NodeSettings(Box<crate::ui::NodeSettingsView>),
+    Canary(Option<Box<crate::release::CanaryView>>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

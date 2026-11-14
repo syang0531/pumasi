@@ -208,7 +208,26 @@ body.login { display: flex; min-height: 100vh; align-items: center; justify-cont
 .login-box { width: 100%; max-width: 480px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
 .login-box form { display: flex; flex-direction: column; gap: 8px; }
 
+/* Settings forms (1.7) */
+form.settings .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; }
+form.settings .grid2 label, form.stack > label { display: flex; flex-direction: column; gap: 4px; }
+label.check { display: flex !important; flex-direction: row !important; align-items: center; gap: 6px; font-weight: 400; }
+ul.diff { margin: 6px 0 0; padding-left: 18px; }
+.canary { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 4px; }
+.canary[data-phase="halted"] h3 { color: var(--bad); }
+.bad { color: var(--bad); }
+
 @media (max-width: 720px) {
+  main { padding: 12px 10px 48px; }
+  section, form.stack { padding: 12px; }
+  .charts { grid-template-columns: 1fr; }
+  .row { flex-direction: column; align-items: stretch; gap: 10px; }
+  .row > div, .row > label { width: 100%; }
+  input, select, textarea, button { font-size: 16px; }
+  input:not([type=checkbox]):not([type=radio]), select { width: 100%; }
+  form.settings .grid2 { grid-template-columns: 1fr; }
+  .me .role { display: none; }
+  td, th { padding: 6px 5px; }
   header.top { gap: 8px; padding: 8px 12px; }
   header nav { order: 3; flex: 0 0 100%; flex-wrap: nowrap; overflow-x: auto; }
   header nav a { white-space: nowrap; }

@@ -23,6 +23,7 @@ pub mod release;
 pub mod sso;
 pub mod store;
 pub mod ticket;
+pub mod ui;
 pub mod vmdisk;
 pub mod webgpu;
 pub mod wire;
@@ -74,7 +75,7 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 2;
+pub const PROTOCOL_MINOR: u32 = 3;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
@@ -86,6 +87,10 @@ pub const POWER_MINOR: u32 = 1;
 /// ([`msg::ToAgent::Probe`], [`msg::FromAgent::Probe`]) and answers other
 /// agents' probes on [`PROBE_ALPN`].
 pub const MONITOR_MINOR: u32 = 2;
+/// The first minor with settings from the dashboard (1.7): the agent
+/// reports its availability settings ([`msg::FromAgent::Settings`]) and
+/// changes them when asked ([`msg::ToAgent::Settings`]).
+pub const SETTINGS_MINOR: u32 = 3;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

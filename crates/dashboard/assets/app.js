@@ -1,5 +1,5 @@
 // Pumasi dashboard: the little the server-rendered pages need in the
-// browser. Local times, copy buttons and live task output.
+// browser. Local times, copy buttons, live task output and charts.
 (function () {
   "use strict";
 
@@ -76,10 +76,30 @@
     });
   }
 
+  // A node's charts as server-sent events (1.7, see nodes.rs): each
+  // "charts" event is the region's new HTML, sent when a sample arrives.
+  function sseRegions(root) {
+    root.querySelectorAll("[data-sse]").forEach(function (box) {
+      if (box.dataset.bound) return;
+      box.dataset.bound = "1";
+      var es = new EventSource(box.dataset.sse);
+      es.addEventListener("charts", function (e) {
+        if (!document.body.contains(box)) { es.close(); return; }
+        box.innerHTML = e.data;
+        box.dataset.updated = String(Date.now());
+        localTimes(box);
+      });
+      es.addEventListener("error", function () {
+        if (!document.body.contains(box)) es.close();
+      });
+    });
+  }
+
   function init(root) {
     localTimes(root);
     copyButtons(root);
     logStreams(root);
+    sseRegions(root);
   }
 
   document.addEventListener("DOMContentLoaded", function () {

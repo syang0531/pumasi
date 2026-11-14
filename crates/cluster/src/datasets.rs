@@ -310,7 +310,12 @@ impl State {
                 .ext
                 .images
                 .retain(|_, s| !matches!(s, ImageState::Pulling));
-            let stored = job.tasks.iter().any(|t| t.ext.stored.is_some());
+            let stored = job.tasks.iter().any(|t| t.ext.stored.is_some())
+                || self
+                    .sched
+                    .checkpoints
+                    .keys()
+                    .any(|(j, _)| *j == job.meta.id);
             if job.meta.ext.finished.is_none() && (job.meta.ext.needs_store || stored) {
                 self.files.open_jobs.insert(job.meta.id);
             }
@@ -361,6 +366,11 @@ impl State {
             }
             if job.meta.ext.finished.is_some() {
                 continue;
+            }
+            for ((j, i), r) in &self.sched.checkpoints {
+                if *j == id {
+                    out.push((files::ckpt_tag(id.0, *i), r.root));
+                }
             }
             let roots: HashSet<BlobHash> = job
                 .meta
@@ -712,6 +722,8 @@ impl State {
         self.files.finishing.remove(&id);
         self.store_cmd(StoreCmd::UntagPrefix(files::in_prefix(id.0)));
         self.store_cmd(StoreCmd::UntagPrefix(format!("img/{id}/")));
+        // Checkpoint records stay (for the job's page); their data goes.
+        self.store_cmd(StoreCmd::UntagPrefix(files::ckpt_prefix(id.0)));
         self.conf_job_ended(id);
         if let Some(job) = self.jobs.get_mut(&id) {
             job.meta.ext.finished = Some(finished);

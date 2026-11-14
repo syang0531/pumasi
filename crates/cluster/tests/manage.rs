@@ -144,6 +144,7 @@ async fn wait_online(cluster: &Cluster, n: usize) {
 /// One task per entry: `["x"]` echoes x at once, `["x", "slow"]` after 3 s.
 fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
     JobSubmission {
+        placement: Default::default(),
         name: "echo".into(),
         executor: Executor::Wasm,
         module: wat::parse_str(SLOW_ECHO_WAT).unwrap(),

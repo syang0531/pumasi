@@ -156,6 +156,7 @@ async fn wait_online(cluster: &Cluster, n: usize) {
 
 fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
     JobSubmission {
+        placement: Default::default(),
         name: "echo".into(),
         executor: Executor::Wasm,
         module: wat::parse_str(ECHO_WAT).unwrap(),
@@ -1361,6 +1362,7 @@ fn docker_available() -> bool {
 
 fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
     JobSubmission {
+        placement: Default::default(),
         name: "docker-test".into(),
         executor: Executor::Docker,
         module: vec![],

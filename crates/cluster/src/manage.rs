@@ -3,7 +3,6 @@
 //! tickets with roles, schedules and `apply`. Extends [`State`].
 
 use std::{
-    cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
@@ -14,7 +13,7 @@ use pumasi_proto::{
     economy::{MilliCu, validate_account},
     job::{JobId, JobSubmission},
     manage::{
-        AccessRole, AccessView, AccountQuota, ApplySpec, Cron, LabelSet, MAX_PRIORITY, NodeConfig,
+        AccessRole, AccessView, AccountQuota, ApplySpec, LabelSet, MAX_PRIORITY, NodeConfig,
         NodeEdit, QuotaView, ScheduleSpec, ScheduleView, Selector, Toleration, access_id,
         validate_access_name, validate_schedule_name,
     },
@@ -87,7 +86,11 @@ impl ScheduleRecord {
     fn view(&self) -> ScheduleView {
         ScheduleView {
             name: self.spec.name.clone(),
-            cron: self.spec.cron.clone(),
+            // 1.9: the time zone, when it has one, in the same field.
+            cron: match &self.spec.tz {
+                Some(tz) => format!("{} ({tz})", self.spec.cron),
+                None => self.spec.cron.clone(),
+            },
             account: self
                 .spec
                 .job
@@ -200,10 +203,8 @@ impl State {
         }
         // Schedules missed while the control plane was down run once now.
         for s in self.mgmt.schedules.values_mut() {
-            if s.next_unix.is_none()
-                && let Ok(c) = s.spec.cron.parse::<Cron>()
-            {
-                s.next_unix = c.next_local(now as i64).map(|t| t as u64);
+            if s.next_unix.is_none() {
+                s.next_unix = s.spec.next_after(now as i64).map(|t| t as u64);
             }
         }
         // Jobs that wait for others keep their tasks out of the queue.
@@ -283,16 +284,48 @@ impl State {
 
     /// Stops a run to make room and puts it back in the queue without
     /// counting it against the job. Returns whether it was running there.
+    /// A run that keeps checkpoints (on an agent that can) gets the stop
+    /// signal and its grace period instead, and goes back to the queue
+    /// once it has saved its checkpoint (1.9).
     pub(crate) fn evict(&mut self, node_id: &str, t: TaskRef, reason: &str) -> bool {
+        self.evict_with(node_id, t, reason, true)
+    }
+
+    /// [`Self::evict`], with `graceful` false stopping it at once.
+    pub(crate) fn evict_with(
+        &mut self,
+        node_id: &str,
+        t: TaskRef,
+        reason: &str,
+        graceful: bool,
+    ) -> bool {
+        let grace = if graceful {
+            self.stop_grace(node_id, &t)
+        } else {
+            None
+        };
         let Some(n) = self.nodes.get_mut(node_id) else {
             return false;
         };
-        if n.running.remove(&t).is_none() {
+        if !n.running.contains_key(&t) || n.stopping.contains_key(&t) {
             return false;
         }
-        n.gpu.busy.remove(&t);
-        if let Some(tx) = &n.tx {
-            let _ = tx.send(ToAgent::Cancel(t));
+        if let Some(grace) = grace {
+            n.stopping
+                .insert(t, Instant::now() + grace + crate::sched::STOP_MARGIN);
+            if let Some(tx) = &n.tx {
+                let _ = tx.send(ToAgent::Stop {
+                    task: t,
+                    grace_ms: grace.as_millis() as u64,
+                });
+            }
+        } else {
+            n.running.remove(&t);
+            n.gpu.busy.remove(&t);
+            n.stopping.remove(&t);
+            if let Some(tx) = &n.tx {
+                let _ = tx.send(ToAgent::Cancel(t));
+            }
         }
         let key = (t.job, t.index, t.check);
         let count = {
@@ -303,63 +336,68 @@ impl State {
         if let Err(e) = self.store.put_preempted((t.job.0, t.index, t.check), count) {
             warn!("persist preemption: {e:#}");
         }
-        info!(node = %node_id, task = %t, "{reason}; run moved back to the queue");
         self.monitor.counters.preemptions += 1;
         let name = self.node_name(node_id);
+        let msg = match grace {
+            Some(g) => format!(
+                "task {}/{} on {name}: {reason}; stopping it ({} to save its checkpoint)",
+                t.job,
+                t.index,
+                pumasi_proto::job::format_duration_ms(g.as_millis() as u64)
+            ),
+            None => format!("task {}/{} on {name}: {reason}", t.job, t.index),
+        };
+        info!(node = %node_id, task = %t, graceful = grace.is_some(), "{reason}; run moved back to the queue");
         self.event(
             pumasi_proto::monitor::EventLevel::Info,
             "task.preempted",
             Some(node_id),
             Some(t.job),
-            format!("task {}/{} on {name}: {reason}", t.job, t.index),
+            msg,
         );
-        self.requeue_run(t, reason);
+        match grace {
+            // Back in the queue once it has stopped; its gang stops with
+            // it now.
+            Some(_) => self.stop_gang_mates(t.job, reason),
+            None => self.requeue_run(t, reason),
+        }
         true
     }
 
     /// Frees room for a queued run by stopping runs of lower priority on
     /// one node: the node that needs the fewest, lowest-priority runs
-    /// stopped. Returns that node.
+    /// stopped. [`crate::sched::Preempt::Wait`] when runs already stopping
+    /// will free enough, or when the ones it stops now take a grace period.
     pub(crate) fn preempt_for(
         &mut self,
         need: &crate::state::Need,
         labels: &HashMap<String, LabelSet>,
-    ) -> Option<String> {
-        let mut best: Option<((i32, usize), String, Vec<TaskRef>)> = None;
-        for (id, n) in &self.nodes {
-            let mut cands: Vec<(i32, std::time::Instant, TaskRef)> = n
-                .running
-                .iter()
-                .map(|(t, started)| (self.priority_of(t.job), *started, *t))
-                .filter(|(p, _, _)| *p < need.item.priority)
-                .collect();
-            if cands.is_empty() {
-                continue;
-            }
-            // Lowest priority first, and among those the newest (least
-            // work lost).
-            cands.sort_by_key(|(p, started, _)| (*p, Reverse(*started)));
-            let mut victims = Vec::new();
-            let mut freed: Vec<u32> = Vec::new();
-            let mut worst = i32::MIN;
-            for (p, _, t) in cands {
-                victims.push(t);
-                worst = worst.max(p);
-                freed.extend(n.gpu.busy.get(&t).cloned().unwrap_or_default());
-                if self.fits(id, n, need, labels, victims.len() as u32, &freed) {
-                    let score = (worst, victims.len());
-                    if best.as_ref().is_none_or(|(s, _, _)| score < *s) {
-                        best = Some((score, id.clone(), victims.clone()));
-                    }
-                    break;
-                }
+        usage: &crate::sched::Usage,
+    ) -> crate::sched::Preempt {
+        let Some((id, victims)) =
+            self.plan_preempt(need, labels, usage, &HashMap::new(), &HashSet::new())
+        else {
+            return crate::sched::Preempt::None;
+        };
+        if victims.is_empty() {
+            return crate::sched::Preempt::Wait;
+        }
+        let mut now = true;
+        for (node, t) in victims {
+            self.evict(&node, t, "preempted by a higher-priority job");
+            if self
+                .nodes
+                .get(&node)
+                .is_some_and(|n| n.running.contains_key(&t))
+            {
+                now = false;
             }
         }
-        let (_, id, victims) = best?;
-        for t in victims {
-            self.evict(&id, t, "preempted by a higher-priority job");
+        if now {
+            crate::sched::Preempt::Room(id)
+        } else {
+            crate::sched::Preempt::Wait
         }
-        Some(id)
     }
 
     /// Whether any run in the cluster has a lower priority than `p`.
@@ -556,42 +594,35 @@ impl State {
             .is_some_and(|max| self.spent_day(account) >= max)
     }
 
-    /// Runs and GPUs in use per account.
-    pub(crate) fn account_usage(&self) -> HashMap<String, (u32, u32)> {
-        let mut out: HashMap<String, (u32, u32)> = HashMap::new();
-        for n in self.nodes.values() {
-            for t in n.running.keys() {
-                if let Some(j) = self.jobs.get(&t.job) {
-                    let e = out.entry(j.meta.account.clone()).or_default();
-                    e.0 += 1;
-                    e.1 += n.gpu.busy.get(t).map_or(0, |g| g.len() as u32);
-                }
-            }
-        }
-        out
-    }
-
-    /// Whether the account may start one more run of this kind.
+    /// Whether the account may start one more run of this kind: its slots,
+    /// GPUs, CPUs and memory (not its quotas per node label, which depend
+    /// on the node: [`Self::label_quota_refusal`]).
     pub(crate) fn within_quota(
         &self,
         need: &crate::state::Need,
-        usage: &HashMap<String, (u32, u32)>,
+        usage: &crate::sched::Usage,
     ) -> bool {
-        let Some(q) = self.mgmt.quotas.get(&need.consumer) else {
-            return true;
-        };
-        let (runs, gpus) = usage.get(&need.consumer).copied().unwrap_or_default();
-        if q.slots.is_some_and(|max| runs >= max) {
-            return false;
+        let used = usage.account(&need.consumer);
+        if let Some(q) = self.mgmt.quotas.get(&need.consumer) {
+            if q.slots.is_some_and(|max| used.runs >= max) {
+                return false;
+            }
+            if let (Some(max), Some(req)) = (q.gpus, &need.gpu)
+                && used.gpus + req.count.max(1) > max
+            {
+                return false;
+            }
         }
-        if let (Some(max), Some(req)) = (q.gpus, &need.gpu) {
-            return gpus + req.count.max(1) <= max;
+        if let Some(r) = self.sched.resources.get(&need.consumer)
+            && r.over(&used, &crate::sched::use_of(need, 0)).is_some()
+        {
+            return false;
         }
         true
     }
 
     pub fn quotas(&self) -> Vec<QuotaView> {
-        let usage = self.account_usage();
+        let usage = self.usage();
         let storage = self.usage_by_account();
         let mut queued: HashMap<&str, u32> = HashMap::new();
         for q in &self.queue {
@@ -611,7 +642,8 @@ impl State {
         names
             .into_iter()
             .map(|a| {
-                let (running, gpus) = usage.get(a).copied().unwrap_or_default();
+                let used = usage.account(a);
+                let (running, gpus) = (used.runs, used.gpus);
                 QuotaView {
                     account: a.clone(),
                     quota: self.account_quota(a),
@@ -832,21 +864,21 @@ impl State {
             .clone()
             .unwrap_or_else(|| OWNER_ACCOUNT.into());
         self.ensure_account(&account)?;
-        let cron: Cron = spec.cron.parse()?;
         let now = now_unix();
+        let next = spec.next_after(now as i64).map(|t| t as u64);
         let rec = match self.mgmt.schedules.get(&spec.name) {
             Some(old) if old.spec == spec => return Ok(()),
             Some(old) => ScheduleRecord {
-                next_unix: if old.spec.cron == spec.cron {
+                next_unix: if old.spec.cron == spec.cron && old.spec.tz == spec.tz {
                     old.next_unix
                 } else {
-                    cron.next_local(now as i64).map(|t| t as u64)
+                    next
                 },
                 spec,
                 ..old.clone()
             },
             None => ScheduleRecord {
-                next_unix: cron.next_local(now as i64).map(|t| t as u64),
+                next_unix: next,
                 spec,
                 last_unix: None,
                 last_job: None,
@@ -855,7 +887,7 @@ impl State {
             },
         };
         self.store.put_schedule(&rec.spec.name, Some(&rec))?;
-        info!(schedule = %rec.spec.name, cron = %rec.spec.cron, %account, "schedule set");
+        info!(schedule = %rec.spec.name, cron = %rec.spec.cron, tz = ?rec.spec.tz, %account, "schedule set");
         self.mgmt.schedules.insert(rec.spec.name.clone(), rec);
         Ok(())
     }
@@ -900,13 +932,7 @@ impl State {
         };
         let mut rec = rec;
         if !manual {
-            rec.next_unix = rec
-                .spec
-                .cron
-                .parse::<Cron>()
-                .ok()
-                .and_then(|c| c.next_local(now as i64))
-                .map(|t| t as u64);
+            rec.next_unix = rec.spec.next_after(now as i64).map(|t| t as u64);
         }
         rec.last_unix = Some(now);
         match &result {
@@ -983,6 +1009,29 @@ impl State {
                 ));
                 if !dry {
                     self.set_account_quota(account, q.clone())?;
+                }
+            }
+        }
+        // CPU and memory quotas (1.9): an account the file lists without
+        // them has none.
+        let mut resources: BTreeMap<&str, pumasi_proto::sched::ResourceQuota> = spec
+            .accounts
+            .iter()
+            .map(|(a, _)| (a.as_str(), Default::default()))
+            .collect();
+        for (a, q) in &spec.resources {
+            resources.insert(a.as_str(), q.clone());
+        }
+        for (account, q) in resources {
+            let cur = self.account_resources(account);
+            if cur != q {
+                changes.push(format!(
+                    "account {account}: CPU and memory quota {} -> {}",
+                    cur.describe(),
+                    q.describe()
+                ));
+                if !dry {
+                    self.set_resources(account, q)?;
                 }
             }
         }

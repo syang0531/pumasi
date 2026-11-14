@@ -240,13 +240,7 @@ pub(crate) async fn check_upload(
         .sum();
     let res = st
         .backend
-        .call(
-            secret,
-            AdminOp::CheckJob {
-                sub: Box::new(sub),
-                upload_bytes,
-            },
-        )
+        .call(secret, AdminOp::check_job(sub, upload_bytes))
         .await?;
     drop(up);
     match res {
@@ -429,6 +423,11 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
     let names = node_names(ctx).await;
     let details = task_details(ctx, id).await;
     let ran = task_executors(ctx, &v).await;
+    // 1.9: placement, runs saving a checkpoint, and the checkpoints.
+    let place = match ctx.call(AdminOp::Placement { id }).await {
+        Ok(AdminResponse::Placement(p)) => Some(*p),
+        _ => None,
+    };
     let s = &v.summary;
     let terminal = s.state.is_terminal();
     let top = html! {
@@ -494,12 +493,35 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
         }
         @if let Some(p) = &v.preparing { div class="flash info" { (p) } }
         @if let Some(w) = &v.waiting { div class="flash info" { (w) } }
+        @if let Some(p) = &place {
+            @if let Some(w) = &p.waiting { div class="flash info" #placement-waiting { (w) } }
+            @if !p.stopping.is_empty() {
+                div class="flash info" #stopping {
+                    (l.t("Saving a checkpoint before moving: task", "옮기기 전에 체크포인트 저장 중: 태스크"))
+                    @for i in &p.stopping { " #" (i) }
+                }
+            }
+        }
         @if has_outputs(&v) {
             p { a class="button" #download-all href={"/jobs/" (s.id) "/outputs.zip"} download { (l.t("Download all outputs (.zip)", "출력 모두 받기 (.zip)")) } }
         }
         (table(&[l.t("Task", "태스크"), l.t("State", "상태"), l.t("Attempts", "시도"), l.t("Node", "노드"), l.t("Queued", "대기"), l.t("Run", "실행"),
                  l.t("Cost", "비용"), l.t("Check", "검증"), l.t("Output files", "출력 파일"), ""],
             rows, l.t("No tasks.", "태스크가 없습니다.")))
+        @if let Some(p) = place.as_ref().filter(|p| !p.checkpoints.is_empty()) {
+            h2 { (l.t("Checkpoints", "체크포인트")) }
+            (table(&[l.t("Task", "태스크"), l.t("Files", "파일"), l.t("Size", "크기"), l.t("Saved", "저장"), l.t("Node", "노드"), l.t("Resumed", "재개")],
+                p.checkpoints.iter().map(|c| html! {
+                    tr data-checkpoint=(c.index) {
+                        td { "#" (c.index) }
+                        td { (c.files) }
+                        td { (format_size(c.size)) }
+                        td { (fmt::time(c.saved_unix)) }
+                        td { (c.node) }
+                        td class="resumed" { (c.resumed) }
+                    }
+                }).collect(), ""))
+        }
     };
     let bottom = html! {
         section {
@@ -521,6 +543,9 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
                     @for a in &v.after { a href={"/jobs/" (a)} { code { (a) } } " " }
                 } }
                 @if let Some(sch) = &v.schedule { dt { (l.t("Schedule", "스케줄")) } dd { (sch) } }
+                @if let Some(p) = place.as_ref().filter(|p| !p.placement.is_empty()) {
+                    dt { (l.t("Placement", "배치")) } dd #placement { (p.placement.describe()) }
+                }
                 dt { (l.t("Deterministic", "결정적 실행")) } dd { (if v.deterministic { l.t("yes", "예") } else { l.t("no", "아니요") }) }
                 @if v.network { dt { (l.t("Network", "네트워크")) } dd { (l.t("allowed", "허용")) } }
             }

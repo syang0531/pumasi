@@ -145,8 +145,8 @@ pub enum RoleArg {
 #[derive(Subcommand)]
 pub enum ScheduleCmd {
     /// Submit JOB_FILE on a cron schedule, in the control plane's local
-    /// time. Input files travel with the schedule (up to 16 MiB; larger
-    /// ones belong in the file store).
+    /// time or the time zone `--tz` names. Input files travel with the
+    /// schedule (up to 16 MiB; larger ones belong in the file store).
     Add {
         name: String,
         job_file: PathBuf,
@@ -154,6 +154,10 @@ pub enum ScheduleCmd {
         /// @daily, @weekly, @monthly.
         #[arg(long)]
         cron: String,
+        /// The time zone the cron times are in, e.g. Asia/Seoul (default:
+        /// the control plane's local time).
+        #[arg(long)]
+        tz: Option<String>,
         /// Account that pays (default: owner).
         #[arg(long)]
         account: Option<String>,
@@ -219,6 +223,58 @@ async fn status(client: &AdminClient) -> Result<ClusterStatus> {
     match client.call(AdminOp::Status).await? {
         AdminResponse::Status(s) => Ok(s),
         _ => bail!("unexpected response"),
+    }
+}
+
+/// CPU and memory quotas (1.9): `None` from a control plane before 1.9.
+async fn resources(client: &AdminClient) -> Option<Vec<pumasi_proto::sched::ResourceView>> {
+    match client.call(AdminOp::Resources).await {
+        Ok(AdminResponse::Resources(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// `pumasi quota`'s CPU and memory flags (1.9).
+#[derive(clap::Args, Debug, Default)]
+pub struct ResourceArgs {
+    /// Whole CPUs its runs hold at once (a WASM run holds one).
+    #[arg(long)]
+    cpus: Option<String>,
+    /// Memory its runs hold at once, e.g. 64G.
+    #[arg(long)]
+    memory: Option<String>,
+    /// A quota on the nodes a label selector picks, such as
+    /// "zone=office slots=4 cpus=8 memory=16G gpus=1". Repeat it for more;
+    /// the ones given replace the account's, and `none` removes them.
+    #[arg(long = "label-quota", value_name = "QUOTA")]
+    label_quotas: Vec<String>,
+}
+
+impl ResourceArgs {
+    fn given(&self) -> bool {
+        self.cpus.is_some() || self.memory.is_some() || !self.label_quotas.is_empty()
+    }
+
+    fn apply(&self, q: &mut pumasi_proto::sched::ResourceQuota) -> Result<()> {
+        if let Some(v) = limit(&self.cpus, |s| {
+            s.parse::<u32>().context("expected a number or `none`")
+        })? {
+            q.cpus = v;
+        }
+        if let Some(v) = limit(&self.memory, parse_size)? {
+            q.memory_bytes = v;
+        }
+        if !self.label_quotas.is_empty() {
+            q.labels = if self.label_quotas.iter().any(|l| l == "none") {
+                Vec::new()
+            } else {
+                self.label_quotas
+                    .iter()
+                    .map(|l| l.parse())
+                    .collect::<Result<_>>()?
+            };
+        }
+        q.validate()
     }
 }
 
@@ -463,12 +519,20 @@ pub async fn quota(
     storage: Option<String>,
     clear: bool,
     policy: PolicyArgs,
+    res: ResourceArgs,
 ) -> Result<i32> {
     let Some(account) = account else {
         let client = connect_admin(home, admin).await?;
         let list = quotas(&client).await;
+        let cpu = match &list {
+            Ok(_) => resources(&client).await,
+            Err(_) => None,
+        };
         client.close().await;
         print_quotas(&list?);
+        if let Some(cpu) = cpu {
+            print_resources(&cpu);
+        }
         return Ok(0);
     };
     validate_account(&account)?;
@@ -534,14 +598,58 @@ pub async fn quota(
                 })
                 .await?;
         }
-        anyhow::Ok((q, p))
+        let mut r = None;
+        if clear || res.given() {
+            let cur = resources(&client)
+                .await
+                .context("this control plane has no CPU and memory quotas (they came in 1.9)")?;
+            let mut rq = if clear {
+                Default::default()
+            } else {
+                cur.into_iter()
+                    .find(|v| v.account == account)
+                    .map(|v| v.quota)
+                    .unwrap_or_default()
+            };
+            res.apply(&mut rq)?;
+            client
+                .call(AdminOp::SetResources {
+                    account: account.clone(),
+                    quota: Box::new(rq.clone()),
+                })
+                .await?;
+            r = Some(rq);
+        }
+        anyhow::Ok((q, p, r))
     };
     let r = set.await;
     client.close().await;
-    let (q, p) = r?;
+    let (q, p, r) = r?;
     eprintln!("quota of {account}: {}", q.describe());
+    if let Some(r) = r {
+        eprintln!("CPU and memory quota of {account}: {}", r.describe());
+    }
     eprintln!("job policy of {account}: {}", p.describe());
     Ok(0)
+}
+
+/// CPU and memory quotas, for accounts that have one or hold something.
+fn print_resources(list: &[pumasi_proto::sched::ResourceView]) {
+    for v in list {
+        let lines = pumasi_proto::sched::usage_lines(v);
+        if lines.is_empty() {
+            if v.used.cpus > 0 {
+                println!(
+                    "{}: {} CPUs, {} of memory (no CPU or memory quota)",
+                    v.account,
+                    v.used.cpus,
+                    format_size(v.used.memory_bytes)
+                );
+            }
+            continue;
+        }
+        println!("{}: {}", v.account, lines.join(", "));
+    }
 }
 
 fn print_quotas(list: &[QuotaView]) {
@@ -739,6 +847,7 @@ pub async fn schedule(home: &Path, cmd: ScheduleCmd) -> Result<i32> {
             name,
             job_file,
             cron,
+            tz,
             account,
             overlap,
             admin,
@@ -754,6 +863,7 @@ pub async fn schedule(home: &Path, cmd: ScheduleCmd) -> Result<i32> {
             }
             job.account = account;
             let spec = ScheduleSpec {
+                tz,
                 name: name.clone(),
                 cron,
                 job,
@@ -761,7 +871,7 @@ pub async fn schedule(home: &Path, cmd: ScheduleCmd) -> Result<i32> {
             };
             spec.validate()?;
             let client = connect_admin(home, &admin).await?;
-            let list = match client.call(AdminOp::SetSchedule(Box::new(spec))).await {
+            let list = match client.call(AdminOp::set_schedule(spec)).await {
                 Ok(_) => schedules(&client).await,
                 Err(e) => Err(e),
             };
@@ -838,8 +948,7 @@ pub async fn apply(
     let mut spec = ClusterFile::load(file, INLINE_INPUT_BYTES)?;
     spec.dry_run = dry_run;
     spec.prune = prune;
-    let AdminResponse::Applied(changes) = call(home, admin, AdminOp::Apply(Box::new(spec))).await?
-    else {
+    let AdminResponse::Applied(changes) = call(home, admin, AdminOp::apply(spec)).await? else {
         bail!("unexpected response");
     };
     if changes.is_empty() {

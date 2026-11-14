@@ -36,7 +36,7 @@ use crate::{
     availability::AvailabilityConfig,
     bench::{self, BenchConfig, CpuKernel},
     docker::DockerExecutor,
-    executor::{LiveOutput, LocalImage, RunResult, TaskIo, WasmExecutor},
+    executor::{LiveOutput, LocalImage, RunResult, StopSignal, TaskIo, WasmExecutor},
     metrics::Sampler,
     microvm::{MicrovmConfig, MicrovmExecutor},
     store::{DEFAULT_CACHE_BYTES, InUse, NodeStore},
@@ -49,6 +49,8 @@ const KEY_FILE: &str = "secret.key";
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How often a running task's new output goes to the cluster.
 const LIVE_OUTPUT_EVERY: Duration = Duration::from_millis(200);
+/// How long checkpointing runs get to stop when the machine goes to sleep.
+const SLEEP_STOP_BUDGET: Duration = Duration::from_secs(10);
 /// How often the agent checks that Docker still answers (or answers
 /// again): Docker Desktop starts after sign-in and can be quit.
 const DOCKER_RECHECK: Duration = Duration::from_secs(30);
@@ -217,6 +219,8 @@ pub struct Agent {
     /// Confidential runs waiting for the cluster's answer about their
     /// keys (phase 16).
     key_waiters: crate::executor::KeyWaiters,
+    /// Checkpointing runs, and how each is asked to stop (1.9).
+    stops: Arc<Mutex<HashMap<TaskRef, Arc<StopSignal>>>>,
     /// What goes after each run's report in its frame (1.4): the writer
     /// takes it when it writes the report.
     report_tails: ReportTails,
@@ -543,6 +547,7 @@ impl Agent {
             webgpu_profile,
             sampler: Arc::new(Mutex::new(sampler)),
             key_waiters: Default::default(),
+            stops: Default::default(),
             report_tails: Default::default(),
             settings_hook: None,
             restarting: watch::channel(None).0,
@@ -1187,6 +1192,9 @@ impl Agent {
                     if !*asleep.borrow_and_update() {
                         continue;
                     }
+                    // Checkpointing runs stop first (briefly) and send
+                    // their checkpoints, so they go on elsewhere.
+                    self.stop_for_sleep(&running).await;
                     // Say goodbye: the control plane moves our runs at
                     // once and closes the connection, which is how we
                     // know it heard. The OS waits a moment for this.
@@ -1435,6 +1443,9 @@ impl Agent {
                     let store = self.node_store.clone();
                     tokio::spawn(async move { store.scrub().await });
                 }
+                Ok(Some(ToAgent::Stop { task, grace_ms })) => {
+                    self.stop_run(task, grace_ms, &running);
+                }
                 Ok(Some(ToAgent::Cancel(task))) => {
                     if let Some(flag) = running.lock().unwrap().get(&task) {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1512,6 +1523,12 @@ impl Agent {
     ) {
         let cancel = Arc::new(AtomicBool::new(false));
         running.lock().unwrap().insert(a.task, cancel.clone());
+        let stop = a.checkpoint.as_ref().map(|_| {
+            let s = Arc::new(StopSignal::new(a.executor == Executor::Wasm));
+            self.stops.lock().unwrap().insert(a.task, s.clone());
+            s
+        });
+        let stops = self.stops.clone();
         // The machine stays awake until this run is reported.
         let awake = self.power.task();
         let executor = self.executor.clone();
@@ -1602,12 +1619,26 @@ impl Agent {
                 &microvm,
                 &cancel,
                 key_link,
+                stop.clone(),
             )
             .await;
             let (mut io, _held, _dirs) = match prepared {
                 Ok(p) => p,
+                Err(_) if stop.as_ref().is_some_and(|s| s.requested().is_some()) => {
+                    // Asked to stop before it started: it goes on elsewhere
+                    // from the checkpoint it had.
+                    running.lock().unwrap().remove(&task);
+                    stops.lock().unwrap().remove(&task);
+                    let _ = out_tx.send(FromAgent::Stopped {
+                        task,
+                        checkpoint: None,
+                        error: None,
+                    });
+                    return;
+                }
                 Err(e) => {
                     running.lock().unwrap().remove(&task);
+                    stops.lock().unwrap().remove(&task);
                     let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
                         task,
                         format!("{e:#}"),
@@ -1696,6 +1727,32 @@ impl Agent {
                 )),
             };
             drop(streamer);
+            // A run told to stop sends its checkpoint instead of a result.
+            if let Some(c) = io.checkpoint.as_ref().filter(|c| c.stop.delivered()) {
+                let (checkpoint, error) = match result {
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                    Ok(_) => match pumasi_proto::job::dir_files(&c.dir) {
+                        Ok(f) if f.is_empty() => (None, None),
+                        Ok(_) => match node_store.push_output(&c.dir, &cluster_addr).await {
+                            Ok(s) => {
+                                info!(task = %task, files = s.files, bytes = s.size, "checkpoint saved to the file store");
+                                (Some(s), None)
+                            }
+                            Err(e) => (None, Some(format!("{e:#}"))),
+                        },
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
+                };
+                running.lock().unwrap().remove(&task);
+                stops.lock().unwrap().remove(&task);
+                let _ = out_tx.send(FromAgent::Stopped {
+                    task,
+                    checkpoint,
+                    error,
+                });
+                return;
+            }
+            stops.lock().unwrap().remove(&task);
             // Output files kept on disk go in the report when they fit, or
             // to the file store.
             timing.pull_ms = pull.ms();
@@ -1767,10 +1824,59 @@ impl Agent {
     }
 }
 
+impl Agent {
+    /// Asks a checkpointing run to stop within `grace_ms`; any other run
+    /// is cancelled.
+    fn stop_run(
+        &self,
+        task: TaskRef,
+        grace_ms: u64,
+        running: &Arc<Mutex<HashMap<TaskRef, Arc<AtomicBool>>>>,
+    ) {
+        let stop = self.stops.lock().unwrap().get(&task).cloned();
+        let cancel = running.lock().unwrap().get(&task).cloned();
+        match (stop, cancel) {
+            (Some(s), Some(c)) => {
+                info!(task = %task, grace_ms, "the cluster asked a run to stop and save its checkpoint");
+                s.request(grace_ms);
+                // A WASM run cannot catch a signal: it stops at once with
+                // what it saved so far.
+                if s.immediate() {
+                    s.deliver();
+                    c.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            (None, Some(c)) => c.store(true, std::sync::atomic::Ordering::Relaxed),
+            _ => {}
+        }
+    }
+
+    /// Before the machine sleeps: checkpointing runs are asked to stop,
+    /// with at most [`SLEEP_STOP_BUDGET`] for all of them.
+    async fn stop_for_sleep(&self, running: &Arc<Mutex<HashMap<TaskRef, Arc<AtomicBool>>>>) {
+        let tasks: Vec<TaskRef> = self.stops.lock().unwrap().keys().copied().collect();
+        if tasks.is_empty() {
+            return;
+        }
+        info!(
+            runs = tasks.len(),
+            "stopping checkpointing runs before sleep"
+        );
+        for t in &tasks {
+            self.stop_run(*t, SLEEP_STOP_BUDGET.as_millis() as u64, running);
+        }
+        let until = Instant::now() + SLEEP_STOP_BUDGET + Duration::from_secs(5);
+        while Instant::now() < until && !self.stops.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
 /// Fetches what a task mounts (and its private image) from the file store
 /// and places it for the executor. Returns the executor's view, the
 /// collections held in the cache while the task runs, and the scratch
 /// directories to remove afterwards.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_io(
     store: &NodeStore,
     a: &TaskAssignment,
@@ -1779,6 +1885,7 @@ async fn prepare_io(
     microvm: &Option<MicrovmExecutor>,
     cancel: &AtomicBool,
     keys: crate::executor::KeyLink,
+    stop: Option<Arc<StopSignal>>,
 ) -> Result<(TaskIo, Vec<InUse>, Vec<TempDir>)> {
     let mut held = Vec::new();
     let mut dirs = Vec::new();
@@ -1825,6 +1932,23 @@ async fn prepare_io(
         io.image = Some(LocalImage {
             digest: img.digest.clone(),
             dir: dir.path().to_path_buf(),
+        });
+        dirs.push(dir);
+    }
+    if let (Some(c), Some(stop)) = (&a.checkpoint, stop) {
+        // `/checkpoint`: the task's last checkpoint, or empty.
+        let dir = store.scratch("checkpoint")?;
+        if let Some(m) = &c.restore {
+            let used = store
+                .ensure(m.root, &m.label, &a.peers, cluster, cancel)
+                .await?;
+            let bytes = store.export_all(&used, dir.path()).await?;
+            info!(task = %a.task, bytes, "restored the task's checkpoint");
+            held.push(used);
+        }
+        io.checkpoint = Some(crate::executor::CheckpointIo {
+            dir: dir.path().to_path_buf(),
+            stop,
         });
         dirs.push(dir);
     }

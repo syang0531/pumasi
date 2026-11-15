@@ -369,7 +369,8 @@ CONNECT proxy.
 Why: every release since 1.3 says "upgrade the control plane first (stop
 it, replace the binary, start it)", by hand on its machine, and on three
 replicas that is three machines. Two CI flakes have been rerun since phase
-20 without a cause; one of them (the local control plane answering only
+20 without a cause, and a third (a restarted replica that cannot read its
+own log) showed up while this roadmap was written; one of them (the local control plane answering only
 after a minute on the Intel Mac runner) may be a real slowness on old
 Macs.
 
@@ -390,12 +391,21 @@ Macs.
   (two agents missing heartbeats 5 seconds apart): find whether the test
   or the agent is at fault; a real agent should not miss a heartbeat while
   idle.
+- **The HA restart failure** seen on this roadmap's own pull request
+  (#60, `ubuntu-latest`, `three_replicas_survive_losing_the_leader`):
+  the crashed leader would not start again because openraft asked for a
+  log entry at index 31975955732986110, far past anything written, and
+  every retry after that failed with the file store's database still
+  locked by the failed start. Find where the bogus index comes from (the
+  log, the committed or purged id, or the applied id in `state.redb`)
+  and release everything a failed `Cluster::start` opened.
 - The long checks also soak on Windows (today Linux and macOS only).
 
 Gate: CI upgrades a service-installed control plane from the previous
 release on Linux, macOS and Windows, rolls a three-replica cluster to a
 new binary without failing a running job, and rolls back a binary that
-exits at start; both flaky tests pass 50 runs in a row on their runners.
+exits at start; the three flaky tests pass 50 runs in a row on their
+runners.
 By hand: the owner upgrades the home cluster, control plane included, from
 the dashboard through the tunnel.
 

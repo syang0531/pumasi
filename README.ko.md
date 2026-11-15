@@ -903,7 +903,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 26 | GPU: 작업 제한 시간에 멈추는 WebGPU 셰이더(워커 프로세스), WebGPU용 GPU 챌린지, `shader-f16`과 subgroups, AMD 등 CUDA 없는 GPU의 WebGPU 벤치마크와 검증, ROCm Docker 작업, GPU 나눠 쓰기(`gpus = 0.5`), GPU로 쓰는 MIG 슬라이스 | 완료(1.10) |
 | 27 | Windows: Pumasi가 관리하는 WSL 배포판의 Docker(`pumasi docker setup`: Docker Desktop·로그인 불필요, NVIDIA GPU), ARM64 microVM(QEMU 11, WHPX 또는 TCG), HCS 백엔드는 채택하지 않음(실제 PC에서 잴 스크립트) | 완료(1.11) |
 | 28 | 운영: 공유·피어별 요청 제한, 서명된 체크포인트 뒤 감사 로그 정리, SCIM, HTTPS 프록시 뒤의 CLI, 팔로워 읽기 | 완료(1.12) |
-| 29 | 컨트롤 플레인까지 닿는 업그레이드(복제본을 하나씩, 롤백 포함)와 대시보드 서비스, Intel Mac·Windows CI 플레이크, Windows 소크 | 계획(1.13) |
+| 29 | 컨트롤 플레인까지 닿는 업그레이드(복제본을 하나씩, 롤백 포함)와 대시보드 서비스, CI에서 흔들리는 Intel Mac·Windows·HA 재시작 테스트, Windows 소크 | 계획(1.13) |
 | 30 | 옛 Intel Mac: 미리 띄운 microVM과 이미지 디스크 재사용, microVM 체크포인트, SMC·Apple Silicon 센서, GitHub Intel 러너 이후의 Intel Mac 빌드 | 계획(1.14) |
 | 31 | 모니터링·대시보드: `cluster.toml`의 노드별 기준·일시 중지, 브라우저에서 예약 작업·비밀, 밀어 주는 차트, 1 MiB 넘는 microVM 실시간 출력, Intel·AMD GPU 온도, 저장소까지의 네트워크, 한국어 이벤트 | 계획(1.15) |
 | 32 | GPU: NVIDIA GPU 나눠 쓰기의 메모리 제한(MPS), MIG 슬라이스 벤치마크, WebGPU 텍스처·렌더 패스, 태스크당 여러 어댑터, WASI preview 2 컴포넌트 | 계획(1.16) |

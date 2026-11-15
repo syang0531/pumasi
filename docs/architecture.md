@@ -3155,9 +3155,7 @@ remotely; install a current binary on them once.
   (account quotas cover slots, GPUs, CU per day, and since 1.9 CPUs and
   memory).
 
-- File store: replicas on owner nodes (the control plane is the only full
-  copy, so back up `<cluster dir>/blobs`), an S3-compatible gateway, and
-  per-node quotas for caches beyond the size cap. Private images are pulled
+- File store: per-node quotas for caches beyond the size cap. Private images are pulled
   from the registry again for each job (nodes that already loaded the
   digest skip the download from the store).
 - GPUs: Intel and Apple GPUs are used only through WebGPU; AMD GPUs are
@@ -3200,20 +3198,21 @@ remotely; install a current binary on them once.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 28 are done ([roadmap.md](roadmap.md));
-  phases 18 and 19 (the hub and buying CU) are on hold.
+- Roadmap: phases 20 to 28 are done and phases 29 to 36 are planned
+  ([roadmap.md](roadmap.md)); phases 18 and 19 (the hub and buying CU)
+  are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it
   (people still appear when they first sign in), filters support only
   `eq` and `and`, no SAML (1.2 added the
   control plane's service installer, `pumasi service install cluster`). 1.0 was tagged after a green
   long-checks run on the tagged commit. The internal security review is done (threat
   model, "Internal review for 1.0"); no third-party audit yet.
-- Windows: microVMs on ARM64, Hyper-V HCS as a faster backend, a Docker
-  path for machines nobody is signed into (dockerd inside a WSL distro).
-- Rollouts go to every node; there is no canary group or per-node
-  selection yet, and the control plane does not upgrade itself.
-- High availability: release binaries are not mirrored to followers, the
-  file store's data reaches them only every 30 seconds, a replica's
+- Windows: Hyper-V HCS as a faster backend waits for real-PC timings
+  (`scripts/windows/boot-times.ps1`), and binaries are unsigned until
+  SignPath Foundation approves the project.
+- The control plane does not upgrade itself (rollouts reach agents, with
+  canaries since 1.7).
+- High availability: a replica's
   address in the membership is the one it joined with (a replica that
   moves must be removed and invited again), and followers answer only
   the dashboard's status, events and current metrics (the API, the CLI,
@@ -3225,6 +3224,4 @@ remotely; install a current binary on them once.
   challenge keeps the billed speed honest, not the results. Disk and
   memory figures are not challenged yet, and no scheduling uses them.
 - MicroVM: a snapshot pool for faster boots.
-- Availability: running tasks are not stopped when a node pauses, and
-  idle detection under a Windows service is not possible yet.
 - WASI preview 2 components.

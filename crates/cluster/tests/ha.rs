@@ -667,7 +667,18 @@ async fn followers_answer_reads() {
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Until the revocation reached the follower's copy (a fixed 500 ms was
+    // not always enough on a loaded Windows runner).
+    let applied = a.ha_view().unwrap().applied;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while b.ha_view().unwrap().applied < applied {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the follower did not apply the revocation: {:#?}",
+            b.ha_view()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let gone = client_of(&b, viewer).await;
     let e = gone
         .call(AdminOp::FollowerRead(Box::new(AdminOp::Status)))

@@ -249,6 +249,17 @@ Intel Macs on Big Sur) on the node (Firecracker nodes use QEMU when it is
 installed; `pumasi vm status` says whether they can), and only go to nodes
 that can.
 
+**Warm microVMs (1.14).** Each image is unpacked onto a disk once per node
+and kept by digest, and the agent keeps a guest of each image it just ran
+booted and waiting: the next task of that image (with the same CPUs and
+memory) goes straight to it, skipping the VMM start, the kernel boot and
+the mounts. On an old Intel Mac that is most of a short task; a guest still
+runs one task and powers off, so nothing is shared between tasks. Two warm
+guests at most by default (`--warm-vms N`, `0` turns it off), within a
+quarter of the machine's memory, none on battery power, each let go after
+ten idle minutes. Tasks with a network card or GPUs boot their own VM as
+before.
+
 ### GPU jobs
 
 Ask for GPUs in the job file and the scheduler places each task on a node
@@ -1067,8 +1078,10 @@ a task that has to move (preemption, `pumasi drain`, a machine paused
 with `--on-pause requeue`, a machine going to sleep) gets SIGTERM and its
 grace period (30 s by default) instead of being killed. Whatever it wrote
 to `/checkpoint` (`$PUMASI_CHECKPOINT`) goes to the file store, and its
-next run, on any node, starts with it there. Docker and WASM tasks can
-checkpoint (a WASM task is stopped at once with what it saved so far);
+next run, on any node, starts with it there. Docker, microVM (since 1.14:
+the guest passes SIGTERM and the grace period on, and `/checkpoint`
+crosses the VM's disks) and WASM tasks can checkpoint (a WASM task is
+stopped at once with what it saved so far);
 [`examples/checkpoint`](examples/checkpoint) resumes a long computation.
 
 **Schedules and dependencies.** A job can run on a cron schedule, in the
@@ -1112,7 +1125,10 @@ Linux, Apple and AMD GPUs in Macs through IOAccelerator statistics, and any
 GPU on Windows through the GPU Engine performance counters. Windows nodes
 read temperatures through WMI (ACPI thermal zones, and
 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)'s
-sensors while it runs, which most desktop boards need). The control plane
+sensors while it runs, which most desktop boards need). Macs (1.14) read the
+CPU die and GPU temperatures and GPU power from the SMC on Intel Macs and
+from the HID sensors and IOReport on Apple Silicon; `pumasi sensors --raw`
+shows what a machine reads. The control plane
 keeps them for 7 days (`--metrics-retention`): 10-second steps for the last
 hour, 1-minute steps for a day, 10-minute steps after that, all of them
 kept across a restart.
@@ -1808,12 +1824,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md). 1.12.0 adds SCIM provisioning, audit log pruning behind a signed checkpoint, limits shared by every dashboard, the CLI behind an HTTPS proxy and followers answering the dashboard's reads: [notes](docs/releases/v1.12.0.md). 1.13.0 upgrades the control plane itself after the agents, replicas one at a time, with a rollback when the new binary does not come back healthy, and fixes the three checks that failed now and then in CI: [notes](docs/releases/v1.13.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md). 1.12.0 adds SCIM provisioning, audit log pruning behind a signed checkpoint, limits shared by every dashboard, the CLI behind an HTTPS proxy and followers answering the dashboard's reads: [notes](docs/releases/v1.12.0.md). 1.13.0 upgrades the control plane itself after the agents, replicas one at a time, with a rollback when the new binary does not come back healthy, and fixes the three checks that failed now and then in CI: [notes](docs/releases/v1.13.0.md). 1.14.0 keeps microVMs warm for the next task of an image, lets microVM tasks checkpoint, and reads Mac temperatures and GPU power from the SMC and IOReport: [notes](docs/releases/v1.14.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations and phase 29 (1.13) upgrades that reach the control plane. Phases 30 to 36 (1.14 to 1.20) are planned: old Intel Macs, monitoring and dashboard leftovers, GPUs, Windows, the file store and microVM networks, high availability and the remote API, and result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane and phase 30 (1.14) old Intel Macs. Phases 31 to 36 (1.15 to 1.20) are planned: monitoring and dashboard leftovers, GPUs, Windows, the file store and microVM networks, high availability and the remote API, and result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1845,7 +1861,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 27 | Windows: Docker in a Pumasi-managed WSL distro (`pumasi docker setup`: no Docker Desktop, no sign-in, NVIDIA GPUs), ARM64 microVMs (QEMU 11, WHPX or TCG); no HCS backend (a script measures it on real PCs) | done (1.11) |
 | 28 | Operations: shared and per-peer request limits, audit log pruning behind a signed checkpoint, SCIM, the CLI behind an HTTPS proxy, follower reads | done (1.12) |
 | 29 | Upgrades that reach the control plane (replicas one at a time, with rollback) and the dashboard service; the Intel Mac, Windows and HA restart failures in CI; soaks on Windows | done (1.13) |
-| 30 | Old Intel Macs: warm microVMs and reused image disks, microVM checkpoints, SMC and Apple Silicon sensors, building for Intel Macs after GitHub's Intel runner | planned (1.14) |
+| 30 | Old Intel Macs: warm microVMs and reused image disks, microVM checkpoints, SMC and Apple Silicon sensors, building for Intel Macs after GitHub's Intel runner | done (1.14) |
 | 31 | Monitoring and the dashboard: per-node thresholds and silences in `cluster.toml`, schedules and secrets in the browser, pushed charts, live microVM output past 1 MiB, Intel and AMD GPU temperatures, the network to the store, Korean events | planned (1.15) |
 | 32 | GPUs: memory limits for parts of NVIDIA GPUs (MPS), benchmarked MIG slices, WebGPU textures and render passes, several adapters per task, WASI preview 2 components | planned (1.16) |
 | 33 | Windows: an HCS backend if real PCs show it is clearly faster, signed binaries (SignPath), a one-step `docker remove` | planned (1.17) |
@@ -1871,10 +1887,15 @@ is slow; Windows on ARM falls back to emulation where QEMU's WHPX does not work)
 Virtualization.framework guests are checked on real machines only: CI
 runners have WHPX only nested, where it breaks QEMU's disks and the agent
 falls back to emulation, and hosted Mac runners cannot virtualize at all.
-macOS 10.15 and 11 themselves have no CI runners either.
+macOS 10.15 and 11 themselves have no CI runners either. The Intel Mac
+binary is built on Apple Silicon and its tests also run there under
+Rosetta 2 (1.14), which goes on after GitHub retires its last Intel runner
+(announced until autumn 2027); from then on the SMC readings, Intel GPUs
+and Virtualization.framework on Intel are checked on real Intel Macs only.
 Live microVM output stops after the first MiB of each stream (the rest
-comes when the task ends), Intel and Apple GPUs report use and memory but
-no temperature or power, and Windows desktops without
+comes when the task ends), Intel GPUs outside Macs report use and memory
+but no temperature or power, a Mac's CPU package power is read but not yet
+shown, and Windows desktops without
 LibreHardwareMonitor often have no temperature to report (few boards fill
 in the ACPI thermal zones). The dashboard edits most settings
 (since 1.7), but per-node alert thresholds and secrets are still CLI-only.

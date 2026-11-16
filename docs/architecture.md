@@ -3142,6 +3142,119 @@ answer `Version` or grant a `Turn`, so the 1.13 leader waits for it
 1.12 leader: replicas go to 1.13 by hand once. A single 1.12 control
 plane installs 1.13 and restarts into it as before, without a trial.
 
+## Phase 30: old Intel Macs (1.14)
+
+Release 1.14 is for the 2014 iMac that takes image jobs only as microVMs:
+the second task of an image no longer pays for a boot, a microVM task can
+checkpoint like a Docker task, and Macs report their CPU and GPU
+temperatures and GPU power. The code is `agent/src/microvm/pool.rs` (the
+warm pool), the pool and stop paths in `agent/src/microvm/mod.rs`, the
+guest's `pool` mode in `guest/src/init.rs`, the shared disk formats in
+`guest/src/lib.rs` and `proto/src/vmdisk.rs`, and `agent/src/sensors.rs`.
+
+### The control disk
+
+The guest only talks to the host through virtio disks, and the backends
+(Firecracker, QEMU, Virtualization.framework) share no other channel that
+works everywhere. A warm guest therefore gets a fourth disk, the control
+disk, which starts with `PUMASI-CONTROL01` and the idle limit, and has a
+stop block at 4 KiB, a task header at 8 KiB (`PUMASI-TASK-0001`, the
+length and the SHA-256 of the input) and the input tar from 1 MiB. The
+guest reads it with `O_DIRECT`, so it sees what the host wrote rather
+than its own page cache. The host writes the input first, syncs, and
+writes the header last, so a guest never acts on half a task, and the
+guest checks the hash before it starts.
+
+### Warm guests
+
+A guest booted with `pumasi.mode=pool` mounts its image and scratch disk,
+prints `pumasi-guest: ready` on its console and polls the task header
+every 25 ms. When a task arrives it prints `pumasi-guest: task received`
+and continues exactly like a cold guest: unpack the input, run, write the
+output disk, power off. A guest runs one task and is never reused, so
+nothing is shared between tasks; one that gets no task within its idle
+limit powers itself off.
+
+`WarmPool` keeps them, keyed by image digest, vCPUs and memory: at most
+one spare per key, `--warm-vms` (2 by default, `0` turns it off) in all,
+within a quarter of the machine's memory, none while the machine runs on
+battery (`SystemProbe::on_battery`, checked by a tidier every 20 seconds
+along with the idle limit of 10 minutes). Booting one for another image
+evicts guests of other images that have waited more than 30 seconds.
+After a microVM task starts, the agent boots a spare for the same key in
+the background, so the next task of the image (with the same size) takes
+it. Its disks are sparse files sized for the largest task the pool takes
+(16 GiB of input, the store's output limit), so any eligible task fits;
+tasks with a network card, GPUs or larger inputs boot cold as before.
+
+The handover checks each step: a guest that has not printed `ready`
+within 90 seconds is dropped, and one that does not print `task received`
+within 15 seconds of its task is killed, the task boots cold, and the pool
+turns itself off on that node with a warning. That is the fallback for a
+backend whose writes to an open disk the guest does not see (QEMU and
+Firecracker are checked in CI; Virtualization.framework and WHPX are
+not). Each warm guest's VMM pid is written next to its disks, and an
+agent that starts again kills the VMMs a previous run left
+(`pool::kill_stale`, matching the process's command line to the
+directory).
+
+### MicroVM checkpoints
+
+A checkpointing task's previous checkpoint goes into the input tar under
+`checkpoint/`, and the guest unpacks it into `/checkpoint` (writable by
+the task's user). When the run has to move, the agent writes a stop
+request to the control disk (every checkpointing microVM gets one, warm
+or not): `TERM` sends SIGTERM to every process in the guest and the
+agent waits the job's grace period; `KILL` follows if the task is still
+running, and the VM is killed 60 seconds after that. The guest's output
+tar carries `/checkpoint` back as `checkpoint/` entries (at most 100,000
+files and the job's checkpoint limit), and the agent unpacks them into
+the same directory a Docker task's checkpoint uses, so the control plane
+stores and hands it on exactly as in phase 25. A stop the task ignores,
+or one that kills the VM before it wrote its output, fails the run like
+a Docker task that does not save in time.
+
+The control plane sends microVM runs that checkpoint only to agents of
+protocol minor 7 (1.14) or later; older agents would run them without
+passing the stop on.
+
+### Mac sensors
+
+sysinfo already reads some SMC and HID temperatures as components; 1.14
+adds what it leaves out. On Intel Macs the agent opens `AppleSMC` through
+IOKit and reads the CPU die and proximity keys (`TC0D`, `TC0P`, ...),
+the integrated GPU's (`TCGC`) and a discrete GPU's (`TG0D`, `TG0P`, ...)
+temperatures, and the CPU package, integrated GPU and discrete GPU powers
+(`PCPC`, `PCPG`, `PG0R`, ...), decoding `sp78`, `fpe2`, `flt ` and the
+other SMC types. On Apple Silicon it loads `libIOReport.dylib` at run
+time and samples the Energy Model group over the metrics interval for CPU
+and GPU energy, and takes the CPU and GPU temperatures from the HID
+sensors sysinfo lists, by name. The hottest
+reading joins the node's temperature (so the temperature alert fires for
+Macs), and GPU temperature and power go to the matching GPU: the
+integrated Intel GPU gets the integrated readings, a discrete GPU or an
+Apple GPU the other. `pumasi sensors --raw` prints the readings and the
+raw keys in the same format as the recorded fixtures, which the parsing
+tests use (a 2014 iMac and a 2017 MacBook Pro over SMC, an M1 over
+IOReport). CPU package power is read but not sent yet: `NodeMetrics` has
+no field for it.
+
+### Intel builds without an Intel runner
+
+Release builds of `x86_64-apple-darwin` already ran on Apple Silicon.
+CI's `rosetta` job does the same for every pull request, checks that the
+binary's minimum OS is 10.15 and that it does not link
+Virtualization.framework, and runs it and the Intel test suites under
+Rosetta 2. When GitHub retires `macos-15-intel`, the SMC readings, Intel
+GPUs and Virtualization.framework on Intel are left to real Intel Macs.
+
+### Compatibility
+
+`PROTOCOL_MINOR` is 7. `RunSpec.checkpoint_limit` is skipped when zero,
+so a 1.13 guest's spec and a 1.14 agent's are the same for tasks that do
+not checkpoint, and the control disk only appears in pool mode or for a
+checkpointing task. Job files and stored state do not change.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -3300,14 +3413,15 @@ remotely; install a current binary on them once.
   per-job allow lists or bandwidth caps, egress is not billed, and
   Firecracker without QEMU has no network (its cards need TAP devices;
   install QEMU next to it).
-- Cluster management: microVM tasks cannot checkpoint (and WASM tasks
-  are stopped without warning, keeping what they saved so far); a
+- Cluster management: WASM tasks are stopped without warning when they
+  move, keeping what they saved so far; a
   checkpoint is saved when a run moves, not periodically, so a machine
   that dies without notice loses the progress since the last move;
   affinity sees only running tasks of the same account; CPU quotas count
   whole CPUs a run asks for, not what it uses.
 - Monitoring: live microVM output covers the first MiB of each stream;
-  Intel and Apple GPUs report use and memory but no temperature or power;
+  Intel GPUs outside Macs report use and memory but no temperature or
+  power; a Mac's CPU package power is read but not sent;
   DRM fdinfo sees only processes the agent may read; Windows desktops
   without LibreHardwareMonitor often have no temperature (few boards fill
   in ACPI thermal zones); per-node thresholds and silences are not in
@@ -3330,7 +3444,7 @@ remotely; install a current binary on them once.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 28 are done and phases 29 to 36 are planned
+- Roadmap: phases 20 to 30 are done and phases 31 to 36 are planned
   ([roadmap.md](roadmap.md)); phases 18 and 19 (the hub and buying CU)
   are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it
@@ -3356,5 +3470,8 @@ remotely; install a current binary on them once.
   and microVM work, which checks cannot cover). The CPU benchmark
   challenge keeps the billed speed honest, not the results. Disk and
   memory figures are not challenged yet, and no scheduling uses them.
-- MicroVM: a snapshot pool for faster boots.
+- MicroVM: warm guests (1.14) speed up repeated images only; tasks with
+  a network or GPUs and the first task of an image still boot cold (a
+  snapshot pool would cover those), and warm guests under
+  Virtualization.framework and WHPX are checked on real machines only.
 - WASI preview 2 components.

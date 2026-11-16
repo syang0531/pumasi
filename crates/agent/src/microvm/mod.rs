@@ -28,6 +28,7 @@
 
 pub mod ext4;
 pub mod net;
+pub mod pool;
 pub mod setup;
 pub mod tee;
 pub mod vmm;
@@ -45,7 +46,8 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use pumasi_guest::{
-    BASE_LABEL, GuestOutcome, OUTPUT_DISK_BYTES, OUTPUT_MARK, RunSpec, SCRATCH_LABEL,
+    BASE_LABEL, ControlLayout, GuestOutcome, OUTPUT_DISK_BYTES, OUTPUT_MARK, RunSpec,
+    SCRATCH_LABEL, StopRequest,
 };
 use pumasi_proto::{
     economy::vcpus,
@@ -53,7 +55,7 @@ use pumasi_proto::{
     msg::{Outcome, TaskRef},
     store::{IMAGE_MANIFEST, ImageManifest, MAX_STORE_OUTPUT_BYTES, image_layer_name},
     vmdisk::{
-        GuestOutput, note_dropped, outcome_of, parse_output, run_spec, write_input_tar,
+        GuestOutput, note_dropped, outcome_of, parse_output_with, run_spec, write_input_tar_with,
         write_layers_tar,
     },
 };
@@ -64,9 +66,10 @@ pub use pumasi_proto::registry::{ContainerConfig, Registry};
 pub use vmm::{Backend, Disk, TeeVm, VmSpec, Vmm};
 
 use crate::{
-    executor::{ConfidentialIo, LiveOutput, LocalImage, RunResult, TaskIo},
+    executor::{ConfidentialIo, LiveOutput, LocalImage, RunResult, StopSignal, TaskIo},
     tempdir::TempDir,
 };
+use pool::{PoolKey, WarmConfig, WarmPool, WarmVm};
 
 /// Guest kernel file name in the VM directory. macOS needs another kernel
 /// (virtio-pci for Virtualization.framework, a bzImage on Intel), so it has
@@ -104,7 +107,7 @@ const PROBE_BYTES: usize = 4 << 20;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Where the executor finds its kernel and init, and keeps its cache.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MicrovmConfig {
     /// Holds `vmlinux`, optionally `pumasi-guest` and `firecracker`, and the
     /// image cache (`images/`) and per-task scratch space (`run/`).
@@ -114,6 +117,8 @@ pub struct MicrovmConfig {
     pub backend: Option<Backend>,
     /// Confidential VMs (phase 16).
     pub confidential: tee::TeeOptions,
+    /// Warm microVMs (1.14).
+    pub warm: WarmConfig,
 }
 
 // `EMBEDDED_GUEST`: the guest init built into this binary, if any.
@@ -347,6 +352,53 @@ pub struct MicrovmExecutor {
     /// The TEEs confidential tasks can run in here, and QEMU for them.
     tee: tee::TeeAssets,
     tee_vmm: Option<Vmm>,
+    /// Guests booted ahead of time (1.14).
+    pool: Arc<WarmPool>,
+}
+
+/// A VMM process that was started, and what keeps it from outliving the
+/// agent on Windows (a job object; `kill_on_drop` covers the rest).
+pub struct RunningVm {
+    pub child: tokio::process::Child,
+    _job: Option<crate::platform::ProcessJob>,
+}
+
+/// How a checkpointing run is asked to stop: through its control disk.
+struct StopCtl<'a> {
+    signal: &'a StopSignal,
+    control: &'a Path,
+}
+
+/// How long a guest told to stop has after its grace period to write its
+/// result and checkpoint before the host stops the VM.
+const AFTER_GRACE: Duration = Duration::from_secs(60);
+
+/// What a warm guest's disks are sized for: everything a task can bring
+/// (the file store's output and checkpoint caps, and this much input). The
+/// files are sparse.
+const POOL_INPUT_BYTES: u64 = 16 << 30;
+
+/// A VM that runs a task, warm or just booted.
+struct Launched {
+    vmm: Vmm,
+    running: RunningVm,
+    /// The task's directory with its disks and console.
+    dir: TempDir,
+    output: PathBuf,
+    control: Option<PathBuf>,
+    /// When the task's run began.
+    start: Instant,
+    warm: bool,
+    /// The network gateway, closed with the VM.
+    gateway: Option<net::Gateway>,
+}
+
+/// Why a warm guest did not take a task.
+enum HandOver {
+    /// This guest: the task boots its own VM.
+    Failed(anyhow::Error),
+    /// Warm guests do not work on this machine at all.
+    Broken(String),
 }
 
 /// How a VM run ended, as seen from the host.
@@ -529,6 +581,7 @@ impl MicrovmExecutor {
         let images = config.dir.join("images");
         std::fs::create_dir_all(images.join("refs"))?;
         let run_dir = config.dir.join("run").join(label);
+        pool::kill_stale(&run_dir);
         if run_dir.exists() {
             let _ = std::fs::remove_dir_all(&run_dir);
         }
@@ -575,6 +628,7 @@ impl MicrovmExecutor {
             pull_lock: Default::default(),
             tee,
             tee_vmm,
+            pool: WarmPool::new(config.warm.clone(), pool::machine_mem_mib()),
         };
         // WHPX is not equally good everywhere: nested under Hyper-V (cloud
         // Windows machines, CI runners) QEMU's virtio disks can break under
@@ -610,8 +664,12 @@ impl MicrovmExecutor {
         if exec.vmm.backend == Backend::Qemu {
             exec.net_vmm = Some(exec.vmm.clone());
         }
+        if exec.pool.config.max > 0 {
+            pool::spawn_tidier(&exec.pool);
+        }
         let vmm = &exec.vmm;
         info!(
+            warm = exec.pool.config.max,
             backend = %vmm.backend,
             vmm = %vmm.bin.display(),
             accelerated = vmm.accelerated,
@@ -649,6 +707,7 @@ impl MicrovmExecutor {
             b"",
             &[],
             std::slice::from_ref(&file),
+            &[],
             &[],
         )?;
         make_output_disk(&output, OUTPUT_DISK_BYTES)?;
@@ -848,24 +907,8 @@ impl MicrovmExecutor {
             io.pull.set(pull_start);
         }
         let image = image?;
-        // The timeout covers the run itself, not the image pull.
-        let run_start = Instant::now();
-        let scratch = TempDir::new_in(&self.run_dir, &format!("{}-{}", task.job, task.index))?;
-        let dir = scratch.path().to_path_buf();
         let mut run_spec = run_spec(&image.config, spec, input);
         run_spec.live = io.live.is_some();
-        let gateway = match net_vmm {
-            Some(_) => {
-                run_spec.network = Some(pumasi_guest::GuestNet {
-                    address: net::GUEST.octets(),
-                    prefix: net::PREFIX,
-                    gateway: net::GATEWAY.octets(),
-                    dns: net::GATEWAY.octets(),
-                });
-                Some(net::Gateway::start().await?)
-            }
-            None => None,
-        };
         if io.keeps_output() {
             run_spec.output_limit = MAX_STORE_OUTPUT_BYTES;
             run_spec.output_files = 1_000_000;
@@ -874,88 +917,113 @@ impl MicrovmExecutor {
             Some(d) => pumasi_proto::job::dir_files(d)?,
             None => Vec::new(),
         };
-        // The scratch disk holds the input files and what the task writes
-        // (its output too); the file is sparse.
-        let scratch_bytes = SCRATCH_BYTES
-            + staged.iter().map(|(_, _, n)| n).sum::<u64>()
-            + if io.keeps_output() {
-                run_spec.files_limit()
-            } else {
-                0
-            };
-        let disks = {
-            let dir = dir.clone();
-            let input = input.clone();
-            let shared = shared_files.to_vec();
-            let run_spec = run_spec.clone();
-            tokio::task::spawn_blocking(move || -> Result<[PathBuf; 3]> {
-                let scratch = dir.join("scratch.ext4");
-                ext4::mkfs(&scratch, scratch_bytes, SCRATCH_LABEL)?;
-                let input_disk = dir.join("input.tar");
-                write_input_disk(
-                    &input_disk,
+        // A checkpointing run gets its last checkpoint at /checkpoint, and a
+        // control disk to be told to stop through (1.14).
+        let checkpoint = match &io.checkpoint {
+            Some(c) => {
+                run_spec.checkpoint_limit = MAX_STORE_OUTPUT_BYTES;
+                pumasi_proto::job::dir_files(&c.dir)?
+            }
+            None => Vec::new(),
+        };
+        let vcpus = vcpus(limits.cpu_millis).min(MAX_VCPUS);
+        let mem_mib = (limits.memory_bytes.div_ceil(1 << 20) + VM_OVERHEAD_MIB).max(MIN_VM_MIB);
+        let key = PoolKey {
+            digest: image.digest.clone(),
+            vcpus,
+            mem_mib,
+        };
+        // Warm guests have no network card and no GPU, and their disks
+        // hold a bounded input.
+        let input_bytes = input_estimate(&run_spec, input, shared_files, &staged, &checkpoint);
+        let warm_fits = gpu.is_none() && net_vmm.is_none() && input_bytes <= POOL_INPUT_BYTES;
+        let warm = if warm_fits && self.pool.enabled() {
+            let w = self.pool.take(&key);
+            // The next task of this image finds a guest booted.
+            self.refill(key.clone(), image.rootfs.clone());
+            w
+        } else {
+            None
+        };
+        let mut launched = None;
+        if let Some(w) = warm {
+            let digest = w.key.digest.clone();
+            match self
+                .hand_over(
+                    w,
                     &run_spec,
-                    &input.stdin,
-                    &shared,
-                    &input.files,
+                    input,
+                    shared_files,
                     &staged,
-                )?;
-                let output = dir.join("output.img");
-                make_output_disk(&output, run_spec.output_disk_bytes())?;
-                Ok([scratch, input_disk, output])
-            })
-            .await??
-        };
-        let [scratch_disk, input_disk, output_disk] = disks;
-        let vm = VmSpec {
-            kernel: self.kernel.clone(),
-            initrd: self.initrd.clone(),
-            mode: "run",
-            disks: vec![
-                Disk {
-                    path: image.rootfs.clone(),
-                    read_only: true,
-                },
-                Disk {
-                    path: scratch_disk,
-                    read_only: false,
-                },
-                Disk {
-                    path: input_disk,
-                    read_only: true,
-                },
-                Disk {
-                    path: output_disk.clone(),
-                    read_only: false,
-                },
-            ],
-            vcpus: vcpus(limits.cpu_millis).min(MAX_VCPUS),
-            mem_mib: (limits.memory_bytes.div_ceil(1 << 20) + VM_OVERHEAD_MIB).max(MIN_VM_MIB),
-            net: gateway.as_ref().map(|g| g.addr),
-            pci: vec![],
-            tee: None,
-        };
-        let mut vm = vm;
-        if let Some((assets, pci)) = &gpu {
-            vm.kernel = assets.kernel.clone();
-            vm.disks.push(Disk {
-                path: assets.drivers.clone(),
-                read_only: true,
-            });
-            vm.pci = pci.clone();
-            vm.mem_mib += GPU_VM_OVERHEAD_MIB;
+                    &checkpoint,
+                    cancel,
+                )
+                .await
+            {
+                Ok(l) => {
+                    debug!(task = %task, %digest, "the task went to a warm microVM");
+                    launched = Some(l);
+                }
+                Err(HandOver::Failed(e)) => {
+                    warn!(task = %task, "a warm microVM did not take the task, booting one: {e:#}")
+                }
+                Err(HandOver::Broken(why)) => self.pool.break_with(why),
+            }
         }
+        let launched = match launched {
+            Some(l) => l,
+            None => {
+                self.launch_cold(
+                    task,
+                    &image,
+                    &run_spec,
+                    input,
+                    shared_files,
+                    &staged,
+                    &checkpoint,
+                    (vcpus, mem_mib),
+                    io,
+                    gpu.as_ref().map(|(a, p)| (*a, p.clone())),
+                    net_vmm,
+                )
+                .await?
+            }
+        };
+        let Launched {
+            vmm,
+            running,
+            dir: scratch,
+            output: output_disk,
+            control,
+            start: run_start,
+            warm,
+            gateway,
+        } = launched;
+        let dir = scratch.path().to_path_buf();
         let deadline = run_start + Duration::from_millis(limits.timeout_ms);
-        debug!(task = %task, image = %spec.image, network = spec.network, "booting microvm");
-        let vmm = match &gpu {
-            Some((assets, _)) => &assets.vmm,
-            None => net_vmm.unwrap_or(&self.vmm),
+        debug!(task = %task, image = %spec.image, network = spec.network, warm, "microvm running");
+        let stop = match (&io.checkpoint, &control) {
+            (Some(c), Some(control)) => Some(StopCtl {
+                signal: &c.stop,
+                control,
+            }),
+            _ => None,
         };
         let end = self
-            .boot_on(vmm, &vm, &dir, Some(deadline), cancel, io.live.as_ref())
-            .await?;
+            .wait_vm(
+                &vmm,
+                running,
+                &dir,
+                Some(deadline),
+                cancel,
+                io.live.as_ref(),
+                stop,
+            )
+            .await;
         drop(gateway);
-        // Billed time starts at boot: pulling an image is not the job's run.
+        let end = end?;
+        // Billed time starts at boot (or when a warm guest got the task):
+        // pulling an image is not the job's run.
         let wall_ms = run_start.elapsed().as_millis() as u64;
         let outcome_for = |o: Outcome| RunResult {
             outcome: o,
@@ -970,12 +1038,22 @@ impl MicrovmExecutor {
         if !matches!(end, VmEnd::Exited(_)) {
             debug!(task = %task, console = %console_tail(&dir), "microvm stopped by the host");
         }
+        let stopped = io
+            .checkpoint
+            .as_ref()
+            .filter(|c| c.stop.delivered())
+            .map(|c| c.dir.clone());
         let status = match end {
             VmEnd::Timeout => return Ok(outcome_for(Outcome::Timeout)),
+            VmEnd::Cancelled if stopped.is_some() => bail!(
+                "the microVM did not write its checkpoint within {} s of its grace period; console:\n{}",
+                AFTER_GRACE.as_secs(),
+                console_tail(&dir)
+            ),
             VmEnd::Cancelled => return Ok(outcome_for(Outcome::Cancelled)),
             VmEnd::Exited(status) => status,
         };
-        let kept = if io.keeps_output() {
+        let kept = if io.keeps_output() && stopped.is_none() {
             Some(Arc::new(io.out_dir("out")?))
         } else {
             None
@@ -985,13 +1063,16 @@ impl MicrovmExecutor {
                 output_disk.clone(),
                 kept.as_ref().map(|d| d.path().to_path_buf()),
             );
-            tokio::task::spawn_blocking(move || read_output_disk(&output_disk, kept_dir.as_deref()))
-                .await??
+            let stopped = stopped.clone();
+            tokio::task::spawn_blocking(move || {
+                read_output_disk_with(&output_disk, kept_dir.as_deref(), stopped.as_deref())
+            })
+            .await??
         };
         let Some(out) = out else {
             bail!(
                 "the microVM stopped without a result ({} {status}); console:\n{}",
-                self.vmm.backend,
+                vmm.backend,
                 console_tail(&dir)
             );
         };
@@ -1008,6 +1089,331 @@ impl MicrovmExecutor {
             peak_memory_bytes: None,
             out_dir: kept,
         })
+    }
+
+    /// Boots a VM for one task: its writable layer, input, output and (for
+    /// a checkpointing run) control disks, a network gateway when the job
+    /// asks for one, its GPUs.
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_cold(
+        &self,
+        task: TaskRef,
+        image: &ImageEntry,
+        run_spec: &RunSpec,
+        input: &TaskInput,
+        shared_files: &[FileEntry],
+        staged: &[(String, PathBuf, u64)],
+        checkpoint: &[(String, PathBuf, u64)],
+        (vcpus, mem_mib): (u32, u64),
+        io: &TaskIo,
+        gpu: Option<(&GpuAssets, Vec<String>)>,
+        net_vmm: Option<&Vmm>,
+    ) -> Result<Launched> {
+        // The timeout covers the run itself, not the image pull.
+        let run_start = Instant::now();
+        let scratch = TempDir::new_in(&self.run_dir, &format!("{}-{}", task.job, task.index))?;
+        let dir = scratch.path().to_path_buf();
+        let mut run_spec = run_spec.clone();
+        let gateway = match net_vmm {
+            Some(_) => {
+                run_spec.network = Some(pumasi_guest::GuestNet {
+                    address: net::GUEST.octets(),
+                    prefix: net::PREFIX,
+                    gateway: net::GATEWAY.octets(),
+                    dns: net::GATEWAY.octets(),
+                });
+                Some(net::Gateway::start().await?)
+            }
+            None => None,
+        };
+        // The scratch disk holds the input files, the checkpoint and what
+        // the task writes (its output too); the file is sparse.
+        let scratch_bytes = SCRATCH_BYTES
+            + staged.iter().map(|(_, _, n)| n).sum::<u64>()
+            + checkpoint.iter().map(|(_, _, n)| n).sum::<u64>()
+            + if io.keeps_output() {
+                run_spec.files_limit()
+            } else {
+                0
+            };
+        let with_control = io.checkpoint.is_some();
+        let disks = {
+            let dir = dir.clone();
+            let input = input.clone();
+            let shared = shared_files.to_vec();
+            let run_spec = run_spec.clone();
+            let staged = staged.to_vec();
+            let checkpoint = checkpoint.to_vec();
+            tokio::task::spawn_blocking(move || -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+                let scratch = dir.join("scratch.ext4");
+                ext4::mkfs(&scratch, scratch_bytes, SCRATCH_LABEL)?;
+                let input_disk = dir.join("input.tar");
+                write_input_disk(
+                    &input_disk,
+                    &run_spec,
+                    &input.stdin,
+                    &shared,
+                    &input.files,
+                    &staged,
+                    &checkpoint,
+                )?;
+                let output = dir.join("output.img");
+                make_output_disk(&output, run_spec.output_disk_bytes())?;
+                let control = if with_control {
+                    let c = dir.join("control.img");
+                    make_control_disk(&c, 0, 0)?;
+                    Some(c)
+                } else {
+                    None
+                };
+                Ok((vec![scratch, input_disk, output], control))
+            })
+            .await??
+        };
+        let (disks, control) = disks;
+        let output_disk = disks[2].clone();
+        let mut vm = VmSpec {
+            kernel: self.kernel.clone(),
+            initrd: self.initrd.clone(),
+            mode: "run",
+            disks: vec![
+                Disk {
+                    path: image.rootfs.clone(),
+                    read_only: true,
+                },
+                Disk {
+                    path: disks[0].clone(),
+                    read_only: false,
+                },
+                Disk {
+                    path: disks[1].clone(),
+                    read_only: true,
+                },
+                Disk {
+                    path: output_disk.clone(),
+                    read_only: false,
+                },
+            ],
+            vcpus,
+            mem_mib,
+            net: gateway.as_ref().map(|g| g.addr),
+            pci: vec![],
+            tee: None,
+        };
+        if let Some(c) = &control {
+            vm.disks.push(Disk {
+                path: c.clone(),
+                read_only: false,
+            });
+        }
+        if let Some((assets, pci)) = &gpu {
+            vm.kernel = assets.kernel.clone();
+            vm.disks.push(Disk {
+                path: assets.drivers.clone(),
+                read_only: true,
+            });
+            vm.pci = pci.clone();
+            vm.mem_mib += GPU_VM_OVERHEAD_MIB;
+        }
+        let vmm = match &gpu {
+            Some((assets, _)) => assets.vmm.clone(),
+            None => net_vmm.unwrap_or(&self.vmm).clone(),
+        };
+        debug!(task = %task, "booting microvm");
+        let running = spawn_vm(&vmm, &vm, &dir)?;
+        Ok(Launched {
+            vmm,
+            running,
+            dir: scratch,
+            output: output_disk,
+            control,
+            start: run_start,
+            warm: false,
+            gateway,
+        })
+    }
+
+    /// Boots a warm guest for `key` in the background, when the pool has
+    /// room for it.
+    fn refill(&self, key: PoolKey, rootfs: PathBuf) {
+        if !self.pool.may_boot(&key) {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            match me.boot_warm(&key, &rootfs).await {
+                Ok(vm) => {
+                    debug!(digest = %key.digest, vcpus = key.vcpus, mem_mib = key.mem_mib, "warm microVM booting");
+                    me.pool.booted(vm);
+                }
+                Err(e) => {
+                    warn!(digest = %key.digest, "could not boot a warm microVM: {e:#}");
+                    me.pool.boot_failed(&key);
+                }
+            }
+        });
+    }
+
+    /// Starts a guest in pool mode: the image, an empty writable layer, an
+    /// output disk and the control disk the task will come on, all sized
+    /// for the largest task.
+    async fn boot_warm(&self, key: &PoolKey, rootfs: &Path) -> Result<WarmVm> {
+        let dir = TempDir::new_in(&self.run_dir, "warm")?;
+        let path = dir.path().to_path_buf();
+        let idle = self.pool.config.idle.as_secs() + 60;
+        let (scratch, output, control) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let scratch = path.join("scratch.ext4");
+            ext4::mkfs(
+                &scratch,
+                SCRATCH_BYTES + MAX_STORE_OUTPUT_BYTES + POOL_INPUT_BYTES,
+                SCRATCH_LABEL,
+            )?;
+            let output = path.join("output.img");
+            make_output_disk(&output, pool_output_bytes())?;
+            let control = path.join("control.img");
+            make_control_disk(&control, idle, POOL_INPUT_BYTES)?;
+            Ok((scratch, output, control))
+        })
+        .await??;
+        let vm = VmSpec {
+            kernel: self.kernel.clone(),
+            initrd: self.initrd.clone(),
+            mode: "pool",
+            disks: vec![
+                Disk {
+                    path: rootfs.to_path_buf(),
+                    read_only: true,
+                },
+                Disk {
+                    path: scratch,
+                    read_only: false,
+                },
+                Disk {
+                    path: control.clone(),
+                    read_only: false,
+                },
+                Disk {
+                    path: output.clone(),
+                    read_only: false,
+                },
+            ],
+            vcpus: key.vcpus,
+            mem_mib: key.mem_mib,
+            net: None,
+            pci: vec![],
+            tee: None,
+        };
+        let running = spawn_vm(&self.vmm, &vm, dir.path())?;
+        if let Some(pid) = running.child.id() {
+            let _ = std::fs::write(dir.path().join(pool::PID_FILE), pid.to_string());
+        }
+        Ok(WarmVm {
+            key: key.clone(),
+            vmm: self.vmm.clone(),
+            running,
+            dir,
+            control,
+            output,
+            spawned: Instant::now(),
+        })
+    }
+
+    /// Gives a task to a warm guest: waits for it to be ready, writes the
+    /// input onto its control disk, and waits for the guest to say it got
+    /// it.
+    #[allow(clippy::too_many_arguments)]
+    async fn hand_over(
+        &self,
+        mut w: WarmVm,
+        run_spec: &RunSpec,
+        input: &TaskInput,
+        shared_files: &[FileEntry],
+        staged: &[(String, PathBuf, u64)],
+        checkpoint: &[(String, PathBuf, u64)],
+        cancel: &AtomicBool,
+    ) -> std::result::Result<Launched, HandOver> {
+        let console = console_path(&w.vmm, w.dir.path());
+        let mut seen = 0u64;
+        loop {
+            if pool::console_has(&console, pumasi_guest::POOL_READY_LINE, &mut seen) {
+                break;
+            }
+            if !matches!(w.running.child.try_wait(), Ok(None)) {
+                return Err(HandOver::Failed(anyhow::anyhow!(
+                    "it stopped before it was ready; console:\n{}",
+                    console_tail(w.dir.path())
+                )));
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(HandOver::Failed(anyhow::anyhow!("the task was cancelled")));
+            }
+            if w.spawned.elapsed() > pool::READY_TIMEOUT {
+                return Err(HandOver::Failed(anyhow::anyhow!(
+                    "not ready within {} s; console:\n{}",
+                    pool::READY_TIMEOUT.as_secs(),
+                    console_tail(w.dir.path())
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let run_start = Instant::now();
+        {
+            let control = w.control.clone();
+            let (run_spec, input, shared) =
+                (run_spec.clone(), input.clone(), shared_files.to_vec());
+            let (staged, checkpoint) = (staged.to_vec(), checkpoint.to_vec());
+            tokio::task::spawn_blocking(move || {
+                write_task(
+                    &control,
+                    &run_spec,
+                    &input.stdin,
+                    &shared,
+                    &input.files,
+                    &staged,
+                    &checkpoint,
+                )
+            })
+            .await
+            .map_err(|e| HandOver::Failed(e.into()))?
+            .map_err(HandOver::Failed)?;
+        }
+        let taken = Instant::now();
+        loop {
+            if pool::console_has(&console, pumasi_guest::POOL_TASK_LINE, &mut seen) {
+                break;
+            }
+            if !matches!(w.running.child.try_wait(), Ok(None)) {
+                return Err(HandOver::Failed(anyhow::anyhow!(
+                    "it stopped while taking the task; console:\n{}",
+                    console_tail(w.dir.path())
+                )));
+            }
+            if taken.elapsed() > pool::TAKE_TIMEOUT {
+                // The guest is up but never saw what the host wrote: this
+                // backend does not pass a disk's new contents on.
+                return Err(HandOver::Broken(format!(
+                    "a {} guest did not see the task written to its control disk within {} s",
+                    w.vmm.backend,
+                    pool::TAKE_TIMEOUT.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(Launched {
+            vmm: w.vmm,
+            running: w.running,
+            dir: w.dir,
+            output: w.output,
+            control: Some(w.control),
+            start: run_start,
+            warm: true,
+            gateway: None,
+        })
+    }
+
+    /// How many guests are warm now, and how many are booting.
+    pub fn warm_counts(&self) -> (usize, usize) {
+        self.pool.counts()
     }
 
     /// Runs a confidential task (phase 16): a VM in the TEE the cluster
@@ -1209,40 +1615,42 @@ impl MicrovmExecutor {
         cancel: &AtomicBool,
         live: Option<&LiveOutput>,
     ) -> Result<VmEnd> {
-        let console = std::fs::File::create(dir.join("console.log"))?;
-        let mut cmd = vmm.command(vm, dir)?;
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(console.try_clone()?)
-            .stderr(console)
-            .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("start {}", vmm.bin.display()))?;
-        // Windows: the VMM dies with its job, so not even a crashed agent
-        // leaves VMs running.
-        let _job = crate::platform::ProcessJob::new()
-            .and_then(|job| job.assign(&child).map(|()| job))
-            .map_err(|e| warn!("could not put the VMM in a job object: {e}"))
-            .ok();
+        let running = spawn_vm(vmm, vm, dir)?;
+        self.wait_vm(vmm, running, dir, deadline, cancel, live, None)
+            .await
+    }
+
+    /// Waits for a started VM to power off, killing it at `deadline` or on
+    /// cancellation. With `stop`, passes a stop request on to the guest
+    /// and kills the VM if it does not end within the grace period and
+    /// [`AFTER_GRACE`].
+    #[allow(clippy::too_many_arguments)]
+    async fn wait_vm(
+        &self,
+        vmm: &Vmm,
+        running: RunningVm,
+        dir: &Path,
+        deadline: Option<Instant>,
+        cancel: &AtomicBool,
+        live: Option<&LiveOutput>,
+        stop: Option<StopCtl<'_>>,
+    ) -> Result<VmEnd> {
+        let RunningVm { mut child, _job } = running;
         // When QEMU writes the console to a file (Windows), watch it: under
         // WHPX a guest reset can leave QEMU stuck instead of exiting. The
         // vz helper writes the console to its stdout; should a guest reboot
         // not stop the VM, the same watch ends it.
-        let (serial, watch_serial) = match vmm.backend {
-            Backend::Qemu if cfg!(windows) => (dir.join(vmm::SERIAL_LOG), true),
-            Backend::Vz => (dir.join("console.log"), true),
-            _ => (PathBuf::new(), false),
-        };
+        let watch_serial =
+            matches!(vmm.backend, Backend::Vz) || (vmm.backend == Backend::Qemu && cfg!(windows));
+        let serial = console_path(vmm, dir);
         let mut done_since: Option<Instant> = None;
         let mut ticks = 0u32;
         let mut serial_seen = 0u64;
-        let mut tail = live.map(|l| {
-            let console = match vmm.backend {
-                Backend::Qemu if cfg!(windows) => dir.join(vmm::SERIAL_LOG),
-                _ => dir.join("console.log"),
-            };
-            LiveTail::new(console, l.clone())
-        });
+        let mut tail = live.map(|l| LiveTail::new(console_path(vmm, dir), l.clone()));
+        // A checkpointing run told to stop: when its grace period ends, and
+        // when the host gives up on it.
+        let mut grace_end: Option<Instant> = None;
+        let mut kill_end: Option<Instant> = None;
         loop {
             tokio::select! {
                 status = child.wait() => {
@@ -1260,9 +1668,25 @@ impl MicrovmExecutor {
                     if watch_serial && done_since.is_none() && ticks.is_multiple_of(10) && guest_said_done(&serial, &mut serial_seen) {
                         done_since = Some(Instant::now());
                     }
-                    let end = if cancel.load(Ordering::Relaxed) {
+                    if let Some(s) = &stop {
+                        if grace_end.is_none()
+                            && let Some(grace) = s.signal.requested()
+                        {
+                            debug!(?grace, "asking the microVM's task to stop");
+                            s.signal.deliver();
+                            grace_end = Some(Instant::now() + grace);
+                            if let Err(e) = write_at(s.control, ControlLayout::STOP_AT, &StopRequest::Term.block()) {
+                                warn!("could not ask the microVM to stop: {e:#}");
+                            }
+                        }
+                        if kill_end.is_none() && grace_end.is_some_and(|g| Instant::now() >= g) {
+                            kill_end = Some(Instant::now() + AFTER_GRACE);
+                            let _ = write_at(s.control, ControlLayout::STOP_AT, &StopRequest::Kill.block());
+                        }
+                    }
+                    let end = if cancel.load(Ordering::Relaxed) || kill_end.is_some_and(|k| Instant::now() >= k) {
                         Some(VmEnd::Cancelled)
-                    } else if deadline.is_some_and(|d| Instant::now() >= d) {
+                    } else if grace_end.is_none() && deadline.is_some_and(|d| Instant::now() >= d) {
                         Some(VmEnd::Timeout)
                     } else if done_since.is_some_and(|t| t.elapsed() >= AFTER_GUEST_DONE) {
                         warn!("the guest restarted but the VMM did not exit; stopping it");
@@ -1520,18 +1944,153 @@ fn write_input_disk(
     shared: &[FileEntry],
     own: &[FileEntry],
     staged: &[(String, PathBuf, u64)],
+    checkpoint: &[(String, PathBuf, u64)],
 ) -> Result<()> {
     let f = std::fs::File::create(path)?;
-    write_input_tar(
+    write_input_tar_with(
         std::io::BufWriter::with_capacity(1 << 20, f),
         spec,
         stdin,
         shared,
         own,
         staged,
+        checkpoint,
     )?
     .flush()?;
     pad_to_sector(path)
+}
+
+/// Starts the VMM for `vm`, its console going to `console.log` in `dir`.
+fn spawn_vm(vmm: &Vmm, vm: &VmSpec, dir: &Path) -> Result<RunningVm> {
+    let console = std::fs::File::create(dir.join("console.log"))?;
+    let mut cmd = vmm.command(vm, dir)?;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(console.try_clone()?)
+        .stderr(console)
+        .kill_on_drop(true);
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("start {}", vmm.bin.display()))?;
+    // Windows: the VMM dies with its job, so not even a crashed agent
+    // leaves VMs running.
+    let job = crate::platform::ProcessJob::new()
+        .and_then(|job| job.assign(&child).map(|()| job))
+        .map_err(|e| warn!("could not put the VMM in a job object: {e}"))
+        .ok();
+    Ok(RunningVm { child, _job: job })
+}
+
+/// Where the guest's console lines land: QEMU on Windows writes the serial
+/// port to a file of its own, every other VMM to its output.
+fn console_path(vmm: &Vmm, dir: &Path) -> PathBuf {
+    match vmm.backend {
+        Backend::Qemu if cfg!(windows) => dir.join(vmm::SERIAL_LOG),
+        _ => dir.join("console.log"),
+    }
+}
+
+/// About how large a task's input tar is.
+fn input_estimate(
+    spec: &RunSpec,
+    input: &TaskInput,
+    shared: &[FileEntry],
+    staged: &[(String, PathBuf, u64)],
+    checkpoint: &[(String, PathBuf, u64)],
+) -> u64 {
+    let header = 1024u64;
+    let files = shared
+        .iter()
+        .chain(&input.files)
+        .map(|f| f.data.len() as u64 + header)
+        .sum::<u64>();
+    let disk = staged
+        .iter()
+        .chain(checkpoint)
+        .map(|(_, _, n)| n + header)
+        .sum::<u64>();
+    let spec = serde_json::to_vec(spec).map_or(0, |v| v.len() as u64);
+    (1 << 20) + spec + input.stdin.len() as u64 + files + disk
+}
+
+/// A control disk: its first block (with a warm guest's idle limit), an
+/// empty stop block and task header, and room for an input of
+/// `input_bytes` (sparse).
+fn make_control_disk(path: &Path, idle_secs: u64, input_bytes: u64) -> Result<()> {
+    let mut f = create_sparse(path, ControlLayout::DATA_AT + input_bytes)?;
+    f.write_all(&pumasi_guest::control_head(idle_secs))?;
+    Ok(())
+}
+
+/// What a warm guest's output disk is sized for: the largest output and
+/// checkpoint a task may leave.
+fn pool_output_bytes() -> u64 {
+    RunSpec {
+        output_limit: MAX_STORE_OUTPUT_BYTES,
+        output_files: 1_000_000,
+        checkpoint_limit: MAX_STORE_OUTPUT_BYTES,
+        ..Default::default()
+    }
+    .output_disk_bytes()
+}
+
+/// Writes a task's input tar onto a warm guest's control disk, then the
+/// header that tells the guest it is there.
+fn write_task(
+    control: &Path,
+    spec: &RunSpec,
+    stdin: &[u8],
+    shared: &[FileEntry],
+    own: &[FileEntry],
+    staged: &[(String, PathBuf, u64)],
+    checkpoint: &[(String, PathBuf, u64)],
+) -> Result<()> {
+    use sha2::Digest;
+    use std::io::{Seek, SeekFrom};
+    /// Counts and hashes what goes through.
+    struct Hashing<W> {
+        inner: W,
+        hasher: sha2::Sha256,
+        len: u64,
+    }
+    impl<W: Write> Write for Hashing<W> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let n = self.inner.write(b)?;
+            self.hasher.update(&b[..n]);
+            self.len += n as u64;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(control)
+        .with_context(|| format!("open {}", control.display()))?;
+    let room = f.metadata()?.len().saturating_sub(ControlLayout::DATA_AT);
+    f.seek(SeekFrom::Start(ControlLayout::DATA_AT))?;
+    let w = Hashing {
+        inner: std::io::BufWriter::with_capacity(1 << 20, f),
+        hasher: sha2::Sha256::new(),
+        len: 0,
+    };
+    let mut w = write_input_tar_with(w, spec, stdin, shared, own, staged, checkpoint)?;
+    w.flush()?;
+    ensure!(
+        w.len <= room,
+        "the task's input ({} bytes) does not fit a warm microVM's control disk",
+        w.len
+    );
+    let hash: [u8; 32] = w.hasher.finalize().into();
+    let f = w.inner.into_inner().map_err(|e| e.into_error())?;
+    f.sync_data()?;
+    drop(f);
+    write_at(
+        control,
+        ControlLayout::TASK_AT,
+        &pumasi_guest::task_header(w.len, &hash),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn make_output_disk(path: &Path, size: u64) -> Result<()> {
@@ -1542,14 +2101,28 @@ pub(crate) fn make_output_disk(path: &Path, size: u64) -> Result<()> {
 
 /// Parses the output disk. `None` if the guest never wrote it.
 fn read_output_disk(path: &Path, kept: Option<&Path>) -> Result<Option<GuestOutput>> {
+    read_output_disk_with(path, kept, None)
+}
+
+/// [`read_output_disk`] that replaces `checkpoint`'s contents with the
+/// checkpoint the guest left, if it wrote a result.
+fn read_output_disk_with(
+    path: &Path,
+    kept: Option<&Path>,
+    checkpoint: Option<&Path>,
+) -> Result<Option<GuestOutput>> {
     let mut f = std::fs::File::open(path)?;
     let mut head = vec![0u8; OUTPUT_MARK.len()];
     f.read_exact(&mut head)?;
     if head == OUTPUT_MARK {
         return Ok(None);
     }
+    if let Some(dir) = checkpoint {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
+    }
     let f = std::fs::File::open(path)?;
-    parse_output(BufReader::new(f), kept)
+    parse_output_with(BufReader::new(f), kept, checkpoint)
         .context("read output disk")
         .map(Some)
 }
@@ -1665,8 +2238,7 @@ mod tests {
         };
         let config = MicrovmConfig {
             dir: dir.into(),
-            backend: None,
-            confidential: Default::default(),
+            ..Default::default()
         };
         let exec = MicrovmExecutor::detect(&config, "probe-test")
             .await
@@ -1797,7 +2369,7 @@ mod tests {
             path: "a.txt".into(),
             data: b"shared".to_vec(),
         }];
-        write_input_disk(&path, &spec, b"in", &shared, &[], &[]).unwrap();
+        write_input_disk(&path, &spec, b"in", &shared, &[], &[], &[]).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len() % 4096, 0);
         let mut ar = tar::Archive::new(std::fs::File::open(&path).unwrap());
         let names: Vec<String> = ar
@@ -1813,6 +2385,6 @@ mod tests {
             path: "../x".into(),
             data: vec![],
         }];
-        assert!(write_input_disk(&path, &spec, b"", &bad, &[], &[]).is_err());
+        assert!(write_input_disk(&path, &spec, b"", &bad, &[], &[], &[]).is_err());
     }
 }

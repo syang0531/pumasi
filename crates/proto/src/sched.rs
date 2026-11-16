@@ -175,9 +175,9 @@ impl Placement {
             ensure!(
                 matches!(
                     sub.executor,
-                    Executor::Wasm | Executor::Docker | Executor::Image
+                    Executor::Wasm | Executor::Docker | Executor::Image | Executor::Microvm
                 ),
-                "checkpoints are for wasm and docker jobs (not microVMs yet)"
+                "checkpoints are for wasm, docker, microvm and image jobs"
             );
             ensure!(
                 sub.tier != Tier::Confidential,

@@ -42,7 +42,7 @@ machines.
 | 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | done |
 | 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | done |
 | 29 | 1.13 | Upgrades that reach the control plane, and the flaky checks | done |
-| 30 | 1.14 | Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors | planned |
+| 30 | 1.14 | Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors | done |
 | 31 | 1.15 | Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI | planned |
 | 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | planned |
 | 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | planned |
@@ -428,6 +428,30 @@ By hand: the owner upgrades the home cluster, control plane included, from
 the dashboard through the tunnel.
 
 ## 30. Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors (1.14)
+
+Done in 1.14.0 ([release notes](releases/v1.14.0.md),
+[details](architecture.md#phase-30-old-intel-macs-114)).
+What differs from the plan: unpacked image disks were already kept by
+digest since phase 3, so the gain is the warm guest, which skips the VMM
+start, the kernel boot and the mounts. The pool keeps at most one spare
+guest per image, CPU count and memory size, two in all by default
+(`--warm-vms`), within a quarter of the machine's memory rather than the
+node's slots (a waiting guest runs nothing, and a task that takes it uses
+its slot as before); tasks with a network card or GPUs boot cold. A
+microVM's checkpoint crosses the VM's existing input and output disks as
+`checkpoint/` entries rather than a disk of its own, so the agent stores
+it exactly like a Docker task's. The Mac's CPU package power is read
+(`pumasi sensors`) but not sent to the control plane yet, since that
+needs a new metrics field. Release builds of `x86_64-apple-darwin` were
+already made on Apple Silicon; CI now also builds it there, checks its
+minimum OS, and runs the Intel tests under Rosetta 2. The recorded SMC and
+IOReport fixtures are written in the formats `smc -l` and IOReport print
+on a 2014 iMac, a 2017 MacBook Pro and an M1, not captured from the
+owner's iMac; `pumasi sensors --raw` prints the same format, so a real
+dump can replace them. Warm guests under Virtualization.framework and
+WHPX are not checked in CI (no runner can boot them): a guest that does
+not see its task within 15 seconds falls back to a cold boot and turns
+the pool off on that node with a warning.
 
 Why: the 2014 iMac takes image jobs only as microVMs (no Docker on its
 macOS), and every task pays a full boot and image unpack; microVM tasks

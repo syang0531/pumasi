@@ -151,6 +151,15 @@ enum Cmd {
     /// them (Docker, microVM passthrough, the cluster's GPU check).
     #[command(subcommand)]
     Gpu(gpu_cmd::GpuCmd),
+    /// Show what this machine's temperature and power sensors read, as the
+    /// agent reports them (Macs: the SMC on Intel, IOReport and the HID
+    /// sensors on Apple Silicon).
+    Sensors {
+        /// Also print the raw SMC and IOReport readings (to attach to an
+        /// issue when a Mac shows no temperature).
+        #[arg(long)]
+        raw: bool,
+    },
     /// Show one node (NODE: name or id prefix): its benchmark profile,
     /// billed CPU score, latency and checks. With --rebenchmark, ask it to
     /// measure itself again. `pumasi node rename` changes its name.
@@ -759,6 +768,11 @@ struct VmArgs {
     /// installed and KVM is usable, vz on macOS 11+, else QEMU).
     #[arg(long)]
     vm_backend: Option<Backend>,
+    /// MicroVMs kept booted for the next task of an image they ran (0
+    /// turns warm microVMs off). They take at most a quarter of the
+    /// machine's memory and stop on battery power.
+    #[arg(long, env = "PUMASI_WARM_VMS", default_value_t = pumasi_agent::microvm::pool::DEFAULT_WARM_VMS)]
+    warm_vms: usize,
 }
 
 impl VmArgs {
@@ -767,6 +781,10 @@ impl VmArgs {
             dir: self.vm_dir.clone().unwrap_or_else(|| home.join("vm")),
             backend: self.vm_backend,
             confidential: Default::default(),
+            warm: pumasi_agent::microvm::pool::WarmConfig {
+                max: self.warm_vms,
+                ..Default::default()
+            },
         }
     }
 }
@@ -1639,6 +1657,11 @@ async fn run(cli: Cli) -> Result<i32> {
             cpus,
         } => bench(&home, dir, quick, json, cpus).await,
         Cmd::Gpu(cmd) => gpu_cmd::run(&home, cmd).await,
+        Cmd::Sensors { raw } => {
+            let home = home.clone();
+            tokio::task::spawn_blocking(move || sensors(&home, raw)).await??;
+            Ok(0)
+        }
         Cmd::Node {
             cmd:
                 Some(NodeCmd::Rename {
@@ -4355,7 +4378,10 @@ async fn vm(home: &Path, cmd: VmCmd) -> Result<i32> {
             network,
             vm,
         } => {
-            let exec = MicrovmExecutor::detect(&vm.config(home), "local").await?;
+            // One task and out: nothing to keep warm for.
+            let mut config = vm.config(home);
+            config.warm.max = 0;
+            let exec = MicrovmExecutor::detect(&config, "local").await?;
             let mut task_env = std::collections::BTreeMap::new();
             for kv in env {
                 let (k, v) = kv
@@ -4875,6 +4901,47 @@ fn print_policy(p: &Policy) {
         p.max_strikes
     );
     println!("runs on machines of the job's own account are free.");
+}
+
+/// `pumasi sensors`: two samples a second apart (power needs an interval),
+/// the second printed.
+fn sensors(home: &Path, raw: bool) -> Result<()> {
+    let mut notes = Vec::new();
+    let gpus = pumasi_agent::gpu::detect(&Default::default(), &mut notes);
+    let dir = if home.is_dir() {
+        home.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    let mut sampler = pumasi_agent::metrics::Sampler::new(&dir, gpus.clone());
+    let _ = sampler.sample(0);
+    std::thread::sleep(Duration::from_secs(1));
+    let m = sampler.sample(0);
+    let temp = |t: Option<f32>| t.map_or_else(|| "-".to_string(), |t| format!("{t:.1} °C"));
+    let watts = |w: Option<f32>| w.map_or_else(|| "-".to_string(), |w| format!("{w:.1} W"));
+    println!("temperature (hottest sensor)  {}", temp(m.temp_c));
+    for g in &m.gpus {
+        let name = gpus
+            .iter()
+            .find(|i| i.index == g.index)
+            .map_or("?", |i| i.name.as_str());
+        println!(
+            "gpu {} ({name})  {}  {}",
+            g.index,
+            temp(g.temp_c),
+            watts(g.power_w)
+        );
+    }
+    if raw {
+        let lines = pumasi_agent::sensors::Reader::new().raw();
+        if lines.is_empty() {
+            println!("no SMC or IOReport readings on this machine");
+        }
+        for l in lines {
+            println!("{l}");
+        }
+    }
+    Ok(())
 }
 
 async fn bench(

@@ -20,10 +20,11 @@ use std::{
 };
 
 use pumasi_guest::{
-    BASE_LABEL, DISK_ROLE_ENTRY, GPU_LABEL, GuestOutcome, GuestResult, INPUT_PREFIX, LIVE_CHUNK,
-    LIVE_MAX_BYTES, MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES, MAX_STREAM_BYTES, MODE_PARAM,
-    OUTPUT_MARK, OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL,
-    SPEC_ENTRY, STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY, live_frame,
+    BASE_LABEL, CHECKPOINT_PREFIX, CONTROL_MAGIC, ControlLayout, DISK_ROLE_ENTRY, GPU_LABEL,
+    GuestOutcome, GuestResult, INPUT_PREFIX, LIVE_CHUNK, LIVE_MAX_BYTES, MAX_CHECKPOINT_FILES,
+    MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES, MAX_STREAM_BYTES, MODE_PARAM, OUTPUT_MARK,
+    OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL, SPEC_ENTRY,
+    STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY, StopRequest, live_frame,
     seal::{
         self, AttestReply, AttestRequest, EVIDENCE_AT, Evidence, Kind, REPLY_AT, SealReader,
         SealWriter, TaskKeys, TeeKind,
@@ -96,6 +97,8 @@ struct Payload {
     output_dir: Option<PathBuf>,
     /// Output file limits (bytes, count).
     limits: (u64, usize),
+    /// A checkpointing run's `/checkpoint` and its limit in bytes (1.14).
+    checkpoint: Option<(PathBuf, u64)>,
 }
 
 const DEFAULT_LIMITS: (u64, usize) = (MAX_OUTPUT_FILES_BYTES, MAX_OUTPUT_FILES);
@@ -109,6 +112,7 @@ impl Payload {
             stderr: None,
             output_dir: None,
             limits: DEFAULT_LIMITS,
+            checkpoint: None,
         }
     }
 }
@@ -142,6 +146,7 @@ fn boot() {
     let payload = match mode.as_str() {
         "build" => build(&disks),
         "run" => run(&disks),
+        "pool" => pool(&disks),
         "probe" => probe(&disks),
         "sealed" => {
             let (p, s) = sealed(&disks);
@@ -173,6 +178,8 @@ struct Disks {
     input: Option<String>,
     output: Option<String>,
     gpu: Option<String>,
+    /// The host's messages while the VM runs (1.14).
+    control: Option<String>,
     /// Confidential tasks: the attest disk and the sealed layers and input.
     attest: Option<String>,
     sealed_layers: Option<String>,
@@ -200,6 +207,8 @@ fn find_disks() -> io::Result<Disks> {
         let head = &head[..n];
         if head.starts_with(OUTPUT_MARK) {
             d.output = Some(dev);
+        } else if head.starts_with(CONTROL_MAGIC) {
+            d.control = Some(dev);
         } else if let Some(kind) = seal::sealed_kind(head) {
             match kind {
                 Kind::Layers => d.sealed_layers = Some(dev),
@@ -476,7 +485,7 @@ fn probe(d: &Disks) -> Payload {
         .and_then(|input| {
             fs::create_dir_all(TASK_DIR).ctx(TASK_DIR)?;
             let input = File::open(input).ctx("open input disk")?;
-            read_input(input, dir).map(|_| ())
+            read_input(input, dir, &dir.join("checkpoint")).map(|_| ())
         });
     match copied {
         Ok(()) => Payload {
@@ -490,6 +499,7 @@ fn probe(d: &Disks) -> Payload {
             stderr: None,
             output_dir: Some(dir.to_path_buf()),
             limits: DEFAULT_LIMITS,
+            checkpoint: None,
         },
         Err(e) => Payload::failed(e),
     }
@@ -512,6 +522,7 @@ fn build(d: &Disks) -> Payload {
             stderr: None,
             output_dir: None,
             limits: DEFAULT_LIMITS,
+            checkpoint: None,
         },
         Err(e) => Payload::failed(e),
     }
@@ -706,9 +717,16 @@ fn run(d: &Disks) -> Payload {
 }
 
 fn run_inner(d: &Disks) -> R<Payload> {
+    let input = d.input.as_deref().ok_or("no input disk")?;
+    mount_root(d)?;
+    let input = File::open(input).ctx("open input disk")?;
+    run_in_root(d, input)
+}
+
+/// Stacks the task's writable layer on the image at [`ROOT`].
+fn mount_root(d: &Disks) -> R<()> {
     let base = d.base.as_deref().ok_or("no base disk")?;
     let scratch = d.scratch.as_deref().ok_or("no scratch disk")?;
-    let input = d.input.as_deref().ok_or("no input disk")?;
     for dir in ["/lower", "/scratch", ROOT] {
         fs::create_dir_all(dir).ctx(dir)?;
     }
@@ -724,17 +742,178 @@ fn run_inner(d: &Disks) -> R<Payload> {
         0,
         "lowerdir=/lower,upperdir=/scratch/upper,workdir=/scratch/work",
     )?;
-    let input = File::open(input).ctx("open input disk")?;
-    run_in_root(d, input)
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pool mode (warm microVMs, 1.14)
+// ---------------------------------------------------------------------------
+
+/// How often a warm guest looks for its task.
+const POOL_POLL_MS: u64 = 25;
+
+fn pool(d: &Disks) -> Payload {
+    match pool_inner(d) {
+        Ok(p) => p,
+        Err(e) => Payload::failed(e),
+    }
+}
+
+/// Mounts everything a run needs, then waits for the host to write a task
+/// onto the control disk, and runs it. The host stops a guest it no longer
+/// wants; one whose host went away powers off after the idle limit on the
+/// control disk.
+fn pool_inner(d: &Disks) -> R<Payload> {
+    let control = d.control.clone().ok_or("no control disk")?;
+    let head = read_direct(&control, 0, 4096).ctx("read control disk")?;
+    let idle = pumasi_guest::control_idle_secs(&head).unwrap_or(0);
+    mount_root(d)?;
+    // `pumasi_guest::POOL_READY_LINE`.
+    log("ready");
+    let since = std::time::Instant::now();
+    let (len, hash) = loop {
+        let head = read_direct(&control, ControlLayout::TASK_AT, 4096).ctx("read control disk")?;
+        if let Some(t) = pumasi_guest::parse_task_header(&head) {
+            break t;
+        }
+        if idle > 0 && since.elapsed().as_secs() >= idle {
+            return Err(format!("no task came within {idle} s"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(POOL_POLL_MS));
+    };
+    // `pumasi_guest::POOL_TASK_LINE`.
+    log("task received");
+    run_in_root(d, ControlInput::new(control, len, hash))
+}
+
+/// The input tar on the control disk, read past the page cache and checked
+/// against its SHA-256 once read.
+struct ControlInput {
+    dev: String,
+    at: u64,
+    left: u64,
+    hash: [u8; 32],
+    hasher: sha2::Sha256,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl ControlInput {
+    const CHUNK: usize = 1 << 20;
+
+    fn new(dev: String, len: u64, hash: [u8; 32]) -> Self {
+        use sha2::Digest;
+        Self {
+            dev,
+            at: ControlLayout::DATA_AT,
+            left: len,
+            hash,
+            hasher: sha2::Sha256::new(),
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for ControlInput {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        use sha2::Digest;
+        if self.pos == self.buf.len() {
+            if self.left == 0 {
+                return Ok(0);
+            }
+            let want = (self.left as usize).min(Self::CHUNK);
+            // O_DIRECT reads whole blocks.
+            let mut b = read_direct(&self.dev, self.at, want.div_ceil(4096) * 4096)?;
+            if b.len() < want {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the control disk ends before the task's input",
+                ));
+            }
+            b.truncate(want);
+            self.hasher.update(&b);
+            self.at += want as u64;
+            self.left -= want as u64;
+            self.buf = b;
+            self.pos = 0;
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Where a run's input comes from: an input disk, or a warm guest's
+/// control disk, which is checked once read.
+trait TaskInput: Read {
+    fn finish(&mut self) -> R<()> {
+        Ok(())
+    }
+}
+
+impl TaskInput for File {}
+impl TaskInput for SealReader<File> {}
+
+impl TaskInput for ControlInput {
+    fn finish(&mut self) -> R<()> {
+        use sha2::Digest;
+        io::copy(self, &mut io::sink()).ctx("read the task's input")?;
+        let got: [u8; 32] = std::mem::take(&mut self.hasher).finalize().into();
+        if got != self.hash {
+            return Err("the task's input on the control disk is damaged".into());
+        }
+        Ok(())
+    }
+}
+
+/// Watches the control disk for a stop request while the task runs, and
+/// passes it on: `SIGTERM` to every process (the task saves its
+/// checkpoint), then `SIGKILL` when the grace period is over. Started
+/// after the fork, so the init stays single-threaded while it forks.
+fn watch_stop(control: String) {
+    let _ = std::thread::Builder::new()
+        .name("stop".into())
+        .spawn(move || {
+            let mut termed = false;
+            loop {
+                if let Ok(b) = read_direct(&control, ControlLayout::STOP_AT, 4096) {
+                    match StopRequest::parse(&b) {
+                        Some(StopRequest::Term) if !termed => {
+                            log("asked to stop: SIGTERM");
+                            unsafe { libc::kill(-1, libc::SIGTERM) };
+                            termed = true;
+                        }
+                        Some(StopRequest::Kill) => {
+                            log("grace period over: SIGKILL");
+                            unsafe { libc::kill(-1, libc::SIGKILL) };
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
 }
 
 /// Reads the input into the root at [`ROOT`], runs the command and
 /// collects the result.
-fn run_in_root(d: &Disks, input: impl Read) -> R<Payload> {
+fn run_in_root(d: &Disks, mut input: impl TaskInput) -> R<Payload> {
     let root = Path::new(ROOT);
     let input_dir = root.join("input");
     ensure_dir(&input_dir, 0o755)?;
-    let spec = read_input(input, &input_dir)?;
+    let checkpoint_dir = root.join(pumasi_guest::CHECKPOINT_DIR.trim_start_matches('/'));
+    let spec = read_input(&mut input, &input_dir, &checkpoint_dir)?;
+    input.finish()?;
+    let checkpoint = if spec.checkpoint_limit > 0 {
+        let dir = checkpoint_dir;
+        ensure_dir(&dir, 0o777)?;
+        Some((dir, spec.checkpoint_limit))
+    } else {
+        None
+    };
     if spec.argv.is_empty() {
         return Err("nothing to run: the image has no command and the job gave none".into());
     }
@@ -798,6 +977,9 @@ fn run_in_root(d: &Disks, input: impl Read) -> R<Payload> {
         );
     }
     drop((stdin, stdout, stderr));
+    if let Some(control) = d.control.clone() {
+        watch_stop(control);
+    }
     let status = match pipes {
         Some((out_r, err_r)) => pump(pid, [out_r, err_r], [&stdout_path, &stderr_path])?,
         None => loop {
@@ -839,6 +1021,7 @@ fn run_in_root(d: &Disks, input: impl Read) -> R<Payload> {
         stderr: Some(stderr_path),
         output_dir: Some(root.join("output")),
         limits: (spec.files_limit(), spec.count_limit()),
+        checkpoint,
     })
 }
 
@@ -1197,8 +1380,9 @@ fn ensure_dir(p: &Path, mode: u32) -> R<()> {
     Ok(())
 }
 
-/// Reads the input disk: the run spec, stdin, and the `/input` files.
-fn read_input(input: impl Read, input_dir: &Path) -> R<RunSpec> {
+/// Reads the input disk: the run spec, stdin, the `/input` files and a
+/// checkpointing run's `/checkpoint`.
+fn read_input(input: impl Read, input_dir: &Path, checkpoint_dir: &Path) -> R<RunSpec> {
     let mut ar = tar::Archive::new(BufReader::with_capacity(1 << 20, input));
     let mut spec: Option<RunSpec> = None;
     for entry in ar.entries().ctx("read input disk")? {
@@ -1229,6 +1413,24 @@ fn read_input(input: impl Read, input_dir: &Path) -> R<RunSpec> {
             let mut out = File::create(&target).ctx(&format!("write /input/{}", rel.display()))?;
             io::copy(&mut entry, &mut out).ctx("write input file")?;
             out.set_permissions(fs::Permissions::from_mode(0o644))
+                .ctx("chmod")?;
+        } else if let Some(rel) = name.strip_prefix(CHECKPOINT_PREFIX) {
+            let Some(rel) = layer_path(Path::new(rel)) else {
+                return Err(format!("bad checkpoint path {name}"));
+            };
+            ensure_dir(checkpoint_dir, 0o777)?;
+            let target = checkpoint_dir.join(&rel);
+            if let Some(parent) = target.parent()
+                && parent != checkpoint_dir
+            {
+                fs::create_dir_all(parent).ctx("create checkpoint dir")?;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o777)).ctx("chmod")?;
+            }
+            let _ = remove_any(&target);
+            let mut out =
+                File::create(&target).ctx(&format!("write /checkpoint/{}", rel.display()))?;
+            io::copy(&mut entry, &mut out).ctx("write checkpoint file")?;
+            out.set_permissions(fs::Permissions::from_mode(0o666))
                 .ctx("chmod")?;
         }
     }
@@ -1493,6 +1695,28 @@ fn write_tar<W: Write>(out: W, mut p: Payload) -> io::Result<W> {
             h.set_mode(0o644);
             h.set_entry_type(tar::EntryType::Regular);
             b.append_data(&mut h, format!("{OUTPUT_PREFIX}{rel}"), f.take(size))?;
+            total += size;
+            kept += 1;
+        }
+    }
+    if let Some((dir, limit)) = &p.checkpoint {
+        let mut files = Vec::new();
+        walk(dir, dir, &mut files);
+        files.sort();
+        let (mut total, mut kept) = (0u64, 0usize);
+        for (rel, path, size) in files {
+            if kept >= MAX_CHECKPOINT_FILES || total + size > *limit || rel.len() > 4096 {
+                log(&format!("checkpoint file {rel} left out: over the limit"));
+                continue;
+            }
+            let Ok(f) = File::open(&path) else {
+                continue;
+            };
+            let mut h = tar::Header::new_gnu();
+            h.set_size(size);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            b.append_data(&mut h, format!("{CHECKPOINT_PREFIX}{rel}"), f.take(size))?;
             total += size;
             kept += 1;
         }

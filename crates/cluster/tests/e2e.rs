@@ -1571,7 +1571,7 @@ fn microvm_config() -> Option<pumasi_agent::MicrovmConfig> {
     Some(pumasi_agent::MicrovmConfig {
         dir: dir.into(),
         backend,
-        confidential: Default::default(),
+        ..Default::default()
     })
 }
 
@@ -3580,4 +3580,178 @@ async fn node_settings_are_written_and_the_agent_restarts_with_them() {
         events.iter().any(|e| e.kind == "node.settings"),
         "{events:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 1.14: warm microVMs and microVM checkpoints (skipped without
+// PUMASI_TEST_VM_DIR, like the other microVM tests)
+// ---------------------------------------------------------------------------
+
+fn vm_job(name: &str, script: &str, timeout_ms: u64) -> JobSubmission {
+    let mut sub = docker_job(&["sh", "-c", script], vec![TaskInput::default()]);
+    sub.name = name.into();
+    sub.executor = Executor::Microvm;
+    sub.docker.as_mut().unwrap().image = microvm_image();
+    sub.limits = Limits {
+        timeout_ms,
+        memory_bytes: 128 << 20,
+        cpu_millis: Some(1000),
+        ..Default::default()
+    };
+    sub
+}
+
+/// The release gate: the second microVM task of an image starts in a guest
+/// that was booted while the first ran, so its run takes well under half
+/// of the first's (a cold boot).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_second_task_of_an_image_starts_warm() {
+    let Some(vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let a = spawn_join(
+        Agent::new(AgentConfig {
+            microvm: Some(vm),
+            ..agent_config("warm", 1, tempdir("w"))
+        })
+        .await
+        .unwrap(),
+        ticket,
+    );
+    wait_online(&cluster, 1).await;
+    let client = admin(&cluster).await;
+    let mut runs = Vec::new();
+    for i in 0..3 {
+        let id = submit(&client, vm_job(&format!("warm-{i}"), "echo hi", 120_000)).await;
+        let view = wait_job(&client, id, 600).await;
+        assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+        assert_eq!(view.tasks[0].stdout.as_deref(), Some(&b"hi\n"[..]));
+        let d = task_details(&client, id).await;
+        eprintln!("run {i}: {:?}", d[0]);
+        runs.push(d[0].run_ms);
+    }
+    // The first boots its own VM; the next ones find one booted.
+    assert!(
+        runs[1] * 2 < runs[0] && runs[2] * 2 < runs[0],
+        "warm runs should take well under half of a cold one: {runs:?} ms"
+    );
+
+    client.close().await;
+    a.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
+/// Counts to 150 in tenths of a second, saving its count on SIGTERM and
+/// going on from it.
+const VM_COUNTER_SH: &str = r#"n=$(cat /checkpoint/n 2>/dev/null || echo 0); start=$n
+trap 'echo $n > /checkpoint/n; exit 0' TERM
+while [ $n -lt 150 ]; do sleep 0.1 & wait $!; n=$((n+1)); done
+echo "start=$start"
+"#;
+
+/// The release gate: a checkpointing microVM task moved off a drained node
+/// finishes without starting over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_checkpoint_survives_a_drain() {
+    use pumasi_proto::{manage::NodeEdit, sched::Checkpoint};
+    let Some(vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let mut agents = Vec::new();
+    for name in ["vma", "vmb"] {
+        agents.push(spawn_join(
+            Agent::new(AgentConfig {
+                microvm: Some(vm.clone()),
+                ..agent_config(name, 1, tempdir(name))
+            })
+            .await
+            .unwrap(),
+            ticket.clone(),
+        ));
+    }
+    wait_online(&cluster, 2).await;
+    let client = admin(&cluster).await;
+    let cordon = |on: bool| NodeEdit {
+        cordon: Some(on),
+        ..Default::default()
+    };
+    let edit = |node: &str, e: NodeEdit| {
+        client.call(AdminOp::EditNode {
+            node: node.into(),
+            edit: Box::new(e),
+        })
+    };
+    edit("vmb", cordon(true)).await.unwrap();
+    // The image is pulled and a guest is warm on vma before the count.
+    let id = submit(&client, vm_job("pull", "true", 120_000)).await;
+    assert_eq!(
+        wait_job(&client, id, 600).await.summary.state,
+        JobState::Succeeded
+    );
+
+    let mut sub = vm_job("vm-counter", VM_COUNTER_SH, 300_000);
+    sub.deterministic = false;
+    sub.placement.checkpoint = Some(Checkpoint { grace_ms: 10_000 });
+    // With its placement (1.9).
+    let AdminResponse::Submitted { id } = client.call(AdminOp::submit(sub)).await.unwrap() else {
+        panic!("not submitted");
+    };
+    // Wait until it runs, and some more: the count is going.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let AdminResponse::Job(view) = client
+            .call(AdminOp::Job {
+                id,
+                with_output: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        if matches!(view.tasks[0].state, TaskState::Running { .. }) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{view:#?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    edit("vmb", cordon(false)).await.unwrap();
+    client
+        .call(AdminOp::Drain { node: "vma".into() })
+        .await
+        .unwrap();
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    let out =
+        String::from_utf8_lossy(view.tasks[0].stdout.as_deref().unwrap_or_default()).to_string();
+    let start: u32 = out
+        .trim()
+        .strip_prefix("start=")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected output {out:?}: {view:#?}"));
+    assert!(start > 0, "it went on from its checkpoint: {out:?}");
+    assert_eq!(view.tasks[0].preempted, 1, "{view:#?}");
+    let AdminResponse::Placement(p) = client.call(AdminOp::Placement { id }).await.unwrap() else {
+        panic!("expected a placement view");
+    };
+    assert_eq!(p.checkpoints[0].resumed, 1, "{p:#?}");
+
+    client.close().await;
+    for a in agents {
+        a.kill().await;
+    }
+    cluster.shutdown().await.unwrap();
 }

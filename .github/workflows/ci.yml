@@ -562,6 +562,47 @@ jobs:
             echo "the network card made the VM configuration invalid"; exit 1
           fi
 
+  # The Intel Mac binary as the release builds it, on Apple Silicon, and
+  # its tests under Rosetta 2 (1.14). This is what checks old Intel Macs
+  # once GitHub retires macos-15-intel (announced until autumn 2027); what
+  # Rosetta cannot show (the SMC, Virtualization.framework on Intel, the
+  # Intel GPU) is checked on real Intel Macs only.
+  rosetta:
+    name: test (x86_64 under Rosetta, macos-latest)
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: rosetta
+      - name: Rosetta 2
+        run: |
+          /usr/bin/pgrep -q oahd || softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
+      - name: The Intel binary, minimum macOS 10.15
+        run: |
+          cargo build --locked -p pumasi-cli --target x86_64-apple-darwin
+          bin=target/x86_64-apple-darwin/debug/pumasi
+          lipo -archs "$bin" | tee /dev/stderr | grep -qx x86_64
+          vtool -show-build "$bin" | tee /dev/stderr | grep -Eq "(minos|version) 10.15( |$)"
+          if otool -L "$bin" | grep -q Virtualization; then
+            echo "Virtualization.framework is linked; the binary would not start on macOS 10.15"; exit 1
+          fi
+          arch -x86_64 "$bin" --version
+          arch -x86_64 "$bin" sensors --raw
+          arch -x86_64 "$bin" vm status --vm-dir "$RUNNER_TEMP/vm" || true
+      - name: Unit and end-to-end tests under Rosetta
+        run: |
+          cargo test --locked --target x86_64-apple-darwin \
+            -p pumasi-proto -p pumasi-guest -p pumasi-agent -p pumasi-cli
+          cargo test --locked --target x86_64-apple-darwin -p pumasi-cluster --test e2e --test sched
+
   # QEMU on Windows: WHPX where the runner offers it, and TCG.
   microvm-windows:
     name: microvm (windows, qemu)

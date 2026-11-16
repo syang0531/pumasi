@@ -667,27 +667,21 @@ async fn followers_answer_reads() {
         },
     )
     .await;
-    // Until the revocation reached the follower's copy (a fixed 500 ms was
-    // not always enough on a loaded Windows runner).
-    let applied = a.ha_view().unwrap().applied;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while b.ha_view().unwrap().applied < applied {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the follower did not apply the revocation: {:#?}",
-            b.ha_view()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // The leader answers before the write went through Raft (the store
+    // queues it), so neither a fixed wait nor the leader's applied index
+    // read right after says when the follower has it: wait for the refusal.
     let gone = client_of(&b, viewer).await;
-    let e = gone
-        .call(AdminOp::FollowerRead(Box::new(AdminOp::Status)))
-        .await
-        .unwrap_err();
-    assert!(
-        format!("{e:#}").contains("invalid admin credentials"),
-        "{e:#}"
-    );
+    let e = eventually(30, "the follower refusing a revoked ticket", || async {
+        match gone
+            .call(AdminOp::FollowerRead(Box::new(AdminOp::Status)))
+            .await
+        {
+            Ok(_) => Err("still answered".to_string()),
+            Err(e) => Ok(format!("{e:#}")),
+        }
+    })
+    .await;
+    assert!(e.contains("invalid admin credentials"), "{e}");
 
     // `read` uses a follower when the ticket names replicas.
     let full = AdminClient::connect(&a.admin_ticket(), NetMode::Local)

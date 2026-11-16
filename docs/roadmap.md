@@ -41,7 +41,7 @@ machines.
 | 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | done |
 | 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | done |
 | 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | done |
-| 29 | 1.13 | Upgrades that reach the control plane, and the flaky checks | planned |
+| 29 | 1.13 | Upgrades that reach the control plane, and the flaky checks | done |
 | 30 | 1.14 | Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors | planned |
 | 31 | 1.15 | Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI | planned |
 | 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | planned |
@@ -365,6 +365,24 @@ that still verifies, SCIM against Keycloak, and the CLI through a local
 CONNECT proxy.
 
 ## 29. Upgrades that reach the control plane, and the flaky checks (1.13)
+
+Done in 1.13.0 ([release notes](releases/v1.13.0.md),
+[details](architecture.md#phase-29-upgrades-that-reach-the-control-plane-113)).
+What differs from the plan: openraft 0.9 has no leadership transfer, so
+the leader steps down by restarting last, once every other replica runs
+the new version, and the others elect a new leader (one that comes back
+within the election timeout may win again, already upgraded). Replicas
+before 1.13 cannot take part, so a cluster with replicas goes to 1.13 by
+hand once. A dashboard alone on its machine installs the rollout's binary
+itself; one sharing the binary follows it, down too after a rollback.
+CI's "previous release" is the latest published one (1.11.0 when this
+was written, which installs and restarts without a trial) plus a build of
+this commit for the trial and rollback. The three flaky tests each had a
+real cause (the purge point read back with the wrong type, a failed start
+keeping its databases open, the agent cache's garbage collection removing
+a download in progress, and control plane stalls counted against nodes'
+heartbeats). The Intel Mac flake is not explained: CI now records what
+the client sees when it happens.
 
 Why: every release since 1.3 says "upgrade the control plane first (stop
 it, replace the binary, start it)", by hand on its machine, and on three

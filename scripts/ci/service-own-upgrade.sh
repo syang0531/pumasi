@@ -15,16 +15,18 @@
 #      plane installs the new binary again, restarts into it, stays healthy
 #      and commits (keeping the old binary as `previous`); `upgrade status`
 #      shows it current on the new version, and the dashboard runs it too,
-#   4. uninstall the services.
+#   4. a dashboard alone on its machine (another binary, another home, no
+#      control plane or agent there) installs the rollout's binary itself,
+#   5. uninstall the services.
 #
 # Usage: service-own-upgrade.sh OLD_BINARY NEW_BINARY WORK_DIR [--foreground] [--from-release]
 #
 # NEW_BINARY must say a newer version than OLD_BINARY (`--version`).
 # --foreground runs the control plane in a shell loop that starts it again
 # whenever it exits, standing in for the service manager (no root needed),
-# and no dashboard. --from-release: OLD_BINARY is a published release from
+# and no dashboard service. --from-release: OLD_BINARY is a published release from
 # before 1.13, which installs and restarts into the new binary without a
-# trial (nothing to roll back to): step 2 is skipped.
+# trial (nothing to roll back to): steps 2 and 4 are skipped.
 # The service mode needs root (sudo) on Linux and macOS and an
 # administrator shell on Windows.
 set -euo pipefail
@@ -43,6 +45,7 @@ for a in "$@"; do
   esac
 done
 UI_PORT=7472
+LONE_PORT=7473
 
 case "$(uname -s)" in
   Linux*) OS=linux ;;
@@ -91,6 +94,7 @@ cleanup() {
     [ -n "${LOOP_PID:-}" ] && kill "$LOOP_PID" 2>/dev/null
     pkill -f "$BIN" 2>/dev/null
   fi
+  [ -n "${LONE_PID:-}" ] && kill "$LONE_PID" 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -98,7 +102,7 @@ dump() {
   if [ "$OS" = linux ] && [ "$MODE" = service ]; then
     sudo journalctl -u pumasi-cluster -u pumasi-ui --no-pager -n 200 || true
   fi
-  for f in "$H"/logs/*.log "$WORK/cluster.log"; do
+  for f in "$H"/logs/*.log "$WORK/cluster.log" "$WORK/lone-ui.log"; do
     [ -f "$f" ] && { echo "=== $f"; tail -n 150 "$f"; }
   done
   ls -la "$WORK/bin" "$UP" 2>/dev/null || true
@@ -122,7 +126,7 @@ wait_until() { # description, command...
 cluster_up() { admin status | grep -q '^cluster ci-own'; }
 runs() { [ "$(sha "$BIN")" = "$1" ]; }
 # The dashboard says its version in its stylesheet's URL.
-ui_runs() { curl -fsS "http://127.0.0.1:$UI_PORT/login" | grep -qF "app.css?v=$1\""; }
+ui_runs() { curl -fsS "http://127.0.0.1:${2:-$UI_PORT}/login" | grep -qF "app.css?v=$1\""; }
 cp_state() { # version, state text
   admin upgrade status >"$WORK/cps.txt" 2>&1 || return 1
   grep -E "^[0-9a-f]+ +leader +[^ ]+ +${1//+/\\+} +$2" "$WORK/cps.txt"
@@ -147,6 +151,19 @@ wait_until "the control plane to answer" cluster_up
 if [ "$MODE" = service ]; then
   svc install ui -- --listen "127.0.0.1:$UI_PORT"
   wait_until "the dashboard" ui_runs "$OLD_VERSION"
+fi
+
+if [ "$FROM_RELEASE" = 0 ]; then
+  echo "--- a dashboard alone on its machine"
+  LONE="$WORK/lone/pumasi$EXT"
+  mkdir -p "$WORK/lone" "$WORK/lone-home"
+  cp "$OLD" "$LONE"
+  chmod +x "$LONE"
+  PUMASI_TEST_OWN_UPGRADE_SECS=5 "$LONE" --home "$(nat "$WORK/lone-home")" ui --no-open \
+    --admin "$(tr -d '\r\n' <"$H/cluster/admin.ticket")" --listen "127.0.0.1:$LONE_PORT" \
+    >"$WORK/lone-ui.log" 2>&1 &
+  LONE_PID=$!
+  wait_until "the lone dashboard" ui_runs "$OLD_VERSION" "$LONE_PORT"
 fi
 
 if [ "$FROM_RELEASE" = 0 ]; then
@@ -198,6 +215,12 @@ if [ "$FROM_RELEASE" = 0 ]; then
 fi
 if [ "$MODE" = service ]; then
   wait_until "the dashboard on the new binary" ui_runs "$NEW_VERSION"
+fi
+if [ "$FROM_RELEASE" = 0 ]; then
+  # It installed the rollout's binary over its own and restarted into it.
+  wait_until "the lone dashboard on the new binary" ui_runs "$NEW_VERSION" "$LONE_PORT"
+  [ "$(sha "$LONE")" = "$NEW_SHA" ] || { echo "the lone dashboard's binary is not the new one"; dump; exit 1; }
+  grep -q "installed pumasi $NEW_VERSION" "$WORK/lone-ui.log"
 fi
 
 if [ "$MODE" = service ]; then

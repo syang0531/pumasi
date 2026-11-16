@@ -105,9 +105,11 @@ pub async fn run_until(
         // upgrade back (1.13).
         crate::follow::Follow::new().map(|f| f.also_older())
     };
+    let own_exe = follow.as_ref().map(|f| f.exe().to_path_buf());
     let (ticket, source) = load_ticket_with_source(home, &args.admin)?;
     let net = net_for_all(&ticket.candidates(), None);
     let probe = (ticket.clone(), ticket_hint(home, &ticket, &source));
+    let ticket_for_install = ticket.clone();
     let upload_limit = parse_size(&args.max_upload)?;
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => Some(pumasi_dashboard::tls_config(cert, key)?),
@@ -184,8 +186,15 @@ pub async fn run_until(
     // A newer binary installed over this one: restart into it (signed-in
     // browsers sign in again).
     let stop = crate::follow::until_stop(shutdown, follow, |_| async { Ok(()) });
+    let install = async {
+        match &own_exe {
+            Some(exe) => install_rollout_binary(home, &ticket_for_install, net, exe).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         r = ui.wait() => r?,
+        never = install => match never {},
         stop = stop => {
             if let crate::follow::Stop::Upgrade { version, exe } = stop {
                 eprintln!("restarting the dashboard into pumasi {version}");
@@ -194,6 +203,131 @@ pub async fn run_until(
         }
     }
     Ok(0)
+}
+
+/// A dashboard on a machine with neither a control plane nor an agent
+/// (whose upgrades replace the shared binary) installs the current
+/// rollout's binary for its platform itself (1.13): signed by the cluster
+/// key in its ticket, newer than its own, fetched from the control plane
+/// and checked against the signed size and SHA-256. Following the binary
+/// then restarts it. Each binary is tried once.
+async fn install_rollout_binary(
+    home: &Path,
+    ticket: &pumasi_proto::ticket::AdminTicket,
+    net: pumasi_proto::net::NetMode,
+    exe: &Path,
+) -> std::convert::Infallible {
+    use pumasi_proto::{
+        msg::{AdminOp, AdminResponse},
+        release::{Target, is_older, read_build_info, sha256_file},
+    };
+    let every = std::env::var("PUMASI_TEST_OWN_UPGRADE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs,
+        );
+    let cluster_key = *ticket.cluster.id.as_bytes();
+    let mut tried = std::collections::HashSet::new();
+    let mut last_err: Option<String> = None;
+    loop {
+        tokio::time::sleep(every).await;
+        if home.join("cluster").join("state.redb").exists()
+            || home.join("agent").join("secret.key").exists()
+        {
+            continue;
+        }
+        let res: Result<()> = async {
+            let client = AdminClient::connect(ticket, net).await?;
+            let res = async {
+                let AdminResponse::Rollout(view) = client.call(AdminOp::RolloutStatus).await?
+                else {
+                    anyhow::bail!("unexpected answer to RolloutStatus");
+                };
+                let Some(release) = view
+                    .releases
+                    .iter()
+                    .find(|r| r.file().target == Target::host())
+                else {
+                    return Ok(());
+                };
+                let file = release.file().clone();
+                if !is_older(pumasi_proto::version(), &file.version) || !tried.insert(file.sha256) {
+                    return Ok(());
+                }
+                release
+                    .verify(&cluster_key)
+                    .context("the release is not signed by this cluster")?;
+                let path = exe.to_path_buf();
+                let on_disk = tokio::task::spawn_blocking(move || {
+                    std::fs::read(&path).ok().and_then(|b| read_build_info(&b))
+                })
+                .await
+                .ok()
+                .flatten();
+                if on_disk.is_some_and(|b| !is_older(&b.version, &file.version)) {
+                    return Ok(());
+                }
+                eprintln!(
+                    "installing pumasi {} over {} (the cluster's rollout)",
+                    file.version,
+                    exe.display()
+                );
+                let dir = home.join("ui-upgrade");
+                std::fs::create_dir_all(&dir)?;
+                let tmp = dir.join("download");
+                let mut out = std::fs::File::create(&tmp)?;
+                let mut offset = 0u64;
+                while offset < file.size {
+                    let AdminResponse::ReleaseChunk(bytes) = client
+                        .call(AdminOp::ReleaseChunk {
+                            sha256: file.sha256,
+                            offset,
+                        })
+                        .await?
+                    else {
+                        anyhow::bail!("unexpected answer to ReleaseChunk");
+                    };
+                    anyhow::ensure!(!bytes.is_empty(), "the download stopped at {offset} bytes");
+                    std::io::Write::write_all(&mut out, &bytes)?;
+                    offset += bytes.len() as u64;
+                }
+                drop(out);
+                let check = tmp.clone();
+                let sha = tokio::task::spawn_blocking(move || sha256_file(&check)).await??;
+                anyhow::ensure!(
+                    offset == file.size && sha == file.sha256,
+                    "the downloaded binary does not match the signed release"
+                );
+                let res = pumasi_agent::upgrade::replace_binary(
+                    &tmp,
+                    file.sha256,
+                    &file.version,
+                    exe,
+                    true,
+                )
+                .await;
+                let _ = std::fs::remove_dir_all(&dir);
+                res?;
+                eprintln!("installed pumasi {}", file.version);
+                Ok(())
+            }
+            .await;
+            client.close().await;
+            res
+        }
+        .await;
+        // Said once while it stays the same (the control plane may be down
+        // for a while).
+        let err = res.err().map(|e| format!("{e:#}"));
+        if let Some(e) = &err
+            && last_err.as_ref() != Some(e)
+        {
+            eprintln!("could not install the cluster's rollout binary: {e}");
+        }
+        last_err = err;
+    }
 }
 
 /// Best effort: a machine without a desktop just shows the URL.

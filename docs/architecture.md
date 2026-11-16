@@ -553,9 +553,9 @@ it afterwards.
 
 The cluster key is the trust root, so the admin secret (which can start a
 rollout) is as powerful as root on every machine that accepts upgrades;
-providers keep the choice with `--auto-upgrade`. The control plane itself
-is upgraded by hand: replace its binary and restart it before rolling out
-agents of a newer protocol.
+providers keep the choice with `--auto-upgrade`. The control plane follows
+after the agents since 1.13 (phase 29); a binary of a newer protocol still
+needs it upgraded by hand first.
 
 ## Phase 5: Windows
 
@@ -3010,6 +3010,138 @@ new tables are created on first start; going back to 1.11 leaves them
 unused. Processes that see `HTTPS_PROXY` now use it for relays: set
 `PUMASI_PROXY=off` where that is not wanted.
 
+## Phase 29: upgrades that reach the control plane (1.13)
+
+Release 1.13 takes the last machine out of an upgrade by hand: the
+control plane installs the rollout's binary itself, restarts into it at
+the right moment, and rolls it back when it does not come back healthy.
+It also fixes the causes of three CI flakes. The code is
+`cluster/src/own.rs` (the records), `cluster/src/server/own_rollout.rs`
+(whose turn it is), `cli/src/own_upgrade.rs` (keeping, swapping and
+rolling back binaries) and the follow loop in `cli/src/follow.rs`.
+
+### Who installs, and when it restarts
+
+Since 1.3 a control plane follows its binary: when a newer pumasi appears
+at the path it started from (an agent on the same machine upgraded the
+shared binary), it restarts into it. Since 1.3.1 a leader with no member
+agent on its machine installs the rollout's binary for its platform
+itself. 1.13 keeps both and changes when the restart happens and what
+surrounds it:
+
+- `Cluster::own_upgrade` answers on followers too, from the replicated
+  rollout record and the release files the leader copies to its
+  replicas (phase 24), and only on a follower that is caught up. A
+  release this machine rolled back from (`upgrade/failed.json`) is never
+  offered again.
+- `Cluster::may_restart(version)` decides the moment. A single control
+  plane restarts once the agents' rollout has settled (no download, no
+  agent waiting, draining or upgrading). A follower asks the leader for
+  its turn (`RaftReq::Turn`): the leader grants one turn at a time, only
+  once the agents have settled, and only while every other voter has
+  answered in the last 3 seconds, so that the quorum survives the
+  restart. The turn ends when the replica reports the new version or
+  after 10 minutes. The leader asks every replica's version every 5
+  seconds (`RaftReq::Version`, which also carries the last release it
+  rolled back from) and restarts last, once every other replica runs the
+  new version: openraft 0.9 has no leadership transfer, so the leader
+  steps down by restarting, and the others' election timeout picks a new
+  leader within a couple of seconds. A leader that comes back before
+  that can win again, already on the new version.
+- `AdminOp::ControlPlanes` returns the leader's view of every replica:
+  version, platform and `ControlPlaneUpgrade` (current, waiting with the
+  reason, upgrading, rolled back, no binary for its platform, unknown).
+  `upgrade status`, `upgrade latest` and `upgrade rollout --wait` print
+  it, and `upgrade latest` fetches binaries for the replicas' platforms
+  too.
+
+### The trial
+
+The records live in `<cluster dir>/upgrade/`, next to the agent's own
+(phase 4), and work the same way:
+
+1. Before it restarts, the control plane makes sure `previous` holds the
+   running binary. The file at its path may already be the new one (an
+   agent replaced it), so it looks for a copy with the running image's
+   SHA-256: `/proc/self/exe` on Linux, the path itself, the agent's
+   `.old` file, the agent's own `previous`. Then it writes `pending.json`
+   (the old and new SHA-256 and versions). Without a copy it restarts
+   without a rollback and says so.
+2. The new binary sees `pending.json` with its own hash and counts the
+   start. It commits (deletes the file) once it has been healthy for 10
+   seconds: a single control plane or a leader that serves, or a follower
+   that follows a leader and has applied its log.
+3. A start that fails before the control plane runs, a fourth start
+   without a commit (a crash loop under systemd, launchd or the Windows
+   service manager, which restart it), or no health within 5 minutes
+   (`PUMASI_CP_TRIAL_SECS`) puts `previous` back with the agent's
+   replacement code, records the release in `failed.json` and restarts
+   (in place on Unix, through the service manager's restart on Windows).
+
+A control plane that rolled back does not restart into that binary again
+even if an agent on its machine installs it (`Own::failed_before`).
+
+### Dashboards
+
+A dashboard follows its binary like the control plane, and since 1.13
+also follows it down, so it goes back with a control plane that rolled
+back. A dashboard on a machine with neither a control plane nor an agent
+installs the rollout's binary itself: it reads the rollout
+(`RolloutStatus`), checks the release's signature against the cluster key
+in its admin ticket, downloads the file with `AdminOp::ReleaseChunk`
+(only binaries of the current rollout, 4 MiB at a time), checks the
+signed size and SHA-256, and replaces its binary; following it then
+restarts the dashboard.
+
+### The flaky checks
+
+- **HA restart.** `RaftLogStorage::get_log_state` read the purge point
+  as `LogId` while it was written as `Option<LogId>`: postcard read the
+  option's tag as part of the term, so after a purge a restarted replica
+  asked for an entry at index 31975955732986110 and refused to start. A
+  unit test writes and reads the purge point across a reopen.
+- **A failed start** (that one, or any other) left the file store's and
+  Raft's databases open in the process, so retries failed with "Database
+  already open". `Cluster::start_on` now shuts down what it started when
+  a later step fails.
+- **The agent cache's garbage collection** removed blobs of a download
+  in progress (iroh-blobs protects only tagged data and what changed
+  since the last mark), so tasks failed with an I/O error on macOS. A
+  download now holds a temporary tag on its hash sequence until it ends;
+  a test runs the collector during a partial download.
+- **Heartbeats.** The control plane's tick ran every 500 ms with
+  `MissedTickBehavior::Burst`, and a control plane that stalled (a
+  loaded Windows runner) then judged nodes by a clock that had moved on
+  without it. The tick now notices how late it is and moves every online
+  node's last-seen time forward by the stall, so only silence while the
+  control plane was listening counts.
+- **The Intel Mac service check** (a control plane service answering
+  only after a minute or more, and once not at all after a restart) is
+  not explained yet; `scripts/ci/service-cluster.sh` records how long
+  each wait took and, on a timeout, what the client said, the sockets
+  and the processes.
+
+CI checks the whole path with real binaries as services on Linux, macOS
+and Windows (`scripts/ci/service-own-upgrade.sh`): the latest published
+release upgrading to a build of the commit, and a build of the commit
+upgrading to one that dies at start (a test hook,
+`upgrade/test-exit-at-start`), rolling back after the fourth start,
+then upgrading for real; a lone dashboard installs the binary itself.
+`replicas_upgrade_one_at_a_time` in `cluster/tests/ha.rs` rolls three
+replicas with a job running across the leader's restart. The Long
+checks workflow soaks on Windows and repeats each once-flaky test 50
+times on its runner.
+
+### Compatibility
+
+`AdminOp::ControlPlanes` and `ReleaseChunk`, their responses, and
+`RaftReq::Version` and `Turn` are appended to their enums; the agent
+protocol and the storage layout do not change. A 1.12 replica cannot
+answer `Version` or grant a `Turn`, so the 1.13 leader waits for it
+("older than 1.13: upgrade it by hand") and a 1.13 follower waits for a
+1.12 leader: replicas go to 1.13 by hand once. A single 1.12 control
+plane installs 1.13 and restarts into it as before, without a trial.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -3210,8 +3342,9 @@ remotely; install a current binary on them once.
 - Windows: Hyper-V HCS as a faster backend waits for real-PC timings
   (`scripts/windows/boot-times.ps1`), and binaries are unsigned until
   SignPath Foundation approves the project.
-- The control plane does not upgrade itself (rollouts reach agents, with
-  canaries since 1.7).
+- The control plane upgrades itself only within one agent protocol (a
+  protocol change still needs it upgraded by hand first), and the leader
+  steps down by restarting (openraft 0.9 has no leadership transfer).
 - High availability: a replica's
   address in the membership is the one it joined with (a replica that
   moves must be removed and invited again), and followers answer only

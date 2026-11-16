@@ -4625,7 +4625,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-agent"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4668,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-cli"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4694,7 +4694,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-cluster"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4737,7 +4737,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-dashboard"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4770,7 +4770,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-guest"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "chacha20poly1305",
  "flate2",
@@ -4787,7 +4787,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-proto"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "blake3",

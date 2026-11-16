@@ -45,14 +45,20 @@ impl RolloutRecord {
     }
 }
 
+/// The rollout in a state database: what a follower, which has no
+/// [`State`], reads (1.13).
+pub(crate) fn load_rollout_from(store: &crate::store::Store) -> Result<Option<RolloutRecord>> {
+    match store.get_meta(ROLLOUT_META)? {
+        Some(b) => Ok(Some(
+            postcard::from_bytes(&b).context("corrupt rollout record")?,
+        )),
+        None => Ok(None),
+    }
+}
+
 impl State {
     pub(crate) fn load_rollout(&self) -> Result<Option<RolloutRecord>> {
-        match self.store.get_meta(ROLLOUT_META)? {
-            Some(b) => Ok(Some(
-                postcard::from_bytes(&b).context("corrupt rollout record")?,
-            )),
-            None => Ok(None),
-        }
+        load_rollout_from(&self.store)
     }
 
     /// Starts a rollout of uploaded binaries. `uploaded` says whether a

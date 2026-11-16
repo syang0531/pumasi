@@ -6,6 +6,7 @@ mod gpu_cmd;
 mod ha_cmd;
 mod manage;
 mod monitor;
+mod own_upgrade;
 mod security;
 mod service;
 mod ui;
@@ -2094,6 +2095,18 @@ async fn cluster_start(
     in_service: bool,
 ) -> Result<i32> {
     let mut config = ClusterConfig::new(home.join("cluster"));
+    // A replica that joined already starts as one (a restart into a new
+    // binary repeats the arguments it was started with).
+    let join = match &replica {
+        Some(_) if config.data_dir.join("state.redb").exists() => {
+            eprintln!(
+                "{} already holds this replica; starting it (the replica ticket is not needed again)",
+                config.data_dir.display()
+            );
+            None
+        }
+        r => r.clone(),
+    };
     config.name = name;
     config.release_source = release.release_source.clone();
     let follow = if release.no_follow_binary {
@@ -2147,9 +2160,33 @@ async fn cluster_start(
     }
     // A fixed port lets agents reconnect after a restart in local mode.
     config.bind = Some(net.bind.unwrap_or_else(|| "0.0.0.0:7480".parse().unwrap()));
-    let cluster = match &replica {
-        Some(t) => Cluster::join_replica(config.clone(), t).await?,
-        None => Cluster::start(config.clone()).await?,
+    // A new binary on trial counts this start, and one that keeps failing
+    // is rolled back before anything else happens (1.13).
+    let own = match follow.as_ref().map(|f| f.exe().to_path_buf()) {
+        Some(exe) if join.is_none() => {
+            match own_upgrade::startup(home, &config.data_dir, &exe).await? {
+                own_upgrade::Begin::Run(own) => Some(*own),
+                own_upgrade::Begin::Restart => return follow::restart(in_service, &exe),
+            }
+        }
+        _ => None,
+    };
+    let started = match &join {
+        Some(t) => Cluster::join_replica(config.clone(), t).await,
+        None => Cluster::start(config.clone()).await,
+    };
+    let cluster = match started {
+        Ok(c) => c,
+        Err(e) => {
+            if let (Some(own), Some(f)) = (&own, &follow)
+                && own.on_trial()
+            {
+                own.roll_back(&format!("the control plane did not start: {e:#}"))
+                    .await?;
+                return follow::restart(in_service, f.exe());
+            }
+            return Err(e);
+        }
     };
     eprintln!();
     if !cluster.is_leader() {
@@ -2159,7 +2196,7 @@ async fn cluster_start(
         );
         eprintln!("`pumasi ha status` shows the replicas; this one takes over if the leader fails");
         eprintln!();
-        return stop_cluster(home, cluster, shutdown, follow, in_service).await;
+        return stop_cluster(home, cluster, shutdown, follow, own, in_service).await;
     }
     let status = cluster.status();
     eprintln!(
@@ -2185,18 +2222,22 @@ async fn cluster_start(
         eprintln!("  pumasi agent join {ticket}");
     }
     eprintln!();
-    stop_cluster(home, cluster, shutdown, follow, in_service).await
+    stop_cluster(home, cluster, shutdown, follow, own, in_service).await
 }
 
 /// Runs the control plane until `shutdown`, or until a newer binary was
-/// installed over this one and the rollout settled: then restarts into it.
-/// With no member agent on this machine to install that binary, the
-/// control plane installs the rollout's binary for its platform itself.
+/// installed over this one and it is this control plane's turn to restart
+/// (1.13: after the agents; replicas one at a time, the leader last): then
+/// restarts into it, on trial. With no member agent on this machine to
+/// install that binary, the control plane installs the rollout's binary
+/// for its platform itself. A binary on trial that does not become healthy
+/// in time is rolled back.
 async fn stop_cluster(
     home: &Path,
     cluster: Cluster,
     shutdown: impl std::future::Future<Output = ()>,
     follow: Option<follow::Follow>,
+    own: Option<own_upgrade::Own>,
     in_service: bool,
 ) -> Result<i32> {
     let own_exe = follow.as_ref().map(|f| f.exe().to_path_buf());
@@ -2204,14 +2245,41 @@ async fn stop_cluster(
         pumasi_agent::upgrade::remove_old_binaries(exe);
     }
     let upgrade_own = async {
-        match own_exe {
-            Some(exe) => upgrade_own_binary(&cluster, home, exe).await,
+        match (&own_exe, &own) {
+            (Some(exe), Some(own)) => upgrade_own_binary(&cluster, home, exe.clone(), own).await,
+            _ => std::future::pending().await,
+        }
+    };
+    let trial = async {
+        match &own {
+            Some(own) => own.watch(&cluster).await,
             None => std::future::pending().await,
         }
     };
+    let ready = |version: String| {
+        let cluster = &cluster;
+        let own = own.as_ref();
+        async move {
+            if let Some(why) = match own {
+                Some(own) => own.failed_before().await,
+                None => None,
+            } {
+                return Err(format!("it was rolled back here before: {why}"));
+            }
+            cluster.may_restart(&version).await
+        }
+    };
     let stop = tokio::select! {
-        stop = follow::until_stop(shutdown, follow, || cluster.rollout_settled()) => stop,
+        stop = follow::until_stop(shutdown, follow, ready) => stop,
         never = upgrade_own => match never {},
+        failed = trial => {
+            let own = own.as_ref().expect("a trial has its records");
+            let exe = own_exe.as_ref().expect("a trial follows its binary");
+            eprintln!("{failed}");
+            cluster.shutdown().await?;
+            own.roll_back(&failed).await?;
+            return follow::restart(in_service, exe);
+        }
     };
     match stop {
         follow::Stop::Shutdown => {
@@ -2221,6 +2289,9 @@ async fn stop_cluster(
         }
         follow::Stop::Upgrade { version, exe } => {
             eprintln!("restarting the control plane into pumasi {version}");
+            if let Some(own) = &own {
+                own.prepare_restart(&version).await;
+            }
             cluster.shutdown().await?;
             follow::restart(in_service, &exe)
         }
@@ -2229,17 +2300,23 @@ async fn stop_cluster(
 
 /// Installs the current rollout's binary for this platform over the
 /// control plane's own when no agent on this machine is a member of the
-/// cluster to do it ([`Cluster::own_upgrade`]). Following the binary then
-/// restarts the control plane (once the rollout settles) and the
-/// dashboard into it. Each binary is tried once per start.
+/// cluster to do it ([`Cluster::own_upgrade`]), keeping the running one to
+/// roll back to. Following the binary then restarts the control plane
+/// (once it is its turn) and the dashboard into it. Each binary is tried
+/// once per start, and never again after a rollback.
 async fn upgrade_own_binary(
     cluster: &Cluster,
     home: &Path,
     exe: PathBuf,
+    own: &own_upgrade::Own,
 ) -> std::convert::Infallible {
     let mut tried = std::collections::HashSet::new();
+    let every = std::env::var("PUMASI_TEST_OWN_UPGRADE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(Duration::from_secs(30), Duration::from_secs);
     loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(every).await;
         let local_node = local_agent_id(home);
         let Some(up) = cluster.own_upgrade(local_node.as_deref()) else {
             continue;
@@ -2265,6 +2342,7 @@ async fn upgrade_own_binary(
             "no agent on this machine installs pumasi {version}; installing it over {}",
             exe.display()
         );
+        own.keep_previous().await;
         match pumasi_agent::upgrade::replace_binary(&up.path, up.file.sha256, version, &exe, true)
             .await
         {

@@ -37,6 +37,9 @@ fn stamp(p: &Path) -> Stamp {
 pub struct Follow {
     exe: PathBuf,
     seen: Stamp,
+    /// Also an older binary: the dashboard goes back with a control plane
+    /// that rolled its upgrade back (1.13).
+    also_older: bool,
 }
 
 impl Follow {
@@ -44,7 +47,18 @@ impl Follow {
     pub fn new() -> Option<Self> {
         let exe = crate::own_exe()?;
         let seen = stamp(&exe);
-        Some(Self { exe, seen })
+        Some(Self {
+            exe,
+            seen,
+            also_older: false,
+        })
+    }
+
+    /// Follows any other version installed over the binary, older ones
+    /// too.
+    pub fn also_older(mut self) -> Self {
+        self.also_older = true;
+        self
     }
 
     /// The binary being watched.
@@ -52,8 +66,9 @@ impl Follow {
         &self.exe
     }
 
-    /// Resolves with the new version once a newer pumasi that starts is
-    /// installed where this one was started from.
+    /// Resolves with the new version once a newer pumasi (or with
+    /// [`Self::also_older`] any other) that starts is installed where this
+    /// one was started from.
     pub async fn newer(&mut self) -> String {
         loop {
             tokio::time::sleep(CHECK_EVERY).await;
@@ -75,14 +90,20 @@ impl Follow {
         })
         .await
         .ok()??;
-        if !is_older(pumasi_proto::version(), &info.version) {
+        let mine = pumasi_proto::version();
+        let follows = if self.also_older {
+            info.version != mine
+        } else {
+            is_older(mine, &info.version)
+        };
+        if !follows {
             return None;
         }
         match smoke_test(&self.exe, &info.version).await {
             Ok(()) => Some(info.version),
             Err(e) => {
                 eprintln!(
-                    "a newer pumasi ({}) is at {}, but it does not start: {e}; staying on {}",
+                    "another pumasi ({}) is at {}, but it does not start: {e}; staying on {}",
                     info.version,
                     self.exe.display(),
                     pumasi_proto::version()
@@ -127,12 +148,17 @@ pub enum Stop {
 }
 
 /// Waits for `shutdown`, or (with `follow`) for a newer binary and then
-/// for `ready` to say it is a good moment to restart.
-pub async fn until_stop(
+/// for `ready` to say it is a good moment to restart (`Err` says why not
+/// yet: the rollout has not settled, another control plane replica goes
+/// first).
+pub async fn until_stop<F>(
     shutdown: impl std::future::Future<Output = ()>,
     follow: Option<Follow>,
-    ready: impl Fn() -> bool,
-) -> Stop {
+    ready: impl Fn(String) -> F,
+) -> Stop
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
     tokio::pin!(shutdown);
     let Some(mut follow) = follow else {
         shutdown.await;
@@ -142,21 +168,32 @@ pub async fn until_stop(
         _ = &mut shutdown => return Stop::Shutdown,
         v = follow.newer() => v,
     };
-    let mut told = false;
+    let mut told: Option<String> = None;
     loop {
-        if ready() {
-            return Stop::Upgrade {
-                version,
-                exe: follow.exe,
-            };
-        }
-        if !told {
-            eprintln!("pumasi {version} is installed; restarting into it once the rollout settles");
-            told = true;
+        let check = ready(version.clone());
+        let r = tokio::select! {
+            _ = &mut shutdown => return Stop::Shutdown,
+            r = check => r,
+        };
+        match r {
+            Ok(()) => {
+                return Stop::Upgrade {
+                    version,
+                    exe: follow.exe,
+                };
+            }
+            Err(why) => {
+                if told.as_deref() != Some(why.as_str()) {
+                    eprintln!(
+                        "pumasi {version} is installed; restarting into it once it is this one's turn ({why})"
+                    );
+                    told = Some(why);
+                }
+            }
         }
         tokio::select! {
             _ = &mut shutdown => return Stop::Shutdown,
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
         }
     }
 }
@@ -189,6 +226,7 @@ mod tests {
         let mut f = Follow {
             exe: exe.clone(),
             seen: None,
+            also_older: false,
         };
         assert_eq!(f.check().await, None);
         // Unchanged since the last look: not even read.

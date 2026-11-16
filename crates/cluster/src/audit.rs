@@ -724,6 +724,8 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | Placement { .. }
         | AuditCheckpoint
         | AuditFrom { .. }
+        | ControlPlanes
+        | ReleaseChunk { .. }
         | ScimView => return None,
         // Unwrapped before anything looks at it.
         FollowerRead(inner) => return describe(inner),

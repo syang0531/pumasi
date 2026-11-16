@@ -61,6 +61,11 @@ pub const ADMIN_TICKET_FILE: &str = "admin.ticket";
 const ADMIN_SECRET_META: &str = "admin_secret";
 const NAME_META: &str = "cluster_name";
 /// How long a backup made for `pumasi backup` is kept for its chunks.
+mod own_rollout;
+
+/// A look at the nodes this much later than its time means the control
+/// plane itself was held up (1.13).
+const STALL: Duration = Duration::from_secs(2);
 const BACKUP_TTL: Duration = Duration::from_secs(600);
 /// Largest chunk of a backup in one answer.
 const BACKUP_CHUNK: usize = 8 * 1024 * 1024;
@@ -179,6 +184,9 @@ pub(crate) struct Shared {
     lead: Mutex<Option<JoinHandle<()>>>,
     /// The newest published release and its download (1.3).
     pub(crate) latest: Mutex<crate::latest::LatestState>,
+    /// This control plane's own upgrades (1.13).
+    own: crate::own::OwnTrial,
+    own_rollout: Mutex<own_rollout::OwnRollout>,
 }
 
 impl Shared {
@@ -407,8 +415,11 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
     tasks.push({
         let inner = inner.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            const EVERY: Duration = Duration::from_millis(500);
+            let mut tick = tokio::time::interval(EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut ticks: u64 = 0;
+            let mut last = Instant::now();
             loop {
                 tick.tick().await;
                 // The control plane's own disk, every 30 seconds.
@@ -434,7 +445,19 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
                         .audit_prune_older(inner.config.keep_audit, crate::state::now_unix());
                 }
                 ticks += 1;
-                inner.state().tick(inner.config.node_timeout);
+                {
+                    let mut st = inner.state();
+                    // How long past its time this look comes: the runtime
+                    // or the state lock was held up for that long.
+                    let now = Instant::now();
+                    let late = now.saturating_duration_since(last).saturating_sub(EVERY);
+                    last = now;
+                    let stalled = if late >= STALL { late } else { Duration::ZERO };
+                    if !stalled.is_zero() {
+                        warn!(secs = stalled.as_secs_f32(), "the control plane was held up; not counting that time against the nodes");
+                    }
+                    st.tick_after(inner.config.node_timeout, stalled);
+                }
                 if ticks.is_multiple_of(10) {
                     let admin = inner.admin_secret();
                     inner.state().tick_sessions(&admin);
@@ -544,6 +567,8 @@ impl Cluster {
             backup: Mutex::new(None),
             lead: Mutex::new(None),
             latest: Mutex::new(Default::default()),
+            own: crate::own::OwnTrial::new(&config.data_dir),
+            own_rollout: Default::default(),
         });
 
         let blobs_protocol = {
@@ -569,21 +594,36 @@ impl Cluster {
             shared: shared.clone(),
             router,
         };
-        if replicated {
-            let ha = Ha::start(
-                &config.data_dir,
-                endpoint.clone(),
-                shared.addr(),
-                shared.store.db().clone(),
-                false,
-            )
-            .await?;
-            *shared.ha.write().unwrap() = Some(ha.clone());
-            *shared.lead.lock().unwrap() = Some(tokio::spawn(lead(shared.clone(), ha)));
-            info!(id = %endpoint.id(), cluster = %shared.key.public(), "control plane replica started");
-        } else {
-            let inner = start_services(&shared, shared.store.with_sink(Sink::Direct)).await?;
-            info!(name = %inner.state().cluster_name, id = %endpoint.id(), "control plane started");
+        let started: Result<()> = async {
+            if replicated {
+                let ha = Ha::start(
+                    &config.data_dir,
+                    endpoint.clone(),
+                    shared.addr(),
+                    shared.store.db().clone(),
+                    false,
+                )
+                .await?;
+                *shared.ha.write().unwrap() = Some(ha.clone());
+                *shared.lead.lock().unwrap() = Some(tokio::spawn(lead(shared.clone(), ha)));
+                info!(id = %endpoint.id(), cluster = %shared.key.public(), "control plane replica started");
+            } else {
+                let inner = start_services(&shared, shared.store.with_sink(Sink::Direct)).await?;
+                info!(name = %inner.state().cluster_name, id = %endpoint.id(), "control plane started");
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = started {
+            // Let go of everything this start opened (the endpoint, the
+            // file store's and the state's databases), so that another
+            // start in this process, or the previous binary after a
+            // rollback, can open them (1.13).
+            drop(shared);
+            if let Err(stop) = cluster.shutdown().await {
+                warn!("cleaning up after a failed start: {stop:#}");
+            }
+            return Err(e);
         }
         Ok(cluster)
     }
@@ -691,58 +731,9 @@ impl Cluster {
 
     /// Whether no upgrade is under way: no release download, and no node
     /// still waiting for, draining for or installing the rollout. Always
-    /// true on a replica that does not lead. A control plane that follows
-    /// its binary restarts only then.
+    /// true on a replica that does not lead.
     pub fn rollout_settled(&self) -> bool {
-        if matches!(
-            self.shared.latest.lock().unwrap().fetch,
-            pumasi_proto::release::FetchState::Running { .. }
-        ) {
-            return false;
-        }
-        let Some(inner) = self.shared.active() else {
-            return true;
-        };
-        let view = inner.state().rollout_view();
-        !view.nodes.iter().any(|n| {
-            matches!(
-                n.state,
-                pumasi_proto::msg::UpgradeState::Waiting
-                    | pumasi_proto::msg::UpgradeState::Draining
-                    | pumasi_proto::msg::UpgradeState::Upgrading
-            )
-        })
-    }
-
-    /// The binary this control plane should install over its own, when
-    /// no agent on its machine will: the current rollout's release for
-    /// this platform, newer than the running version, kept in the release
-    /// store. `local_node` is the node id of an agent on this machine, if
-    /// it has one; while that agent is a member of the cluster it upgrades
-    /// the shared binary itself (and rolls back if it fails), so this
-    /// returns `None`. Only the leading replica answers.
-    pub fn own_upgrade(&self, local_node: Option<&str>) -> Option<OwnUpgrade> {
-        let inner = self.shared.active()?;
-        let st = inner.state();
-        if local_node.is_some_and(|id| st.members.contains_key(id)) {
-            return None;
-        }
-        let file = st
-            .rollout
-            .as_ref()?
-            .release_for(&pumasi_proto::release::Target::host())?
-            .file()
-            .clone();
-        drop(st);
-        if !pumasi_proto::release::is_older(pumasi_proto::version(), &file.version)
-            || !self.shared.releases.has(&file.sha256, file.size)
-        {
-            return None;
-        }
-        Some(OwnUpgrade {
-            path: self.shared.releases.path_of(&file.sha256),
-            file,
-        })
+        self.shared.agents_settled()
     }
 
     /// Where uploaded release binaries are kept.
@@ -903,6 +894,7 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
     let mut last_check: Option<Instant> = None;
     let mut last_mirror: Option<Instant> = None;
     let mut replicas: Vec<EndpointAddr> = Vec::new();
+    let mut last_versions: Option<Instant> = None;
     let mut check = tokio::time::interval(Duration::from_millis(500));
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -965,6 +957,12 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
                     inner.state().send_replicas(&now);
                     shared.write_admin_ticket(inner.admin_secret());
                     replicas = now;
+                }
+                // What every replica runs, for their own upgrades (1.13).
+                if last_versions.is_none_or(|t| t.elapsed() >= own_rollout::VERSIONS_EVERY) {
+                    last_versions = Some(Instant::now());
+                    let (shared, ha) = (shared.clone(), ha.clone());
+                    tokio::spawn(async move { shared.poll_versions(&ha).await });
                 }
             }
             (false, None) => {
@@ -1038,6 +1036,14 @@ impl ha::AsyncTags for Tags {
 
     fn release_chunk(&self, sha256: &[u8; 32], offset: u64) -> Result<Vec<u8>> {
         self.0.releases.read(sha256, offset, 4 << 20)
+    }
+
+    fn version(&self) -> pumasi_proto::release::ReplicaVersion {
+        self.0.own_version()
+    }
+
+    fn turn(&self, peer: iroh::EndpointId, version: &str) -> Result<(), String> {
+        self.0.grant_turn(peer, version)
     }
 }
 
@@ -2603,6 +2609,8 @@ async fn upgrade_to_latest(
             if is_older(pumasi_proto::version(), &tag) {
                 targets.insert(Target::host());
             }
+            // And the other replicas' (1.13).
+            targets.extend(shared.replica_targets_older_than(&tag));
             (targets, current)
         };
         if targets.is_empty() {
@@ -2858,6 +2866,25 @@ async fn handle_store_admin(
                 }
             }
             .await
+        }
+        AdminOp::ControlPlanes => Ok(AdminResponse::ControlPlanes(inner.shared.control_planes())),
+        AdminOp::ReleaseChunk { sha256, offset } => {
+            let known = inner
+                .state()
+                .rollout_files()
+                .iter()
+                .any(|(s, _)| *s == sha256);
+            if known {
+                inner
+                    .shared
+                    .releases
+                    .read(&sha256, offset, 4 << 20)
+                    .map(AdminResponse::ReleaseChunk)
+            } else {
+                Err(anyhow::anyhow!(
+                    "no binary with that SHA-256 in the current rollout"
+                ))
+            }
         }
         AdminOp::HaStatus => Ok(AdminResponse::Ha(Box::new(match inner.ha() {
             Some(ha) => ha.view(),

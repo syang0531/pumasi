@@ -235,6 +235,7 @@ pub async fn run(home: &std::path::Path, cmd: UpgradeCmd) -> Result<i32> {
                 bail!("unexpected response");
             };
             print_rollout(&view);
+            print_control_planes(&client).await;
             print_canary(&client).await;
             client.close().await;
             Ok(0)
@@ -369,6 +370,7 @@ async fn latest(
         bail!("unexpected response");
     };
     print_rollout(&view);
+    print_control_planes(client).await;
     print_canary(client).await;
     if !wait {
         return Ok(0);
@@ -433,6 +435,8 @@ async fn wait_rollout(client: &AdminClient, timeout: Duration) -> Result<i32> {
         if pending == 0 {
             println!();
             print_rollout(&view);
+            // The control planes go next, by themselves (1.13).
+            print_control_planes(client).await;
             let failed = view
                 .nodes
                 .iter()
@@ -484,6 +488,32 @@ fn print_rollout(view: &RolloutView) {
     }
     if view.nodes.is_empty() {
         println!("(no nodes)");
+    }
+}
+
+/// Each control plane replica's version and its own upgrade (nothing
+/// against a control plane before 1.13).
+async fn print_control_planes(client: &AdminClient) {
+    let Ok(AdminResponse::ControlPlanes(cps)) = client.call(AdminOp::ControlPlanes).await else {
+        return;
+    };
+    println!();
+    println!(
+        "{:<12} {:<8} {:<16} {:<20} STATE",
+        "CONTROL", "ROLE", "PLATFORM", "VERSION"
+    );
+    for c in &cps {
+        println!(
+            "{:<12} {:<8} {:<16} {:<20} {}",
+            short(&c.id),
+            if c.leader { "leader" } else { "follower" },
+            c.target
+                .as_ref()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".into()),
+            truncate(c.version.as_deref().unwrap_or("-"), 20),
+            c.state
+        );
     }
 }
 

@@ -262,25 +262,27 @@ which is what the providers send.
 
 1. Read the release notes (protocol and storage layout changes).
 2. `pumasi backup` (step 4).
-3. Replace the control plane's binary and restart it. With replicas,
-   upgrade the followers one at a time first (`pumasi ha status` shows
-   who leads), then the leader, so a majority is always up. The database
-   is migrated in place on first open; there is no way back to an older
-   binary except restoring the backup.
-4. Roll the agents out from the admin's machine: `pumasi upgrade latest
-   --wait` (the control plane downloads the release and checks it against
-   its SHA256SUMS), or with binaries you downloaded,
+3. Roll out from the admin's machine: `pumasi upgrade latest --wait`
+   (the control plane downloads the release and checks it against its
+   SHA256SUMS), or with binaries you downloaded,
    `pumasi upgrade rollout pumasi-linux-x86_64 pumasi-macos-aarch64 pumasi-windows-x86_64.exe --wait`.
-   Older agents keep connecting as long as the control plane still
-   supports their protocol version, and the rollout replaces them.
-5. Restart `pumasi ui` with the new binary. From 1.3 on, a control plane
-   and a dashboard that share their binary with an agent restart into the
-   new version by themselves once the rollout has settled, so on such a
-   machine steps 3 and 5 happen on their own (a protocol change still
-   needs the control plane first). From 1.3.1 on the same holds on a
-   machine that runs only the control plane: with no member agent there,
-   the leading control plane installs the rollout's binary for its own
-   platform itself.
+   The agents go first. Then the control plane (1.13): each replica
+   installs the binary for its platform, followers restart one at a time
+   with the leader's leave and only while a majority stays up, and the
+   leader restarts last. Each new binary is on trial: if it does not
+   become healthy within 5 minutes (or keeps crashing), the previous one
+   is put back and `pumasi upgrade status` says why. The database is
+   migrated in place on first open; there is no way back to an older
+   binary after a migration except restoring the backup, so read the
+   release notes for layout changes.
+4. Dashboards restart into the new binary by themselves: one sharing
+   the binary with the control plane follows it, and one alone on its
+   machine installs the rollout's binary itself.
+5. By hand only when the release notes say so: a newer agent protocol
+   (the rollout refuses it without `--force`), or replicas from before
+   1.13. Then replace the control plane's binary and restart it first,
+   followers one at a time (`pumasi ha status` shows who leads), then
+   the leader, before rolling out.
 
 ## 4. Back up and restore
 

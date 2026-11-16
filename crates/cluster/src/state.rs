@@ -1181,7 +1181,22 @@ impl State {
     }
 
     pub fn tick(&mut self, node_timeout: Duration) {
+        self.tick_after(node_timeout, Duration::ZERO)
+    }
+
+    /// [`State::tick`] after the control plane itself could not look for
+    /// `stalled` (its timer or the state lock was held up): heartbeats that
+    /// arrived meanwhile were not read either, so that time does not count
+    /// against the nodes. A busy Windows runner held the whole process up
+    /// for longer than the node timeout and two idle agents were taken for
+    /// gone, seconds apart (1.13).
+    pub fn tick_after(&mut self, node_timeout: Duration, stalled: Duration) {
         let now = Instant::now();
+        if !stalled.is_zero() {
+            for n in self.nodes.values_mut().filter(|n| n.online) {
+                n.last_seen = (n.last_seen + stalled).min(now);
+            }
+        }
         let silent: Vec<(String, u64)> = self
             .nodes
             .iter()
@@ -2726,6 +2741,24 @@ mod tests {
             key,
         )
         .unwrap()
+    }
+
+    /// Time the control plane itself was held up does not count as
+    /// silence from the nodes; real silence still does (1.13).
+    #[test]
+    fn a_stalled_control_plane_does_not_lose_its_nodes() {
+        let mut st = state();
+        let (a, _rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let timeout = Duration::from_secs(10);
+        // Last heard from 12 s ago, while the control plane was held up
+        // for 8 of them.
+        st.nodes.get_mut(&a).unwrap().last_seen = Instant::now() - Duration::from_secs(12);
+        st.tick_after(timeout, Duration::from_secs(8));
+        assert!(st.nodes[&a].online, "the stall is not the node's silence");
+        // Silent for longer than the timeout with no stall: gone.
+        st.nodes.get_mut(&a).unwrap().last_seen = Instant::now() - Duration::from_secs(12);
+        st.tick(timeout);
+        assert!(!st.nodes.get(&a).is_some_and(|n| n.online));
     }
 
     #[test]

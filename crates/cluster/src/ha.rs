@@ -233,7 +233,11 @@ impl RaftLogStorage<C> for LogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, SErr> {
-        let purged: Option<LogId<NodeId>> = self.meta(PURGED)?;
+        // Stored as an `Option` (see `purge`). Decoding it as a bare
+        // `LogId` read the option's tag as the term and the leader's node id
+        // as the index: a replica that had purged at an entry of a leader
+        // with a nonzero id could not start again (1.13).
+        let purged: Option<LogId<NodeId>> = self.meta::<Option<LogId<NodeId>>>(PURGED)?.flatten();
         let last = {
             let tx = self.db.begin_read().map_err(io_read)?;
             let t = tx.open_table(LOG).map_err(io_read)?;
@@ -542,6 +546,15 @@ pub enum RaftReq {
     /// From the leader: what followers answer reads with. No answer is
     /// sent (an older follower cannot read it and drops it).
     Reads(Box<pumasi_proto::ha::ReadCache>),
+    // 1.13 from here. An older replica cannot read these and closes the
+    // stream: its version shows as unknown.
+    /// From the leader: what this replica runs.
+    Version,
+    /// To the leader: may this replica restart into `version` now? One
+    /// replica at a time, and never when that would cost the quorum.
+    Turn {
+        version: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -558,6 +571,10 @@ pub enum RaftResp {
     Mirrored(usize),
     Releases(Vec<([u8; 32], u64)>),
     Chunk(Vec<u8>),
+    // 1.13 from here.
+    Version(pumasi_proto::release::ReplicaVersion),
+    /// `Err` says why not yet.
+    Turn(Result<(), String>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1193,6 +1210,8 @@ impl Ha {
                 }
                 RaftResp::Mirrored(0)
             }
+            RaftReq::Version => RaftResp::Version(tags.version()),
+            RaftReq::Turn { version } => RaftResp::Turn(tags.turn(peer, &version)),
             RaftReq::Join { .. } => unreachable!("handled above"),
         }
     }
@@ -1361,6 +1380,83 @@ impl Ha {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+
+    /// One request to the replica at `addr`, on its own connection.
+    async fn ask(&self, addr: EndpointAddr, req: &RaftReq, ttl: Duration) -> Result<RaftResp> {
+        let conn = tokio::time::timeout(ttl, self.endpoint.connect(addr, RAFT_ALPN))
+            .await
+            .context("timed out connecting")??;
+        let resp = tokio::time::timeout(ttl, call(&conn, req)).await;
+        conn.close(0u32.into(), b"done");
+        resp.context("no answer in time")?
+    }
+
+    /// What every other replica runs (1.13): `None` for one that did not
+    /// answer (down, or older than 1.13).
+    pub async fn versions(
+        &self,
+    ) -> Vec<(EndpointId, Option<pumasi_proto::release::ReplicaVersion>)> {
+        let others: Vec<EndpointAddr> = self
+            .members()
+            .into_iter()
+            .filter(|(id, _)| *id != self.id)
+            .filter_map(|(_, n)| n.addr)
+            .collect();
+        let asks = others.into_iter().map(|addr| async move {
+            let id = addr.id;
+            let v = match self
+                .ask(addr, &RaftReq::Version, Duration::from_secs(5))
+                .await
+            {
+                Ok(RaftResp::Version(v)) => Some(v),
+                Ok(other) => {
+                    debug!("version of {}: {other:?}", id.fmt_short());
+                    None
+                }
+                Err(e) => {
+                    debug!("version of {}: {e:#}", id.fmt_short());
+                    None
+                }
+            };
+            (id, v)
+        });
+        n0_future::join_all(asks).await
+    }
+
+    /// Asks the leader whether this follower may restart into `version`
+    /// now (1.13).
+    pub async fn ask_turn(&self, version: &str) -> Result<(), String> {
+        let leader = self
+            .leader_addr()
+            .ok_or_else(|| "no leader is known".to_string())?;
+        if leader.id == self.endpoint.id() {
+            return Err("this replica leads".into());
+        }
+        let req = RaftReq::Turn {
+            version: version.to_string(),
+        };
+        match self.ask(leader, &req, Duration::from_secs(10)).await {
+            Ok(RaftResp::Turn(r)) => r,
+            Ok(RaftResp::Refused(why)) => Err(why),
+            Ok(other) => Err(format!("unexpected answer {other:?}")),
+            Err(e) => Err(format!(
+                "the leader did not answer ({e:#}); it may be older than 1.13"
+            )),
+        }
+    }
+
+    /// Whether this replica is caught up with a leader it knows, or leads.
+    pub fn in_step(&self) -> bool {
+        let m = self.metrics();
+        let Some(leader) = m.current_leader else {
+            return false;
+        };
+        if leader == self.id {
+            return m.state == ServerState::Leader;
+        }
+        // Follows a leader and has applied (nearly) all of its log.
+        m.last_applied.map(|l| l.index) >= m.last_log_index.map(|i| i.saturating_sub(64))
+    }
 }
 
 fn op_size(op: &Op) -> usize {
@@ -1382,6 +1478,11 @@ pub trait AsyncTags: Clone + Send + Sync + 'static {
     /// On the leader: the rollout's binaries (SHA-256, size).
     fn releases(&self) -> Result<Vec<([u8; 32], u64)>>;
     fn release_chunk(&self, sha256: &[u8; 32], offset: u64) -> Result<Vec<u8>>;
+    /// What this replica runs (1.13).
+    fn version(&self) -> pumasi_proto::release::ReplicaVersion;
+    /// On the leader: whether replica `peer` may restart into `version`
+    /// now (1.13).
+    fn turn(&self, peer: EndpointId, version: &str) -> Result<(), String>;
 }
 
 /// Asks the replicas in `candidates` to let this one join, following
@@ -1561,5 +1662,58 @@ pub mod mirror {
         let keep: Vec<[u8; 32]> = list.iter().map(|(s, _)| *s).collect();
         releases.prune(&keep);
         Ok(copied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::{CommittedLeaderId, EntryPayload};
+
+    fn entry(index: u64, leader: NodeId) -> Entry<C> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(3, leader), index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    /// The purge point comes back as written, whatever the leader's node
+    /// id (an id read as the index made restarts fail, 1.13).
+    #[tokio::test]
+    async fn the_purge_point_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "pumasi-ha-purge-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RAFT_DB);
+        // A real node id: the first 8 bytes of an endpoint id.
+        let leader: NodeId = 31_975_955_732_986_110;
+        {
+            let mut log = LogStore::open(&path).unwrap();
+            let tx = log.db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(LOG).unwrap();
+                for i in 1..=5 {
+                    t.insert(i, enc(&entry(i, leader)).as_slice()).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            log.purge(entry(2, leader).log_id).await.unwrap();
+        }
+        let mut log = LogStore::open(&path).unwrap();
+        let st = log.get_log_state().await.unwrap();
+        assert_eq!(st.last_purged_log_id, Some(entry(2, leader).log_id));
+        assert_eq!(st.last_log_id, Some(entry(5, leader).log_id));
+        let rest = log.try_get_log_entries(3..=5).await.unwrap();
+        assert_eq!(rest.len(), 3);
+        // Purged up to the last entry: the purge point is the last log id.
+        log.purge(entry(5, leader).log_id).await.unwrap();
+        let st = log.get_log_state().await.unwrap();
+        assert_eq!(st.last_log_id, Some(entry(5, leader).log_id));
+        assert_eq!(st.last_purged_log_id, Some(entry(5, leader).log_id));
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

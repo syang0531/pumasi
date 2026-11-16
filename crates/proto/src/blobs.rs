@@ -423,6 +423,82 @@ mod scrub_tests {
         }
     }
 
+    /// The store's garbage collector deletes partial blobs that nothing
+    /// refers to, even while they are being downloaded; a temp tag on the
+    /// collection's root keeps them (what a node's cache holds while it
+    /// fetches a mount, 1.13).
+    #[tokio::test]
+    async fn a_temp_tag_keeps_a_partial_download() {
+        use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt};
+        let dir = std::env::temp_dir().join(format!("pumasi-gc-{:016x}", rand::random::<u64>()));
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), data(3 << 20, 7)).unwrap();
+        let full = open_store(&dir.join("full"), None).await.unwrap();
+        let files = vec![("a.bin".to_string(), src.join("a.bin"))];
+        let (tt, _, _) = import_files(&full, &files, false).await.unwrap();
+        let root = tt.hash();
+        let child = entries(&full, root).await.unwrap()[0].hash;
+        let root_bao = full
+            .export_bao(root, ChunkRanges::all())
+            .bao_to_vec()
+            .await
+            .unwrap();
+        let half = ChunkRanges::bytes(0..(1 << 20));
+        let child_bao = full
+            .export_bao(child, half.clone())
+            .bao_to_vec()
+            .await
+            .unwrap();
+        // Copies the root and the first MiB of the file into `store`.
+        async fn partial(store: &Store, root: Hash, rb: &[u8], child: Hash, cb: &[u8]) {
+            store
+                .import_bao_bytes(root, ChunkRanges::all(), rb.to_vec())
+                .await
+                .unwrap();
+            store
+                .import_bao_bytes(child, ChunkRanges::bytes(0..(1 << 20)), cb.to_vec())
+                .await
+                .unwrap();
+        }
+        let has_child = |store: Store| async move {
+            matches!(
+                store.blobs().status(child).await,
+                Ok(BlobStatus::Partial { .. } | BlobStatus::Complete { .. })
+            )
+        };
+        let gc = Some((Duration::from_millis(100), None));
+        for keep in [false, true] {
+            let store = open_store(&dir.join(format!("cache-{keep}")), gc.clone())
+                .await
+                .unwrap();
+            let _tt = if keep {
+                Some(
+                    store
+                        .tags()
+                        .temp_tag(HashAndFormat::hash_seq(root))
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            partial(&store, root, &root_bao, child, &child_bao).await;
+            let mut gone = false;
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if !has_child(store.clone().into()).await {
+                    gone = true;
+                    break;
+                }
+            }
+            assert_eq!(gone, !keep, "kept by a temp tag: {keep}");
+            store.shutdown().await.unwrap();
+        }
+        full.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn verify_finds_a_changed_byte() {
         let dir =

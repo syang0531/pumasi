@@ -2,7 +2,9 @@ name: Long checks
 
 # What used to need a dedicated machine, on GitHub's hosted runners (free
 # and unlimited for public repositories, at most 6 hours per job): a
-# 5h20m soak on Linux and on macOS, and every fuzz target for 20 minutes.
+# 5h20m soak on Linux, macOS and Windows, every fuzz target for 20
+# minutes, and the tests that used to be flaky 50 times in a row each on
+# the runner they failed on (1.13).
 # Runs every Sunday and on demand (Actions → Long checks → Run workflow).
 # The release checklist (docs/operations.md, "Before a release") asks for
 # a green run of this workflow on the commit being tagged.
@@ -18,6 +20,9 @@ on:
       fuzz_seconds:
         description: "Seconds per fuzz target"
         default: "1200"
+      repeat:
+        description: "Runs of each once-flaky test"
+        default: "50"
 
 permissions:
   contents: read
@@ -31,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 358
     steps:
@@ -47,6 +52,7 @@ jobs:
       - if: runner.os == 'macOS'
         run: brew install bash jq && echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: Soak
+        shell: bash
         run: |
           bash --version | head -n1
           scripts/soak.sh --bin target/release/pumasi --duration "${{ inputs.duration || '320m' }}" \
@@ -57,6 +63,52 @@ jobs:
           name: soak-report-${{ matrix.os }}
           path: soak-report
           if-no-files-found: ignore
+
+  # The tests that failed now and then before 1.13, each on the runner it
+  # failed on, many times in a row: the fixes hold, or this says otherwise.
+  repeat:
+    name: repeat ${{ matrix.test }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: ha
+            test: three_replicas_survive_losing_the_leader
+          - os: macos-latest
+            target: store
+            test: datasets_feed_sharded_jobs_and_outputs_come_back
+          - os: windows-latest
+            target: manage
+            test: selectors_drain_and_preemption
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: repeat
+      - run: cargo test -p pumasi-cluster --test ${{ matrix.target }} --no-run
+      - name: Run ${{ inputs.repeat || '50' }} times
+        shell: bash
+        run: |
+          n=${{ inputs.repeat || '50' }}
+          for i in $(seq 1 "$n"); do
+            echo "::group::run $i of $n"
+            start=$SECONDS
+            if ! cargo test -p pumasi-cluster --test ${{ matrix.target }} ${{ matrix.test }} -- --exact --nocapture >run.log 2>&1; then
+              echo "::endgroup::"
+              tail -n 400 run.log
+              echo "::error::${{ matrix.test }} failed on run $i of $n"
+              exit 1
+            fi
+            echo "run $i passed in $((SECONDS - start)) s"
+            echo "::endgroup::"
+          done
+          echo "${{ matrix.test }}: $n runs in a row passed"
 
   fuzz:
     runs-on: ubuntu-latest

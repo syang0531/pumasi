@@ -868,7 +868,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/b"
           cargo build -p pumasi-cli
           cp "target/debug/pumasi$ext" "$RUNNER_TEMP/b/pumasi-old$ext"
-          PUMASI_BUILD_ID=ci-new cargo build -p pumasi-cli
+          # One patch release newer, so the control plane takes it for an
+          # upgrade of its own (agents go by the binary's SHA-256).
+          v=$(cargo pkgid -p pumasi-cli | sed 's/.*[#@]//')
+          next=$(echo "${v%%[-+]*}" | awk -F. '{print $1"."$2"."$3+1}')
+          PUMASI_VERSION="$next+ci-new" cargo build -p pumasi-cli
           cp "target/debug/pumasi$ext" "$RUNNER_TEMP/b/pumasi-new$ext"
           "$RUNNER_TEMP/b/pumasi-old$ext" --version
           "$RUNNER_TEMP/b/pumasi-new$ext" --version
@@ -935,3 +939,23 @@ jobs:
       - name: Control plane and remote API as services, restart, uninstall
         shell: bash
         run: scripts/ci/service-cluster.sh "$RUNNER_TEMP/b/pumasi-new$EXT" "$RUNNER_TEMP/svc-cluster"
+      - name: Control plane as a service upgrades itself, and rolls back a binary that dies at start
+        shell: bash
+        run: |
+          scripts/ci/service-own-upgrade.sh "$RUNNER_TEMP/b/pumasi-old$EXT" \
+            "$RUNNER_TEMP/b/pumasi-new$EXT" "$RUNNER_TEMP/svc-own"
+      - name: The published release as a service upgrades to the new binary
+        shell: bash
+        run: |
+          os=linux; [ "$RUNNER_OS" = macOS ] && os=macos; [ "$RUNNER_OS" = Windows ] && os=windows
+          arch=$(uname -m); [ "$arch" = arm64 ] && arch=aarch64
+          curl -fsSL -o "$RUNNER_TEMP/b/pumasi-prev$EXT" \
+            "https://github.com/${{ github.repository }}/releases/latest/download/pumasi-$os-$arch$EXT"
+          chmod +x "$RUNNER_TEMP/b/pumasi-prev$EXT"
+          "$RUNNER_TEMP/b/pumasi-prev$EXT" --version
+          # A release from 1.13 on takes the trial path; one from before
+          # installs and restarts without one.
+          from=""
+          if "$RUNNER_TEMP/b/pumasi-prev$EXT" --version | grep -qE ' 1\.([0-9]|1[0-2])\.'; then from=--from-release; fi
+          scripts/ci/service-own-upgrade.sh "$RUNNER_TEMP/b/pumasi-prev$EXT" \
+            "$RUNNER_TEMP/b/pumasi-new$EXT" "$RUNNER_TEMP/svc-prev" $from

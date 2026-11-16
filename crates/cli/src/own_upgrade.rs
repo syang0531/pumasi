@@ -25,11 +25,16 @@ pub struct Own {
     /// The upgrade this start is the trial of.
     on_trial: Option<Pending>,
     home: PathBuf,
+    /// The binary at `exe` (size, modified) and why it was rolled back
+    /// before, if it was.
+    failed: std::sync::Mutex<Option<(FileStamp, Option<String>)>>,
 }
+
+type FileStamp = (u64, Option<std::time::SystemTime>);
 
 /// What a control plane does after looking at its upgrade records.
 pub enum Begin {
-    Run(Own),
+    Run(Box<Own>),
     /// Too many starts of a new binary: the previous one is back; restart
     /// into it.
     Restart,
@@ -62,6 +67,25 @@ impl Own {
 
     pub fn on_trial(&self) -> bool {
         self.on_trial.is_some()
+    }
+
+    /// Why the binary now at `exe` was rolled back on this machine before,
+    /// if it was: then the control plane does not restart into it again
+    /// (an agent on this machine may have installed it).
+    pub async fn failed_before(&self) -> Option<String> {
+        let m = std::fs::metadata(&self.exe).ok()?;
+        let stamp = (m.len(), m.modified().ok());
+        if let Some((s, why)) = self.failed.lock().unwrap().as_ref()
+            && *s == stamp
+        {
+            return why.clone();
+        }
+        let why = hash(self.exe.clone())
+            .await
+            .ok()
+            .and_then(|sha| self.trial.failed_with(&sha));
+        *self.failed.lock().unwrap() = Some((stamp, why.clone()));
+        why
     }
 
     /// Makes sure `previous` holds the running binary, so a new one can be
@@ -202,6 +226,7 @@ pub async fn startup(home: &Path, data_dir: &Path, exe: &Path) -> Result<Begin> 
         trial: trial.clone(),
         on_trial: None,
         home: home.to_path_buf(),
+        failed: Default::default(),
     };
     if trial.pending().is_some() {
         let s = own.sha().await?;
@@ -241,5 +266,5 @@ pub async fn startup(home: &Path, data_dir: &Path, exe: &Path) -> Result<Begin> 
         );
         std::process::exit(3);
     }
-    Ok(Begin::Run(own))
+    Ok(Begin::Run(Box::new(own)))
 }

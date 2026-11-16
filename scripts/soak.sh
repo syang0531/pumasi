@@ -11,8 +11,8 @@
 #
 # The default is 72 hours, for a long run on a machine you own. CI runs
 # 10 minutes on every pull request, and the Long checks workflow 5h20m on
-# Linux and macOS (the run a release waits for). Linux and macOS; needs
-# bash 4 or later, curl and jq. The report directory gets samples.csv (time, process, RSS
+# Linux, macOS and (1.13) Windows (the run a release waits for). Linux,
+# macOS, and Windows under Git Bash; needs bash 4 or later, curl and jq. The report directory gets samples.csv (time, process, RSS
 # in KiB, open files), jobs.csv and summary.txt.
 set -euo pipefail
 
@@ -49,6 +49,13 @@ secs() {
 total=$(secs "$duration")
 agent_every=$(secs "$agent_every")
 cluster_every=$(secs "$cluster_every")
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) windows=1 ;;
+  *) windows=0 ;;
+esac
+# Paths as the native binary expects them.
+nat() { if [ "$windows" = 1 ]; then cygpath -w "$1"; else echo "$1"; fi; }
+[ "$windows" = 0 ] || [ -e "$bin" ] || bin=$bin.exe
 bin=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
 [ -x "$bin" ] || { echo "no pumasi binary at $bin (build it, or pass --bin)"; exit 2; }
 command -v jq >/dev/null || { echo "soak.sh needs jq"; exit 2; }
@@ -81,7 +88,8 @@ wait_for() {
 }
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$report/summary.txt"; }
 
-export PUMASI_HOME=$work/admin
+PUMASI_HOME=$(nat "$work/admin")
+export PUMASI_HOME
 # A fixed address, so agents find the control plane again after a restart.
 port=$(( 20000 + RANDOM % 20000 ))
 start_cluster() {
@@ -93,9 +101,9 @@ start_cluster() {
 start_agent() {
   local i=$1
   if [ -e "$work/node-$i/agent/membership.json" ]; then
-    "$bin" --home "$work/node-$i" agent start --net local >>"$work/agent-$i.log" 2>&1 &
+    "$bin" --home "$(nat "$work/node-$i")" agent start --net local >>"$work/agent-$i.log" 2>&1 &
   else
-    "$bin" --home "$work/node-$i" agent join "$join" --net local --name "soak-$i" --slots 2 \
+    "$bin" --home "$(nat "$work/node-$i")" agent join "$join" --net local --name "soak-$i" --slots 2 \
       >>"$work/agent-$i.log" 2>&1 &
   fi
   pid[agent-$i]=$!
@@ -105,7 +113,7 @@ start_cluster
 join=$("$bin" token --ttl 1h --uses "$agents")
 for i in $(seq 1 "$agents"); do start_agent "$i"; done
 wait_for "the agents" sh -c "[ \$('$bin' status | grep -c ' online') -ge $agents ]"
-"$bin" ui --api-only --listen 127.0.0.1:0 --no-open --url-file "$work/ui.url" \
+"$bin" ui --api-only --listen 127.0.0.1:0 --no-open --url-file "$(nat "$work/ui.url")" \
   >>"$work/ui.log" 2>&1 &
 pid[api]=$!
 wait_for "the API" test -s "$work/ui.url"
@@ -126,8 +134,28 @@ deterministic = false
 queue_timeout = "20m"
 EOF
 
+# Windows: Git Bash's ps knows neither RSS nor open files; PowerShell
+# gives the working set and the handle count of the native processes.
+sample_windows() {
+  local now=$1 name ids="" winpid rss fds
+  declare -A of
+  for name in "${!pid[@]}"; do
+    winpid=$(cat "/proc/${pid[$name]}/winpid" 2>/dev/null) || continue
+    of[$winpid]=$name
+    ids="$ids${ids:+,}$winpid"
+  done
+  [ -n "$ids" ] || return 0
+  while IFS=, read -r winpid rss fds; do
+    fds=${fds%$'\r'}
+    if [ -n "${of[$winpid]:-}" ]; then
+      echo "$now,${of[$winpid]},$rss,$fds" >>"$report/samples.csv"
+    fi
+  done < <(powershell -NoProfile -Command "Get-Process -Id $ids -ErrorAction SilentlyContinue | \
+    ForEach-Object { '{0},{1},{2}' -f \$_.Id, [int64](\$_.WorkingSet64 / 1024), \$_.HandleCount }" 2>/dev/null)
+}
 sample() {
   local now=$1 name p rss fds
+  if [ "$windows" = 1 ]; then sample_windows "$now"; return; fi
   for name in "${!pid[@]}"; do
     p=${pid[$name]}
     rss=$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ') || continue

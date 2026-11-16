@@ -95,7 +95,10 @@ status_has() { svc status | tee "$WORK/status.txt"; grep -q -e "$1" "$WORK/statu
 status_lacks() { svc status >"$WORK/status.txt" || true; ! grep -q -e "$1" "$WORK/status.txt"; }
 
 echo "--- starting the control plane"
-"$OLD" --home "$(nat "$CHOME")" cluster start --net local --no-token --name ci \
+# --no-follow-binary: with no agent on its machine, a control plane
+# would install the rollout's binary over its own (1.13), here the "old"
+# binary the other checks use; service-own-upgrade.sh checks that.
+"$OLD" --home "$(nat "$CHOME")" cluster start --net local --no-token --name ci --no-follow-binary \
   >"$WORK/cluster.log" 2>&1 &
 CLUSTER_PID=$!
 wait_until "the control plane" test -s "$CHOME/cluster/admin.ticket"

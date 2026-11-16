@@ -78,7 +78,7 @@ pub struct UiArgs {
     /// identity provider.
     #[arg(long)]
     public_url: Option<String>,
-    /// Keep running the old code when a newer pumasi is installed over
+    /// Keep running the old code when another pumasi is installed over
     /// this binary (by default the dashboard restarts into it; signed-in
     /// browsers then sign in again).
     #[arg(long)]
@@ -101,7 +101,9 @@ pub async fn run_until(
     let follow = if args.no_follow_binary {
         None
     } else {
-        crate::follow::Follow::new()
+        // Back down too, when the control plane on this binary rolls an
+        // upgrade back (1.13).
+        crate::follow::Follow::new().map(|f| f.also_older())
     };
     let (ticket, source) = load_ticket_with_source(home, &args.admin)?;
     let net = net_for_all(&ticket.candidates(), None);

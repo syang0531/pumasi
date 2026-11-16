@@ -37,6 +37,9 @@ fn stamp(p: &Path) -> Stamp {
 pub struct Follow {
     exe: PathBuf,
     seen: Stamp,
+    /// Also an older binary: the dashboard goes back with a control plane
+    /// that rolled its upgrade back (1.13).
+    also_older: bool,
 }
 
 impl Follow {
@@ -44,7 +47,18 @@ impl Follow {
     pub fn new() -> Option<Self> {
         let exe = crate::own_exe()?;
         let seen = stamp(&exe);
-        Some(Self { exe, seen })
+        Some(Self {
+            exe,
+            seen,
+            also_older: false,
+        })
+    }
+
+    /// Follows any other version installed over the binary, older ones
+    /// too.
+    pub fn also_older(mut self) -> Self {
+        self.also_older = true;
+        self
     }
 
     /// The binary being watched.
@@ -52,8 +66,9 @@ impl Follow {
         &self.exe
     }
 
-    /// Resolves with the new version once a newer pumasi that starts is
-    /// installed where this one was started from.
+    /// Resolves with the new version once a newer pumasi (or with
+    /// [`Self::also_older`] any other) that starts is installed where this
+    /// one was started from.
     pub async fn newer(&mut self) -> String {
         loop {
             tokio::time::sleep(CHECK_EVERY).await;
@@ -75,14 +90,20 @@ impl Follow {
         })
         .await
         .ok()??;
-        if !is_older(pumasi_proto::version(), &info.version) {
+        let mine = pumasi_proto::version();
+        let follows = if self.also_older {
+            info.version != mine
+        } else {
+            is_older(mine, &info.version)
+        };
+        if !follows {
             return None;
         }
         match smoke_test(&self.exe, &info.version).await {
             Ok(()) => Some(info.version),
             Err(e) => {
                 eprintln!(
-                    "a newer pumasi ({}) is at {}, but it does not start: {e}; staying on {}",
+                    "another pumasi ({}) is at {}, but it does not start: {e}; staying on {}",
                     info.version,
                     self.exe.display(),
                     pumasi_proto::version()
@@ -205,6 +226,7 @@ mod tests {
         let mut f = Follow {
             exe: exe.clone(),
             seen: None,
+            also_older: false,
         };
         assert_eq!(f.check().await, None);
         // Unchanged since the last look: not even read.

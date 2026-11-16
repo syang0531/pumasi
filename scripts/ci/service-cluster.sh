@@ -58,16 +58,39 @@ dump() {
     [ -f "$f" ] && { echo "=== $f"; tail -n 80 "$f"; }
   done
   ls -la "$H" "$H/cluster" 2>/dev/null || true
+  # What answers on the control plane's port, and what a client sees when
+  # it calls (1.13: the Intel macOS runner once could not reach a
+  # restarted control plane for 6 minutes; this says why next time).
+  echo "=== processes"
+  ps -axo pid,ppid,stat,lstart,command 2>/dev/null | grep -i "[p]umasi" || true
+  if [ "$OS" != windows ]; then
+    echo "=== sockets"
+    as_root lsof -nP -iUDP -iTCP 2>/dev/null | grep -i pumasi || true
+  else
+    netstat -ano | grep -E ":7481|:$PORT" || true
+  fi
+  echo "=== a call with debug logs"
+  local t=""
+  command -v timeout >/dev/null && t="timeout 60"
+  command -v gtimeout >/dev/null && t="gtimeout 60"
+  PUMASI_LOG=pumasi=debug,iroh=debug,noq=info,warn $t \
+    "$BIN" --home "$(nat "$H")" status 2>&1 | tail -n 120 || true
 }
 
 wait_until() { # description, command...
   local what=$1; shift
+  local start=$SECONDS
   # The Intel macOS runners take a minute or more to answer after a start.
   for _ in $(seq 1 300); do
-    if "$@" >/dev/null 2>&1; then return 0; fi
+    if "$@" >"$WORK/last.txt" 2>&1; then
+      # How long it took, when that was long: the Intel macOS flake.
+      [ $((SECONDS - start)) -lt 15 ] || echo "($what took $((SECONDS - start)) s)"
+      return 0
+    fi
     sleep 1
   done
-  echo "timed out waiting for: $what"
+  echo "timed out waiting for: $what (after $((SECONDS - start)) s); the last try said:"
+  cat "$WORK/last.txt" || true
   dump
   exit 1
 }

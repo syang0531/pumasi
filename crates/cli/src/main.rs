@@ -2165,7 +2165,7 @@ async fn cluster_start(
     let own = match follow.as_ref().map(|f| f.exe().to_path_buf()) {
         Some(exe) if join.is_none() => {
             match own_upgrade::startup(home, &config.data_dir, &exe).await? {
-                own_upgrade::Begin::Run(own) => Some(own),
+                own_upgrade::Begin::Run(own) => Some(*own),
                 own_upgrade::Begin::Restart => return follow::restart(in_service, &exe),
             }
         }
@@ -2258,7 +2258,16 @@ async fn stop_cluster(
     };
     let ready = |version: String| {
         let cluster = &cluster;
-        async move { cluster.may_restart(&version).await }
+        let own = own.as_ref();
+        async move {
+            if let Some(why) = match own {
+                Some(own) => own.failed_before().await,
+                None => None,
+            } {
+                return Err(format!("it was rolled back here before: {why}"));
+            }
+            cluster.may_restart(&version).await
+        }
     };
     let stop = tokio::select! {
         stop = follow::until_stop(shutdown, follow, ready) => stop,

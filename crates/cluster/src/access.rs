@@ -123,6 +123,8 @@ fn op_name(op: &AdminOp) -> &'static str {
         ScimTokenCreate { .. } | ScimTokenRevoke { .. } => "manage SCIM tokens",
         ScimView => "read provisioned users",
         FollowerRead(inner) => op_name(inner),
+        ControlPlanes => "read the control plane replicas",
+        ReleaseChunk { .. } => "download release binaries",
     }
 }
 
@@ -176,6 +178,7 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | StoreFiles { .. }
             | Resources
             | Placement { .. }
+            | ControlPlanes
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },

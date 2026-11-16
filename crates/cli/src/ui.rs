@@ -181,7 +181,7 @@ pub async fn run_until(
     }
     // A newer binary installed over this one: restart into it (signed-in
     // browsers sign in again).
-    let stop = crate::follow::until_stop(shutdown, follow, || true);
+    let stop = crate::follow::until_stop(shutdown, follow, |_| async { Ok(()) });
     tokio::select! {
         r = ui.wait() => r?,
         stop = stop => {

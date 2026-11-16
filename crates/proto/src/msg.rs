@@ -1181,6 +1181,17 @@ pub enum AdminOp {
     /// [`AdminOp::Events`] and [`AdminOp::Metrics`] with `since_secs` 0.
     /// The leader answers it like the call inside.
     FollowerRead(Box<AdminOp>),
+    // 1.13 from here.
+    /// Each control plane replica's version and where it is with the
+    /// rollout ([`AdminResponse::ControlPlanes`]).
+    ControlPlanes,
+    /// One chunk of a binary of the current rollout, by SHA-256, from
+    /// `offset` (admin tickets only): a dashboard on a machine without a
+    /// control plane or an agent installs its own this way.
+    ReleaseChunk {
+        sha256: [u8; 32],
+        offset: u64,
+    },
 }
 
 impl AdminOp {
@@ -1493,6 +1504,10 @@ pub enum AdminResponse {
         view: crate::scim::ScimTokenView,
     },
     ScimView(Box<crate::scim::ScimView>),
+    // 1.13 from here.
+    ControlPlanes(Vec<crate::release::ControlPlaneView>),
+    /// Up to 4 MiB of a release binary; empty past its end.
+    ReleaseChunk(Vec<u8>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

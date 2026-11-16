@@ -994,6 +994,16 @@ impl Store {
         self.commit(b)
     }
 
+    /// Whether node `id` is a member (what a follower, which has no state
+    /// loaded, can ask, 1.13).
+    pub fn is_member(&self, id: &str) -> bool {
+        (|| -> Result<bool> {
+            let tx = self.read()?;
+            Ok(tx.open_table(MEMBERS)?.get(id)?.is_some())
+        })()
+        .unwrap_or(false)
+    }
+
     pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let tx = self.read()?;
         let t = tx.open_table(META)?;

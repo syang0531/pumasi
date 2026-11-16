@@ -285,6 +285,58 @@ impl fmt::Display for FetchState {
     }
 }
 
+/// One control plane replica and its own upgrade (1.13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlPlaneView {
+    /// The replica's endpoint id.
+    pub id: String,
+    pub leader: bool,
+    /// What it runs, when it answered (a replica older than 1.13 does not
+    /// say).
+    pub version: Option<String>,
+    pub target: Option<Target>,
+    pub state: ControlPlaneUpgrade,
+}
+
+/// Where a control plane replica is with the current rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlPlaneUpgrade {
+    /// Runs the rollout's version or newer, or there is no rollout.
+    Current,
+    /// Has the new binary, or will, and waits for its turn: why.
+    Waiting(String),
+    /// Restarting into the new binary now (its turn).
+    Upgrading,
+    /// The new binary did not come back healthy and was rolled back.
+    Failed(String),
+    /// The rollout has no binary for its platform.
+    NoRelease,
+    /// Did not answer (down, or older than 1.13).
+    Unknown,
+}
+
+impl fmt::Display for ControlPlaneUpgrade {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ControlPlaneUpgrade::Current => f.write_str("current"),
+            ControlPlaneUpgrade::Waiting(why) => write!(f, "waiting: {why}"),
+            ControlPlaneUpgrade::Upgrading => f.write_str("upgrading"),
+            ControlPlaneUpgrade::Failed(why) => write!(f, "rolled back: {why}"),
+            ControlPlaneUpgrade::NoRelease => f.write_str("no binary for its platform"),
+            ControlPlaneUpgrade::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+/// What a control plane replica says about itself to the leader (1.13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaVersion {
+    pub version: String,
+    pub target: Target,
+    /// A release this replica rolled back from: (version, why).
+    pub failed: Option<(String, String)>,
+}
+
 /// How long canaries run before the rest of the cluster gets a release,
 /// unless `--canary-soak` says otherwise.
 pub const DEFAULT_CANARY_SOAK_SECS: u64 = 30 * 60;

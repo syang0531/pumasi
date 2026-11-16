@@ -717,3 +717,284 @@ async fn return_to_follower_retry(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+
+/// A binary that says it is pumasi `version` (the start of this test's
+/// own executable and a build-info line).
+fn binary_claiming(version: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut bytes = vec![0u8; 4096];
+    let mut f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+    f.read_exact(&mut bytes).unwrap();
+    bytes.extend_from_slice(
+        format!(
+            "\0pumasi-build-info:v={version};p={};\0",
+            pumasi_proto::PROTOCOL_VERSION
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// A version newer than this build's.
+fn newer_version() -> String {
+    let mine = pumasi_proto::version();
+    let core_end = mine.find(['-', '+']).unwrap_or(mine.len());
+    let core: String = mine[..core_end]
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '9' } else { c })
+        .collect();
+    format!("{core}{}", &mine[core_end..])
+}
+
+/// Starts a replica again from its directory (Windows can take a moment to
+/// let go of the old endpoint's port).
+async fn restart(dir: &std::path::Path, bind: &str) -> Cluster {
+    let mut tries = 0;
+    loop {
+        match Cluster::start(config(dir.to_path_buf(), bind)).await {
+            Ok(c) => return c,
+            Err(e) if tries < 20 => {
+                tries += 1;
+                eprintln!("restarting a replica: {e:#}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("restarting a replica: {e:#}"),
+        }
+    }
+}
+
+/// Retries `f` for up to `secs` until it is `Ok`; panics with the last
+/// error.
+async fn eventually<T, F, Fut>(secs: u64, what: &str, mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        match f().await {
+            Ok(v) => return v,
+            Err(e) if tokio::time::Instant::now() > deadline => panic!("{what}: {e}"),
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
+/// The control plane's own upgrade with replicas (1.13): followers one at
+/// a time with the leader's leave, never while that would cost the quorum,
+/// and the leader last, stepping down; a job running across it finishes
+/// and is paid once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn replicas_upgrade_one_at_a_time() {
+    use pumasi_proto::release::{ControlPlaneUpgrade, ReleaseFile, Target, sha256};
+    init_tracing();
+    let (dir_a, dir_b, dir_c) = (tempdir("up-a"), tempdir("up-b"), tempdir("up-c"));
+    let (bind_a, bind_b, bind_c) = (free_port(), free_port(), free_port());
+    let a = Cluster::start(config(dir_a.clone(), &bind_a))
+        .await
+        .unwrap();
+    let client = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+    call(&client, AdminOp::SetPolicy(policy())).await;
+    call(
+        &client,
+        AdminOp::Deposit {
+            account: "owner".into(),
+            amount: DEPOSIT,
+            memo: "test".into(),
+        },
+    )
+    .await;
+    let b = Cluster::join_replica(
+        config(dir_b.clone(), &bind_b),
+        &invite_replica(&client).await,
+    )
+    .await
+    .unwrap();
+    let c = Cluster::join_replica(
+        config(dir_c.clone(), &bind_c),
+        &invite_replica(&client).await,
+    )
+    .await
+    .unwrap();
+    wait_replicated(&client, 3).await;
+    assert!(a.is_leader());
+    let client = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+    let ticket = match call(
+        &client,
+        AdminOp::CreateJoinToken {
+            ttl_secs: 600,
+            uses: Some(1),
+            invite: Some(Invite {
+                account: "bob".into(),
+                allow_docker: false,
+            }),
+        },
+    )
+    .await
+    {
+        AdminResponse::JoinToken { ticket, .. } => ticket.parse::<JoinTicket>().unwrap(),
+        other => panic!("unexpected {other:?}"),
+    };
+    let bob = provider("bob", 2, ticket).await;
+    let warm = submit(&client, submission(vec![vec!["warm"]])).await;
+    assert_eq!(
+        wait_job(&client, warm, 60).await.summary.state,
+        JobState::Succeeded
+    );
+
+    // A release newer than every replica.
+    let version = newer_version();
+    let bytes = binary_claiming(&version);
+    let file = ReleaseFile {
+        target: Target::host(),
+        version: version.clone(),
+        protocol: pumasi_proto::PROTOCOL_VERSION,
+        sha256: sha256(&bytes),
+        size: bytes.len() as u64,
+    };
+    match call(
+        &client,
+        AdminOp::UploadRelease {
+            sha256: file.sha256,
+            size: file.size,
+            offset: 0,
+            bytes: bytes.clone(),
+        },
+    )
+    .await
+    {
+        AdminResponse::Uploaded { have } => assert_eq!(have, file.size),
+        other => panic!("unexpected {other:?}"),
+    }
+    match call(
+        &client,
+        AdminOp::Rollout {
+            files: vec![file.clone()],
+            force: false,
+        },
+    )
+    .await
+    {
+        AdminResponse::Rollout(_) => {}
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // Every replica, followers too, finds the binary to install.
+    for (name, cl) in [("a", &a), ("b", &b), ("c", &c)] {
+        let up = eventually(60, &format!("{name} has the binary"), || async {
+            cl.own_upgrade(None)
+                .ok_or_else(|| "no upgrade yet".to_string())
+        })
+        .await;
+        assert_eq!(up.file.sha256, file.sha256);
+        assert_eq!(std::fs::read(&up.path).unwrap(), bytes);
+    }
+
+    // The leader goes last.
+    let why = eventually(30, "the leader waits for the followers", || async {
+        match a.may_restart(&version).await {
+            Err(why) if why.contains("followers go first") => Ok(why),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    assert!(
+        why.contains(&b.endpoint_id().fmt_short().to_string())
+            || why.contains(&c.endpoint_id().fmt_short().to_string()),
+        "{why}"
+    );
+
+    // A follower may not restart while that would leave no majority.
+    c.shutdown().await.unwrap();
+    let why = eventually(30, "no turn without a majority", || async {
+        match b.may_restart(&version).await {
+            Err(why) if why.contains("majority") => Ok(why),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    assert!(why.contains("2 of 3"), "{why}");
+    let c = restart(&dir_c, &bind_c).await;
+    wait_replicated(&client, 3).await;
+
+    // One follower at a time.
+    eventually(30, "b gets its turn", || b.may_restart(&version)).await;
+    let why = c.may_restart(&version).await.unwrap_err();
+    assert!(why.contains("is restarting"), "{why}");
+    let view = a.control_planes();
+    assert_eq!(view.len(), 3, "{view:#?}");
+    let b_view = view
+        .iter()
+        .find(|v| v.id == b.endpoint_id().to_string())
+        .unwrap();
+    assert_eq!(b_view.state, ControlPlaneUpgrade::Upgrading, "{view:#?}");
+
+    // B restarts into the new version; then it is C's turn.
+    b.shutdown().await.unwrap();
+    let b = restart(&dir_b, &bind_b).await;
+    b.report_version_for_tests(&version);
+    eventually(60, "c gets its turn once b runs the new version", || {
+        c.may_restart(&version)
+    })
+    .await;
+    let why = a.may_restart(&version).await.unwrap_err();
+    assert!(
+        why.contains("restarting") || why.contains("still runs"),
+        "{why}"
+    );
+    c.shutdown().await.unwrap();
+    let c = restart(&dir_c, &bind_c).await;
+    c.report_version_for_tests(&version);
+
+    // Then the leader, while a job runs: it steps down, one of the others
+    // takes over, and the job finishes there.
+    eventually(60, "the leader's turn", || a.may_restart(&version)).await;
+    let slow = submit(
+        &client,
+        submission((0..4).map(|_| vec!["slow", "spin"]).collect()),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    a.shutdown().await.unwrap();
+    let a = restart(&dir_a, &bind_a).await;
+    a.report_version_for_tests(&version);
+    let slow = wait_job(&client, slow, 120).await;
+    assert_eq!(slow.summary.state, JobState::Succeeded, "{slow:#?}");
+    paid_once(&slow, &receipts(&client, slow.summary.id).await);
+    assert_eq!(total(&accounts(&client).await), DEPOSIT);
+    // (A replica back within the election timeout, with the whole log, may
+    // win the election again; on the new version either way.)
+    let leader = eventually(30, "a leader", || async {
+        [&a, &b, &c]
+            .into_iter()
+            .find(|r| r.is_leader())
+            .ok_or_else(|| "no leader".to_string())
+    })
+    .await;
+
+    // Every replica is current in the new leader's view.
+    eventually(30, "every replica is current", || async {
+        let view = leader.control_planes();
+        if view.len() == 3 && view.iter().all(|v| v.state == ControlPlaneUpgrade::Current) {
+            Ok(())
+        } else {
+            Err(format!("{view:#?}"))
+        }
+    })
+    .await;
+    match call(&client, AdminOp::ControlPlanes).await {
+        AdminResponse::ControlPlanes(v) => assert_eq!(v.len(), 3, "{v:#?}"),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    client.close().await;
+    bob.handle.abort();
+    bob.endpoint.close().await;
+    for cl in [a, b, c] {
+        cl.shutdown().await.unwrap();
+    }
+}

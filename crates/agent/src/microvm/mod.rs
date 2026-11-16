@@ -938,7 +938,7 @@ impl MicrovmExecutor {
         let input_bytes = input_estimate(&run_spec, input, shared_files, &staged, &checkpoint);
         let warm_fits = gpu.is_none() && net_vmm.is_none() && input_bytes <= POOL_INPUT_BYTES;
         let warm = if warm_fits && self.pool.enabled() {
-            let w = self.pool.take(&key);
+            let w = self.pool.take_or_wait(&key, pool::READY_TIMEOUT).await;
             // The next task of this image finds a guest booted.
             self.refill(key.clone(), image.rootfs.clone());
             w

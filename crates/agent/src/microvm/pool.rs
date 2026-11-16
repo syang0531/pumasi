@@ -89,6 +89,8 @@ struct State {
     vms: Vec<WarmVm>,
     /// Guests being booted.
     booting: Vec<PoolKey>,
+    /// Tasks waiting for one of those, one task per booting guest.
+    waiting: Vec<PoolKey>,
     /// Why the pool turned itself off, if it did.
     broken: Option<String>,
     on_battery: bool,
@@ -100,6 +102,8 @@ pub struct WarmPool {
     /// Memory warm guests may take together, in MiB.
     mem_budget: u64,
     state: Mutex<State>,
+    /// Wakes tasks waiting for a booting guest.
+    changed: tokio::sync::Notify,
 }
 
 impl WarmPool {
@@ -113,6 +117,7 @@ impl WarmPool {
             config,
             mem_budget,
             state: Mutex::default(),
+            changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -132,6 +137,46 @@ impl WarmPool {
             }
             debug!(digest = %key.digest, "a warm microVM had stopped; dropping it");
         }
+    }
+
+    /// A warm guest for `key`, waiting up to `wait` for one that is
+    /// booting when none is ready. A task arriving while the guest for its
+    /// image boots (the previous task was short) gets that guest rather
+    /// than booting a second one: it started earlier, so it is never the
+    /// slower choice. One task waits per booting guest.
+    pub async fn take_or_wait(&self, key: &PoolKey, wait: Duration) -> Option<WarmVm> {
+        if let Some(vm) = self.take(key) {
+            return Some(vm);
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            let booting = st.booting.iter().filter(|k| *k == key).count();
+            let waiting = st.waiting.iter().filter(|k| *k == key).count();
+            if booting <= waiting {
+                return None;
+            }
+            st.waiting.push(key.clone());
+        }
+        let deadline = tokio::time::Instant::now() + wait;
+        let vm = loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(vm) = self.take(key) {
+                break Some(vm);
+            }
+            if !self.state.lock().unwrap().booting.contains(key) {
+                break None;
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                break None;
+            }
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Some(i) = st.waiting.iter().position(|k| k == key) {
+            st.waiting.remove(i);
+        }
+        vm
     }
 
     /// Whether another guest for `key` may boot now; if so it counts as
@@ -187,6 +232,8 @@ impl WarmPool {
         if st.broken.is_none() && !st.on_battery {
             st.vms.push(vm);
         }
+        drop(st);
+        self.changed.notify_waiters();
     }
 
     pub fn boot_failed(&self, key: &PoolKey) {
@@ -194,6 +241,8 @@ impl WarmPool {
         if let Some(i) = st.booting.iter().position(|k| k == key) {
             st.booting.remove(i);
         }
+        drop(st);
+        self.changed.notify_waiters();
     }
 
     /// Turns the pool off for good (this agent run): warm guests do not
@@ -207,6 +256,8 @@ impl WarmPool {
             st.broken = Some(why);
         }
         st.vms.clear();
+        drop(st);
+        self.changed.notify_waiters();
     }
 
     /// Lets go of guests that waited too long or stopped, and of all of
@@ -376,6 +427,43 @@ mod tests {
         assert!(!pool.may_boot(&key("c", 768)));
         assert!(pool.may_boot(&key("c", 512)));
         assert!(keys(&pool).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_task_waits_for_the_guest_booting_for_it() {
+        let pool = WarmPool::new(WarmConfig::default(), 8 << 10);
+        // Nothing booting: no wait.
+        let t = std::time::Instant::now();
+        assert!(
+            pool.take_or_wait(&key("a", 256), Duration::from_secs(5))
+                .await
+                .is_none()
+        );
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(pool.may_boot(&key("a", 256)));
+        let waiter = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                pool.take_or_wait(&key("a", 256), Duration::from_secs(30))
+                    .await
+            })
+        };
+        while pool.state.lock().unwrap().waiting.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        // One task per booting guest: the next does not wait.
+        let t = std::time::Instant::now();
+        assert!(
+            pool.take_or_wait(&key("a", 256), Duration::from_secs(5))
+                .await
+                .is_none()
+        );
+        assert!(t.elapsed() < Duration::from_secs(1));
+        // The boot fails: the waiter stops waiting at once.
+        pool.boot_failed(&key("a", 256));
+        let got = tokio::time::timeout(Duration::from_secs(5), waiter).await;
+        assert!(got.expect("the waiter woke").unwrap().is_none());
+        assert!(pool.state.lock().unwrap().waiting.is_empty());
     }
 
     #[test]

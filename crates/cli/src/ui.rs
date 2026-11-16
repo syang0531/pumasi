@@ -115,13 +115,16 @@ pub async fn run_until(
         (Some(cert), Some(key)) => Some(pumasi_dashboard::tls_config(cert, key)?),
         _ => None,
     };
+    // Restarted into a new binary: on Windows the old process lets go of
+    // its port only as it exits, just after starting this one (1.13).
+    let restarted = std::env::var_os(crate::follow::RESTARTED_ENV).is_some();
     let listener = match args.listen {
-        Some(addr) => tokio::net::TcpListener::bind(addr)
+        Some(addr) => bind_retrying(addr, restarted)
             .await
             .with_context(|| format!("listen on {addr}"))?,
         None => {
             let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-            match tokio::net::TcpListener::bind((ip, DEFAULT_PORT)).await {
+            match bind_retrying(SocketAddr::new(ip, DEFAULT_PORT), restarted).await {
                 Ok(l) => l,
                 Err(_) => tokio::net::TcpListener::bind((ip, 0)).await?,
             }
@@ -179,7 +182,6 @@ pub async fn run_until(
             Err(e) => eprintln!("warning: cannot reach the control plane: {e:#}; {hint}"),
         }
     });
-    let restarted = std::env::var_os(crate::follow::RESTARTED_ENV).is_some();
     if !args.no_open && !args.api_only && !restarted {
         open_browser(&url);
     }
@@ -203,6 +205,24 @@ pub async fn run_until(
         }
     }
     Ok(0)
+}
+
+/// Binds `addr`; when `retry`, keeps trying for 10 seconds while the
+/// address is in use.
+async fn bind_retrying(addr: SocketAddr, retry: bool) -> std::io::Result<tokio::net::TcpListener> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Err(e)
+                if retry
+                    && e.kind() == std::io::ErrorKind::AddrInUse
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            r => return r,
+        }
+    }
 }
 
 /// A dashboard on a machine with neither a control plane nor an agent

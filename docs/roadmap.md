@@ -7,14 +7,28 @@ iMac on Big Sur, and Claude's cloud sessions using it through the HTTP
 API. Phases 18 and 19 (the hub, Madang, and buying CU) are **on hold**
 until the project owner asks for them; nothing below depends on them.
 
-Phases 20 to 28 cover what is still missing in the scope the project set
-itself: GPUs, Windows, old Intel Macs, the file store, k8s-style cluster
-management, the dashboard and monitoring. Most items come from the
-issues filed from that use, the "What is not done yet" list in
+Phases 20 to 28 (1.4 to 1.12) covered what was missing in the scope the
+project set itself: GPUs, Windows, old Intel Macs, the file store,
+k8s-style cluster management, the dashboard and monitoring. Most items
+came from the issues filed from real use, the "Not yet" list in
 [architecture.md](architecture.md) and the README's known gaps; the order
-puts first what the home cluster runs into every day. Each phase is one pull request (or a few), ends in a minor
-release, and has a gate: what CI checks and what the owner checks by hand
-on real machines.
+put first what the home cluster runs into every day.
+
+Phases 29 to 36 (1.13 to 1.20) take what those phases left over, in the
+same scope, plus the parts of the research that are still open: result
+checks for work that is not deterministic ("honeypot" tasks), disk and
+memory figures that are challenged like the CPU's, and upgrades that
+reach the control plane itself. There were no open issues when they were
+planned (2026-11-15); the sources are each phase's "what differs from the
+plan", the "Not yet" list, the handoffs' leftovers (two CI flakes, the
+HCS measurement, signing) and the research's recommendations. The order
+again starts with what the home cluster meets every day (upgrading the
+control plane by hand, the iMac's slow microVMs) and ends with what
+matters once outside providers are invited.
+
+Each phase is one pull request (or a few), ends in a minor release, and
+has a gate: what CI checks and what the owner checks by hand on real
+machines.
 
 | Phase | Release | Scope | Status |
 | --- | --- | --- | --- |
@@ -27,6 +41,14 @@ on real machines.
 | 26 | 1.10 | GPUs: WebGPU timeouts and checks, AMD, shared GPUs | done |
 | 27 | 1.11 | Windows: Docker without Docker Desktop, ARM64 microVMs | done |
 | 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | done |
+| 29 | 1.13 | Upgrades that reach the control plane, and the flaky checks | planned |
+| 30 | 1.14 | Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors | planned |
+| 31 | 1.15 | Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI | planned |
+| 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | planned |
+| 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | planned |
+| 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | planned |
+| 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | planned |
+| 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | planned |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
 | 19 | | Buying CU with won through the hub (Toss Payments) | on hold |
 
@@ -342,6 +364,242 @@ Gate: CI tests the limits across two `pumasi ui` processes, a pruned log
 that still verifies, SCIM against Keycloak, and the CLI through a local
 CONNECT proxy.
 
+## 29. Upgrades that reach the control plane, and the flaky checks (1.13)
+
+Why: every release since 1.3 says "upgrade the control plane first (stop
+it, replace the binary, start it)", by hand on its machine, and on three
+replicas that is three machines. Two CI flakes have been rerun since phase
+20 without a cause, and a third (a restarted replica that cannot read its
+own log) showed up while this roadmap was written; one of them (the local control plane answering only
+after a minute on the Intel Mac runner) may be a real slowness on old
+Macs.
+
+- **The control plane upgrades itself.** `pumasi upgrade latest` and
+  `upgrade rollout` (and the dashboard's Upgrade button) upgrade the
+  control plane after the agents, through its service manager, with the
+  same signed-binary check and a rollback when the new binary does not
+  come back healthy within a timeout. With replicas: followers one at a
+  time, then a leadership transfer, then the old leader, never losing the
+  quorum; `pumasi upgrade status` shows each replica's version.
+- **The dashboard service** (`service install ui`) is upgraded with its
+  control plane, so the cluster ends up on one version without a terminal.
+- **The Intel Mac flake:** find why `pumasi status` fails for 1 to 2
+  minutes after the service starts on `macos-15-intel` (the service logs
+  `control plane started` within a second), and fix the cause rather than
+  the wait.
+- **The Windows heartbeat flake** in `manage::selectors_drain_and_preemption`
+  (two agents missing heartbeats 5 seconds apart): find whether the test
+  or the agent is at fault; a real agent should not miss a heartbeat while
+  idle.
+- **The HA restart failure** seen on this roadmap's own pull request
+  (#60, `ubuntu-latest`, `three_replicas_survive_losing_the_leader`):
+  the crashed leader would not start again because openraft asked for a
+  log entry at index 31975955732986110, far past anything written, and
+  every retry after that failed with the file store's database still
+  locked by the failed start. Find where the bogus index comes from (the
+  log, the committed or purged id, or the applied id in `state.redb`)
+  and release everything a failed `Cluster::start` opened.
+- The long checks also soak on Windows (today Linux and macOS only).
+
+Gate: CI upgrades a service-installed control plane from the previous
+release on Linux, macOS and Windows, rolls a three-replica cluster to a
+new binary without failing a running job, and rolls back a binary that
+exits at start; the three flaky tests pass 50 runs in a row on their
+runners.
+By hand: the owner upgrades the home cluster, control plane included, from
+the dashboard through the tunnel.
+
+## 30. Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors (1.14)
+
+Why: the 2014 iMac takes image jobs only as microVMs (no Docker on its
+macOS), and every task pays a full boot and image unpack; microVM tasks
+cannot checkpoint, so when it sleeps or its owner comes back they start
+over elsewhere; and Macs report no temperature or GPU power, so the
+temperature alert never fires for them. GitHub's Intel Mac runner
+(`macos-15-intel`) is announced until autumn 2027.
+
+- **Warm microVMs:** keep a small pool of booted, idle guests per image
+  (bounded by memory and the node's slots, off on battery) and hand a task
+  to one; reuse unpacked image disks between tasks of the same digest.
+  On every backend, not only vz.
+- **MicroVM checkpoints:** the guest gets the same stop signal and grace
+  period as Docker tasks, and its checkpoint directory is a disk the agent
+  stores like a Docker task's (phase 25), so a microVM task moved by sleep,
+  drain or `--on-pause requeue` resumes.
+- **Mac sensors:** CPU and GPU temperatures and package power through the
+  SMC on Intel Macs and the IOReport/HID sensors on Apple Silicon, in
+  `top`, the dashboard and the temperature alert.
+- **After the Intel runner:** build `x86_64-apple-darwin` on an Apple
+  Silicon runner, keep the minimum-OS check on the binary, and run the
+  Intel tests under Rosetta 2 where they can; the README says what is then
+  checked on real Intel Macs only.
+
+Gate: CI times a second microVM task of the same image on Linux (KVM)
+against the first and expects it well under half; a checkpointed microVM
+task moved off a drained node finishes without starting over; sensor
+parsing is tested against recorded SMC and IOReport output. By hand: on
+the iMac, the second `vm run` of an image starts in seconds, a microVM
+task resumes after the iMac sleeps, and the dashboard shows its CPU
+temperature.
+
+## 31. Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI (1.15)
+
+Why: phases 22 and 23 left several things CLI-only or partial, and the
+Korean dashboard still shows events in English.
+
+- **Everything in `cluster.toml` and the browser:** per-node and
+  per-label alert thresholds and silences in `cluster.toml` (`apply` and
+  its diff), and the dashboard's editor takes schedules too; secrets are
+  listed, added and rotated from the dashboard (values never shown again).
+- **Charts pushed by the control plane** over the stream instead of
+  polled every 2 seconds behind it.
+- **Live microVM output past the first MiB** (the guest's ring buffer
+  is drained continuously instead of stopping).
+- **GPU temperature and power for Intel and AMD on Linux** (hwmon) and
+  on Windows where the driver exposes them; Macs come in phase 30.
+- **The network to the file store:** agents measure latency and
+  throughput to the control plane's store, not only to each other, and
+  the matrix shows it.
+- **Events and alert notices in Korean** on the Korean dashboard (a
+  message key and arguments with each event instead of English text).
+
+Gate: Playwright covers the new forms and a chart that moves without a
+poll; CI checks a 5 MiB live microVM stream on Linux and an `apply` of
+per-node thresholds. By hand: the owner silences one node and edits a
+schedule from a phone; a Linux machine with an Intel or AMD GPU shows its
+temperature.
+
+## 32. GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters (1.16)
+
+Why: parts of GPUs (`gpus = 0.5`) share memory on trust, so one task can
+take all of the RTX 3080's memory from the other; WebGPU offers compute
+shaders only, so the iMac's and other CUDA-less GPUs cannot draw; and a
+WebGPU task gets one adapter.
+
+- **Memory limits for parts of NVIDIA GPUs** with the CUDA MPS server
+  (`CUDA_MPS_PINNED_DEVICE_MEM_LIMIT` and an active-thread percentage per
+  task), started by the agent where the driver allows it; time slicing
+  without limits stays the fallback and is shown as such.
+- **MIG slices benchmarked** like whole GPUs instead of estimated.
+- **WebGPU textures, samplers and render passes** (and more than one bind
+  group), with a rendering example checked against the CPU.
+- **Several adapters per task** (`gpus = 2` on wasm jobs) where the node
+  has them.
+- **WASI preview 2 components** for wasm jobs, and `wasi:webgpu` once
+  Wasmtime runs it, next to today's core modules.
+
+Gate: CI runs the drawing example on software rasterizers on Linux,
+Windows and macOS, and a component job everywhere; the MPS limit is tested
+against a stand-in. By hand: two half-GPU jobs on the RTX 3080, where the
+one that asks for more than its half fails with an out-of-memory error
+and the other keeps running; the drawing example on the iMac's AMD GPU.
+
+## 33. Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker (1.17)
+
+Why: phase 27 left HCS waiting for `scripts/windows/boot-times.ps1` on
+real PCs, signing waiting for SignPath Foundation, and `docker remove`
+leaving the hidden account's profile until a reboot. This phase comes
+after the measurement and the approval have had time to arrive.
+
+- **HCS backend, only if the measurement says so:** when
+  `boot-times.ps1` shows HCS booting clearly faster than QEMU with WHPX
+  on the owner's PCs, add it as a microVM backend (its own guest kernel
+  build and VHD), picked automatically where it works; otherwise record
+  the numbers and drop it from the roadmap.
+- **Signed Windows binaries** once SignPath approves (the workflow's
+  `sign` job is ready); Smart App Control then stops blocking installs and
+  upgrades.
+- **`pumasi docker remove` finishes in one go** (stop the WSL VM, then
+  remove the profile), and `docker setup` repairs a distro whose task or
+  account was changed by hand.
+- Windows desktops without LibreHardwareMonitor: a documented, opt-in
+  way to get CPU temperatures (no kernel driver ships with Pumasi).
+
+Gate: CI runs the HCS backend's microVM tests where the runner allows it
+(or its unit tests and a recorded boot otherwise), and `docker remove`
+then `setup` on a Windows runner. By hand: `boot-times.ps1` numbers in the
+release notes; a signed binary installs with Smart App Control on.
+
+## 34. File store and microVM networks: node caches, images from the store, UDP and allow lists (1.18)
+
+Why: node caches have only a size cap, private images are pulled from the
+registry again for each job, and microVM networks forward TCP and DNS
+only, with no per-job allow list and no billing for egress.
+
+- **Node cache quotas** per node (like the storage label's quota) and
+  per account, with eviction that keeps what queued jobs need.
+- **Images through the store:** a private image's layers are pulled once
+  into the store and nodes fetch them from the closest copy, for Docker
+  and microVMs, so the registry is not asked again for each job.
+- **MicroVM networks:** UDP (and so QUIC), IPv6 where the host has it,
+  per-job egress allow lists (`network = ["pypi.org:443", ...]`) and
+  bandwidth caps, with the same private-range blocking as today; egress
+  counted per task and billed in CU at the price list's rate.
+- Firecracker without QEMU gets a network where the agent may create TAP
+  devices (as root on Linux).
+
+Gate: CI pulls a private image once for a 4-task job over two nodes, runs
+UDP and an allow list in Linux microVMs (a denied host fails, an allowed
+one answers, a private address stays blocked) and checks the egress
+figure on the receipt. By hand: a microVM job on the iMac reaches only
+its allow list.
+
+## 35. High availability and the remote API: reads from followers, limits that survive a failover, ACME (1.19)
+
+Why: phase 28 left the API and the CLI reading from the leader, shared
+limits in the leader's memory, and replicas that must be removed and
+invited again when they move; the remote API still needs certbot, a proxy
+or a tunnel for its certificate, and `?wait=` polls.
+
+- **The API and the CLI read from followers** (status, jobs, events,
+  metrics history) with the same freshness rule as the dashboard;
+  submitters too, for their own jobs.
+- **Shared limits and sign-in blocks replicated** (compacted, not one
+  log entry per request), so a failover keeps them.
+- **Replicas that move** update their address in the membership
+  themselves, signed by their key.
+- **`?wait=` and `logs -f` pushed** by the control plane instead of
+  polled.
+- **Policies per job:** an account policy can cap CPUs, memory and CU per
+  job, not only per account.
+- **ACME** in `pumasi ui` (`--acme DOMAIN`, HTTP-01 and TLS-ALPN-01) for
+  machines that face the internet without a proxy.
+
+Gate: CI kills the leader during a burst of failed sign-ins and the limit
+holds on the new leader; a replica restarted on another address rejoins
+without an invite; ACME against a local Pebble server; `?wait=` answers
+within 100 ms of a job finishing. By hand: the cloud sessions keep working
+through the tunnel while the owner restarts the leader.
+
+## 36. Result checks: honeypot tasks, disk and memory challenges, re-benchmarks (1.20)
+
+Why: the research's answer for work that is not deterministic (Docker,
+microVMs, GPUs) is tasks with known answers, and it is still open: the CPU
+and GPU challenges keep billed speed honest, not results, and disk and
+memory figures are taken on trust. This matters once outside providers
+are invited, which is why it comes last.
+
+- **Honeypot tasks:** the control plane slips tasks with known answers
+  (built-in ones per executor, and an account's own via `pumasi honeypot
+  add`) into providers' queues at a rate set per trust level; a wrong
+  answer holds that provider's receipts, lowers its score and raises its
+  re-run rate, like a check mismatch today. Providers cannot tell them
+  from real tasks by their image, size or timing.
+- **Disk and memory challenges** next to the CPU one, and **periodic
+  re-benchmarks** (not only at join), with a drop raising the existing
+  benchmark alert.
+- **A score per provider** (uptime, check and honeypot results,
+  completed tasks) in `pumasi node`, the dashboard and placement, the
+  in-cluster half of the hub's trust score.
+- **Labels from checked figures:** the automatic `disk=nvme|ssd|hdd`
+  label follows the disk challenge, so a node that claims NVMe and
+  measures like an HDD loses it, and selectors can trust it.
+
+Gate: CI runs a provider that returns wrong answers to a honeypot and
+gets its receipts held, one that inflates its disk benchmark and gets
+caught, and placement that prefers the higher score. By hand: an invited
+provider's score in the dashboard after a day of work.
+
 ## Not planned
 
 - Long-running services (Deployments, Services, ingress): Pumasi stays a
@@ -350,3 +608,8 @@ CONNECT proxy.
   Catalina Macs stay WASM-only, or run Linux (phase 21's guide).
 - CUDA on Intel, AMD or Apple GPUs; those use WebGPU or, for AMD on Linux,
   ROCm images.
+- NVIDIA confidential computing (GPUs in confidential jobs): it needs
+  H100-class GPUs that neither the owner nor CI has.
+- A paid third-party security audit and the 72-hour soak in the
+  research's 1.0 gate: both need the owner's budget or machines (hosted
+  runners stop at 6 hours), and are done when the owner asks.

@@ -1808,7 +1808,7 @@ paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows and phase 28 (1.12) operations; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows and phase 28 (1.12) operations. Phases 29 to 36 (1.13 to 1.20) are planned: upgrades that reach the control plane, old Intel Macs, monitoring and dashboard leftovers, GPUs, Windows, the file store and microVM networks, high availability and the remote API, and result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1839,6 +1839,14 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 26 | GPUs: WebGPU shaders stopped at the job's timeout (worker process), the GPU challenge over WebGPU, `shader-f16` and subgroups, AMD and other CUDA-less GPUs benchmarked and checked over WebGPU, ROCm Docker jobs, parts of GPUs (`gpus = 0.5`), MIG slices as GPUs | done (1.10) |
 | 27 | Windows: Docker in a Pumasi-managed WSL distro (`pumasi docker setup`: no Docker Desktop, no sign-in, NVIDIA GPUs), ARM64 microVMs (QEMU 11, WHPX or TCG); no HCS backend (a script measures it on real PCs) | done (1.11) |
 | 28 | Operations: shared and per-peer request limits, audit log pruning behind a signed checkpoint, SCIM, the CLI behind an HTTPS proxy, follower reads | done (1.12) |
+| 29 | Upgrades that reach the control plane (replicas one at a time, with rollback) and the dashboard service; the Intel Mac, Windows and HA restart failures in CI; soaks on Windows | planned (1.13) |
+| 30 | Old Intel Macs: warm microVMs and reused image disks, microVM checkpoints, SMC and Apple Silicon sensors, building for Intel Macs after GitHub's Intel runner | planned (1.14) |
+| 31 | Monitoring and the dashboard: per-node thresholds and silences in `cluster.toml`, schedules and secrets in the browser, pushed charts, live microVM output past 1 MiB, Intel and AMD GPU temperatures, the network to the store, Korean events | planned (1.15) |
+| 32 | GPUs: memory limits for parts of NVIDIA GPUs (MPS), benchmarked MIG slices, WebGPU textures and render passes, several adapters per task, WASI preview 2 components | planned (1.16) |
+| 33 | Windows: an HCS backend if real PCs show it is clearly faster, signed binaries (SignPath), a one-step `docker remove` | planned (1.17) |
+| 34 | File store and microVM networks: node cache quotas, private images through the store, UDP, IPv6, per-job allow lists, bandwidth caps, billed egress | planned (1.18) |
+| 35 | High availability and the remote API: the API and CLI reading from followers, limits replicated across failovers, replicas that move, pushed `?wait=`, per-job CPU, memory and CU caps, ACME | planned (1.19) |
+| 36 | Result checks: honeypot tasks with known answers, disk and memory challenges, periodic re-benchmarks, a score per provider | planned (1.20) |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | on hold |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | on hold |
 
@@ -1847,14 +1855,14 @@ replicas follow only the replica they joined. WebGPU is experimental: it is
 checked on software rasterizers in CI and on real GPUs by hand, offers
 compute shaders only (no textures or samplers, one bind group). Parts of
 GPUs share memory on trust (only MIG slices enforce it). Accounts
-exist only inside one cluster (SSO signs people in, but there is no SCIM
-or SAML, and nobody is removed until their session ends or is revoked), and CU are not connected to real payments. GPUs are checked on real hardware by hand, not in CI (hosted
+exist only inside one cluster (SSO signs people in and SCIM takes access
+away, but SCIM never creates accounts and there is no SAML), and CU are not connected to real payments. GPUs are checked on real hardware by hand, not in CI (hosted
 runners have none); VFIO passthrough is experimental and NVIDIA-only
 (Turing and newer, with the open kernel modules); Intel and Apple GPUs are
 used only through WebGPU. MicroVM networks need QEMU or Virtualization.framework (not Firecracker
 alone) and forward TCP and DNS only. MicroVMs need KVM (Linux), Virtualization.framework
-(macOS 11+) or WHPX (Windows x86_64) for speed (QEMU without them works but
-is slow, and Windows on ARM has no microVMs yet). WHPX and
+(macOS 11+) or WHPX (Windows) for speed (QEMU without them works but
+is slow; Windows on ARM falls back to emulation where QEMU's WHPX does not work). WHPX and
 Virtualization.framework guests are checked on real machines only: CI
 runners have WHPX only nested, where it breaks QEMU's disks and the agent
 falls back to emulation, and hosted Mac runners cannot virtualize at all.
@@ -1863,14 +1871,13 @@ Live microVM output stops after the first MiB of each stream (the rest
 comes when the task ends), Intel and Apple GPUs report use and memory but
 no temperature or power, and Windows desktops without
 LibreHardwareMonitor often have no temperature to report (few boards fill
-in the ACPI thermal zones). The dashboard shows prices and alert rules
-but does not change them (the CLI and `apply` do), and keeps its sign-ins
-in memory (restarting `pumasi ui` signs everyone out). The remote API has
+in the ACPI thermal zones). The dashboard edits most settings
+(since 1.7), but per-node alert thresholds and secrets are still CLI-only.
+The control plane is upgraded by hand on its machine (agents and the
+rest follow `pumasi upgrade`). The remote API has
 no built-in tunnel or certificate renewal (Cloudflare Tunnel, a reverse
-proxy or certbot do that; there is no iroh-based proxy for the CLI yet),
-its failed sign-in counts and request limits live in each `pumasi ui`
-process (and the control plane itself does not limit unauthenticated
-sign-in calls per peer), the audit log is never pruned, uploads
+proxy or certbot do that), limits shared between dashboards live in the
+leader's memory (a failover resets them), uploads
 through Cloudflare stop at its plan's body limit, and `?wait=` follows a
 job by polling the control plane. Drawing in Docker is checked on real
 GPUs by hand; EEVEE on a Linux host runs under Xvfb and so on the CPU

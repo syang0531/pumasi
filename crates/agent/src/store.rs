@@ -214,6 +214,16 @@ impl NodeStore {
             .clone();
         let _one = lock.lock().await;
         let hash = blobs::to_hash(&root);
+        // Keep what is here, and what the download writes, from the garbage
+        // collector until the cache tag below does: it deletes every blob no
+        // tag refers to when it starts, partial ones being written included,
+        // and a task then failed reading a blob whose file was gone (1.13).
+        let _keep = self
+            .store
+            .tags()
+            .temp_tag(blobs::HashAndFormat::hash_seq(hash))
+            .await
+            .map_err(|e| anyhow::anyhow!("protect {label}: {e}"))?;
         let (_, mut complete) = blobs::missing(&self.store, hash).await?;
         if !complete {
             let start = Instant::now();

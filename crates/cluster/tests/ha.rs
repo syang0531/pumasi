@@ -465,6 +465,36 @@ async fn three_replicas_survive_losing_the_leader() {
     }
 }
 
+/// A start that fails after opening the file store lets go of it, so the
+/// next start in the same process works (1.13: a failed restart of a
+/// replica left the store's database locked, and every retry failed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_start_releases_what_it_opened() {
+    init_tracing();
+    let dir = tempdir("failed-start");
+    let cluster = Cluster::start(config(dir.clone(), "127.0.0.1:0"))
+        .await
+        .unwrap();
+    cluster.shutdown().await.unwrap();
+    // A Raft log that cannot be opened: replication looks on, and the
+    // start fails after the file store and the endpoint are open.
+    std::fs::write(dir.join("raft.redb"), b"not a database").unwrap();
+    for _ in 0..2 {
+        let err = Cluster::start(config(dir.clone(), "127.0.0.1:0"))
+            .await
+            .err()
+            .expect("a broken log fails the start");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("raft.redb"), "{msg}");
+        assert!(!msg.contains("already open"), "{msg}");
+    }
+    std::fs::remove_file(dir.join("raft.redb")).unwrap();
+    let cluster = Cluster::start(config(dir.clone(), "127.0.0.1:0"))
+        .await
+        .expect("starts once the log is gone");
+    cluster.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_backup_restores_the_cluster() {
     init_tracing();

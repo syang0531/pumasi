@@ -233,7 +233,11 @@ impl RaftLogStorage<C> for LogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, SErr> {
-        let purged: Option<LogId<NodeId>> = self.meta(PURGED)?;
+        // Stored as an `Option` (see `purge`). Decoding it as a bare
+        // `LogId` read the option's tag as the term and the leader's node id
+        // as the index: a replica that had purged at an entry of a leader
+        // with a nonzero id could not start again (1.13).
+        let purged: Option<LogId<NodeId>> = self.meta::<Option<LogId<NodeId>>>(PURGED)?.flatten();
         let last = {
             let tx = self.db.begin_read().map_err(io_read)?;
             let t = tx.open_table(LOG).map_err(io_read)?;
@@ -1561,5 +1565,58 @@ pub mod mirror {
         let keep: Vec<[u8; 32]> = list.iter().map(|(s, _)| *s).collect();
         releases.prune(&keep);
         Ok(copied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::{CommittedLeaderId, EntryPayload};
+
+    fn entry(index: u64, leader: NodeId) -> Entry<C> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(3, leader), index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    /// The purge point comes back as written, whatever the leader's node
+    /// id (an id read as the index made restarts fail, 1.13).
+    #[tokio::test]
+    async fn the_purge_point_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "pumasi-ha-purge-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RAFT_DB);
+        // A real node id: the first 8 bytes of an endpoint id.
+        let leader: NodeId = 31_975_955_732_986_110;
+        {
+            let mut log = LogStore::open(&path).unwrap();
+            let tx = log.db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(LOG).unwrap();
+                for i in 1..=5 {
+                    t.insert(i, enc(&entry(i, leader)).as_slice()).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            log.purge(entry(2, leader).log_id).await.unwrap();
+        }
+        let mut log = LogStore::open(&path).unwrap();
+        let st = log.get_log_state().await.unwrap();
+        assert_eq!(st.last_purged_log_id, Some(entry(2, leader).log_id));
+        assert_eq!(st.last_log_id, Some(entry(5, leader).log_id));
+        let rest = log.try_get_log_entries(3..=5).await.unwrap();
+        assert_eq!(rest.len(), 3);
+        // Purged up to the last entry: the purge point is the last log id.
+        log.purge(entry(5, leader).log_id).await.unwrap();
+        let st = log.get_log_state().await.unwrap();
+        assert_eq!(st.last_log_id, Some(entry(5, leader).log_id));
+        assert_eq!(st.last_purged_log_id, Some(entry(5, leader).log_id));
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

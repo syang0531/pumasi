@@ -467,6 +467,8 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
                 if !fresh.addrs.is_empty() {
                     *inner.shared.addr.lock().unwrap() = fresh;
                 }
+                let addr = inner.shared.addr.lock().unwrap().clone();
+                inner.state().net.store_addr = Some(addr);
             }
         })
     });
@@ -518,6 +520,7 @@ impl Cluster {
                 ADMIN_ALPN.to_vec(),
                 BLOBS_ALPN.to_vec(),
                 RAFT_ALPN.to_vec(),
+                pumasi_proto::PROBE_ALPN.to_vec(),
             ],
             config.bind,
         )
@@ -588,6 +591,11 @@ impl Cluster {
             .accept(ADMIN_ALPN, AdminHandler(shared.clone()))
             .accept(BLOBS_ALPN, blobs_protocol)
             .accept(RAFT_ALPN, RaftHandler(shared.clone()))
+            // Agents measure the network to the file store (1.15).
+            .accept(
+                pumasi_proto::PROBE_ALPN,
+                pumasi_proto::probe::ProbeServer::default(),
+            )
             .spawn();
 
         let cluster = Self {
@@ -1406,6 +1414,10 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     st.on_heartbeat(&node_id, generation);
                     st.on_metrics(&node_id, generation, *m);
                 }
+                Ok(Some(FromAgent::MetricsExtra(x))) => {
+                    let mut st = inner.state();
+                    st.on_metrics_extra(&node_id, generation, *x);
+                }
                 Ok(Some(FromAgent::Logs { task, stdout, stderr })) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
@@ -1723,6 +1735,14 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
             inner.state().audit(&who, &action, target, &msg, false);
             AdminResponse::Error(msg)
         }
+        Ok(AdminOp::MetricsWait {
+            node,
+            since_secs,
+            after_unix,
+            wait_secs,
+        }) => metrics_wait(inner, node, since_secs, after_unix, wait_secs)
+            .await
+            .unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}"))),
         Ok(op) => {
             let described = crate::audit::describe(&op);
             let resp = match handle_store_admin(inner, op).await {
@@ -1750,6 +1770,42 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
         }
     };
     access::scope(&caller, resp)
+}
+
+/// [`AdminOp::MetricsWait`] (1.15): the metrics once a sample newer than
+/// `after_unix` came (or at once, or when the wait is over), so the
+/// dashboard's charts follow the samples as the control plane gets them.
+async fn metrics_wait(
+    inner: &Arc<Inner>,
+    node: Option<String>,
+    since_secs: u64,
+    after_unix: u64,
+    wait_secs: u32,
+) -> Result<AdminResponse> {
+    let mut rx = inner.state().monitor.samples.subscribe();
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(u64::from(wait_secs.min(30)));
+    if after_unix > 0 {
+        // A node that is not there is an error now rather than after the
+        // wait.
+        inner.state().metrics_view(node.as_deref(), 0)?;
+        loop {
+            if inner.state().latest_sample_unix(node.as_deref()) > after_unix {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => continue,
+                _ => break,
+            }
+        }
+    }
+    let st = inner.state();
+    Ok(AdminResponse::MetricsPush(Box::new(
+        pumasi_proto::monitor::MetricsPush {
+            view: st.metrics_view(node.as_deref(), since_secs)?,
+            extra: st.metrics_extra(node.as_deref()),
+        },
+    )))
 }
 
 /// The S3 key calls (1.8): any ticket makes keys that act as itself and
@@ -2407,7 +2463,7 @@ async fn repair_leader(inner: &Arc<Inner>) {
             "store.repaired",
             Some(&node),
             None,
-            format!("the control plane fetched {label} back from {name}"),
+            pumasi_proto::text::Text::new("store.repaired", [label.clone(), name.clone()]),
         );
     }
     if !missing.is_empty() && st.reps.leader_missing.is_empty() {
@@ -2416,10 +2472,7 @@ async fn repair_leader(inner: &Arc<Inner>) {
             "store.missing",
             None,
             None,
-            format!(
-                "the control plane's store lacks {} dataset versions and no online node has them",
-                missing.len()
-            ),
+            pumasi_proto::text::Text::new("store.missing", [missing.len()]),
         );
     }
     st.reps.leader_missing = missing;
@@ -2655,7 +2708,7 @@ async fn upgrade_to_latest(
                 "rollout.latest",
                 None,
                 None,
-                format!("release {tag} downloaded and checked; {summary}"),
+                pumasi_proto::text::Text::new("rollout.latest", [tag.clone(), summary.clone()]),
             );
         }
         Ok((tag, summary))
@@ -2681,10 +2734,10 @@ async fn upgrade_to_latest(
                     "rollout.latest.failed",
                     None,
                     None,
-                    format!(
-                        "upgrade to {} failed: {reason}",
-                        version.as_deref().unwrap_or("the newest release")
-                    ),
+                    match version.as_deref() {
+                        Some(v) => pumasi_proto::text::Text::new("rollout.latest.failed", [v.to_string(), reason.to_string()]),
+                        None => pumasi_proto::text::Text::new("rollout.newest.failed", [reason.to_string()]),
+                    },
                 );
             }
             FetchState::Failed {
@@ -3219,6 +3272,14 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
         } => Ok(AdminResponse::Events(
             inner.state().events(after, since_unix, limit),
         )),
+        AdminOp::EventsKeyed {
+            after,
+            since_unix,
+            limit,
+        } => Ok(AdminResponse::EventsKeyed(
+            inner.state().events_keyed(after, since_unix, limit),
+        )),
+        AdminOp::AlertTexts => Ok(AdminResponse::AlertTexts(inner.state().alert_texts())),
         AdminOp::Logs {
             job,
             index,

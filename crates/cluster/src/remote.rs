@@ -134,7 +134,10 @@ impl State {
                 "node.executor_unavailable",
                 Some(id),
                 None,
-                format!("node {name}: {e} unavailable: {why}"),
+                pumasi_proto::text::Text::new(
+                    "node.executor_unavailable",
+                    [name.clone(), e.to_string(), why.to_string()],
+                ),
             );
         }
         for e in gained {
@@ -144,7 +147,7 @@ impl State {
                 "node.executor_available",
                 Some(id),
                 None,
-                format!("node {name}: {e} available"),
+                pumasi_proto::text::Text::new("node.executor_available", [name.clone(), e.to_string()]),
             );
         }
         self.schedule();
@@ -187,9 +190,15 @@ impl State {
             "task.image",
             Some(id),
             Some(task.job),
-            format!(
-                "task {}/{} on {name} runs {image} ({digest})",
-                task.job, task.index
+            pumasi_proto::text::Text::new(
+                "task.image",
+                [
+                    task.job.to_string(),
+                    task.index.to_string(),
+                    name.clone(),
+                    image.to_string(),
+                    digest.to_string(),
+                ],
             ),
         );
     }
@@ -261,11 +270,22 @@ impl State {
                 "job.queue_timeout",
                 None,
                 Some(id),
-                format!(
-                    "job {id}: {} task{} {msg}",
-                    late.len(),
-                    if late.len() == 1 { "" } else { "s" }
-                ),
+                if late.len() == 1 {
+                    pumasi_proto::text::Text::new(
+                        "job.queue_timeout.one",
+                        [id.to_string(), format_duration_ms(timeout_ms), why.clone()],
+                    )
+                } else {
+                    pumasi_proto::text::Text::new(
+                        "job.queue_timeout",
+                        [
+                            id.to_string(),
+                            late.len().to_string(),
+                            format_duration_ms(timeout_ms),
+                            why.clone(),
+                        ],
+                    )
+                },
             );
         }
     }

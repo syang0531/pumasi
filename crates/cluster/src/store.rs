@@ -156,6 +156,8 @@ const MEMBER_WEBGPU_EXTRA: TableDefinition<&str, &[u8]> =
 /// SCIM users and groups (1.12), by id.
 const SCIM_USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("scim_users");
 const SCIM_GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("scim_groups");
+/// An event's message by key (1.15), by event number.
+const EVENT_TEXTS: TableDefinition<u64, &[u8]> = TableDefinition::new("event_texts");
 /// Meta key of the SCIM tokens (their hashes).
 const SCIM_TOKENS_META: &str = "scim_tokens";
 
@@ -232,7 +234,8 @@ macro_rules! tables {
             JOB_GPU_EXT,
             MEMBER_WEBGPU_EXTRA,
             SCIM_USERS,
-            SCIM_GROUPS
+            SCIM_GROUPS,
+            EVENT_TEXTS
         )
     };
 }
@@ -649,6 +652,7 @@ impl Store {
         tx.open_table(MEMBER_WEBGPU_EXTRA)?;
         tx.open_table(SCIM_USERS)?;
         tx.open_table(SCIM_GROUPS)?;
+        tx.open_table(EVENT_TEXTS)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1650,12 +1654,34 @@ impl Store {
 
     // -- monitoring (phase 11) ---------------------------------------------
 
-    pub fn put_events(&self, events: &[EventView]) -> Result<()> {
+    pub fn put_events(
+        &self,
+        events: &[EventView],
+        texts: &[(u64, pumasi_proto::text::Text)],
+    ) -> Result<()> {
         let mut b = Batch::default();
         for e in events {
             b.put(EVENTS, e.seq, enc(e).as_slice());
         }
+        for (seq, t) in texts {
+            b.put(EVENT_TEXTS, *seq, enc(t).as_slice());
+        }
         self.commit(b)
+    }
+
+    /// The messages by key of events from number `from` on (1.15).
+    pub fn load_event_texts(&self, from: u64) -> Result<Vec<(u64, pumasi_proto::text::Text)>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(EVENT_TEXTS)?.range(from..)? {
+            let (k, v) = row?;
+            // A text a newer build wrote in a shape this one cannot read
+            // is left out; its event keeps its English message.
+            if let Ok(t) = dec(v.value()) {
+                out.push((k.value(), t));
+            }
+        }
+        Ok(out)
     }
 
     /// The newest `limit` events, oldest first.
@@ -1722,6 +1748,12 @@ impl Store {
             }
             for k in &doomed {
                 b.del(EVENTS, *k);
+            }
+            if let Some(last) = doomed.last() {
+                for row in tx.open_table(EVENT_TEXTS)?.range(..=*last)? {
+                    let (k, _) = row?;
+                    b.del(EVENT_TEXTS, k.value());
+                }
             }
             events = doomed.len();
             let t = tx.open_table(METRICS)?;

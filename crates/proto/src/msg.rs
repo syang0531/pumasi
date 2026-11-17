@@ -601,6 +601,10 @@ pub enum FromAgent {
     /// [`FromAgent::WebGpu`] profile (challenge hash rates, optional
     /// features), signed, sent after it.
     WebGpuExtra(Box<crate::webgpu::SignedWebGpuExtra>),
+    // Minor 8 (1.15) from here.
+    /// What the machine measured beyond its last [`FromAgent::Metrics`]
+    /// (its CPU package power), sent right after it.
+    MetricsExtra(Box<crate::monitor::NodeMetricsExtra>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,6 +1196,36 @@ pub enum AdminOp {
         sha256: [u8; 32],
         offset: u64,
     },
+    // 1.15 from here.
+    /// [`AdminOp::Apply`] with alert tuning, silences or schedules that
+    /// keep their job ([`crate::manage::ApplyMore`]), and what
+    /// [`AdminOp::ApplyExt`] carries.
+    ApplyMore {
+        spec: Box<ApplySpec>,
+        ext: Box<crate::sched::ApplyExt>,
+        more: Box<crate::manage::ApplyMore>,
+    },
+    /// [`AdminOp::Metrics`] answered once a node has a sample newer than
+    /// `after_unix` (at once when one already does, or after `wait_secs`,
+    /// at most 30, with what there is), with what nodes measure beyond
+    /// [`crate::monitor::NodeMetrics`]: the dashboard's charts follow the
+    /// samples as they arrive instead of asking every few seconds.
+    /// `after_unix` 0 answers at once.
+    MetricsWait {
+        node: Option<String>,
+        since_secs: u64,
+        after_unix: u64,
+        wait_secs: u32,
+    },
+    /// [`AdminOp::Events`] with each event's message by key, for the Korean
+    /// dashboard.
+    EventsKeyed {
+        after: u64,
+        since_unix: u64,
+        limit: u32,
+    },
+    /// The messages of the firing alerts by key.
+    AlertTexts,
 }
 
 impl AdminOp {
@@ -1258,6 +1292,14 @@ impl AdminOp {
     /// an older CLI could read says.
     pub fn apply(spec: ApplySpec) -> AdminOp {
         let ext = spec.ext();
+        let more = spec.more();
+        if !more.is_empty() {
+            return AdminOp::ApplyMore {
+                spec: Box::new(spec),
+                ext: Box::new(ext),
+                more: Box::new(more),
+            };
+        }
         if ext.is_empty() {
             AdminOp::Apply(Box::new(spec))
         } else {
@@ -1290,6 +1332,15 @@ impl AdminOp {
             }
             AdminOp::ApplyExt { mut spec, ext } => {
                 spec.set_ext(*ext);
+                AdminOp::Apply(spec)
+            }
+            AdminOp::ApplyMore {
+                mut spec,
+                ext,
+                more,
+            } => {
+                spec.set_ext(*ext);
+                spec.set_more(*more);
                 AdminOp::Apply(spec)
             }
             AdminOp::SubmitExt { mut sub, ext } => {
@@ -1508,6 +1559,10 @@ pub enum AdminResponse {
     ControlPlanes(Vec<crate::release::ControlPlaneView>),
     /// Up to 4 MiB of a release binary; empty past its end.
     ReleaseChunk(Vec<u8>),
+    // 1.15 from here.
+    MetricsPush(Box<crate::monitor::MetricsPush>),
+    EventsKeyed(Vec<crate::monitor::KeyedEvent>),
+    AlertTexts(Vec<crate::monitor::AlertText>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

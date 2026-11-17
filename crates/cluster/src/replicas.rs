@@ -603,10 +603,13 @@ impl State {
                     "store.scrub",
                     Some(node),
                     None,
-                    format!(
-                        "{name} checked {} replicas ({}): no damage",
-                        s.checked,
-                        pumasi_proto::store::format_size(s.bytes)
+                    pumasi_proto::text::Text::new(
+                        "store.scrub.node",
+                        [
+                            name.clone(),
+                            s.checked.to_string(),
+                            pumasi_proto::store::format_size(s.bytes),
+                        ],
                     ),
                 );
             } else {
@@ -616,10 +619,7 @@ impl State {
                     "store.damaged",
                     Some(node),
                     None,
-                    format!(
-                        "{name} found damaged data in {}; fetching it again",
-                        what.join(", ")
-                    ),
+                    pumasi_proto::text::Text::new("store.damaged.node", [name.clone(), what.join(", ")]),
                 );
             }
         }
@@ -651,10 +651,12 @@ impl State {
                 "store.scrub",
                 None,
                 None,
-                format!(
-                    "the control plane checked {} collections ({}): no damage",
-                    report.checked,
-                    pumasi_proto::store::format_size(report.bytes)
+                pumasi_proto::text::Text::new(
+                    "store.scrub.cp",
+                    [
+                        report.checked.to_string(),
+                        pumasi_proto::store::format_size(report.bytes),
+                    ],
                 ),
             );
         } else {
@@ -664,10 +666,7 @@ impl State {
                 "store.damaged",
                 None,
                 None,
-                format!(
-                    "the control plane's store has damaged data in {}; node replicas keep good copies",
-                    what.join(", ")
-                ),
+                pumasi_proto::text::Text::new("store.damaged.cp", [what.join(", ")]),
             );
         }
     }

@@ -674,7 +674,7 @@ impl State {
                 "confidential.keys",
                 Some(node),
                 Some(task.job),
-                format!("keys released to task {}/{}", task.job, task.index),
+                pumasi_proto::text::Text::new("confidential.keys", [task.job.to_string(), task.index.to_string()]),
             ),
             Err(why) => {
                 warn!(node = %node, task = %task, "keys refused: {why}");
@@ -683,7 +683,10 @@ impl State {
                     "confidential.refused",
                     Some(node),
                     Some(task.job),
-                    format!("keys refused for task {}/{}: {why}", task.job, task.index),
+                    pumasi_proto::text::Text::new(
+                        "confidential.refused",
+                        [task.job.to_string(), task.index.to_string(), why.to_string()],
+                    ),
                 );
             }
         }
@@ -758,11 +761,9 @@ impl State {
                     "confidential.measurement",
                     Some(node),
                     Some(task.job),
-                    format!(
-                        "new {} launch measurement {}: trust it with `pumasi confidential trust {}` if this agent's guest is the one you expect",
-                        checked.tee,
-                        short(&id),
-                        short(&id)
+                    pumasi_proto::text::Text::new(
+                        "confidential.measurement",
+                        [checked.tee.to_string(), short(&id).to_string()],
                     ),
                 );
             }
@@ -871,15 +872,13 @@ impl State {
             "confidential.trust",
             None,
             None,
-            format!(
-                "{} launch measurement {} {}",
-                rec.tee,
-                short(&full),
+            pumasi_proto::text::Text::new(
                 if trusted {
-                    "trusted"
+                    "confidential.trust"
                 } else {
-                    "no longer trusted"
-                }
+                    "confidential.untrust"
+                },
+                [rec.tee.to_string(), short(&full).to_string()],
             ),
         );
         Ok(full)
@@ -901,14 +900,7 @@ impl State {
                 "node.trust",
                 Some(&id),
                 None,
-                format!(
-                    "{name} {} trusted jobs",
-                    if trusted {
-                        "now runs"
-                    } else {
-                        "no longer runs"
-                    }
-                ),
+                pumasi_proto::text::Text::new(if trusted { "node.trust" } else { "node.untrust" }, [&name]),
             );
             self.schedule();
         }

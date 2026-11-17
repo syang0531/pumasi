@@ -4916,10 +4916,11 @@ fn sensors(home: &Path, raw: bool) -> Result<()> {
     let mut sampler = pumasi_agent::metrics::Sampler::new(&dir, gpus.clone());
     let _ = sampler.sample(0);
     std::thread::sleep(Duration::from_secs(1));
-    let m = sampler.sample(0);
+    let (m, extra) = sampler.sample(0);
     let temp = |t: Option<f32>| t.map_or_else(|| "-".to_string(), |t| format!("{t:.1} °C"));
     let watts = |w: Option<f32>| w.map_or_else(|| "-".to_string(), |w| format!("{w:.1} W"));
     println!("temperature (hottest sensor)  {}", temp(m.temp_c));
+    println!("cpu package power             {}", watts(extra.cpu_power_w));
     for g in &m.gpus {
         let name = gpus
             .iter()

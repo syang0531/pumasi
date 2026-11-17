@@ -192,8 +192,8 @@ impl State {
         let name = self.node_name(id);
         info!(node = %id, moved, "node went to sleep");
         let msg = match moved {
-            0 => format!("node {name} went to sleep"),
-            n => format!("node {name} went to sleep; {n} runs moved back to the queue"),
+            0 => pumasi_proto::text::Text::new("node.asleep", [&name]),
+            n => pumasi_proto::text::Text::new("node.asleep.moved", [name.clone(), n.to_string()]),
         };
         self.event(EventLevel::Info, "node.asleep", Some(id), None, msg);
         self.on_disconnect(id, generation);
@@ -332,7 +332,7 @@ impl State {
             "node.wake",
             Some(id),
             None,
-            format!("magic packet for node {name} sent by {by}"),
+            pumasi_proto::text::Text::new("node.wake", [name.clone(), by.clone()]),
         );
         Ok(lines)
     }
@@ -455,8 +455,9 @@ impl State {
                             "node.wake_failed",
                             Some(&id),
                             None,
-                            format!(
-                                "node {name} has not woken after {WAKE_WARN_AFTER} magic packets; check Wake-on-LAN in its firmware and OS settings"
+                            pumasi_proto::text::Text::new(
+                                "node.wake_failed",
+                                [name.clone(), WAKE_WARN_AFTER.to_string()],
                             ),
                         );
                     }

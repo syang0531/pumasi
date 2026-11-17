@@ -1278,6 +1278,34 @@ pub struct ApplySpec {
     /// The CPU and memory quota of every account in `accounts`.
     #[serde(skip)]
     pub resources: Vec<(String, crate::sched::ResourceQuota)>,
+    // 1.15 from here, never on the wire inside the spec either:
+    // [`AdminOp::ApplyMore`](crate::msg::AdminOp) carries them.
+    /// Repeat and resolved notices and per-node thresholds, when the file's
+    /// `[alerts]` sets any of them.
+    #[serde(skip)]
+    pub alert_tuning: Option<crate::monitor::AlertTuning>,
+    /// `[silences.NAME]`.
+    #[serde(skip)]
+    pub silences: Vec<crate::monitor::FileSilence>,
+    /// Schedules listed without a `job`: they keep the job they have.
+    #[serde(skip)]
+    pub keep_jobs: Vec<String>,
+}
+
+/// What an `apply` has beyond [`ApplySpec`]'s wire layout and
+/// [`crate::sched::ApplyExt`] (1.15): alert tuning, silences and the
+/// schedules that keep their job.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ApplyMore {
+    pub alert_tuning: Option<crate::monitor::AlertTuning>,
+    pub silences: Vec<crate::monitor::FileSilence>,
+    pub keep_jobs: Vec<String>,
+}
+
+impl ApplyMore {
+    pub fn is_empty(&self) -> bool {
+        self.alert_tuning.is_none() && self.silences.is_empty() && self.keep_jobs.is_empty()
+    }
 }
 
 impl ApplySpec {
@@ -1291,6 +1319,22 @@ impl ApplySpec {
                 .map(|s| (s.name.clone(), s.ext()))
                 .collect(),
         }
+    }
+
+    /// What the spec has beyond [`Self::ext`] (1.15).
+    pub fn more(&self) -> ApplyMore {
+        ApplyMore {
+            alert_tuning: self.alert_tuning.clone(),
+            silences: self.silences.clone(),
+            keep_jobs: self.keep_jobs.clone(),
+        }
+    }
+
+    /// Puts back what [`Self::more`] took out.
+    pub fn set_more(&mut self, more: ApplyMore) {
+        self.alert_tuning = more.alert_tuning;
+        self.silences = more.silences;
+        self.keep_jobs = more.keep_jobs;
     }
 
     /// Puts back what [`Self::ext`] took out.
@@ -1332,8 +1376,34 @@ impl ApplySpec {
         let mut seen = BTreeSet::new();
         for s in &self.schedules {
             ensure!(seen.insert(&s.name), "schedule {} is listed twice", s.name);
+            if self.keep_jobs.contains(&s.name) {
+                // Its job is the one it has (checked when it was set).
+                validate_schedule_name(&s.name)?;
+                s.cron
+                    .parse::<Cron>()
+                    .with_context(|| format!("schedule {}", s.name))?;
+                if let Some(tz) = &s.tz {
+                    crate::sched::validate_tz(tz).with_context(|| format!("schedule {}", s.name))?;
+                }
+            } else {
+                s.validate()
+                    .with_context(|| format!("schedule {}", s.name))?;
+            }
+        }
+        for k in &self.keep_jobs {
+            ensure!(
+                self.schedules.iter().any(|s| s.name == *k),
+                "schedule {k} keeps its job but is not listed"
+            );
+        }
+        if let Some(t) = &self.alert_tuning {
+            t.validate().context("alerts")?;
+        }
+        let mut seen = BTreeSet::new();
+        for s in &self.silences {
+            ensure!(seen.insert(&s.name), "silence {} is listed twice", s.name);
             s.validate()
-                .with_context(|| format!("schedule {}", s.name))?;
+                .with_context(|| format!("silence {}", s.name))?;
         }
         if let Some(a) = &self.alerts {
             a.validate().context("alerts")?;
@@ -1375,6 +1445,31 @@ impl ApplySpec {
 /// [webhooks.ops]
 /// url_env = "PUMASI_SLACK_URL"    # or url = "https://hooks.slack.com/..."
 /// ```
+///
+/// From 1.15, `[alerts]` also takes the repeat and resolved notices and
+/// thresholds for some nodes, and silences have a table of their own:
+///
+/// ```toml
+/// [alerts]
+/// repeat = "1h"                   # send a firing alert again every hour
+/// resolved = true
+///
+/// [alerts.nodes.imac]             # a node by name
+/// temperature = 95
+/// disk = "off"
+///
+/// [alerts.labels."os=windows"]    # any node selector
+/// node_offline = "30m"
+///
+/// [silences.imac-move]
+/// rule = "node_offline"           # left out: every rule
+/// nodes = "name=imac"             # left out: everything
+/// until = 2026-12-01T09:00:00+09:00
+/// comment = "moving the iMac"
+/// ```
+///
+/// And a schedule without `job` keeps the job it has (the dashboard's
+/// editor lists schedules that way).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterFile {
@@ -1387,6 +1482,75 @@ pub struct ClusterFile {
     pub alerts: Option<AlertsFile>,
     #[serde(default)]
     pub webhooks: BTreeMap<String, WebhookFile>,
+    // 1.15.
+    #[serde(default)]
+    pub silences: BTreeMap<String, SilenceFile>,
+}
+
+/// `[silences.NAME]` (1.15).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SilenceFile {
+    /// One alert rule (`temperature`, ...); left out, every rule.
+    pub rule: Option<String>,
+    /// A node selector (`name=imac`, `os=windows`); left out, everything.
+    pub nodes: Option<String>,
+    /// When it ends: a TOML date-time (`2026-12-01T09:00:00+09:00`, or
+    /// without the offset in this machine's time zone), a date (its
+    /// midnight), or the same as text.
+    pub until: DateTimeValue,
+    #[serde(default)]
+    pub comment: String,
+}
+
+/// A TOML date-time or date, or text in the same form.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DateTimeValue {
+    Toml(toml::value::Datetime),
+    Text(String),
+}
+
+impl DateTimeValue {
+    /// Unix seconds; a time without an offset is local to this machine.
+    pub fn unix(&self) -> Result<u64> {
+        let text = match self {
+            DateTimeValue::Toml(d) => d.to_string(),
+            DateTimeValue::Text(t) => t.trim().to_string(),
+        };
+        parse_until(&text)
+    }
+}
+
+/// `2026-12-01T09:00:00+09:00`, `2026-12-01T09:00Z`, `2026-12-01 09:00`
+/// (local), `2026-12-01` (local midnight), to unix seconds.
+pub fn parse_until(text: &str) -> Result<u64> {
+    let t = text.trim();
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Ok(d.timestamp().max(0) as u64);
+    }
+    let with_t = t.replacen(' ', "T", 1);
+    for f in ["%Y-%m-%dT%H:%M%:z", "%Y-%m-%dT%H:%M%#z"] {
+        if let Ok(d) = chrono::DateTime::parse_from_str(&with_t, f) {
+            return Ok(d.timestamp().max(0) as u64);
+        }
+    }
+    let naive = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
+        .iter()
+        .find_map(|f| NaiveDateTime::parse_from_str(&with_t, f).ok())
+        .or_else(|| {
+            NaiveDate::parse_from_str(t, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        })
+        .with_context(|| {
+            format!("{t:?} is not a date and time like 2026-12-01T09:00:00+09:00")
+        })?;
+    let local = chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .with_context(|| format!("{t:?} does not exist in this time zone"))?;
+    Ok(local.timestamp().max(0) as u64)
 }
 
 /// `[alerts]`: each rule a duration, percentage or number as text or
@@ -1403,6 +1567,68 @@ pub struct AlertsFile {
     pub perf_drop: Option<Setting>,
     pub smart: Option<Setting>,
     pub check_mismatch: Option<Setting>,
+    // 1.15: how notices are sent and thresholds for some nodes. When any
+    // of these is in the file, all of them are applied together (left
+    // out: no repeat, resolved notices on, no overrides).
+    /// Send a firing alert's notice again this often (`"off"`: once).
+    pub repeat: Option<Setting>,
+    /// Send a notice when an alert stops firing.
+    pub resolved: Option<bool>,
+    /// Thresholds for nodes by name.
+    pub nodes: Option<BTreeMap<String, OverrideFile>>,
+    /// Thresholds for nodes a selector picks (`"os=windows"`).
+    pub labels: Option<BTreeMap<String, OverrideFile>>,
+}
+
+/// `[alerts.nodes.NAME]` and `[alerts.labels."SELECTOR"]` (1.15): each
+/// rule as in `[alerts]`, `"off"` to turn it off for these nodes; left out,
+/// the cluster's rule.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverrideFile {
+    pub node_offline: Option<Setting>,
+    pub disk: Option<Setting>,
+    pub temperature: Option<Setting>,
+}
+
+impl OverrideFile {
+    fn to_override(&self, nodes: Selector, what: &str) -> Result<crate::monitor::AlertOverride> {
+        use crate::monitor::{parse_opt_percent, parse_opt_secs};
+        let node_offline_secs = match &self.node_offline {
+            None => None,
+            Some(Setting::Int(n)) if *n > 0 => Some(Some(*n as u64)),
+            Some(v) => Some(parse_opt_secs(&v.text()).with_context(|| format!("{what}.node_offline"))?),
+        };
+        let disk_percent = match &self.disk {
+            None => None,
+            Some(v) => Some(parse_opt_percent(&v.text()).with_context(|| format!("{what}.disk"))?),
+        };
+        let temp_c = match &self.temperature {
+            None => None,
+            Some(v) => Some(parse_degrees(&v.text()).with_context(|| format!("{what}.temperature"))?),
+        };
+        Ok(crate::monitor::AlertOverride {
+            nodes,
+            node_offline_secs,
+            disk_percent,
+            temp_c,
+        })
+    }
+}
+
+/// `90`, `"90 °C"`, `"90C"`, or `"off"`.
+fn parse_degrees(t: &str) -> Result<Option<u16>> {
+    if crate::monitor::is_off(t) {
+        return Ok(None);
+    }
+    Ok(Some(
+        t.trim()
+            .trim_end_matches('C')
+            .trim_end_matches('°')
+            .trim()
+            .parse::<u16>()
+            .context("degrees Celsius")?,
+    ))
 }
 
 /// A value in `[alerts]`: `false`, `90`, `"90%"`, `"2m"`, `"off"`.
@@ -1471,21 +1697,7 @@ impl AlertsFile {
         .transpose()?;
         let temp_c = match &self.temperature {
             None | Some(Setting::Bool(true)) => d.temp_c,
-            Some(v) => {
-                let t = v.text();
-                if crate::monitor::is_off(&t) {
-                    None
-                } else {
-                    Some(
-                        t.trim()
-                            .trim_end_matches('C')
-                            .trim_end_matches('°')
-                            .trim()
-                            .parse::<u16>()
-                            .context("alerts.temperature: degrees Celsius")?,
-                    )
-                }
-            }
+            Some(v) => parse_degrees(&v.text()).context("alerts.temperature")?,
         };
         let p = AlertPolicy {
             node_offline_secs: secs(
@@ -1506,6 +1718,47 @@ impl AlertsFile {
         };
         p.validate()?;
         Ok(p)
+    }
+
+    /// The repeat and resolved notices and per-node thresholds, when the
+    /// table sets any of them (1.15).
+    pub fn tuning(&self) -> Result<Option<crate::monitor::AlertTuning>> {
+        use crate::monitor::{AlertTuning, parse_opt_secs};
+        if self.repeat.is_none()
+            && self.resolved.is_none()
+            && self.nodes.is_none()
+            && self.labels.is_none()
+        {
+            return Ok(None);
+        }
+        let d = AlertTuning::default();
+        let repeat_secs = match &self.repeat {
+            None => d.repeat_secs,
+            Some(Setting::Int(n)) if *n > 0 => Some(*n as u64),
+            Some(v) => parse_opt_secs(&v.text()).context("alerts.repeat")?,
+        };
+        let mut overrides = Vec::new();
+        for (name, o) in self.nodes.iter().flatten() {
+            ensure!(!name.trim().is_empty(), "alerts.nodes: a node name cannot be empty");
+            let sel = Selector(vec![SelectorTerm {
+                key: "name".into(),
+                op: SelectorOp::In(vec![name.clone()]),
+            }]);
+            overrides.push(o.to_override(sel, &format!("alerts.nodes.{name}"))?);
+        }
+        for (sel, o) in self.labels.iter().flatten() {
+            let what = format!("alerts.labels.{sel:?}");
+            let parsed: Selector = sel.parse().with_context(|| what.clone())?;
+            overrides.push(o.to_override(parsed, &what)?);
+        }
+        overrides.retain(|o| !o.is_empty());
+        let t = AlertTuning {
+            repeat_secs,
+            resolved: self.resolved.unwrap_or(d.resolved),
+            overrides,
+        };
+        t.validate()?;
+        Ok(Some(t))
     }
 }
 
@@ -1647,8 +1900,9 @@ impl NumberOrText {
 #[serde(deny_unknown_fields)]
 pub struct ScheduleFile {
     pub cron: String,
-    /// A job.toml, relative to cluster.toml.
-    pub job: PathBuf,
+    /// A job.toml, relative to cluster.toml. Left out (1.15), the schedule
+    /// keeps the job it has.
+    pub job: Option<PathBuf>,
     pub account: Option<String>,
     #[serde(default)]
     pub overlap: bool,
@@ -1717,13 +1971,22 @@ impl ClusterFile {
             spec.accounts.push((account, q));
         }
         for (name, s) in self.schedules {
-            let job_path = base.join(&s.job);
-            let (mut job, upload) = JobFile::load_split(&job_path, inline_limit)
-                .with_context(|| format!("schedule {name}: {}", job_path.display()))?;
-            ensure!(
-                upload.is_empty(),
-                "schedule {name}: the job's input files are too large to keep with a schedule; put them in the file store (`pumasi store put`) and mount them with `store:NAME`"
-            );
+            let mut job = match &s.job {
+                Some(path) => {
+                    let job_path = base.join(path);
+                    let (job, upload) = JobFile::load_split(&job_path, inline_limit)
+                        .with_context(|| format!("schedule {name}: {}", job_path.display()))?;
+                    ensure!(
+                        upload.is_empty(),
+                        "schedule {name}: the job's input files are too large to keep with a schedule; put them in the file store (`pumasi store put`) and mount them with `store:NAME`"
+                    );
+                    job
+                }
+                None => {
+                    spec.keep_jobs.push(name.clone());
+                    kept_job()
+                }
+            };
             if let Some(a) = &s.account {
                 validate_account(a)?;
             }
@@ -1738,6 +2001,25 @@ impl ClusterFile {
         }
         if let Some(a) = &self.alerts {
             spec.alerts = Some(a.policy()?);
+            spec.alert_tuning = a.tuning()?;
+        }
+        for (name, f) in self.silences {
+            let nodes = match &f.nodes {
+                Some(s) => Some(
+                    Selector::nodes(s).with_context(|| format!("silence {name}: nodes"))?,
+                ),
+                None => None,
+            };
+            spec.silences.push(crate::monitor::FileSilence {
+                until_unix: f
+                    .until
+                    .unix()
+                    .with_context(|| format!("silence {name}: until"))?,
+                name,
+                rule: f.rule,
+                nodes,
+                comment: f.comment,
+            });
         }
         for (name, w) in self.webhooks {
             let url = match (w.url, w.url_env) {
@@ -1755,6 +2037,37 @@ impl ClusterFile {
         }
         spec.validate()?;
         Ok(spec)
+    }
+}
+
+/// The job of a schedule listed without one: a stand-in the control plane
+/// replaces with the job the schedule has ([`ApplySpec::keep_jobs`]).
+pub fn kept_job() -> JobSubmission {
+    JobSubmission {
+        name: String::new(),
+        executor: Executor::default(),
+        module: Vec::new(),
+        docker: None,
+        files: Vec::new(),
+        tasks: Vec::new(),
+        limits: Default::default(),
+        tier: Default::default(),
+        max_attempts: 0,
+        max_price_per_hour: None,
+        account: None,
+        deterministic: false,
+        mounts: Vec::new(),
+        task_mounts: Vec::new(),
+        output_dataset: None,
+        gpu: None,
+        priority: 0,
+        selector: Selector::default(),
+        tolerations: Vec::new(),
+        after: Vec::new(),
+        queue_timeout_ms: None,
+        gpu_capabilities: Vec::new(),
+        placement: Default::default(),
+        gpu_ext: Default::default(),
     }
 }
 

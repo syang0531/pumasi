@@ -1,4 +1,5 @@
-//! Network probes between agents (1.6). The control plane asks one agent
+//! Network probes between agents (1.6), and from agents to the control
+//! plane's file store (1.15, which answers them the same way). The control plane asks one agent
 //! to probe another ([`ToAgent::Probe`](pumasi_proto::msg::ToAgent)); it
 //! connects on [`PROBE_ALPN`], times a few round trips of eight bytes, then
 //! sends a short transfer and times its arrival. The other agent echoes
@@ -18,7 +19,7 @@ use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
 };
-use pumasi_proto::{
+use crate::{
     PROBE_ALPN,
     monitor::{PROBE_MAX_BYTES, PROBE_PINGS, ProbeResult},
 };
@@ -208,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn probes_another_endpoint() {
-        use pumasi_proto::net::{NetMode, bind_endpoint_with};
+        use crate::net::{NetMode, bind_endpoint_with};
         let key = || iroh::SecretKey::generate();
         let server =
             bind_endpoint_with(key(), NetMode::Local, &[], vec![PROBE_ALPN.to_vec()], None)

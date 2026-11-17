@@ -1,8 +1,9 @@
 //! The network between nodes (1.6): the control plane asks one agent at a
 //! time to probe another over iroh ([`ToAgent::Probe`]: a few round trips
 //! and a short transfer), keeps the last result of each pair, and uses it
-//! to point a node at the closest cache in the file store. Extends
-//! [`State`].
+//! to point a node at the closest cache in the file store. Since 1.15 the
+//! agents also probe the control plane's file store ([`STORE_LINK`]),
+//! which answers probes like an agent. Extends [`State`].
 
 use std::{
     collections::HashMap,
@@ -12,7 +13,7 @@ use std::{
 use anyhow::Result;
 use pumasi_proto::{
     MONITOR_MINOR,
-    monitor::{LinkView, NetView, PROBE_BYTES, ProbeResult},
+    monitor::{LinkView, NetView, PROBE_BYTES, ProbeResult, STORE_LINK},
     msg::ToAgent,
 };
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,9 @@ pub(crate) struct NetState {
     /// The probe asked for and not answered yet: (from, to, when).
     pending: Option<(String, String, Instant)>,
     last_sent: Option<Instant>,
+    /// Where agents reach the control plane's file store (its own
+    /// address), kept fresh by the server (1.15).
+    pub store_addr: Option<iroh::EndpointAddr>,
     dirty: bool,
     last_save: Instant,
 }
@@ -74,6 +78,7 @@ impl Default for NetState {
             links: HashMap::new(),
             pending: None,
             last_sent: None,
+            store_addr: None,
             dirty: false,
             last_save: Instant::now(),
         }
@@ -89,11 +94,16 @@ impl State {
         {
             self.net.links = links
                 .into_iter()
-                .filter(|(a, b, _)| self.members.contains_key(a) && self.members.contains_key(b))
+                .filter(|(a, b, _)| self.members.contains_key(a) && self.is_link_end(b))
                 .map(|(a, b, l)| ((a, b), l))
                 .collect();
         }
         Ok(())
+    }
+
+    /// A node, or the control plane's file store.
+    fn is_link_end(&self, id: &str) -> bool {
+        id == STORE_LINK || self.members.contains_key(id)
     }
 
     /// How often the control plane asks for a probe (`None`: never).
@@ -144,16 +154,20 @@ impl State {
             })
             .map(|(id, _)| id)
             .collect();
+        let store = STORE_LINK.to_string();
         let mut best: Option<(u64, &String, &String)> = None;
         for from in &ready {
-            for to in &ready {
-                if from == to || !self.files.caches.get(*to).is_some_and(|c| c.addr.is_some()) {
-                    continue;
-                }
+            // The other nodes' caches, and the control plane's store.
+            let targets = ready
+                .iter()
+                .copied()
+                .filter(|to| *to != *from && self.files.caches.get(*to).is_some_and(|c| c.addr.is_some()))
+                .chain(self.net.store_addr.is_some().then_some(&store));
+            for to in targets {
                 let age = self
                     .net
                     .links
-                    .get(&((*from).clone(), (*to).clone()))
+                    .get(&((*from).clone(), to.clone()))
                     .map_or(0, |l| l.unix);
                 if best.is_none_or(|(b, _, _)| age < b) {
                     best = Some((age, from, to));
@@ -164,7 +178,11 @@ impl State {
             return;
         };
         let (from, to) = (from.clone(), to.clone());
-        let addr = self.files.caches[&to].addr.clone().expect("checked");
+        let addr = if to == STORE_LINK {
+            self.net.store_addr.clone().expect("checked")
+        } else {
+            self.files.caches[&to].addr.clone().expect("checked")
+        };
         let sent = self
             .nodes
             .get(&from)
@@ -201,7 +219,7 @@ impl State {
         {
             self.net.pending = None;
         }
-        if !self.members.contains_key(&r.node) {
+        if !self.is_link_end(&r.node) {
             return;
         }
         if let Some(e) = &r.error {
@@ -231,9 +249,10 @@ impl State {
         }
         self.net.last_save = Instant::now();
         self.net.dirty = false;
+        let members = &self.members;
         self.net
             .links
-            .retain(|(a, b), _| self.members.contains_key(a) && self.members.contains_key(b));
+            .retain(|(a, b), _| members.contains_key(a) && (b == STORE_LINK || members.contains_key(b)));
         let all: Vec<(&String, &String, &Link)> =
             self.net.links.iter().map(|((a, b), l)| (a, b, l)).collect();
         if let Err(e) = self.store.put_meta_record(LINKS_META, &all) {
@@ -250,10 +269,14 @@ impl State {
             .net
             .links
             .iter()
-            .filter(|((a, b), _)| self.members.contains_key(a) && self.members.contains_key(b))
+            .filter(|((a, b), _)| self.members.contains_key(a) && self.is_link_end(b))
             .map(|((a, b), l)| LinkView {
                 from: self.node_name(a),
-                to: self.node_name(b),
+                to: if b == STORE_LINK {
+                    STORE_LINK.to_string()
+                } else {
+                    self.node_name(b)
+                },
                 rtt_us: l.rtt_us,
                 bps: l.bps,
                 direct: l.direct,

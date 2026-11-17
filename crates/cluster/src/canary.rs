@@ -200,7 +200,7 @@ impl State {
             "rollout.halted",
             None,
             None,
-            format!("rollout halted at the canaries: {reason}"),
+            pumasi_proto::text::Text::new("rollout.halted", [reason.to_string()]),
         );
     }
 
@@ -219,7 +219,7 @@ impl State {
             "rollout.promoted",
             None,
             None,
-            format!("the canaries passed; the rollout goes on to every node ({by})"),
+            pumasi_proto::text::Text::new("rollout.promoted", [by.clone()]),
         );
     }
 
@@ -417,7 +417,7 @@ impl State {
                     "rollout.canary",
                     None,
                     None,
-                    format!("{} added to the canaries by {by}", names.join(", ")),
+                    pumasi_proto::text::Text::new("rollout.canary", [names.join(", "), by.to_string()]),
                 );
             }
         }

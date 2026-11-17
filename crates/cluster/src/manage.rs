@@ -339,13 +339,20 @@ impl State {
         self.monitor.counters.preemptions += 1;
         let name = self.node_name(node_id);
         let msg = match grace {
-            Some(g) => format!(
-                "task {}/{} on {name}: {reason}; stopping it ({} to save its checkpoint)",
-                t.job,
-                t.index,
-                pumasi_proto::job::format_duration_ms(g.as_millis() as u64)
+            Some(g) => pumasi_proto::text::Text::new(
+                "task.preempted.grace",
+                [
+                    t.job.to_string(),
+                    t.index.to_string(),
+                    name.clone(),
+                    reason.to_string(),
+                    pumasi_proto::job::format_duration_ms(g.as_millis() as u64),
+                ],
             ),
-            None => format!("task {}/{} on {name}: {reason}", t.job, t.index),
+            None => pumasi_proto::text::Text::new(
+                "task.preempted",
+                [t.job.to_string(), t.index.to_string(), name.clone(), reason.to_string()],
+            ),
         };
         info!(node = %node_id, task = %t, graceful = grace.is_some(), "{reason}; run moved back to the queue");
         self.event(
@@ -1049,13 +1056,35 @@ impl State {
             }
         }
         for s in &spec.schedules {
+            // A schedule listed without a job keeps the one it has (1.15).
+            let s = if spec.keep_jobs.contains(&s.name) {
+                let Some(r) = self.mgmt.schedules.get(&s.name) else {
+                    changes.push(format!(
+                        "schedule {}: skipped (no such schedule; give it a job)",
+                        s.name
+                    ));
+                    continue;
+                };
+                let mut kept = s.clone();
+                kept.job = r.spec.job.clone();
+                if s.job.account.is_some() {
+                    kept.job.account = s.job.account.clone();
+                }
+                kept
+            } else {
+                s.clone()
+            };
             match self.mgmt.schedules.get(&s.name) {
-                Some(r) if r.spec == *s => continue,
-                Some(_) => changes.push(format!("schedule {}: updated", s.name)),
+                Some(r) if r.spec == s => continue,
+                Some(r) => changes.push(format!(
+                    "schedule {}: updated{}",
+                    s.name,
+                    schedule_diff(&r.spec, &s)
+                )),
                 None => changes.push(format!("schedule {}: created ({})", s.name, s.cron)),
             }
             if !dry {
-                self.set_schedule(s.clone())?;
+                self.set_schedule(s)?;
             }
         }
         if let Some(p) = &spec.alerts
@@ -1064,6 +1093,29 @@ impl State {
             changes.push("alerts: policy updated".to_string());
             if !dry {
                 self.set_alert_policy(p.clone())?;
+            }
+        }
+        // Repeat and resolved notices and per-node thresholds (1.15).
+        if let Some(t) = &spec.alert_tuning
+            && *t != self.monitor.tuning
+        {
+            changes.extend(tuning_diff(&self.monitor.tuning, t));
+            if !dry {
+                self.set_alert_tuning(t.clone())?;
+            }
+        }
+        for f in &spec.silences {
+            if let Some(line) = self.apply_file_silence(f, dry)? {
+                changes.push(line);
+            }
+        }
+        if spec.prune {
+            let keep: Vec<String> = spec.silences.iter().map(|f| f.id()).collect();
+            for id in self.file_silences_not_in(&keep) {
+                changes.push(format!("silence {id}: removed"));
+                if !dry {
+                    self.remove_silence(&id)?;
+                }
             }
         }
         let current = self.webhook_specs();
@@ -1112,6 +1164,81 @@ impl State {
         }
         Ok(changes)
     }
+}
+
+/// ` (cron 0 3 * * * -> 0 4 * * *)`: what changed in a schedule, besides
+/// its job.
+fn schedule_diff(a: &ScheduleSpec, b: &ScheduleSpec) -> String {
+    let mut parts = Vec::new();
+    if a.cron != b.cron {
+        parts.push(format!("cron {} -> {}", a.cron, b.cron));
+    }
+    if a.tz != b.tz {
+        let tz = |t: &Option<String>| t.clone().unwrap_or_else(|| "local".into());
+        parts.push(format!("time zone {} -> {}", tz(&a.tz), tz(&b.tz)));
+    }
+    if a.overlap != b.overlap {
+        parts.push(format!("overlap {} -> {}", a.overlap, b.overlap));
+    }
+    if a.job.account != b.job.account {
+        let acc = |x: &Option<String>| x.clone().unwrap_or_else(|| "-".into());
+        parts.push(format!(
+            "account {} -> {}",
+            acc(&a.job.account),
+            acc(&b.job.account)
+        ));
+    }
+    let mut ja = a.job.clone();
+    ja.account = b.job.account.clone();
+    if ja != b.job {
+        parts.push("job".into());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// One line per change between two alert tunings (1.15).
+fn tuning_diff(
+    a: &pumasi_proto::monitor::AlertTuning,
+    b: &pumasi_proto::monitor::AlertTuning,
+) -> Vec<String> {
+    use pumasi_proto::monitor::human_duration;
+    let mut out = Vec::new();
+    let rep = |r: Option<u64>| r.map_or("once".to_string(), |s| format!("every {}", human_duration(s)));
+    if a.repeat_secs != b.repeat_secs {
+        out.push(format!(
+            "alerts: repeat {} -> {}",
+            rep(a.repeat_secs),
+            rep(b.repeat_secs)
+        ));
+    }
+    if a.resolved != b.resolved {
+        out.push(format!("alerts: resolved notices {} -> {}", a.resolved, b.resolved));
+    }
+    for o in &b.overrides {
+        match a.overrides.iter().find(|x| x.nodes == o.nodes) {
+            Some(x) if x == o => {}
+            Some(x) => out.push(format!(
+                "alerts on {}: {} -> {}",
+                o.nodes,
+                x.describe(false),
+                o.describe(false)
+            )),
+            None => out.push(format!("alerts on {}: {}", o.nodes, o.describe(false))),
+        }
+    }
+    for x in &a.overrides {
+        if !b.overrides.iter().any(|o| o.nodes == x.nodes) {
+            out.push(format!("alerts on {}: removed", x.nodes));
+        }
+    }
+    if out.is_empty() {
+        out.push("alerts: thresholds reordered".into());
+    }
+    out
 }
 
 /// `labels {zone=home} -> {zone=lab}, cordoned`.

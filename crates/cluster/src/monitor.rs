@@ -14,13 +14,14 @@ use pumasi_proto::{
     MONITOR_MINOR,
     job::{Executor, JobId, MAX_OUTPUT_BYTES},
     monitor::{
-        AlertPolicy, AlertTuning, AlertTuningView, AlertView, AlertsView, ClusterMetrics,
-        EventLevel, EventView, LOG_CHUNK_BYTES, LogChunk, MetricPoint, MetricsView, NodeMetrics,
-        NodeMetricsView, Silence, SilenceSpec, WebhookFormat, WebhookSpec, WebhookView,
-        escape_label, human_duration, redact_url,
+        AlertPolicy, AlertText, AlertTuning, AlertTuningView, AlertView, AlertsView,
+        ClusterMetrics, EventLevel, EventView, KeyedEvent, LOG_CHUNK_BYTES, LogChunk, MetricPoint,
+        MetricsView, NodeMetrics, NodeMetricsExtra, NodeMetricsView, Silence, SilenceSpec,
+        WebhookFormat, WebhookSpec, WebhookView, escape_label, human_duration, redact_url,
     },
     msg::{JobState, TaskRef, TaskState},
     store::format_size,
+    text::Text,
 };
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
@@ -51,9 +52,36 @@ const SILENCES_META: &str = "alert_silences";
 /// Silences kept at most.
 const MAX_SILENCES: usize = 256;
 
+/// What an event says: English text (older call sites), or a message by
+/// key whose English text is stored as the event's message (1.15).
+pub(crate) enum EventMsg {
+    Plain(String),
+    Text(Text),
+}
+
+impl From<String> for EventMsg {
+    fn from(s: String) -> Self {
+        EventMsg::Plain(s)
+    }
+}
+
+impl From<&str> for EventMsg {
+    fn from(s: &str) -> Self {
+        EventMsg::Plain(s.to_string())
+    }
+}
+
+impl From<Text> for EventMsg {
+    fn from(t: Text) -> Self {
+        EventMsg::Text(t)
+    }
+}
+
 /// One node's metrics: the latest sample and the time series.
 pub(crate) struct NodeSeries {
     latest: Option<(u64, NodeMetrics)>,
+    /// What came with the latest sample beyond it (1.15).
+    pub(crate) extra: Option<NodeMetricsExtra>,
     rates: (u64, u64),
     tiers: Vec<Tier>,
 }
@@ -131,6 +159,7 @@ impl NodeSeries {
     fn new(retention: u64) -> Self {
         Self {
             latest: None,
+            extra: None,
             rates: (0, 0),
             tiers: TIERS
                 .iter()
@@ -324,6 +353,9 @@ pub(crate) struct Monitor {
     events: VecDeque<EventView>,
     pending_events: Vec<EventView>,
     next_event_seq: u64,
+    /// Messages by key of the events in `events` (1.15), by number.
+    event_texts: HashMap<u64, Text>,
+    pending_texts: Vec<(u64, Text)>,
     /// Jobs not finished yet, watched to report when they finish.
     pub active_jobs: HashSet<JobId>,
     /// Finished task runs in the failure-rate window: (unix, succeeded).
@@ -338,6 +370,12 @@ pub(crate) struct Monitor {
     silences: Vec<Silence>,
     /// Stateful alerts firing now, by (rule, subject).
     firing: BTreeMap<(String, String), AlertView>,
+    /// Their messages by key (1.15).
+    firing_texts: HashMap<(String, String), Text>,
+    /// Bumped with every metrics sample, for [`MetricsWait`] (1.15).
+    ///
+    /// [`MetricsWait`]: pumasi_proto::msg::AdminOp::MetricsWait
+    pub samples: tokio::sync::watch::Sender<u64>,
     /// When a firing alert's last notice went out; missing while a
     /// silence has kept it quiet from the start.
     notified: HashMap<(String, String), u64>,
@@ -362,6 +400,8 @@ impl Default for Monitor {
             events: VecDeque::new(),
             pending_events: Vec::new(),
             next_event_seq: 1,
+            event_texts: HashMap::new(),
+            pending_texts: Vec::new(),
             active_jobs: HashSet::new(),
             runs: VecDeque::new(),
             counters: Counters::default(),
@@ -370,6 +410,8 @@ impl Default for Monitor {
             tuning: AlertTuning::default(),
             silences: Vec::new(),
             firing: BTreeMap::new(),
+            firing_texts: HashMap::new(),
+            samples: tokio::sync::watch::channel(0).0,
             notified: HashMap::new(),
             webhooks: BTreeMap::new(),
             deliver: None,
@@ -419,6 +461,9 @@ impl State {
         }
         let events = self.store.load_events(EVENT_RING)?;
         m.next_event_seq = events.last().map_or(1, |e| e.seq + 1);
+        if let Some(first) = events.first() {
+            m.event_texts = self.store.load_event_texts(first.seq)?.into_iter().collect();
+        }
         m.events = events.into();
         let now = now_unix();
         let mut points = self.store.load_points(&tier_since(now, m.retention_secs))?;
@@ -479,8 +524,12 @@ impl State {
         kind: &str,
         node: Option<&str>,
         job: Option<JobId>,
-        message: impl Into<String>,
+        message: impl Into<EventMsg>,
     ) {
+        let (message, text) = match message.into() {
+            EventMsg::Plain(s) => (s, None),
+            EventMsg::Text(t) => (t.en(), Some(t)),
+        };
         let node_name = node.map(|id| self.node_name(id));
         let account = job
             .and_then(|j| self.jobs.get(&j))
@@ -494,15 +543,47 @@ impl State {
             node: node_name,
             job,
             account,
-            message: message.into(),
+            message,
         };
         m.next_event_seq += 1;
         *m.counters.events.entry(level).or_default() += 1;
+        if let Some(t) = text {
+            m.event_texts.insert(e.seq, t.clone());
+            m.pending_texts.push((e.seq, t));
+        }
         m.events.push_back(e.clone());
         while m.events.len() > EVENT_RING {
-            m.events.pop_front();
+            if let Some(old) = m.events.pop_front() {
+                m.event_texts.remove(&old.seq);
+            }
         }
         m.pending_events.push(e);
+    }
+
+    /// [`Self::events`] with each event's message by key (1.15).
+    pub fn events_keyed(&self, after: u64, since_unix: u64, limit: u32) -> Vec<KeyedEvent> {
+        self.events(after, since_unix, limit)
+            .into_iter()
+            .map(|event| KeyedEvent {
+                text: self.monitor.event_texts.get(&event.seq).cloned(),
+                event,
+            })
+            .collect()
+    }
+
+    /// The firing alerts' messages by key (1.15).
+    pub fn alert_texts(&self) -> Vec<AlertText> {
+        self.monitor
+            .firing
+            .keys()
+            .filter_map(|k| {
+                Some(AlertText {
+                    rule: k.0.clone(),
+                    subject: k.1.clone(),
+                    text: self.monitor.firing_texts.get(k)?.clone(),
+                })
+            })
+            .collect()
     }
 
     /// A node's disk (total, used bytes) from its latest fresh sample.
@@ -552,15 +633,65 @@ impl State {
             return;
         }
         let retention = self.monitor.retention_secs;
-        let done = self
+        // An older agent sends nothing more; a 1.15 one sends its extra
+        // right after.
+        let old_agent = self.node_minor(id) < pumasi_proto::METRICS_EXTRA_MINOR;
+        let series = self
             .monitor
             .series
             .entry(id.to_string())
-            .or_insert_with(|| NodeSeries::new(retention))
-            .add(now_unix(), m);
+            .or_insert_with(|| NodeSeries::new(retention));
+        let done = series.add(now_unix(), m);
+        if old_agent {
+            series.extra = None;
+            self.monitor.samples.send_modify(|n| *n += 1);
+        }
         self.monitor
             .pending_points
             .extend(done.into_iter().map(|(t, p)| (id.to_string(), t, p)));
+    }
+
+    /// What came with a node's latest sample beyond it (1.15).
+    pub fn on_metrics_extra(&mut self, id: &str, generation: u64, x: NodeMetricsExtra) {
+        if !self
+            .nodes
+            .get(id)
+            .is_some_and(|n| n.generation == generation)
+        {
+            return;
+        }
+        if let Some(s) = self.monitor.series.get_mut(id) {
+            s.extra = Some(x);
+        }
+        self.monitor.samples.send_modify(|n| *n += 1);
+    }
+
+    /// What every node (or one) measures beyond [`NodeMetrics`], by id.
+    pub fn metrics_extra(&self, node: Option<&str>) -> Vec<(String, NodeMetricsExtra)> {
+        let only = node.and_then(|n| self.resolve_node(n).ok());
+        let now = now_unix();
+        let mut out: Vec<(String, NodeMetricsExtra)> = self
+            .monitor
+            .series
+            .iter()
+            .filter(|(id, _)| only.as_ref().is_none_or(|o| *o == **id))
+            .filter(|(_, s)| s.fresh(now).is_some())
+            .filter_map(|(id, s)| Some((id.clone(), s.extra.clone()?)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// When the newest sample of a node (or of any) came.
+    pub fn latest_sample_unix(&self, node: Option<&str>) -> u64 {
+        let only = node.and_then(|n| self.resolve_node(n).ok());
+        self.monitor
+            .series
+            .iter()
+            .filter(|(id, _)| only.as_ref().is_none_or(|o| *o == **id))
+            .filter_map(|(_, s)| s.latest.as_ref().map(|(t, _)| *t))
+            .max()
+            .unwrap_or(0)
     }
 
     fn cluster_metrics(&self) -> ClusterMetrics {
@@ -751,7 +882,14 @@ impl State {
                 "task.failed",
                 Some(node),
                 Some(task.job),
-                format!("task {}/{} failed: {outcome}", task.job, task.index),
+                Text::new(
+                    "task.failed",
+                    [
+                        task.job.to_string(),
+                        task.index.to_string(),
+                        outcome.to_string(),
+                    ],
+                ),
             );
         }
     }
@@ -761,26 +899,25 @@ impl State {
     pub(crate) fn note_mismatch(&mut self, task: TaskRef, bad: &[String], inconclusive: bool) {
         self.monitor.counters.check_mismatches += 1;
         let names: Vec<String> = bad.iter().map(|id| self.node_name(id)).collect();
-        let msg = if inconclusive {
-            format!(
-                "check of task {}/{} inconclusive: runs on different nodes disagreed",
-                task.job, task.index
+        let text = if inconclusive {
+            Text::new(
+                "check.inconclusive",
+                [task.job.to_string(), task.index.to_string()],
             )
         } else {
-            format!(
-                "check of task {}/{} rejected the result of {}",
-                task.job,
-                task.index,
-                names.join(", ")
+            Text::new(
+                "check.mismatch",
+                [task.job.to_string(), task.index.to_string(), names.join(", ")],
             )
         };
+        let msg = text.en();
         let subject = names.first().cloned().unwrap_or_else(|| "cluster".into());
         self.event(
             EventLevel::Warning,
             "check.mismatch",
             None,
             Some(task.job),
-            msg.clone(),
+            text,
         );
         if self.monitor.policy.check_mismatch {
             self.alert_once("check_mismatch", &subject, EventLevel::Warning, &msg);
@@ -815,14 +952,9 @@ impl State {
             return;
         }
         let name = self.node_name(node);
-        let msg = format!("benchmark of {name} dropped: {}", parts.join(", "));
-        self.event(
-            EventLevel::Warning,
-            "perf.drop",
-            Some(node),
-            None,
-            msg.clone(),
-        );
+        let text = Text::new("perf.drop", [name.clone(), parts.join(", ")]);
+        let msg = text.en();
+        self.event(EventLevel::Warning, "perf.drop", Some(node), None, text);
         self.alert_once("perf_drop", &name, EventLevel::Warning, &msg);
     }
 
@@ -991,10 +1123,10 @@ impl State {
     pub(crate) fn wanted_alerts(
         &mut self,
         now: u64,
-    ) -> BTreeMap<(String, String), (EventLevel, String)> {
+    ) -> BTreeMap<(String, String), (EventLevel, Text)> {
         let p = self.monitor.policy.clone();
         let mut want = BTreeMap::new();
-        let mut put = |rule: &str, subject: &str, level, msg: String| {
+        let mut put = |rule: &str, subject: &str, level, msg: Text| {
             want.insert((rule.to_string(), subject.to_string()), (level, msg));
         };
         for m in self.members.values() {
@@ -1038,9 +1170,9 @@ impl State {
                         "node_offline",
                         &name,
                         EventLevel::Critical,
-                        format!(
-                            "node {name} offline for {}",
-                            human_duration(gone.max(after))
+                        Text::new(
+                            "alert.node_offline",
+                            [name.clone(), human_duration(gone.max(after))],
                         ),
                     );
                 }
@@ -1054,10 +1186,14 @@ impl State {
                     "disk",
                     &name,
                     EventLevel::Warning,
-                    format!(
-                        "disk of {name} {pct:.0}% full ({} of {})",
-                        format_size(l.disk_used),
-                        format_size(l.disk_total)
+                    Text::new(
+                        "alert.disk",
+                        [
+                            name.clone(),
+                            format!("{pct:.0}"),
+                            format_size(l.disk_used),
+                            format_size(l.disk_total),
+                        ],
                     ),
                 );
             }
@@ -1069,7 +1205,7 @@ impl State {
                     "temperature",
                     &name,
                     EventLevel::Warning,
-                    format!("{name} is at {t:.0} °C"),
+                    Text::new("alert.temperature", [name.clone(), format!("{t:.0}")]),
                 );
             }
             if p.smart
@@ -1084,17 +1220,20 @@ impl State {
                         "smart",
                         &name,
                         EventLevel::Critical,
-                        format!("drive {} of {name} fails its SMART health check", s.model),
+                        Text::new("alert.smart.failed", [s.model.clone(), name.clone()]),
                     );
                 } else if s.percent_used.is_some_and(|u| u >= 90) {
                     put(
                         "smart",
                         &name,
                         EventLevel::Warning,
-                        format!(
-                            "drive {} of {name} has used {}% of its endurance",
-                            s.model,
-                            s.percent_used.unwrap_or(0)
+                        Text::new(
+                            "alert.smart.worn",
+                            [
+                                s.model.clone(),
+                                name.clone(),
+                                s.percent_used.unwrap_or(0).to_string(),
+                            ],
                         ),
                     );
                 } else if s.media_errors.is_some_and(|e| e > 0) {
@@ -1102,10 +1241,13 @@ impl State {
                         "smart",
                         &name,
                         EventLevel::Warning,
-                        format!(
-                            "drive {} of {name} reports {} media errors",
-                            s.model,
-                            s.media_errors.unwrap_or(0)
+                        Text::new(
+                            "alert.smart.errors",
+                            [
+                                s.model.clone(),
+                                name.clone(),
+                                s.media_errors.unwrap_or(0).to_string(),
+                            ],
                         ),
                     );
                 }
@@ -1120,10 +1262,9 @@ impl State {
                     "disk",
                     "control-plane",
                     EventLevel::Warning,
-                    format!(
-                        "control plane disk (file store) {pct:.0}% full ({} of {})",
-                        format_size(used),
-                        format_size(total)
+                    Text::new(
+                        "alert.cp_disk",
+                        [format!("{pct:.0}"), format_size(used), format_size(total)],
                     ),
                 );
             }
@@ -1140,10 +1281,14 @@ impl State {
                     "failure_rate",
                     "cluster",
                     EventLevel::Warning,
-                    format!(
-                        "{failed} of {n} runs failed in the last {} ({}%)",
-                        human_duration(f.window_secs),
-                        failed * 100 / n
+                    Text::new(
+                        "alert.failure_rate",
+                        [
+                            failed.to_string(),
+                            n.to_string(),
+                            human_duration(f.window_secs),
+                            (failed * 100 / n).to_string(),
+                        ],
                     ),
                 );
             }
@@ -1166,23 +1311,24 @@ impl State {
         for k in gone {
             let a = self.monitor.firing.remove(&k).expect("listed");
             let told = self.monitor.notified.remove(&k).is_some();
+            let text = self.monitor.firing_texts.remove(&k);
             info!(rule = %a.rule, subject = %a.subject, "alert resolved");
-            self.event(
-                EventLevel::Info,
-                "alert.resolved",
-                None,
-                None,
-                format!("resolved: {}", a.message),
-            );
+            let msg: EventMsg = match text {
+                Some(t) => Text::wrap("alert.resolved", [""; 0], t).into(),
+                None => format!("resolved: {}", a.message).into(),
+            };
+            self.event(EventLevel::Info, "alert.resolved", None, None, msg);
             if told && self.monitor.tuning.resolved {
                 let n = self.notice("resolved", &a);
                 self.notify(n);
             }
         }
         let repeat = self.monitor.tuning.repeat_secs;
-        for ((rule, subject), (level, message)) in want {
+        for ((rule, subject), (level, text)) in want {
             let key = (rule.clone(), subject.clone());
             let quiet = self.silenced(&rule, &subject, now);
+            let message = text.en();
+            self.monitor.firing_texts.insert(key.clone(), text.clone());
             if let Some(a) = self.monitor.firing.get_mut(&key) {
                 // The message follows the measurement (`offline for 5m`).
                 a.message = message;
@@ -1214,9 +1360,9 @@ impl State {
             };
             warn!(rule = %a.rule, subject = %a.subject, silenced = quiet, "alert firing: {}", a.message);
             let text = if quiet {
-                format!("{} (silenced)", a.message)
+                Text::wrap("alert.silenced_firing", [""; 0], text)
             } else {
-                a.message.clone()
+                text
             };
             self.event(level, "alert.firing", None, None, text);
             if !quiet {
@@ -1304,28 +1450,108 @@ impl State {
             by: by.to_string(),
             created_unix: now,
         };
+        self.put_silence(s)?;
+        Ok(id)
+    }
+
+    /// Stores a silence (replacing one with its id) and says so.
+    fn put_silence(&mut self, s: Silence) -> Result<()> {
         let mut all = self.monitor.silences.clone();
+        all.retain(|o| o.id != s.id);
         all.push(s.clone());
         self.store.put_meta_record(SILENCES_META, &all)?;
         info!(id = %s.id, what = %s.describe(), until = s.until_unix, "alerts silenced");
+        let secs = s.until_unix.saturating_sub(s.created_unix);
+        let mut args = vec![human_duration(secs), s.by.clone()];
+        let key = if s.comment.is_empty() {
+            "alert.silenced"
+        } else {
+            args.push(s.comment.clone());
+            "alert.silenced.comment"
+        };
         self.event(
             EventLevel::Info,
             "alert.silenced",
             None,
             None,
-            format!(
-                "{} silenced for {} by {by}{}",
-                s.describe(),
-                human_duration(spec.secs),
-                if s.comment.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", s.comment)
-                }
-            ),
+            Text::wrap(key, args, s.text()),
         );
         self.monitor.silences = all;
-        Ok(id)
+        self.evaluate_alerts(now_unix());
+        Ok(())
+    }
+
+    /// Makes a `cluster.toml` silence (1.15) match the file: answers with
+    /// what changed, if anything. One that has ended is skipped.
+    pub(crate) fn apply_file_silence(
+        &mut self,
+        f: &pumasi_proto::monitor::FileSilence,
+        dry: bool,
+    ) -> Result<Option<String>> {
+        f.validate()?;
+        let now = now_unix();
+        let id = f.id();
+        let current = self.monitor.silences.iter().find(|s| s.id == id);
+        if current.is_some_and(|c| f.same_as(c)) {
+            return Ok(None);
+        }
+        if f.until_unix <= now {
+            return Ok(match current {
+                // It ended: let the stored one end too.
+                Some(_) => None,
+                None => Some(format!("silence {}: ended, skipped", f.name)),
+            });
+        }
+        ensure!(
+            f.until_unix <= now + 90 * 86_400,
+            "silence {}: a silence lasts at most 90 days",
+            f.name
+        );
+        let line = format!(
+            "silence {}: {} until {}",
+            f.name,
+            if current.is_some() { "updated," } else { "created," },
+            pumasi_proto::audit::rfc3339(f.until_unix)
+        );
+        if !dry {
+            ensure!(
+                current.is_some()
+                    || self
+                        .monitor
+                        .silences
+                        .iter()
+                        .filter(|s| s.until_unix > now)
+                        .count()
+                        < MAX_SILENCES,
+                "too many silences ({MAX_SILENCES})"
+            );
+            self.put_silence(Silence {
+                id,
+                rule: f.rule.clone(),
+                nodes: f.nodes.clone(),
+                until_unix: f.until_unix,
+                comment: f.comment.clone(),
+                by: pumasi_proto::monitor::FILE_SILENCE_BY.to_string(),
+                created_unix: now,
+            })?;
+        }
+        Ok(Some(line))
+    }
+
+    /// The `cluster.toml` silences in force that are not in `keep` (names'
+    /// ids), for `apply --prune`.
+    pub(crate) fn file_silences_not_in(&self, keep: &[String]) -> Vec<String> {
+        let now = now_unix();
+        self.monitor
+            .silences
+            .iter()
+            .filter(|s| {
+                s.until_unix > now
+                    && s.by == pumasi_proto::monitor::FILE_SILENCE_BY
+                    && !keep.contains(&s.id)
+            })
+            .map(|s| s.id.clone())
+            .collect()
     }
 
     /// Ends a silence (id or unique prefix).
@@ -1354,7 +1580,7 @@ impl State {
             "alert.unsilenced",
             None,
             None,
-            format!("silence of {} ended", s.describe()),
+            Text::wrap("alert.unsilenced", [""; 0], s.text()),
         );
         self.evaluate_alerts(now_unix());
         Ok(())
@@ -1465,9 +1691,14 @@ impl State {
                 kind,
                 None,
                 Some(id),
-                format!(
-                    "job {id} ({}) {label}: {} of {} tasks succeeded",
-                    s.name, s.succeeded, s.tasks
+                Text::new(
+                    kind,
+                    [
+                        id.to_string(),
+                        s.name.clone(),
+                        s.succeeded.to_string(),
+                        s.tasks.to_string(),
+                    ],
                 ),
             );
         }
@@ -1490,7 +1721,8 @@ impl State {
     pub fn flush_monitor(&mut self) {
         self.monitor.last_flush = Instant::now();
         let events = std::mem::take(&mut self.monitor.pending_events);
-        if let Err(e) = self.store.put_events(&events) {
+        let texts = std::mem::take(&mut self.monitor.pending_texts);
+        if let Err(e) = self.store.put_events(&events, &texts) {
             warn!("persist events: {e:#}");
         }
         let points = std::mem::take(&mut self.monitor.pending_points);
@@ -1584,7 +1816,7 @@ impl State {
 
         // Machine metrics, from each node's latest sample while it is fresh.
         type GetM = fn(&NodeMetrics, &NodeSeries) -> Option<f64>;
-        let machine: [(&str, &str, &str, GetM); 10] = [
+        let machine: [(&str, &str, &str, GetM); 11] = [
             (
                 "pumasi_node_cpu_usage_ratio",
                 "gauge",
@@ -1638,6 +1870,12 @@ impl State {
                 "gauge",
                 "The hottest CPU or board sensor.",
                 |m, _| m.temp_c.map(|t| t as f64),
+            ),
+            (
+                "pumasi_node_cpu_power_watts",
+                "gauge",
+                "The CPU package's power draw (Macs, and Linux with RAPL).",
+                |_, s| s.extra.as_ref()?.cpu_power_w.map(|p| p as f64),
             ),
             (
                 "pumasi_node_metrics_age_seconds",

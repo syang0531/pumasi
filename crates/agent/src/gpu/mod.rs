@@ -15,6 +15,7 @@
 
 pub mod cuda;
 pub mod docker_check;
+pub mod hwmon;
 pub mod nvml;
 pub mod usage;
 pub mod vfio;

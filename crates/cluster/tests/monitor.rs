@@ -632,3 +632,247 @@ async fn probes_silences_and_metrics_over_a_restart() {
     client.close().await;
     cluster.shutdown().await.unwrap();
 }
+
+/// Release 1.15: per-node thresholds and silences from a `cluster.toml`
+/// (with the diff `apply` shows), events and alerts by message key,
+/// metrics pushed when a sample arrives, and agents probing the control
+/// plane's store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_thresholds_silences_keyed_events_and_pushed_metrics() {
+    use pumasi_proto::{
+        manage::ClusterFile,
+        monitor::{FILE_SILENCE_BY, STORE_LINK, file_silence_id},
+    };
+    init_tracing();
+    let cluster = start_cluster_probing(tempdir("cp-31"), None, Some(Duration::from_millis(300)))
+        .await
+        .unwrap();
+    let ticket = || {
+        cluster
+            .create_join_ticket(Duration::from_secs(60), None)
+            .unwrap()
+    };
+    let a = spawn_agent("p31-a", ticket()).await;
+    let b = spawn_agent("p31-b", ticket()).await;
+    wait_online(&cluster, 2).await;
+    let client = admin(&cluster).await;
+
+    // Agents measure the store too: the matrix gets a column for it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let AdminResponse::Net(v) = client.call(AdminOp::Net).await.unwrap() else {
+            panic!()
+        };
+        if let Some(l) = v.link("p31-a", STORE_LINK)
+            && l.error.is_none()
+            && l.bps.is_some()
+            && l.rtt_us.is_some()
+        {
+            eprintln!("probe a→store: {l:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no store probe: {v:#?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A pushed sample: answered when the next one arrives, not on a timer.
+    let push = |after: u64, wait: u32| {
+        let c = &client;
+        async move {
+            let AdminResponse::MetricsPush(p) = c
+                .call(AdminOp::MetricsWait {
+                    node: Some("p31-a".into()),
+                    since_secs: 600,
+                    after_unix: after,
+                    wait_secs: wait,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            p
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let first = loop {
+        let p = push(0, 0).await;
+        let latest = p.view.nodes.first().map_or(0, |n| n.latest_unix);
+        if latest > 0 {
+            break latest;
+        }
+        assert!(Instant::now() < deadline, "no samples");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let started = Instant::now();
+    let p = push(first, 25).await;
+    let id = p.view.nodes[0].id.clone();
+    assert!(
+        p.view.nodes[0].latest_unix > first,
+        "the wait ended without a new sample"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    // What came beyond the metrics (CPU package power where it can be
+    // read): every node that sent a sample has an entry.
+    assert!(p.extra_of(&id).is_some(), "{:?}", p.extra);
+
+    // Thresholds for one node, from the file, with the diff first.
+    let until = pumasi_proto::audit::rfc3339(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600,
+    );
+    let file = |silence: bool| {
+        let mut text = String::from(
+            "[alerts]\nnode_offline = \"1s\"\ndisk = \"off\"\ntemperature = \"off\"\nrepeat = \"1h\"\n\n\
+             [alerts.nodes.p31-a]\nnode_offline = \"off\"\n\n\
+             [alerts.labels.\"os=plan9\"]\ndisk = \"99%\"\n",
+        );
+        if silence {
+            text.push_str(&format!(
+                "\n[silences.quiet-b]\nrule = \"node_offline\"\nnodes = \"name=p31-b\"\nuntil = \"{until}\"\ncomment = \"moving it\"\n"
+            ));
+        }
+        ClusterFile::parse(&text)
+            .unwrap()
+            .resolve(std::path::Path::new("."), 0)
+            .unwrap()
+    };
+    let apply = |mut spec: pumasi_proto::manage::ApplySpec, dry: bool, prune: bool| {
+        let c = &client;
+        spec.dry_run = dry;
+        spec.prune = prune;
+        async move {
+            let AdminResponse::Applied(changes) = c.call(AdminOp::apply(spec)).await.unwrap()
+            else {
+                panic!()
+            };
+            changes
+        }
+    };
+    let preview = apply(file(false), true, false).await;
+    eprintln!("preview: {preview:#?}");
+    for want in [
+        "alerts: policy updated",
+        "alerts: repeat once -> every 1h",
+        "alerts on name=p31-a: node_offline off",
+        "alerts on os=plan9: disk 99%",
+    ] {
+        assert!(preview.iter().any(|c| c == want), "{want}: {preview:#?}");
+    }
+    let AdminResponse::AlertTuning(v) = client.call(AdminOp::AlertTuning).await.unwrap() else {
+        panic!()
+    };
+    assert!(v.tuning.overrides.is_empty(), "a preview changes nothing");
+    assert_eq!(apply(file(false), false, false).await, preview);
+    assert!(
+        apply(file(false), false, false).await.is_empty(),
+        "applied again: nothing"
+    );
+    let AdminResponse::AlertTuning(v) = client.call(AdminOp::AlertTuning).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(v.tuning.repeat_secs, Some(3600));
+    assert_eq!(v.tuning.overrides.len(), 2);
+
+    // Both go offline: only b's alert fires, a's threshold is off.
+    a.kill().await;
+    b.kill().await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let alerts = loop {
+        let AdminResponse::Alerts(al) = client.call(AdminOp::Alerts).await.unwrap() else {
+            panic!()
+        };
+        if al.firing.iter().any(|f| f.rule == "node_offline") {
+            break al;
+        }
+        assert!(Instant::now() < deadline, "no offline alert: {al:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let subjects: Vec<&str> = alerts
+        .firing
+        .iter()
+        .filter(|f| f.rule == "node_offline")
+        .map(|f| f.subject.as_str())
+        .collect();
+    assert_eq!(subjects, ["p31-b"], "{alerts:?}");
+
+    // The alert and the events by key, for a Korean dashboard.
+    let AdminResponse::AlertTexts(texts) = client.call(AdminOp::AlertTexts).await.unwrap() else {
+        panic!()
+    };
+    let t = texts
+        .iter()
+        .find(|t| t.rule == "node_offline" && t.subject == "p31-b")
+        .unwrap_or_else(|| panic!("{texts:?}"));
+    let ko = t.text.render(true).unwrap();
+    assert!(ko.contains("p31-b") && ko.contains("오프라인"), "{ko}");
+    let AdminResponse::EventsKeyed(events) = client
+        .call(AdminOp::EventsKeyed {
+            after: 0,
+            since_unix: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let offline = events
+        .iter()
+        .find(|e| e.event.kind == "node.offline" && e.event.node.as_deref() == Some("p31-b"))
+        .unwrap_or_else(|| panic!("{events:#?}"));
+    let text = offline.text.as_ref().expect("a key");
+    assert_eq!(
+        text.render(false).as_deref(),
+        Some(offline.event.message.as_str())
+    );
+    assert!(text.render(true).unwrap().contains("오프라인"));
+
+    // A silence from the file keeps b quiet; applying again finds it.
+    let changes = apply(file(true), false, false).await;
+    assert!(
+        changes.len() == 1 && changes[0].starts_with("silence quiet-b: created, until "),
+        "{changes:?}"
+    );
+    assert!(apply(file(true), false, false).await.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let AdminResponse::AlertTuning(v) = client.call(AdminOp::AlertTuning).await.unwrap() else {
+            panic!()
+        };
+        let s = v
+            .silences
+            .iter()
+            .find(|s| s.id == file_silence_id("quiet-b"))
+            .unwrap_or_else(|| panic!("{v:?}"));
+        assert_eq!(s.by, FILE_SILENCE_BY);
+        assert_eq!(s.comment, "moving it");
+        if v.silenced == [("node_offline".to_string(), "p31-b".to_string())] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "b not silenced: {v:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Left out of the file: kept, unless pruned.
+    assert!(apply(file(false), false, false).await.is_empty());
+    let id = file_silence_id("quiet-b");
+    assert_eq!(
+        apply(file(false), true, true).await,
+        [format!("silence {id}: removed")]
+    );
+    apply(file(false), false, true).await;
+    let AdminResponse::AlertTuning(v) = client.call(AdminOp::AlertTuning).await.unwrap() else {
+        panic!()
+    };
+    assert!(v.silences.iter().all(|s| s.id != id), "{v:?}");
+
+    client.close().await;
+    cluster.shutdown().await.unwrap();
+}

@@ -121,7 +121,7 @@ pub async fn page(ctx: Ctx, Query(q): Query<EventsQuery>) -> Response {
                     ul class="plain" {
                         @for s in &t.silences {
                             li {
-                                strong { (s.describe()) } " · " (l.t("until", "까지:")) " " (fmt::time(s.until_unix)) " · " (s.by)
+                                strong { (s.text().render(l == Lang::Ko).unwrap_or_else(|| s.describe())) } " · " (l.t("until", "까지:")) " " (fmt::time(s.until_unix)) " · " (s.by)
                                 @if !s.comment.is_empty() { br; span class="dim" { (s.comment) } }
                                 @if admin { " " button hx-post={"/events/silences/" (s.id) "/end"} hx-target="#flash" { (l.t("End", "끝내기")) } }
                             }

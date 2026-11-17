@@ -3236,8 +3236,8 @@ integrated Intel GPU gets the integrated readings, a discrete GPU or an
 Apple GPU the other. `pumasi sensors --raw` prints the readings and the
 raw keys in the same format as the recorded fixtures, which the parsing
 tests use (a 2014 iMac and a 2017 MacBook Pro over SMC, an M1 over
-IOReport). CPU package power is read but not sent yet: `NodeMetrics` has
-no field for it.
+IOReport). CPU package power is read here and, from 1.15, sent beside
+each sample (phase 31).
 
 ### Intel builds without an Intel runner
 
@@ -3254,6 +3254,138 @@ GPUs and Virtualization.framework on Intel are left to real Intel Macs.
 so a 1.13 guest's spec and a 1.14 agent's are the same for tasks that do
 not checkpoint, and the control disk only appears in pool mode or for a
 checkpointing task. Job files and stored state do not change.
+
+## Phase 31: monitoring and the dashboard (1.15)
+
+Release 1.15 moves what phases 22 and 23 left in the CLI into
+`cluster.toml` and the browser, and fills in sensors and the network to
+the store. The code is `proto/src/text.rs` (message keys),
+`proto/src/manage.rs` (the file's new tables), `cluster/src/monitor.rs`
+(keyed events, file silences, pushed samples), `cluster/src/net.rs` and
+`proto/src/probe.rs` (the store as a probe target), `agent/src/gpu/hwmon.rs`
+and the `kmt` module of `agent/src/gpu/usage.rs` (sensors), the `Streamer`
+in `guest/src/init.rs`, and the dashboard's `pages/settings.rs` and
+`pages/nodes.rs`.
+
+### New data in new calls
+
+postcard encodes a struct by position and has no optional trailing
+fields, so a message an older peer reads cannot grow. Every addition is
+therefore a new variant at the end of an enum, which an older peer
+refuses as a whole and a newer one can fall back from:
+
+- `AdminOp::ApplyMore { spec, ext, more }` carries an `ApplySpec` with
+  `ApplyMore` (the alert tuning, the file's silences, and the schedules
+  whose jobs to keep). `AdminOp::apply` sends it only when `more` is not
+  empty, so a file without the new tables still reaches a 1.14 control
+  plane.
+- `AdminOp::MetricsWait`, `EventsKeyed` and `AlertTexts` are reads; a
+  dashboard that gets an error from one uses the 1.14 call instead.
+- `FromAgent::MetricsExtra` follows each `Metrics` from an agent whose
+  control plane speaks minor 8; it carries what the agent reads beyond
+  `NodeMetrics` (for now the CPU package power).
+
+### Thresholds and silences in the file
+
+`[alerts]` keeps its policy keys and gains `repeat`, `resolved`, `nodes`
+and `labels`; when any of these four is present the file states the whole
+`AlertTuning` (left-out keys take the defaults), and `[alerts.nodes.X]`
+becomes the selector `name=X`. With none, `apply` does not touch the
+tuning, so 1.14 files mean what they meant. `apply` compares the tuning
+and prints one line per change (`alerts on name=laptop: ...`).
+
+A `[silences.NAME]` becomes a `FileSilence`. Its id is the first four bytes
+of SHA-256 over `pumasi/silence/NAME`, eight hex digits like any silence,
+and it is stored with `by = "cluster.toml"`; applying the file again
+finds it by that id and changes nothing when rule, nodes, end and comment
+match. An end in the past is skipped with a line rather than refused, so
+an old file still applies. `--prune` removes stored silences by
+`cluster.toml` whose ids the file does not list; the dashboard never
+prunes. `until` takes a TOML date-time or date or the same as text; a
+time without an offset is local to the machine that runs `apply`.
+
+A schedule without `job` is resolved with a placeholder job and listed
+in `keep_jobs`; the control plane swaps in the stored schedule's job (with
+the file's `account`, when it gives one) before comparing, so the diff
+names only what the file changed, and a missing schedule is skipped.
+This is what lets the dashboard's editor, which cannot read job files,
+list and change schedules.
+
+### Message keys
+
+`Text { key, args, inner }` names a template in `proto/src/text.rs`,
+where each key has an English and a Korean form with `{0}`, `{1}` and
+`{inner}` (an alert's resolved and silenced notices wrap the alert's own
+text). The control plane builds every event and alert message as a
+`Text`, renders the English form into `EventView.message` as before, and
+keeps the `Text` in a new table, `event_texts`, keyed by the event's
+sequence number and pruned with the events; firing alerts keep theirs in
+memory. A test checks that both forms of every key use the same
+arguments. The dashboard asks for keyed events and alert texts only on a
+Korean page and renders them there; a key it does not know (a newer
+control plane) falls back to the English message.
+
+### Pushed samples
+
+The monitor keeps a `watch` counter that goes up with each sample.
+`MetricsWait { node, after_unix, wait_secs }` returns at once when the
+node's newest sample is newer than `after_unix`, else waits on the
+counter until one is or `wait_secs` (at most 30) pass, and answers the
+same view as `Metrics` plus each node's `NodeMetricsExtra`. It runs
+outside the state lock, in the admin connection's own task. The
+dashboard's server-sent event stream for a node's charts loops on it,
+passing the time of the last sample it drew, so each event follows a
+sample by a round trip; against a 1.14 control plane the first call
+fails and the stream polls every 2 seconds. The charts carry
+`data-source="push"` or `"poll"` and the sample time, which is what the
+Playwright test watches.
+
+### The store as a probe target
+
+The control plane's endpoint now also accepts the probe ALPN with the
+same `ProbeServer` the agents run (moved from the agent crate to
+`proto/src/probe.rs`). `tick_net` adds `@store`, with the control plane's
+own address, to each agent's targets, and the oldest pair goes next as
+before; a 1.6 agent probes whatever address it is given, so agents need
+no change. The link is stored and shown under the node's name and
+`@store`, the matrix's last column.
+
+### Live microVM output
+
+The guest's pump used to copy the task's pipes to the output files and
+print each chunk to the console inline, stopping after 1 MiB so that a
+slow serial console could hold the task up only that long. Now the pump
+only copies, and a second thread (started after the fork, so the child is
+forked from a single-threaded init) reads the files by offset behind it
+and prints `live_frame` lines, alternating between stdout and stderr, up
+to `LIVE_MAX_BYTES`, which is now the result's `MAX_STREAM_BYTES` (4 MiB).
+When the task ends the pump stops the thread after its current line; the
+result carries the whole output, which continues the frames already sent,
+so the agent's `LiveTail` needs no change.
+
+### Sensors
+
+On Linux, `Sensors` reads the GPU's own hwmon directory under its PCI
+address: the temperature labelled `edge` (amdgpu), `pkg` or `gpu` (Intel),
+else `temp1`; power from `power1_average` or `power1_input`, else as the
+rate of `energy1_input` (microjoules) between two samples. Intel's
+integrated GPU, which has no hwmon of its own, takes the coretemp
+`Package id` temperature and the `uncore` RAPL domain. The CPU package
+power is the sum of the `package-N` RAPL domains, with the counter's wrap
+from `max_energy_range_uj`. Everything reads under a root directory, so
+the tests use a fake sysfs. On Windows, `D3DKMTQueryAdapterInfo` with
+`KMTQAITYPE_ADAPTERPERFDATA` (WDDM 2.4) gives each adapter's temperature
+in tenths of a degree; gdi32 is loaded from System32 at run time, so the
+agent still starts on older Windows.
+
+### Compatibility
+
+`PROTOCOL_MINOR` is 8. The state database gains `event_texts` (opened at
+start, so a 1.14 database simply has none) and keeps layout 7; rollouts
+upgrade followers before the leader, and a 1.14 replica never reads the
+table. A 1.14 dashboard against a 1.15 control plane works as before; a
+1.15 dashboard against a 1.14 control plane falls back on every new call
+and leaves the thresholds and schedules out of its editor.
 
 ## Persistence
 
@@ -3419,22 +3551,19 @@ remotely; install a current binary on them once.
   that dies without notice loses the progress since the last move;
   affinity sees only running tasks of the same account; CPU quotas count
   whole CPUs a run asks for, not what it uses.
-- Monitoring: live microVM output covers the first MiB of each stream;
-  Intel GPUs outside Macs report use and memory but no temperature or
-  power; a Mac's CPU package power is read but not sent;
-  DRM fdinfo sees only processes the agent may read; Windows desktops
-  without LibreHardwareMonitor often have no temperature (few boards fill
-  in ACPI thermal zones); per-node thresholds and silences are not in
-  `cluster.toml`; the network is measured between agents, not to the
-  control plane's file store.
-- Dashboard: the `cluster.toml` editor takes no schedules, no
-  `url_env` and never prunes (use `pumasi apply`); per-node alert
-  thresholds and secrets are still CLI-only; the Upgrade panel's canary
+- Monitoring: live microVM output covers what the result keeps (4 MiB a
+  stream) as fast as the console carries it; Windows GPUs report a
+  temperature but no power, and Linux CPU package power needs an agent
+  that can read RAPL; DRM fdinfo sees only processes the agent may read;
+  Windows desktops without LibreHardwareMonitor often have no temperature
+  (few boards fill in ACPI thermal zones).
+- Dashboard: the `cluster.toml` editor takes no job files and no
+  `url_env`, never prunes, and does not show the file's silences (use
+  `pumasi apply`); the Upgrade panel's canary
   checkboxes appear only with a published release to upgrade to (canary
   rollouts of your own binaries are `pumasi upgrade rollout --canary`);
   node settings need an agent run as a service (1.4 or later) that is
-  online; charts poll the control plane every 2 seconds behind the
-  stream rather than being pushed by it.
+  online.
 - WebGPU: compute shaders only (no textures, samplers or render
   passes), one bind group, one adapter per task, optional features
   limited to `shader-f16` and subgroups, and core modules only (no

@@ -2486,6 +2486,91 @@ mod tests {
         let bob = &spec.resources.iter().find(|(a, _)| a == "bob").unwrap().1;
         assert!(bob.is_empty());
         assert!(!spec.ext().is_empty());
+        // 1.15: repeat and per-node thresholds.
+        let t = spec.more().alert_tuning.unwrap();
+        assert_eq!(t.repeat_secs, Some(4 * 3600));
+        assert_eq!(t.overrides.len(), 2);
+        assert_eq!(t.overrides[0].nodes.to_string(), "name=laptop");
+        assert_eq!(t.overrides[0].node_offline_secs, Some(None));
+        assert_eq!(t.overrides[0].temp_c, Some(Some(95)));
+        assert_eq!(t.overrides[1].disk_percent, Some(Some(95)));
+    }
+
+    #[test]
+    fn cluster_file_tuning_silences_and_kept_jobs() {
+        let text = r#"
+            [alerts]
+            disk = "85%"
+
+            [alerts.nodes.imac]
+            disk = "off"
+            node_offline = "10m"
+
+            [alerts.labels."gpu=nvidia"]
+            temperature = "85 °C"
+
+            [silences.move]
+            rule = "node_offline"
+            nodes = "name=imac"
+            until = "2099-01-01"
+            comment = "moving it"
+
+            [silences.quiet]
+            until = 2099-01-01T09:00:00+09:00
+
+            [schedules.nightly]
+            cron = "@daily"
+            tz = "Asia/Seoul"
+        "#;
+        let spec = ClusterFile::parse(text)
+            .unwrap()
+            .resolve(Path::new("."), 0)
+            .unwrap();
+        let more = spec.more();
+        let t = more.alert_tuning.unwrap();
+        assert_eq!((t.repeat_secs, t.resolved), (None, true), "defaults");
+        let imac = &t.overrides[0];
+        assert_eq!(imac.nodes.to_string(), "name=imac");
+        assert_eq!(imac.disk_percent, Some(None));
+        assert_eq!(imac.node_offline_secs, Some(Some(600)));
+        assert_eq!(imac.temp_c, None);
+        assert_eq!(t.overrides[1].temp_c, Some(Some(85)));
+        assert_eq!(more.silences.len(), 2);
+        let mv = more.silences.iter().find(|s| s.name == "move").unwrap();
+        assert_eq!(mv.rule.as_deref(), Some("node_offline"));
+        assert_eq!(mv.nodes.as_ref().unwrap().to_string(), "name=imac");
+        assert_eq!(mv.comment, "moving it");
+        let quiet = more.silences.iter().find(|s| s.name == "quiet").unwrap();
+        assert_eq!(
+            quiet.until_unix, 4_070_908_800,
+            "09:00 in Seoul is midnight UTC"
+        );
+        assert_eq!(quiet.id(), crate::monitor::file_silence_id("quiet"));
+        assert_ne!(quiet.id(), mv.id());
+        assert_eq!(more.keep_jobs, vec!["nightly".to_string()]);
+        spec.validate().unwrap();
+        // No tuning keys: the tuning is left alone.
+        let plain = ClusterFile::parse("[alerts]\ndisk = \"85%\"\n")
+            .unwrap()
+            .resolve(Path::new("."), 0)
+            .unwrap();
+        assert!(plain.more().is_empty());
+        // Bad values say where.
+        for (bad, what) in [
+            ("[alerts.nodes.x]\ndisk = \"lots\"\n", "alerts.nodes.x.disk"),
+            ("[alerts.labels.\"a b\"]\ndisk = \"90%\"\n", "alerts.labels"),
+            ("[silences.s]\nuntil = \"someday\"\n", "silence s: until"),
+            (
+                "[silences.s]\nuntil = \"2099-01-01\"\nrule = \"nope\"\n",
+                "nope",
+            ),
+        ] {
+            let e = ClusterFile::parse(bad)
+                .and_then(|f| f.resolve(Path::new("."), 0))
+                .and_then(|s| s.validate().map(|()| s));
+            let msg = format!("{:#}", e.unwrap_err());
+            assert!(msg.contains(what), "{bad}: {msg}");
+        }
     }
 
     #[test]

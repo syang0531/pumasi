@@ -103,11 +103,11 @@ async fn secrets_section(ctx: &Ctx) -> Markup {
         Err(e) => Err(format!("{e:#}")),
     };
     html! {
-        section #secrets hx-get="/settings/secrets" hx-trigger="refresh from:body" hx-swap="outerHTML" {
+        section #secrets hx-get="/settings/secrets" hx-trigger="refresh from:body" hx-swap="outerHTML" hx-disinherit="*" {
             h2 { (l.t("Secrets", "시크릿")) }
             p class="dim" { (l.t(
-                "Values jobs and the cluster use without anyone seeing them again: registry/HOST logs in to a private registry (user:password or a token), others go to jobs that name them. A value is sent once and never shown.",
-                "다시 볼 수 없게 저장해 두고 작업과 클러스터가 쓰는 값입니다. registry/호스트는 비공개 레지스트리 로그인(user:password 또는 토큰)이고, 나머지는 이름을 적은 작업에 전달됩니다. 값은 한 번 보내면 다시 보이지 않습니다."
+                "Values the control plane keeps without anyone seeing them again: registry/HOST logs jobs in to a private registry (user:password or a token), and the login never leaves the control plane. A value is sent once and never shown.",
+                "컨트롤 플레인이 다시 볼 수 없게 보관하는 값입니다. registry/호스트는 작업이 비공개 레지스트리에 로그인할 때 쓰고(user:password 또는 토큰), 로그인 정보는 컨트롤 플레인 밖으로 나가지 않습니다. 값은 한 번 보내면 다시 보이지 않습니다."
             )) }
             @match &list {
                 Err(e) => div class="flash bad" { (e) },
@@ -128,7 +128,7 @@ async fn secrets_section(ctx: &Ctx) -> Markup {
                                 }
                                 td {
                                     form class="inline" hx-post="/settings/secrets" hx-target="#flash"
-                                        hx-confirm=(l.t("Remove this secret? Jobs that name it fail to start.", "이 시크릿을 지울까요? 이것을 쓰는 작업은 시작하지 못합니다.")) {
+                                        hx-confirm=(l.t("Remove this secret? Images that need it can no longer be pulled.", "이 시크릿을 지울까요? 이것이 필요한 이미지는 더 받을 수 없습니다.")) {
                                         input type="hidden" name="name" value=(s.name);
                                         button type="submit" class="link danger" name="action" value="remove" { (l.t("Remove", "지우기")) }
                                     }

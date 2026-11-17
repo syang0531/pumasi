@@ -548,7 +548,7 @@ pumasi schedule ls
 pumasi run merge.toml --after 작업ID         # 또는 job.toml에 after = ["작업ID"]
 ```
 
-**선언적 설정.** 라벨, 테인트, cordon, 쿼터, 스케줄, 경보 규칙, 웹훅을 파일 하나에 두고 적용합니다([`examples/cluster.toml`](examples/cluster.toml) 참고). 두 번 적용해도 두 번째에는 바뀌는 것이 없습니다. `--dry-run`은 바뀔 내용만 보여 주고, `--prune`은 파일에 없는 스케줄과 웹훅도 지웁니다.
+**선언적 설정.** 라벨, 테인트, cordon, 쿼터, 스케줄, 경보 규칙, 웹훅을 파일 하나에 두고 적용합니다([`examples/cluster.toml`](examples/cluster.toml) 참고). 두 번 적용해도 두 번째에는 바뀌는 것이 없습니다. `--dry-run`은 바뀔 내용만 보여 주고, `--prune`은 파일에 없는 스케줄, 웹훅, 일시 중지도 지웁니다. `job`이 없는 스케줄(1.15)은 지금의 작업을 그대로 둡니다.
 
 ```sh
 pumasi apply -f cluster.toml --dry-run
@@ -559,7 +559,7 @@ pumasi apply -f cluster.toml
 
 ### 모니터링과 경보
 
-에이전트는 5초마다 CPU, 메모리, 데이터 디렉터리가 있는 디스크, 네트워크 트래픽, 가장 뜨거운 온도 센서, GPU별 사용률·VRAM·온도·전력을 보고합니다. GPU는 제조사와 상관없이 사용률과 메모리를 보고합니다. NVIDIA는 NVML, Linux의 AMD·Intel은 sysfs와 DRM fdinfo, Mac의 Apple·AMD GPU는 IOAccelerator 통계, Windows는 모든 GPU를 GPU Engine 성능 카운터로 읽습니다. Windows 노드는 WMI로 온도를 읽습니다(ACPI 열 영역, 그리고 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)가 실행 중이면 그 센서. 데스크톱 보드는 대부분 이것이 있어야 온도가 나옵니다). Mac(1.14)은 Intel Mac에서는 SMC로, Apple Silicon에서는 HID 센서와 IOReport로 CPU 다이·GPU 온도와 GPU 전력을 읽고, `pumasi sensors --raw`로 기기가 무엇을 읽는지 볼 수 있습니다. 컨트롤 플레인은 이를 7일(`--metrics-retention`) 동안 보관하는데, 최근 1시간은 10초 단위, 하루까지는 1분 단위, 그 뒤는 10분 단위로 줄여 두고, 모두 재시작해도 남습니다.
+에이전트는 5초마다 CPU, 메모리, 데이터 디렉터리가 있는 디스크, 네트워크 트래픽, 가장 뜨거운 온도 센서, GPU별 사용률·VRAM·온도·전력을 보고합니다. GPU는 제조사와 상관없이 사용률과 메모리를 보고합니다. NVIDIA는 NVML, Linux의 AMD·Intel은 sysfs와 DRM fdinfo, Mac의 Apple·AMD GPU는 IOAccelerator 통계, Windows는 모든 GPU를 GPU Engine 성능 카운터로 읽습니다. Windows 노드는 WMI로 온도를 읽습니다(ACPI 열 영역, 그리고 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)가 실행 중이면 그 센서. 데스크톱 보드는 대부분 이것이 있어야 온도가 나옵니다). Mac(1.14)은 Intel Mac에서는 SMC로, Apple Silicon에서는 HID 센서와 IOReport로 CPU 다이·GPU 온도와 GPU 전력을 읽습니다. Linux(1.15)에서는 AMD·Intel 외장 GPU가 hwmon으로 온도와 전력을, Intel 내장 GPU는 CPU 패키지 온도와 RAPL의 `uncore` 전력을 보고하고, Windows는 드라이버가 주면(WDDM 2.4) GPU 온도를 보고합니다. CPU 패키지 전력은 Mac에서는 SMC·IOReport로, Linux에서는 RAPL로 읽습니다(대부분의 배포판에서 root만 읽을 수 있음). `pumasi sensors --raw`로 기기가 무엇을 읽는지 볼 수 있습니다. 컨트롤 플레인은 이를 7일(`--metrics-retention`) 동안 보관하는데, 최근 1시간은 10초 단위, 하루까지는 1분 단위, 그 뒤는 10분 단위로 줄여 두고, 모두 재시작해도 남습니다.
 
 ```sh
 pumasi top                     # 모든 노드, 큐, 울리는 경보를 실시간으로
@@ -568,16 +568,16 @@ pumasi logs 작업ID -t 3 -f     # 실행 중인 태스크의 stdout·stderr
 pumasi events -f               # 노드 접속·이탈, 작업 종료, 경보
 ```
 
-태스크 출력은 microVM 태스크까지 1초 안에 `pumasi logs -f`에 나타납니다(1.6 이상 에이전트. 그보다 오래된 에이전트의 microVM 태스크는 끝날 때 한꺼번에 보입니다).
+태스크 출력은 microVM 태스크까지 1초 안에 `pumasi logs -f`에 나타납니다(1.6 이상 에이전트. 그보다 오래된 에이전트의 microVM 태스크는 끝날 때 한꺼번에 보이고, 1.15 전에는 스트림마다 처음 1 MiB만 보였습니다).
 
-**노드 사이 네트워크.** 에이전트끼리 가끔 서로를 잽니다(같은 iroh 연결로 왕복 다섯 번과 1 MiB 전송, 20초마다 한 쌍, 에이전트 하나가 받는 양은 1분에 16 MiB까지). `pumasi net`과 대시보드 노드 목록에 행렬로 나오고, 파일 저장소에서 받는 노드는 가장 가까운 다른 노드의 캐시부터 찾습니다. 간격은 `pumasi cluster start --net-probe-every 1m`(또는 `off`)로 바꿉니다.
+**노드 사이 네트워크.** 에이전트끼리 가끔 서로를 잽니다(같은 iroh 연결로 왕복 다섯 번과 1 MiB 전송, 20초마다 한 쌍, 에이전트 하나가 받는 양은 1분에 16 MiB까지). `pumasi net`과 대시보드 노드 목록에 행렬로 나오고, 파일 저장소에서 받는 노드는 가장 가까운 다른 노드의 캐시부터 찾습니다. 1.15부터는 에이전트가 컨트롤 플레인의 파일 저장소까지도 재고, 행렬의 마지막 열에 나옵니다. 간격은 `pumasi cluster start --net-probe-every 1m`(또는 `off`)로 바꿉니다.
 
 ```
-round trip (row: from, column: to)
-                  desktop     laptop    old-mac
-desktop                 -     1.2 ms     3.4 ms
-laptop             1.1 ms          -     3.9 ms
-old-mac            3.3 ms     4.0 ms          -
+round trip (row: from, column: to; store: the control plane's file store)
+                  desktop     laptop    old-mac      store
+desktop                 -     1.2 ms     3.4 ms     0.9 ms
+laptop             1.1 ms          -     3.9 ms     1.4 ms
+old-mac            3.3 ms     4.0 ms          -     3.0 ms
 ```
 
 **Prometheus와 Grafana.** `pumasi cluster start --metrics-addr 127.0.0.1:9464`로 Prometheus 텍스트 형식의 `/metrics`를 엽니다. 노드 지표, 우선순위별 큐, 실행·선점 횟수, 검증 불일치, 울리는 경보, 계정 잔액, 파일 저장소 크기가 들어 있습니다. 주소를 주지 않으면 꺼져 있고, `--metrics-token`(또는 `PUMASI_METRICS_TOKEN`)을 주면 `Authorization: Bearer 토큰`을 요구합니다. [`examples/prometheus.yml`](examples/prometheus.yml)과 [`examples/grafana`](examples/grafana)의 대시보드를 참고하세요.
@@ -597,7 +597,26 @@ pumasi alert ls
 
 대시보드의 이벤트 페이지에 모두 나오고, 관리자는 거기서 일시 중지를 걸고 끝내거나 웹훅에 시험 알림을 보낼 수 있습니다.
 
-둘 다 `cluster.toml`의 `[alerts]`와 `[webhooks.이름]`에 둘 수도 있습니다(`url_env`로 URL을 파일 밖에 두기).
+둘 다 `cluster.toml`의 `[alerts]`와 `[webhooks.이름]`에 둘 수도 있고(`url_env`로 URL을 파일 밖에 두기), 1.15부터는 노드별 기준과 일시 중지도 둘 수 있습니다. `apply --dry-run`이 바뀌는 것을 한 줄씩 보여 줍니다.
+
+```toml
+[alerts]
+repeat = "4h"
+
+[alerts.nodes.laptop]              # 이름으로
+node_offline = "off"
+
+[alerts.labels."gpu=nvidia"]       # 셀렉터로
+temperature = 85
+
+[silences.old-mac-disk]
+rule = "node_offline"
+nodes = "name=old-mac"
+until = 2026-12-01T09:00:00        # 이 기기의 시간대, 90일까지
+comment = "디스크 교체"
+```
+
+파일을 다시 적용하면 같은 일시 중지를 이름으로 찾습니다. 파일에서 뺀 일시 중지는 `--prune`을 주지 않으면 끝날 때까지 남습니다. 한국어 대시보드는 이벤트와 경보를 한국어로 보여 줍니다(1.15 컨트롤 플레인부터, 그 전 이벤트는 영어).
 
 ### 컨트롤 플레인 복제본과 백업
 
@@ -631,14 +650,14 @@ pumasi ui            # 브라우저에서 http://127.0.0.1:7400/login?token=... 
 `pumasi ui`는 대시보드를 내 기기에서 띄우고 CLI와 같은 연결로 클러스터에 붙습니다. 그래서 컨트롤 플레인은 포트를 열지 않고, 티켓이 통하는 곳(`pumasi login`)이면 어디서든 됩니다. 바이너리에 들어 있어 Node나 따로 설치할 것이 없습니다. 화면은 다음과 같습니다.
 
 - **개요**: 온라인 노드, 실행·대기 중인 태스크, 진행 중인 작업, 사용 중인 GPU, 울리는 경보, 최근 작업과 이벤트를 몇 초마다 갱신
-- **노드**: 노드별 상태, CPU, 메모리, 디스크, 온도, GPU. 노드 하나의 1시간·하루·일주일 차트(새 샘플이 오면 바로 갱신), 벤치마크, GPU, 라벨·테인트, 작업을 받는 조건(슬롯, CPU 비율, 시간대, 유휴 시간, 전원 연결 시에만. 에이전트의 `agent.toml`에 쓰고 한가해지면 재시작), cordon·drain·벤치마크 다시·제거 버튼, 카나리 롤아웃이 되는 업그레이드 패널
+- **노드**: 노드별 상태, CPU, 메모리, 디스크, 온도, GPU. 노드 하나의 1시간·하루·일주일 차트(새 샘플이 오면 컨트롤 플레인이 밀어 줌, 1.15)와 CPU 패키지 전력, 벤치마크, GPU, 라벨·테인트, 작업을 받는 조건(슬롯, CPU 비율, 시간대, 유휴 시간, 전원 연결 시에만. 에이전트의 `agent.toml`에 쓰고 한가해지면 재시작), cordon·drain·벤치마크 다시·제거 버튼, 카나리 롤아웃이 되는 업그레이드 패널
 - **작업**: 작업 제출(job.toml 붙여넣기, 파일이나 폴더 첨부), 태스크별 stdout·stderr 실시간 보기, 취소, 출력 파일 하나 또는 전부를 zip으로 받기, 서명된 영수증(`pumasi verify-receipts` 형식)
 - **저장소**: 데이터셋과 버전, 쿼터 대비 사용량, 폴더를 새 버전으로 올리기, zip으로 받기
 - **CU**: 잔액과 원장. 관리자는 지급·인출
 - **계정**: 계정별 쿼터, 지금 쓰는 양, 작업 정책(허용 이미지와 실행기, 네트워크, 제한 시간, 태스크당 GPU, selector, toleration). 관리자는 폼에서 수정
 - **초대**: 설치 명령이 붙은 참가 티켓, 제공자 초대, 사람에게 주는 액세스 티켓
 - **요금**(관리자가 수정), **예약 작업**(job.toml과 파일로 cron 예약 추가, 지금 실행, 삭제), **이벤트**(경보 규칙·웹훅·묵음을 그 자리에서 수정)
-- **설정**: 로그인한 브라우저 목록과 취소, `apply`로 바뀔 내용을 먼저 보여 주는 `cluster.toml` 편집기
+- **설정**: 로그인한 브라우저 목록과 취소, 클러스터 비밀(1.15: 추가, 새 값으로 교체, 지우기. 값은 다시 보이지 않음), `apply`로 바뀔 내용을 먼저 보여 주는 `cluster.toml` 편집기(1.15: 노드별 경보 기준과 예약 작업까지. 예약의 cron·시간대·겹침을 바꾸면 작업은 그대로)
 
 한국어와 영어를 지원합니다(브라우저 언어, 또는 머리말의 전환 링크). 휴대폰에서도 쓸 수 있습니다. 로그인은 컨트롤 플레인이 보관하므로 `pumasi ui`를 다시 시작하거나 업그레이드해도 유지됩니다(1.7). `pumasi access sessions`로 목록을 보고 `--revoke ID`로 하나를 로그아웃시킵니다.
 
@@ -756,7 +775,7 @@ SCIM(1.12)을 켜면 ID 제공자(Entra ID, Okta)가 퇴사자를 Pumasi에 바�
 | `pumasi quota [계정 --slots N --gpus N --cu-per-day CU --max-priority N --storage 크기 --images P,.. --require-digest yes --executors E,.. --network deny --selector S --tolerations T,.. --max-timeout D --max-gpus-per-task N] [--clear]` | 모든 계정의 한도·작업 정책·사용량 보기, 또는 한 계정 변경 (`none`이나 `any`는 한도 해제) |
 | `pumasi access create 이름 --role admin\|submitter\|viewer [--account A] [--ttl 30d]` / `ls` / `revoke ID\|이름` | 다른 사람에게 줄 역할 티켓. `pumasi whoami`는 지금 쓰는 티켓과 submitter의 쿼터·작업 정책 표시 |
 | `pumasi schedule add 이름 job.toml --cron "0 3 * * *" [--account A] [--overlap]` / `ls` / `rm 이름` / `run 이름` | cron 일정으로 제출하는 작업 |
-| `pumasi apply -f cluster.toml [--dry-run] [--prune]` | 라벨·테인트·cordon·쿼터·스케줄·경보 규칙·웹훅을 파일과 같게 맞춤. 두 번 적용해도 결과 같음 |
+| `pumasi apply -f cluster.toml [--dry-run] [--prune]` | 라벨·테인트·cordon·쿼터·스케줄·경보 규칙·노드별 기준·일시 중지·웹훅을 파일과 같게 맞춤. 두 번 적용해도 결과 같음 |
 | `pumasi get nodes\|jobs\|accounts\|schedules\|access [-l 셀렉터] [-o json]` / `describe node\|job\|account\|schedule 이름` | 목록 보기, 하나 자세히 보기 |
 | `pumasi top [--interval 2s] [--once]` | 노드별 CPU·메모리·디스크·네트워크·온도·GPU, 큐, 울리는 경보를 Ctrl-C까지 갱신 |
 | `pumasi metrics [노드] [--since 1h] [-o json]` | 모든 노드의 최신 지표, 또는 노드 하나의 기록 |
@@ -875,7 +894,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 
 ## 로드맵
 
-조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md). 1.5.1은 `--trusted-proxy`를 더해, 다른 기기의 리버스 프록시 뒤에서 모든 클라이언트가 로그인 실패 제한 하나를 같이 쓰던 문제를 고쳤습니다: [노트](docs/releases/v1.5.1.md). 1.6.0은 실행 중인 microVM 태스크의 출력을 바로 보여 주고, 모든 GPU와 Windows 온도를 보고하고, 노드 사이 네트워크를 재고, 경보 일시 중지·반복 알림·노드별 기준을 더했습니다: [노트](docs/releases/v1.6.0.md). 1.7.0은 대시보드 로그인을 재시작 뒤에도 유지하고, 경보 규칙·웹훅·요금·예약 작업·`cluster.toml`·노드 작업 조건을 브라우저에서 고치며, 카나리 롤아웃·실시간 차트·휴대폰 화면을 더했습니다: [노트](docs/releases/v1.7.0.md). 1.8.0은 파일 저장소를 여러 기기에 두고 S3 게이트웨이를 더했습니다: [노트](docs/releases/v1.8.0.md). 1.9.0은 갱 스케줄링, 분산·어피니티, CPU·메모리 쿼터, 체크포인트, 스케줄 시간대를 더했습니다: [노트](docs/releases/v1.9.0.md). 1.10.0은 폭주하는 WebGPU 셰이더를 작업 제한 시간에 멈추고, WebGPU 어댑터와 AMD GPU를 GPU 검증으로 재며, 태스크가 GPU를 나눠 쓰게 합니다(`gpus = 0.5`, MIG 슬라이스): [노트](docs/releases/v1.10.0.md). 1.11.0은 Windows에서 Docker Desktop 없이 부팅 때부터 Docker를 돌리고(`pumasi docker setup`), Windows on Arm에서 microVM을 돌립니다: [노트](docs/releases/v1.11.0.md). 1.12.0은 SCIM 프로비저닝, 서명된 체크포인트 뒤 감사 로그 정리, 모든 대시보드가 공유하는 제한, HTTPS 프록시 뒤의 CLI, 대시보드 읽기에 답하는 팔로워를 더했습니다: [노트](docs/releases/v1.12.0.md). 1.13.0은 에이전트 다음에 컨트롤 플레인이 스스로 업그레이드하고(복제본은 하나씩, 새 바이너리가 정상이 되지 않으면 롤백), CI에서 가끔 실패하던 테스트 세 개의 원인을 고쳤습니다: [노트](docs/releases/v1.13.0.md). 1.14.0은 같은 이미지의 다음 태스크를 위해 microVM을 미리 띄워 두고, microVM 태스크가 체크포인트를 쓰게 하고, SMC와 IOReport로 Mac 온도와 GPU 전력을 읽습니다: [노트](docs/releases/v1.14.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를, 22단계(1.6)에서 모니터링을, 23단계(1.7)에서 대시보드를, 24단계(1.8)에서 파일 저장소를, 25단계(1.9)에서 스케줄링을, 26단계(1.10)에서 GPU를, 27단계(1.11)에서 Windows를, 28단계(1.12)에서 운영을, 29단계(1.13)에서 컨트롤 플레인까지 닿는 업그레이드를, 30단계(1.14)에서 옛 Intel Mac을 다뤘습니다. 31~36단계(1.15~1.20)는 계획 중입니다: 모니터링·대시보드에 남은 것, GPU, Windows, 파일 저장소와 microVM 네트워크, 고가용성과 원격 API, 결정적이지 않은 작업의 결과 검증. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
+조직이 자기 장비에서 Pumasi를 운영하고 어디서든 쓰는 데 필요한 것은 1~17단계입니다. [docs/security-review.md](docs/security-review.md) 범위의 내부 보안 점검은 끝났습니다(발견 사항과 수정 내용은 [위협 모델](docs/threat-model.md#internal-review-for-10)). 1.0은 태그한 커밋에서 장시간 점검(Linux·macOS 5시간 소크, 퍼징 타깃마다 20분)이 통과한 뒤 태그했습니다([릴리스 노트](docs/releases/v1.0.0.md). 1.0.1은 Windows Docker GPU 그리기와 Blender 예제를 고쳤습니다: [노트](docs/releases/v1.0.1.md). 1.1.0은 자체 릴레이 서버와 분명한 티켓 오류를 더했습니다: [노트](docs/releases/v1.1.0.md). 1.2.0은 컨트롤 플레인·대시보드 서비스 설치, 참가 티켓 목록·취소, macOS microVM 수정입니다: [노트](docs/releases/v1.2.0.md). 1.2.1은 Windows 스마트 앱 컨트롤 차단을 알려 줍니다: [노트](docs/releases/v1.2.1.md). 1.2.2는 배포가 버전을 내리지 않게 합니다: [노트](docs/releases/v1.2.2.md). 1.2.3은 터널 뒤에서 대시보드가 열리게 고쳤습니다: [노트](docs/releases/v1.2.3.md). 1.3.0은 노드 이름 변경, 대시보드·API·CLI에서 최신 릴리스로 클러스터 업그레이드, macOS 11 이상 vz microVM(Big Sur의 옛 Intel Mac 포함)의 네트워크를 더했습니다: [노트](docs/releases/v1.3.0.md). 1.3.2는 Intel Mac에서 microVM이 부팅되게 고쳤습니다: [노트](docs/releases/v1.3.2.md). 1.4.0은 서비스를 다시 설치하지 않고 옵션을 바꾸고, 대시보드와 API에서 계정 정책을 고치고, 제출 전에 작업을 검사하고, 태스크 시간을 대기·입력 가져오기·이미지 받기·실행·출력 저장으로 나눠 보여 줍니다: [노트](docs/releases/v1.4.0.md). 1.4.1은 노드가 태스크를 시작하지 못하면 컨트롤 플레인이 멈추던 문제와, Windows에서 `Restart-Service`로 서비스가 재시작되지 않던 문제를 고쳤습니다: [노트](docs/releases/v1.4.1.md). 1.5.0은 잠드는 기기를 다루고(실행 중 깨워 두기, 잠들기 전 알림, Wake-on-LAN) `executor = "image"`를 더했습니다: [노트](docs/releases/v1.5.0.md). 1.5.1은 `--trusted-proxy`를 더해, 다른 기기의 리버스 프록시 뒤에서 모든 클라이언트가 로그인 실패 제한 하나를 같이 쓰던 문제를 고쳤습니다: [노트](docs/releases/v1.5.1.md). 1.6.0은 실행 중인 microVM 태스크의 출력을 바로 보여 주고, 모든 GPU와 Windows 온도를 보고하고, 노드 사이 네트워크를 재고, 경보 일시 중지·반복 알림·노드별 기준을 더했습니다: [노트](docs/releases/v1.6.0.md). 1.7.0은 대시보드 로그인을 재시작 뒤에도 유지하고, 경보 규칙·웹훅·요금·예약 작업·`cluster.toml`·노드 작업 조건을 브라우저에서 고치며, 카나리 롤아웃·실시간 차트·휴대폰 화면을 더했습니다: [노트](docs/releases/v1.7.0.md). 1.8.0은 파일 저장소를 여러 기기에 두고 S3 게이트웨이를 더했습니다: [노트](docs/releases/v1.8.0.md). 1.9.0은 갱 스케줄링, 분산·어피니티, CPU·메모리 쿼터, 체크포인트, 스케줄 시간대를 더했습니다: [노트](docs/releases/v1.9.0.md). 1.10.0은 폭주하는 WebGPU 셰이더를 작업 제한 시간에 멈추고, WebGPU 어댑터와 AMD GPU를 GPU 검증으로 재며, 태스크가 GPU를 나눠 쓰게 합니다(`gpus = 0.5`, MIG 슬라이스): [노트](docs/releases/v1.10.0.md). 1.11.0은 Windows에서 Docker Desktop 없이 부팅 때부터 Docker를 돌리고(`pumasi docker setup`), Windows on Arm에서 microVM을 돌립니다: [노트](docs/releases/v1.11.0.md). 1.12.0은 SCIM 프로비저닝, 서명된 체크포인트 뒤 감사 로그 정리, 모든 대시보드가 공유하는 제한, HTTPS 프록시 뒤의 CLI, 대시보드 읽기에 답하는 팔로워를 더했습니다: [노트](docs/releases/v1.12.0.md). 1.13.0은 에이전트 다음에 컨트롤 플레인이 스스로 업그레이드하고(복제본은 하나씩, 새 바이너리가 정상이 되지 않으면 롤백), CI에서 가끔 실패하던 테스트 세 개의 원인을 고쳤습니다: [노트](docs/releases/v1.13.0.md). 1.14.0은 같은 이미지의 다음 태스크를 위해 microVM을 미리 띄워 두고, microVM 태스크가 체크포인트를 쓰게 하고, SMC와 IOReport로 Mac 온도와 GPU 전력을 읽습니다: [노트](docs/releases/v1.14.0.md). 1.15.0은 노드별 경보 기준과 일시 중지를 `cluster.toml`에 두고, 예약 작업과 비밀을 브라우저에서 고치고, 대시보드 차트를 밀어 주고, microVM 출력을 1 MiB 넘게 실시간으로 보여 주고, Intel·AMD GPU 온도를 읽고, 파일 저장소까지의 네트워크를 재고, 이벤트를 한국어로 보여 줍니다: [노트](docs/releases/v1.15.0.md)). 아직 유료 외부 감사는 받지 않았습니다([SECURITY.md](SECURITY.md)). 20~28단계는 GPU, Windows, 옛 Mac, 파일 저장소, 클러스터 관리, 대시보드, 모니터링에서 아직 빠진 것을 채웁니다. 20단계(1.4)에서 실사용 이슈를 닫았고, 21단계(1.5)에서 잠드는 기기를, 22단계(1.6)에서 모니터링을, 23단계(1.7)에서 대시보드를, 24단계(1.8)에서 파일 저장소를, 25단계(1.9)에서 스케줄링을, 26단계(1.10)에서 GPU를, 27단계(1.11)에서 Windows를, 28단계(1.12)에서 운영을, 29단계(1.13)에서 컨트롤 플레인까지 닿는 업그레이드를, 30단계(1.14)에서 옛 Intel Mac을, 31단계(1.15)에서 모니터링·대시보드에 남은 것을 다뤘습니다. 32~36단계(1.16~1.20)는 계획 중입니다: GPU, Windows, 파일 저장소와 microVM 네트워크, 고가용성과 원격 API, 결정적이지 않은 작업의 결과 검증. 단계별 범위와 완료 기준은 [docs/roadmap.md](docs/roadmap.md)에 있습니다. 18·19단계는 다른 클러스터와 거래할 때만 필요하며 보류 중입니다.
 
 | 단계 | 범위 | 상태 |
 | --- | --- | --- |
@@ -907,7 +926,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 28 | 운영: 공유·피어별 요청 제한, 서명된 체크포인트 뒤 감사 로그 정리, SCIM, HTTPS 프록시 뒤의 CLI, 팔로워 읽기 | 완료(1.12) |
 | 29 | 컨트롤 플레인까지 닿는 업그레이드(복제본을 하나씩, 롤백 포함)와 대시보드 서비스, CI에서 흔들리는 Intel Mac·Windows·HA 재시작 테스트, Windows 소크 | 완료(1.13) |
 | 30 | 옛 Intel Mac: 미리 띄운 microVM과 이미지 디스크 재사용, microVM 체크포인트, SMC·Apple Silicon 센서, GitHub Intel 러너 이후의 Intel Mac 빌드 | 완료(1.14) |
-| 31 | 모니터링·대시보드: `cluster.toml`의 노드별 기준·일시 중지, 브라우저에서 예약 작업·비밀, 밀어 주는 차트, 1 MiB 넘는 microVM 실시간 출력, Intel·AMD GPU 온도, 저장소까지의 네트워크, 한국어 이벤트 | 계획(1.15) |
+| 31 | 모니터링·대시보드: `cluster.toml`의 노드별 기준·일시 중지, 브라우저에서 예약 작업·비밀, 밀어 주는 차트, 1 MiB 넘는 microVM 실시간 출력, Intel·AMD GPU 온도, 저장소까지의 네트워크, 한국어 이벤트 | 완료(1.15) |
 | 32 | GPU: NVIDIA GPU 나눠 쓰기의 메모리 제한(MPS), MIG 슬라이스 벤치마크, WebGPU 텍스처·렌더 패스, 태스크당 여러 어댑터, WASI preview 2 컴포넌트 | 계획(1.16) |
 | 33 | Windows: 실제 PC에서 분명히 빠르면 HCS 백엔드, 서명된 바이너리(SignPath), 한 번에 끝나는 `docker remove` | 계획(1.17) |
 | 34 | 파일 저장소·microVM 네트워크: 노드 캐시 쿼터, 저장소를 거치는 비공개 이미지, UDP, IPv6, 작업별 허용 목록, 대역폭 상한, 이그레스 과금 | 계획(1.18) |
@@ -916,7 +935,7 @@ microVM 태스크는 `docker run`처럼 이미지의 entrypoint와 명령(또는
 | 18 | 허브 마당(별도 비공개 저장소 `madang`): 제공자 발견, 지역 지연 측정, 신뢰도 점수, 수수료가 있는 그룹 간 CU 원장 | 보류 |
 | 19 | 허브에서 원화로 CU 구매(토스페이먼츠). 환전과 사용자 간 양도 없음 | 보류 |
 
-알려진 한계: 이전 릴리스의 에이전트는 처음 참가한 컨트롤 플레인 복제본만 따라갑니다. 컨트롤 플레인은 같은 에이전트 프로토콜 안에서만 스스로 업그레이드하고(프로토콜이 바뀌면 먼저 손으로), 1.13 이전의 복제본은 한 번 손으로 올립니다. CU는 실제 결제와 연결되어 있지 않습니다. SSO로 로그인하고 SCIM으로 권한을 뺏을 수 있지만, SCIM이 계정을 만들지는 않고 SAML은 없습니다. 대시보드끼리 공유하는 요청 제한은 리더 메모리에 있어 장애 전환하면 초기화됩니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 WebGPU로만 씁니다. WebGPU는 실험 기능입니다. CI에서는 소프트웨어 래스터라이저로, 실제 GPU는 손으로 확인하며, 컴퓨트 셰이더만 됩니다(텍스처·샘플러 없음, 바인드 그룹 하나). GPU 나눠 쓰기는 메모리를 신뢰로 나눕니다(MIG 슬라이스만 강제). microVM 네트워크는 QEMU나 Virtualization.framework가 있어야 하고(Firecracker만으로는 안 됨) TCP와 DNS만 넘깁니다. microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, Windows on Arm은 QEMU의 WHPX가 안 되면 에뮬레이션으로 돕니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. Intel Mac 바이너리는 Apple Silicon에서 빌드하고 테스트도 그곳의 Rosetta 2로 돌리므로(1.14) GitHub가 마지막 Intel 러너를 내린 뒤(2027년 가을까지로 발표)에도 이어지지만, 그때부터 SMC 값, Intel GPU, Intel의 Virtualization.framework는 실제 Intel Mac에서만 확인합니다. microVM 실시간 출력은 스트림마다 처음 1 MiB까지이고(나머지는 태스크가 끝날 때), Mac 밖의 Intel GPU는 사용률과 메모리만 있고 온도·전력은 없으며, Mac의 CPU 패키지 전력은 읽지만 아직 보여 주지 않고, LibreHardwareMonitor가 없는 Windows 데스크톱은 온도가 안 나오는 경우가 많습니다(ACPI 열 영역을 채우는 보드가 드묾). 대시보드는 1.7부터 대부분의 설정을 고치지만 노드별 경보 기준과 비밀은 아직 CLI로만 다룹니다. 원격 API에는 터널이나 인증서 갱신이 내장되어 있지 않고(Cloudflare Tunnel, 리버스 프록시, certbot이 맡음), Cloudflare를 거친 업로드는 요금제의 본문 한도에서 멈추고, `?wait=`는 컨트롤 플레인을 폴링해 작업을 따라갑니다. Docker 안의 그리기는 실제 GPU에서 손으로 확인합니다. Linux 호스트의 EEVEE는 Xvfb 아래에서 돌아 이미지가 GPU 디스플레이를 따로 가져오지 않는 한 CPU로 그립니다(Cycles는 상관없음).
+알려진 한계: 이전 릴리스의 에이전트는 처음 참가한 컨트롤 플레인 복제본만 따라갑니다. 컨트롤 플레인은 같은 에이전트 프로토콜 안에서만 스스로 업그레이드하고(프로토콜이 바뀌면 먼저 손으로), 1.13 이전의 복제본은 한 번 손으로 올립니다. CU는 실제 결제와 연결되어 있지 않습니다. SSO로 로그인하고 SCIM으로 권한을 뺏을 수 있지만, SCIM이 계정을 만들지는 않고 SAML은 없습니다. 대시보드끼리 공유하는 요청 제한은 리더 메모리에 있어 장애 전환하면 초기화됩니다. GPU는 CI에 없어서(호스팅 러너에 GPU 없음) 실기에서 손으로 확인하고, VFIO 패스스루는 실험 기능이며 NVIDIA 전용입니다(Turing 이후, 오픈 커널 모듈). Intel·Apple GPU는 WebGPU로만 씁니다. WebGPU는 실험 기능입니다. CI에서는 소프트웨어 래스터라이저로, 실제 GPU는 손으로 확인하며, 컴퓨트 셰이더만 됩니다(텍스처·샘플러 없음, 바인드 그룹 하나). GPU 나눠 쓰기는 메모리를 신뢰로 나눕니다(MIG 슬라이스만 강제). microVM 네트워크는 QEMU나 Virtualization.framework가 있어야 하고(Firecracker만으로는 안 됨) TCP와 DNS만 넘깁니다. microVM을 빠르게 돌리려면 KVM(Linux), Virtualization.framework(macOS 11 이상), WHPX(Windows) 중 하나가 필요합니다(없으면 QEMU가 동작은 하지만 느리고, Windows on Arm은 QEMU의 WHPX가 안 되면 에뮬레이션으로 돕니다). CI 러너의 WHPX는 중첩 환경이라 QEMU 디스크가 깨지고, GitHub Mac 러너는 가상화를 아예 못 하므로, WHPX와 Virtualization.framework 게스트 부팅은 실기에서만 확인합니다. macOS 10.15·11 러너도 없습니다. Intel Mac 바이너리는 Apple Silicon에서 빌드하고 테스트도 그곳의 Rosetta 2로 돌리므로(1.14) GitHub가 마지막 Intel 러너를 내린 뒤(2027년 가을까지로 발표)에도 이어지지만, 그때부터 SMC 값, Intel GPU, Intel의 Virtualization.framework는 실제 Intel Mac에서만 확인합니다. microVM 실시간 출력은 결과가 담는 스트림당 4 MiB까지이고 콘솔이 태스크보다 느리면 나머지는 결과로 옵니다. Windows는 GPU 온도만 있고 전력은 없으며, Linux의 CPU 패키지 전력은 root로 도는 에이전트만 보고하고, LibreHardwareMonitor가 없는 Windows 데스크톱은 온도가 안 나오는 경우가 많습니다(ACPI 열 영역을 채우는 보드가 드묾). 대시보드의 `cluster.toml` 편집기는 파일의 일시 중지를 보여 주지 않습니다(이벤트 페이지에 나옴). 원격 API에는 터널이나 인증서 갱신이 내장되어 있지 않고(Cloudflare Tunnel, 리버스 프록시, certbot이 맡음), Cloudflare를 거친 업로드는 요금제의 본문 한도에서 멈추고, `?wait=`는 컨트롤 플레인을 폴링해 작업을 따라갑니다. Docker 안의 그리기는 실제 GPU에서 손으로 확인합니다. Linux 호스트의 EEVEE는 Xvfb 아래에서 돌아 이미지가 GPU 디스플레이를 따로 가져오지 않는 한 CPU로 그립니다(Cycles는 상관없음).
 
 ## 코드 서명 정책 (Code signing policy)
 

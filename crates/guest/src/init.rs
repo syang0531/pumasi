@@ -1479,6 +1479,12 @@ fn child(
     envp: Vec<CString>,
 ) -> ! {
     unsafe {
+        // Rust's runtime ignores SIGPIPE in the init, and an ignored signal
+        // stays ignored across exec: `yes | head` would never end.
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
         libc::setsid();
         libc::dup2(stdin.as_raw_fd(), 0);
         libc::dup2(stdout.as_raw_fd(), 1);

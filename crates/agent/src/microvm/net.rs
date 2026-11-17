@@ -89,6 +89,15 @@ const HOST_WINDOW: usize = 256 * 1024;
 const CHUNK: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 512;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Tests: where a connection to a destination really goes. A guest can
+/// only reach the gateway's host through it with an address that is not
+/// loopback (smoltcp keeps `::1` to itself), and CI runners may have no
+/// IPv6 at all, so the IPv6 test points a documentation address at a
+/// local IPv4 listener.
+#[cfg(test)]
+static REDIRECT: std::sync::LazyLock<Mutex<HashMap<SocketAddr, SocketAddr>>> =
+    std::sync::LazyLock::new(Default::default);
 /// A connection the guest started but never completed.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long QEMU (or the vz helper) has to connect after the gateway
@@ -1187,6 +1196,8 @@ async fn connect(
     ev: mpsc::UnboundedSender<Event>,
     meter: Arc<Meter>,
 ) {
+    #[cfg(test)]
+    let to = REDIRECT.lock().unwrap().get(&to).copied().unwrap_or(to);
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(to)).await {
         Ok(Ok(s)) => s,
         _ => {
@@ -1898,18 +1909,22 @@ mod tests {
     /// own (neighbor discovery included).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn guest_tcp_over_ipv6() {
-        let Ok(server) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
-            eprintln!("no IPv6 loopback here; skipped");
-            return;
-        };
-        let port = server.local_addr().unwrap().port();
+        let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let local = server.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut s, _)) = server.accept().await {
                 let _ = s.write_all(b"over v6").await;
             }
         });
-        let policy: Policy =
-            Arc::new(move |ip, p| ip == IpAddr::V6(Ipv6Addr::LOCALHOST) && p == port);
+        // A public-looking IPv6 destination (documentation range), which
+        // the gateway's host socket reaches at the local listener.
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x15);
+        let port = 8080;
+        REDIRECT
+            .lock()
+            .unwrap()
+            .insert(SocketAddr::new(IpAddr::V6(dst), port), local);
+        let policy: Policy = Arc::new(move |ip, p| ip == IpAddr::V6(dst) && p == port);
         let gw = Gateway::start_with(
             policy,
             Options {
@@ -1921,14 +1936,13 @@ mod tests {
         .unwrap();
         assert!(gw.guest_net().v6.is_some());
         let mut g = FakeGuest::attach(&gw).await;
-        let h = g.tcp_to(
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
-            43000,
-        );
+        let h = g.tcp_to(SocketAddr::new(IpAddr::V6(dst), port), 43000);
         let mut got = Vec::new();
+        let mut state = tcp::State::Closed;
         for _ in 0..400 {
             g.pump(5).await;
             let s = g.sockets.get_mut::<tcp::Socket>(h);
+            state = s.state();
             while s.can_recv() {
                 let mut b = vec![0; 1024];
                 let n = s.recv_slice(&mut b).unwrap();
@@ -1938,7 +1952,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(got, b"over v6");
+        assert_eq!(got, b"over v6", "guest socket {state}");
         assert_eq!(gw.usage().rx_bytes, 7);
     }
 }

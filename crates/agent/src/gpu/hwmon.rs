@@ -162,14 +162,15 @@ impl Sensors {
             };
             let wrap = read_num(&z.join("max_energy_range_uj"));
             let energy = z.join("energy_uj");
-            if name.starts_with("package") {
-                if let Some(w) = self.counters.watts(&energy, now, wrap) {
-                    add(&mut package, w);
-                }
+            let sum = if name.starts_with("package") {
+                &mut package
             } else if name == "uncore" {
-                if let Some(w) = self.counters.watts(&energy, now, wrap) {
-                    add(&mut uncore, w);
-                }
+                &mut uncore
+            } else {
+                continue;
+            };
+            if let Some(w) = self.counters.watts(&energy, now, wrap) {
+                add(sum, w);
             }
         }
         RaplReading {

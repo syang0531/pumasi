@@ -771,10 +771,11 @@ pub mod windows {
                     let open = GetProcAddress(module, c"D3DKMTOpenAdapterFromLuid".as_ptr().cast())?;
                     let query = GetProcAddress(module, c"D3DKMTQueryAdapterInfo".as_ptr().cast())?;
                     let close = GetProcAddress(module, c"D3DKMTCloseAdapter".as_ptr().cast())?;
+                    type Proc = unsafe extern "system" fn() -> isize;
                     Some(Api {
-                        open: std::mem::transmute::<_, OpenFn>(open),
-                        query: std::mem::transmute::<_, QueryFn>(query),
-                        close: std::mem::transmute::<_, CloseFn>(close),
+                        open: std::mem::transmute::<Proc, OpenFn>(open),
+                        query: std::mem::transmute::<Proc, QueryFn>(query),
+                        close: std::mem::transmute::<Proc, CloseFn>(close),
                     })
                 }
             })

@@ -318,10 +318,10 @@ impl GuestResult {
 /// Start of a console line that carries task output. The record separator
 /// keeps it apart from anything the kernel or a program prints.
 pub const LIVE_PREFIX: &str = "\u{1e}pumasi-out ";
-/// Output the guest prints live per stream; the rest comes with the
-/// result only. What is streamed is always the start of the output, so
-/// the final output continues it.
-pub const LIVE_MAX_BYTES: u64 = 1 << 20;
+/// Output the guest prints live per stream: all of what the result keeps
+/// (1 MiB before 1.15). What is streamed is always the start of the
+/// output, so the final output continues it.
+pub const LIVE_MAX_BYTES: u64 = MAX_STREAM_BYTES;
 /// Bytes of output in one console line.
 pub const LIVE_CHUNK: usize = 3 * 1024;
 

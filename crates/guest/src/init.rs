@@ -2,8 +2,9 @@
 //! disk, and reboots or powers off (`pumasi.exit`), which ends the VMM
 //! process on the host.
 //!
-//! The init is single-threaded on purpose: it forks the task (or the layer
-//! unpacker) and the child may then allocate freely before `execve`.
+//! The init forks the task (or the layer unpacker) while it is still
+//! single-threaded, so the child may allocate freely before `execve`; its
+//! threads (watching for a stop, streaming the output) start after that.
 
 use std::{
     collections::HashSet,
@@ -330,16 +331,96 @@ fn pipe() -> R<(File, File)> {
     Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
 
-/// Copies the task's output from its pipes to the files at `paths`, and
-/// the first [`LIVE_MAX_BYTES`] of each stream to the console as
-/// [`live_frame`] lines, until the task has ended and every copy of the
-/// pipes is closed. Answers with the task's wait status.
+/// Copies the task's output from its pipes to the files at `paths` until
+/// the task has ended and every copy of the pipes is closed, while a
+/// [`Streamer`] sends the files to the console. Answers with the task's
+/// wait status.
 fn pump(pid: libc::pid_t, pipes: [File; 2], paths: [&Path; 2]) -> R<libc::c_int> {
     let mut files = [
         File::create(paths[0]).ctx("create stdout")?,
         File::create(paths[1]).ctx("create stderr")?,
     ];
-    for p in &pipes {
+    let streamer = Streamer::start([paths[0].to_path_buf(), paths[1].to_path_buf()]);
+    let status = copy_pipes(pid, &pipes, &mut files);
+    drop(streamer);
+    status
+}
+
+/// Sends the first [`LIVE_MAX_BYTES`] of each output file to the console as
+/// [`live_frame`] lines while the task runs (1.6; past the first MiB from
+/// 1.15). It reads the files behind the pump, so a slow console never
+/// holds up the task: whatever it has not sent when the task ends comes
+/// with the result, which continues what was streamed.
+struct Streamer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Streamer {
+    fn start(paths: [PathBuf; 2]) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("live".into())
+            .spawn(move || stream_files(&paths, &flag))
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for Streamer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn stream_files(paths: &[PathBuf; 2], stop: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    let files: [Option<File>; 2] = [File::open(&paths[0]).ok(), File::open(&paths[1]).ok()];
+    let mut sent = [0u64; 2];
+    let mut buf = vec![0u8; LIVE_CHUNK];
+    let console = io::stderr();
+    while !stop.load(Ordering::Relaxed) {
+        let mut moved = false;
+        // A chunk of each stream in turn, so neither waits for the other.
+        for i in 0..2 {
+            let Some(f) = &files[i] else { continue };
+            let room = LIVE_MAX_BYTES.saturating_sub(sent[i]) as usize;
+            if room == 0 {
+                continue;
+            }
+            let want = room.min(LIVE_CHUNK);
+            let n = match f.read_at(&mut buf[..want], sent[i]) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if n == 0 {
+                continue;
+            }
+            let line = live_frame(i as u8 + 1, sent[i], &buf[..n]);
+            // One line under the lock, so nothing else the init prints
+            // lands in the middle of it.
+            if console.lock().write_all(line.as_bytes()).is_err() {
+                return;
+            }
+            sent[i] += n as u64;
+            moved = true;
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+        if !moved {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// The pump's loop: the pipes to the files, until both are closed.
+fn copy_pipes(pid: libc::pid_t, pipes: &[File; 2], files: &mut [File; 2]) -> R<libc::c_int> {
+    for p in pipes {
         unsafe {
             let fd = p.as_raw_fd();
             libc::fcntl(
@@ -349,10 +430,7 @@ fn pump(pid: libc::pid_t, pipes: [File; 2], paths: [&Path; 2]) -> R<libc::c_int>
             );
         }
     }
-    let mut console = io::stderr();
     let mut open = [true, true];
-    let mut sent = [0u64; 2];
-    let mut streaming = [true, true];
     let mut status = None;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -420,22 +498,7 @@ fn pump(pid: libc::pid_t, pipes: [File; 2], paths: [&Path; 2]) -> R<libc::c_int>
                         break;
                     }
                     Ok(n) => {
-                        let data = &buf[..n];
-                        let _ = files[i].write_all(data);
-                        if streaming[i] {
-                            let room = (LIVE_MAX_BYTES - sent[i]) as usize;
-                            for chunk in data[..n.min(room)].chunks(LIVE_CHUNK) {
-                                let line = live_frame(i as u8 + 1, sent[i], chunk);
-                                if console.write_all(line.as_bytes()).is_err() {
-                                    streaming[i] = false;
-                                    break;
-                                }
-                                sent[i] += chunk.len() as u64;
-                            }
-                            if sent[i] >= LIVE_MAX_BYTES {
-                                streaming[i] = false;
-                            }
-                        }
+                        let _ = files[i].write_all(&buf[..n]);
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,

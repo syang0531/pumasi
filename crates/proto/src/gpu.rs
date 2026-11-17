@@ -241,6 +241,25 @@ pub const MAX_GPUS_PER_TASK: u32 = 16;
 /// A whole GPU in [`GpuExt::share`]'s hundredths.
 pub const GPU_SHARE_WHOLE: u32 = 100;
 
+/// How a node shares its GPUs between parts (1.16). NVIDIA GPUs whose
+/// parts run through the CUDA MPS server get a memory limit and a share of
+/// the GPU's threads each; on the others parts are time-sliced and share
+/// memory on trust.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuSharing {
+    /// Indices of the GPUs whose parts are limited by MPS.
+    pub mps: Vec<u32>,
+    /// Why the node's NVIDIA GPUs have no MPS, when it has some without:
+    /// "MPS is off", "nvidia-cuda-mps-control was not found", ...
+    pub note: String,
+}
+
+impl GpuSharing {
+    pub fn limited(&self, gpu: u32) -> bool {
+        self.mps.contains(&gpu)
+    }
+}
+
 /// What a job asks of its GPUs beyond its [`GpuRequest`] (1.10). It rides
 /// beside the submission ([`crate::job::JobExt`]), never inside it, so the
 /// submission keeps its layout.

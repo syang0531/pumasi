@@ -1,0 +1,14 @@
+# Drawing over WebGPU (1.16): a compute shader fills a texture, a render
+# pass samples it as the background and blends triangles from a vertex
+# buffer on top, and the module draws the same picture on the CPU to
+# check the GPU's. The picture comes back as
+# pumasi-out/<job>/task-0/render.ppm (and the CPU's as render-cpu.ppm).
+#   cargo build --release --target wasm32-wasip1 --manifest-path examples/webgpu/Cargo.toml
+name = "webgpu-render"
+module = "target/wasm32-wasip1/release/render.wasm"
+args = ["256"]
+gpus = 1
+
+[resources]
+memory_mb = 256
+timeout = "5m"

@@ -1,7 +1,10 @@
 //! Bindings for Pumasi's WebGPU host API (`pumasi_webgpu`), for wasm
 //! modules built for `wasm32-wasip1`. A wasm job with `gpus = 1` gets one
-//! GPU and runs WGSL compute shaders on it; see `docs/architecture.md`
-//! ("WebGPU executor") for the calls.
+//! GPU and runs WGSL compute shaders on it, and since 1.16 draws with
+//! textures, samplers and render passes ([`Texture`], [`RenderShader`],
+//! [`render`]); `gpus = 2` or more gives it several ([`adapters`],
+//! [`select`]). See `docs/architecture.md` ("WebGPU executor", "Phase
+//! 32") for the calls.
 //!
 //! ```no_run
 //! use webgpu_examples::{Buffer, Shader, dispatch, wait};
@@ -24,6 +27,46 @@ mod sys {
         pub fn wait() -> i32;
         pub fn release(handle: i32) -> i32;
         pub fn error(ptr: *mut u8, cap: i32) -> i32;
+        // 1.16
+        pub fn adapters() -> i32;
+        pub fn select(index: i32) -> i32;
+        pub fn texture(json: *const u8, len: i32) -> i32;
+        pub fn sampler(json: *const u8, len: i32) -> i32;
+        pub fn render_shader(src: *const u8, len: i32, json: *const u8, json_len: i32) -> i32;
+        pub fn write_texture(
+            tex: i32,
+            mip: i32,
+            x: i32,
+            y: i32,
+            z: i32,
+            w: i32,
+            h: i32,
+            d: i32,
+            src: *const u8,
+            len: i32,
+        ) -> i32;
+        pub fn read_texture(
+            tex: i32,
+            mip: i32,
+            x: i32,
+            y: i32,
+            z: i32,
+            w: i32,
+            h: i32,
+            d: i32,
+            dst: *mut u8,
+            len: i32,
+        ) -> i32;
+        pub fn bind_group(shader: i32, group: i32, entries: *const i32, n: i32) -> i32;
+        pub fn dispatch_groups(
+            shader: i32,
+            groups: *const i32,
+            n: i32,
+            x: i32,
+            y: i32,
+            z: i32,
+        ) -> i32;
+        pub fn render(json: *const u8, len: i32) -> i32;
     }
 }
 
@@ -191,6 +234,218 @@ pub fn dispatch(shader: &Shader, buffers: &[&Buffer], groups: [u32; 3]) -> Resul
 /// Waits until every dispatch so far has finished.
 pub fn wait() -> Result<()> {
     check(unsafe { sys::wait() }).map(drop)
+}
+
+/// How many GPUs the task has (1.16): `gpus = 2` gives two. 0 without
+/// any.
+pub fn adapters() -> usize {
+    unsafe { sys::adapters() }.max(0) as usize
+}
+
+/// Makes the task's GPU number `index` (from 0) the one new shaders,
+/// buffers and textures go to, and the one [`adapter`] describes (1.16).
+/// Every object stays on the GPU it was made on.
+pub fn select(index: usize) -> Result<()> {
+    check(unsafe { sys::select(index as i32) }).map(drop)
+}
+
+/// A texture (1.16), made from a `GPUTextureDescriptor` as JSON:
+/// `{"size":[w,h],"format":"rgba8unorm"}`; `usage` defaults to every use
+/// the format allows.
+pub struct Texture(i32);
+
+impl Texture {
+    pub fn new(descriptor: &str) -> Result<Self> {
+        check(unsafe { sys::texture(descriptor.as_ptr(), descriptor.len() as i32) }).map(Texture)
+    }
+
+    /// The handle, for JSON descriptors (`"view": handle`).
+    pub fn handle(&self) -> i32 {
+        self.0
+    }
+
+    /// Copies tightly packed texels into the region `[x, y, z]` and
+    /// `[width, height, depth]` of mip level `mip`.
+    pub fn write(&self, mip: u32, origin: [u32; 3], size: [u32; 3], data: &[u8]) -> Result<()> {
+        check(unsafe {
+            sys::write_texture(
+                self.0,
+                mip as i32,
+                origin[0] as i32,
+                origin[1] as i32,
+                origin[2] as i32,
+                size[0] as i32,
+                size[1] as i32,
+                size[2] as i32,
+                data.as_ptr(),
+                data.len() as i32,
+            )
+        })
+        .map(drop)
+    }
+
+    /// Waits for earlier work and copies a region out, tightly packed
+    /// (`bytes_per_texel` is 4 for `rgba8unorm`).
+    pub fn read(
+        &self,
+        mip: u32,
+        origin: [u32; 3],
+        size: [u32; 3],
+        bytes_per_texel: usize,
+    ) -> Result<Vec<u8>> {
+        let mut out =
+            vec![0u8; size[0] as usize * size[1] as usize * size[2] as usize * bytes_per_texel];
+        check(unsafe {
+            sys::read_texture(
+                self.0,
+                mip as i32,
+                origin[0] as i32,
+                origin[1] as i32,
+                origin[2] as i32,
+                size[0] as i32,
+                size[1] as i32,
+                size[2] as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
+        })?;
+        Ok(out)
+    }
+}
+
+impl Drop for Texture {
+    fn drop(&mut self) {
+        unsafe { sys::release(self.0) };
+    }
+}
+
+/// A sampler (1.16) from a `GPUSamplerDescriptor` as JSON:
+/// `{"magFilter":"linear","minFilter":"linear"}`.
+pub struct Sampler(i32);
+
+impl Sampler {
+    pub fn new(descriptor: &str) -> Result<Self> {
+        check(unsafe { sys::sampler(descriptor.as_ptr(), descriptor.len() as i32) }).map(Sampler)
+    }
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        unsafe { sys::release(self.0) };
+    }
+}
+
+/// A render pipeline (1.16): WGSL with vertex and fragment entry points,
+/// and a `GPURenderPipelineDescriptor` as JSON without `module` and
+/// `layout`: `{"vertex":{"entryPoint":"vs"},"fragment":{"entryPoint":"fs",
+/// "targets":[{"format":"rgba8unorm"}]}}`.
+pub struct RenderShader(i32);
+
+impl RenderShader {
+    pub fn new(wgsl: &str, descriptor: &str) -> Result<Self> {
+        check(unsafe {
+            sys::render_shader(
+                wgsl.as_ptr(),
+                wgsl.len() as i32,
+                descriptor.as_ptr(),
+                descriptor.len() as i32,
+            )
+        })
+        .map(RenderShader)
+    }
+
+    pub fn handle(&self) -> i32 {
+        self.0
+    }
+}
+
+impl Drop for RenderShader {
+    fn drop(&mut self) {
+        unsafe { sys::release(self.0) };
+    }
+}
+
+/// What goes in a bind group.
+pub enum Resource<'a> {
+    Buffer(&'a Buffer),
+    Texture(&'a Texture),
+    Sampler(&'a Sampler),
+}
+
+impl Resource<'_> {
+    fn handle(&self) -> i32 {
+        match self {
+            Resource::Buffer(b) => b.handle,
+            Resource::Texture(t) => t.0,
+            Resource::Sampler(s) => s.0,
+        }
+    }
+}
+
+/// A bind group (1.16) for group `group` of a compute or render shader,
+/// with `(binding, resource)` entries. It fits only that shader (layouts
+/// are automatic).
+pub struct BindGroup(i32);
+
+impl BindGroup {
+    fn make(shader: i32, group: u32, entries: &[(u32, Resource)]) -> Result<Self> {
+        let flat: Vec<i32> = entries
+            .iter()
+            .flat_map(|(b, r)| [*b as i32, r.handle()])
+            .collect();
+        check(unsafe { sys::bind_group(shader, group as i32, flat.as_ptr(), entries.len() as i32) })
+            .map(BindGroup)
+    }
+
+    pub fn compute(shader: &Shader, group: u32, entries: &[(u32, Resource)]) -> Result<Self> {
+        Self::make(shader.0, group, entries)
+    }
+
+    pub fn render(shader: &RenderShader, group: u32, entries: &[(u32, Resource)]) -> Result<Self> {
+        Self::make(shader.0, group, entries)
+    }
+
+    pub fn handle(&self) -> i32 {
+        self.0
+    }
+}
+
+impl Drop for BindGroup {
+    fn drop(&mut self) {
+        unsafe { sys::release(self.0) };
+    }
+}
+
+impl Buffer {
+    /// The handle, for JSON descriptors (`"vertexBuffers": [handle]`).
+    pub fn handle(&self) -> i32 {
+        self.handle
+    }
+}
+
+/// Runs `groups` workgroups of `shader` with bind groups at `@group(0..)`
+/// (1.16).
+pub fn dispatch_groups(shader: &Shader, bind: &[&BindGroup], groups: [u32; 3]) -> Result<()> {
+    let handles: Vec<i32> = bind.iter().map(|b| b.0).collect();
+    check(unsafe {
+        sys::dispatch_groups(
+            shader.0,
+            handles.as_ptr(),
+            handles.len() as i32,
+            groups[0] as i32,
+            groups[1] as i32,
+            groups[2] as i32,
+        )
+    })
+    .map(drop)
+}
+
+/// Runs one render pass (1.16), described as JSON: a
+/// `GPURenderPassDescriptor` plus `pipeline`, `bindGroups`,
+/// `vertexBuffers`, `indexBuffer`, `viewport`, `scissorRect` and `draws`,
+/// with handles where WebGPU takes objects.
+pub fn render(pass: &str) -> Result<()> {
+    check(unsafe { sys::render(pass.as_ptr(), pass.len() as i32) }).map(drop)
 }
 
 /// SplitMix64, so every run builds the same inputs.

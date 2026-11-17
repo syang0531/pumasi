@@ -109,6 +109,10 @@ pub struct AgentConfig {
     /// libraries (`/usr/lib/wsl`, read-only), which Docker Desktop leaves
     /// out of GPU containers. `None`: on Windows hosts.
     pub docker_wsl_libs: Option<bool>,
+    /// Start NVIDIA's MPS server so parts of NVIDIA GPUs get a memory
+    /// limit (1.16), where the machine allows it (Linux, root, Volta or
+    /// newer, `nvidia-cuda-mps-control` installed).
+    pub gpu_mps: bool,
     /// The machine's sleep (1.5): staying awake while tasks run, saying
     /// so before it sleeps, Wake-on-LAN and `--on-pause`. The default
     /// does none of it.
@@ -221,6 +225,10 @@ pub struct Agent {
     hashing: Option<Arc<crate::webgpu::WebGpu>>,
     /// GPUs (by index) measured, and so checked, over WebGPU.
     webgpu_checked: HashSet<u32>,
+    /// The MPS daemon parts of NVIDIA GPUs run under (1.16), and what the
+    /// cluster is told about it.
+    mps: Option<Arc<crate::gpu::mps::Mps>>,
+    gpu_sharing: pumasi_proto::gpu::GpuSharing,
     /// Samples the machine for the cluster's monitoring.
     sampler: Arc<Mutex<Sampler>>,
     /// Confidential runs waiting for the cluster's answer about their
@@ -558,6 +566,21 @@ impl Agent {
                 ),
             ),
         };
+        // Memory limits for parts of NVIDIA GPUs (1.16).
+        let (mps, gpu_sharing) = {
+            // Parts of GPUs run only on Docker, so without it there is
+            // nothing to limit.
+            let gpus = match &devices {
+                Some(d) if config.gpus && config.fake_gpus.is_none() && docker.is_some() => {
+                    d.profile.gpus.clone()
+                }
+                _ => Vec::new(),
+            };
+            let enabled = config.gpu_mps;
+            let dir = config.data_dir.clone();
+            tokio::task::spawn_blocking(move || crate::gpu::mps::Mps::start(enabled, &gpus, &dir))
+                .await?
+        };
         if docker.is_some() {
             info.executors.push(Executor::Docker);
         }
@@ -621,6 +644,8 @@ impl Agent {
             webgpu_checked,
             webgpu_profile,
             webgpu_extra,
+            mps: mps.map(Arc::new),
+            gpu_sharing,
             sampler: Arc::new(Mutex::new(sampler)),
             key_waiters: Default::default(),
             stops: Default::default(),
@@ -1100,6 +1125,11 @@ impl Agent {
         }
         // The control plane is never older than its agents, so it knows this.
         let _ = out_tx.send(FromAgent::WebGpu(Box::new(self.webgpu_profile.clone())));
+        if cp_minor >= pumasi_proto::GPU_SHARING_MINOR
+            && self.gpu_sharing != pumasi_proto::gpu::GpuSharing::default()
+        {
+            let _ = out_tx.send(FromAgent::GpuSharing(Box::new(self.gpu_sharing.clone())));
+        }
         if cp_minor >= pumasi_proto::GPU_MINOR {
             let _ = out_tx.send(FromAgent::WebGpuExtra(Box::new(self.webgpu_extra.clone())));
         }
@@ -1477,13 +1507,12 @@ impl Agent {
                     });
                 }
                 Ok(Some(ToAgent::GpuChallenge(ch))) => {
-                    let pci = self
+                    let gpu = self
                         .devices
                         .borrow()
                         .as_ref()
                         .and_then(|d| d.profile.gpus.iter().find(|g| g.index == ch.device))
-                        .map(|g| g.pci.clone())
-                        .unwrap_or_default();
+                        .cloned();
                     // A WebGPU adapter's slot, or a GPU measured over
                     // WebGPU (1.10); else CUDA.
                     let over_webgpu = (ch.device >= pumasi_proto::webgpu::WEBGPU_SLOT_BASE
@@ -1496,12 +1525,12 @@ impl Agent {
                             tokio::task::spawn_blocking(move || w.solve(ch.device, &ch))
                                 .await
                                 .unwrap_or_default()
-                        } else if pci.is_empty() {
-                            Vec::new()
-                        } else {
-                            tokio::task::spawn_blocking(move || crate::gpu::solve(&pci, &ch))
+                        } else if let Some(g) = gpu {
+                            tokio::task::spawn_blocking(move || crate::gpu::solve_on(&g, &ch))
                                 .await
                                 .unwrap_or_default()
+                        } else {
+                            Vec::new()
                         };
                         let _ = out_tx.send(FromAgent::GpuResult {
                             nonce: ch.nonce,
@@ -1650,17 +1679,20 @@ impl Agent {
         let out_tx = out_tx.clone();
         let key = self.key.clone();
         let corrupt = self.config.corrupt_results;
-        // A wasm task's GPU is a WebGPU adapter, named by its slot.
+        // A wasm task's GPUs are WebGPU adapters, named by their slots
+        // (several since 1.16).
         let mut webgpu = None;
         let gpus: Vec<pumasi_proto::gpu::GpuInfo> = if a.executor == Executor::Wasm {
-            if let Some(&slot) = a.gpus.first() {
+            if !a.gpus.is_empty() {
                 webgpu = self.webgpu.as_ref().and_then(|g| {
-                    g.by_slot(slot).map(|adapter| crate::webgpu::WebGpuTask {
+                    let adapters: Option<Vec<u32>> =
+                        a.gpus.iter().map(|slot| g.by_slot(*slot)).collect();
+                    adapters.map(|adapters| crate::webgpu::WebGpuTask {
                         gpu: g.clone(),
-                        adapter,
+                        adapters,
                     })
                 });
-                if webgpu.is_none() || a.gpus.len() != 1 {
+                if webgpu.is_none() {
                     running.lock().unwrap().remove(&a.task);
                     let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
                         a.task,
@@ -1692,6 +1724,14 @@ impl Agent {
             ))));
             return;
         }
+        // A part of an NVIDIA GPU runs under MPS where the node has it
+        // (1.16): its memory and threads are limited to its part.
+        let mps_part = match (&self.mps, gpus.as_slice()) {
+            (Some(mps), [g]) if self.gpu_sharing.limited(g.index) => {
+                crate::gpu::mps::share_of(&a.input.env).map(|share| mps.part(g, share))
+            }
+            _ => None,
+        };
         let node_store = self.node_store.clone();
         let cluster_addr = cluster_addr.clone();
         let cluster = *cluster_key.id.as_bytes();
@@ -1750,6 +1790,7 @@ impl Agent {
             }
             let pull = io.pull.clone();
             io.gpus = gpus;
+            io.mps = mps_part;
             io.webgpu = webgpu;
             io.gpu_capabilities = a.gpu_capabilities.clone();
             io.image_report = Some(crate::executor::ImageReport {

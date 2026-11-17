@@ -536,13 +536,15 @@ pub struct State {
 /// What a run holding part of a GPU (1.10) finds in its environment:
 /// its part, and settings that keep common frameworks from taking the
 /// whole GPU's memory (TensorFlow and JAX do by default). A task's own
-/// values win.
+/// values win, except for its part (1.16).
 pub(crate) const GPU_FRACTION_ENV: &str = "PUMASI_GPU_FRACTION";
 
 fn share_env(env: &mut std::collections::BTreeMap<String, String>, share: u32) {
     let fraction = pumasi_proto::gpu::format_share(share);
+    // The cluster's own word: since 1.16 the agent sizes the run's MPS
+    // memory limit from it, so the job cannot set it.
+    env.insert(GPU_FRACTION_ENV.to_string(), fraction.clone());
     for (k, v) in [
-        (GPU_FRACTION_ENV, fraction.clone()),
         ("TF_FORCE_GPU_ALLOW_GROWTH", "true".to_string()),
         ("XLA_PYTHON_CLIENT_MEM_FRACTION", fraction),
     ] {
@@ -2092,6 +2094,14 @@ impl State {
                 refused.get_or_insert(R::VmNetwork);
                 continue;
             }
+            // Several WebGPU adapters per task need a 1.16 agent.
+            if e == Executor::Wasm
+                && need.gpu.as_ref().is_some_and(|g| g.count > 1)
+                && self.agent_minor(id) < pumasi_proto::GPU_SHARING_MINOR
+            {
+                refused.get_or_insert(R::OldAgent);
+                continue;
+            }
             // GPUs this executor reaches on the node at all (busy or not).
             if let Some(req) = &need.gpu
                 && self
@@ -3525,6 +3535,103 @@ mod tests {
         let mut sub = gpu_job(1, tasks);
         sub.gpu_ext.share = 50;
         sub
+    }
+
+    /// Wasm tasks with several WebGPU adapters (1.16) go only to agents
+    /// that run them, fastest adapters first, and pay for each.
+    #[test]
+    fn webgpu_tasks_take_several_adapters_from_new_agents() {
+        use pumasi_proto::webgpu::WEBGPU_SLOT_BASE;
+        let mut st = state();
+        st.deposit(OWNER_ACCOUNT, 1_000_000, "").unwrap();
+        let (old_id, old_key, mut old_rx) = join_gpus(&mut st, "old", vec![], bob(true));
+        let (new_id, new_key, mut new_rx) = join_gpus(&mut st, "new", vec![], bob(true));
+        let g = st.nodes[&new_id].generation;
+        st.on_minor(&new_id, g, pumasi_proto::GPU_SHARING_MINOR);
+        let mut sub = webgpu_job(1);
+        sub.gpu.as_mut().unwrap().count = 2;
+        let job = st.submit(sub).unwrap();
+        let two = vec![adapter(0, None, 800), adapter(1, None, 900)];
+        send_webgpu(&mut st, &old_id, &old_key, two.clone());
+        assert!(
+            assigned(&mut old_rx).is_empty(),
+            "a 1.15 agent takes one adapter"
+        );
+        send_webgpu(&mut st, &new_id, &new_key, two);
+        let got = assigned(&mut new_rx);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].gpus, vec![WEBGPU_SLOT_BASE + 1, WEBGPU_SLOT_BASE]);
+        let b = st
+            .gpu_billing(&new_id, Executor::Wasm, &got[0].gpus, 0)
+            .unwrap();
+        assert_eq!(b.names.len(), 2);
+        assert_eq!(b.gflops, 1_700);
+        // Both of the new node's adapters are busy now: a one-adapter task
+        // goes to the old node.
+        st.submit(webgpu_job(1)).unwrap();
+        assert!(assigned(&mut new_rx).is_empty());
+        assert_eq!(assigned(&mut old_rx).len(), 1);
+        assert!(matches!(
+            st.jobs[&job].tasks[0].state,
+            TaskState::Running { .. }
+        ));
+        // More adapters than any node has never fits.
+        let mut sub = webgpu_job(1);
+        sub.gpu.as_mut().unwrap().count = 9;
+        assert!(st.submit(sub).is_err());
+    }
+
+    /// The agent says which GPUs give parts a memory limit (1.16); the GPU
+    /// view says how parts share each GPU, and the part a run gets is the
+    /// cluster's word, not the job's.
+    #[test]
+    fn gpu_views_say_how_parts_share_memory() {
+        let mut st = state();
+        let (id, _, mut rx) = join_gpus(
+            &mut st,
+            "one",
+            vec![gpu(0, 12_000, 0), gpu(1, 12_000, 0)],
+            None,
+        );
+        let g = st.nodes[&id].generation;
+        st.on_gpu_sharing(
+            &id,
+            g,
+            pumasi_proto::gpu::GpuSharing {
+                mps: vec![0],
+                note: String::new(),
+            },
+        );
+        let notes = |st: &State| -> Vec<String> {
+            let view = st.status();
+            let node = view.nodes.iter().find(|n| n.id == id).unwrap();
+            node.gpus
+                .iter()
+                .map(|g| g.note.clone().unwrap_or_default())
+                .collect()
+        };
+        let n = notes(&st);
+        assert!(n[0].contains("memory limit (MPS)"), "{n:?}");
+        assert!(n[1].is_empty(), "{n:?}");
+        let mut sub = half_gpu_job(2);
+        sub.tasks[0].env.insert(GPU_FRACTION_ENV.into(), "1".into());
+        st.submit(sub).unwrap();
+        let got = assigned(&mut rx);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].gpus, vec![0]);
+        assert_eq!(
+            got[0].input.env[GPU_FRACTION_ENV], "0.5",
+            "the cluster's part wins"
+        );
+        let n = notes(&st);
+        assert!(n[0].contains("memory limited by MPS"), "{n:?}");
+        // A stale connection's report changes nothing.
+        st.on_gpu_sharing(&id, g + 1, Default::default());
+        assert!(notes(&st)[0].contains("MPS"));
+        // Without MPS, parts are time-sliced.
+        st.on_gpu_sharing(&id, g, Default::default());
+        let n = notes(&st);
+        assert!(n[0].contains("time-sliced, memory on trust"), "{n:?}");
     }
 
     #[test]

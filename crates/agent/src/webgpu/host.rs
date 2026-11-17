@@ -16,32 +16,50 @@ use wasmtime::{Caller, Extern, Linker, Trap};
 
 use super::{
     WebGpu,
-    worker::{AdapterKey, Client, Gone, Req, Resp},
+    worker::{AdapterKey, Client, Gone, HANDLE_BITS, Req, Resp},
 };
 
-/// The adapter a task runs on.
+/// The adapters a task runs on: one for `gpus = 1`, more since 1.16.
 #[derive(Debug, Clone)]
 pub struct WebGpuTask {
     pub gpu: Arc<WebGpu>,
-    pub adapter: u32,
+    /// Adapter indices, in the order the module numbers them (`select`).
+    pub adapters: Vec<u32>,
 }
 
 impl WebGpuTask {
-    /// The adapter's description.
-    pub fn info(&self) -> Option<WebGpuAdapter> {
-        self.gpu.get(self.adapter).map(|(a, _)| a.clone())
+    /// A task with one adapter.
+    pub fn one(gpu: Arc<WebGpu>, adapter: u32) -> Self {
+        Self {
+            gpu,
+            adapters: vec![adapter],
+        }
+    }
+
+    /// The description of the task's `n`th adapter.
+    pub fn info(&self, n: usize) -> Option<WebGpuAdapter> {
+        self.gpu.get(*self.adapters.get(n)?).map(|(a, _)| a.clone())
     }
 }
 
-/// What the host API keeps per task: the adapter it may use and, once the
-/// module made its first call, the worker holding its device.
-pub struct GpuState {
-    task: Option<WebGpuTask>,
+/// One of the task's adapters, once the module used it: the worker that
+/// holds its device.
+#[derive(Default)]
+struct Device {
     client: Option<Client>,
     /// The adapter as JSON, once the device is open.
     info: String,
     /// Why the device cannot be used any more.
     dead: Option<String>,
+}
+
+/// What the host API keeps per task: the adapters it may use and, once the
+/// module used one, the worker holding its device.
+pub struct GpuState {
+    task: Option<WebGpuTask>,
+    devices: Vec<Device>,
+    /// The adapter new objects go to (`select`).
+    current: usize,
     deadline: Instant,
     cancel: Arc<AtomicBool>,
     limit_bytes: u64,
@@ -50,6 +68,8 @@ pub struct GpuState {
     pub busy: Duration,
     /// Dispatches run.
     pub dispatches: u64,
+    /// Draws run (1.16).
+    pub draws: u64,
     /// The worker was killed at the deadline or on cancellation.
     pub killed: bool,
 }
@@ -82,6 +102,7 @@ impl From<&str> for Stop {
 type Call<T> = std::result::Result<T, Stop>;
 
 const NO_GPU: &str = "this task has no GPU (ask for one with gpus = 1)";
+const ODD: &str = "the GPU worker answered oddly";
 
 impl GpuState {
     pub fn new(
@@ -90,17 +111,18 @@ impl GpuState {
         cancel: Arc<AtomicBool>,
         limit_bytes: u64,
     ) -> Self {
+        let n = task.as_ref().map_or(0, |t| t.adapters.len());
         Self {
             task,
-            client: None,
-            info: String::new(),
-            dead: None,
+            devices: (0..n).map(|_| Device::default()).collect(),
+            current: 0,
             deadline,
             cancel,
             limit_bytes,
             error: String::new(),
             busy: Duration::ZERO,
             dispatches: 0,
+            draws: 0,
             killed: false,
         }
     }
@@ -108,37 +130,67 @@ impl GpuState {
     /// What the task did on the GPU, for its stderr; `None` when it did
     /// not use it.
     pub fn summary(&self) -> Option<String> {
+        let used: Vec<usize> = (0..self.devices.len())
+            .filter(|i| !self.devices[*i].info.is_empty())
+            .collect();
         // A worker killed while it was still opening the device counts as
         // used too.
-        if self.info.is_empty() && !self.killed {
+        if used.is_empty() && !self.killed {
             return None;
         }
-        let name = self
-            .task
-            .as_ref()
-            .and_then(WebGpuTask::info)
-            .map(|a| a.describe())
-            .unwrap_or_default();
+        let names: Vec<String> = match &self.task {
+            Some(t) => used
+                .iter()
+                .chain(used.is_empty().then_some(&0))
+                .filter_map(|i| t.info(*i))
+                .map(|a| a.describe())
+                .collect(),
+            None => Vec::new(),
+        };
         let mut s = format!(
-            "WebGPU {name}: {} dispatches, {} ms waiting for the GPU",
-            self.dispatches,
-            self.busy.as_millis()
+            "WebGPU {}: {} dispatches",
+            names.join(" and "),
+            self.dispatches
         );
+        if self.draws > 0 {
+            s.push_str(&format!(", {} draws", self.draws));
+        }
+        s.push_str(&format!(
+            ", {} ms waiting for the GPU",
+            self.busy.as_millis()
+        ));
         if self.killed {
             s.push_str("; the GPU work was stopped at the task's end");
         }
         Some(s)
     }
 
-    /// Sends a request to the task's worker (started and its device opened
-    /// on first use) and returns its answer.
-    fn send(&mut self, req: Req) -> Call<Resp> {
-        if let Some(d) = &self.dead {
-            return Err(Stop::Fail(d.clone()));
+    /// The adapter that holds `handle`.
+    fn device_of(&self, handle: i32) -> Call<usize> {
+        let d = (u32::try_from(handle).map_err(|_| format!("no GPU object {handle}"))?
+            >> HANDLE_BITS) as usize;
+        if self.task.is_none() {
+            return Err(NO_GPU.into());
         }
-        if self.client.is_none() {
-            let task = self.task.as_ref().ok_or(NO_GPU)?;
-            let (a, adapter) = task.gpu.get(task.adapter).ok_or("the GPU is gone")?;
+        if d >= self.devices.len() {
+            return Err(Stop::Fail(format!("no GPU object {handle}")));
+        }
+        Ok(d)
+    }
+
+    /// Sends a request to the worker of adapter `d` (started and its
+    /// device opened on first use) and returns its answer.
+    fn send_to(&mut self, d: usize, req: Req) -> Call<Resp> {
+        let task = self.task.as_ref().ok_or(NO_GPU)?;
+        if d >= self.devices.len() {
+            return Err("the task has no such GPU".into());
+        }
+        if let Some(e) = &self.devices[d].dead {
+            return Err(Stop::Fail(e.clone()));
+        }
+        if self.devices[d].client.is_none() {
+            let index = task.adapters[d];
+            let (a, adapter) = task.gpu.get(index).ok_or("the GPU is gone")?;
             let key = AdapterKey::of(adapter).ok_or("the GPU is gone")?;
             let info = serde_json::json!({
                 "name": a.name,
@@ -147,67 +199,91 @@ impl GpuState {
                 "device_type": a.device_type.to_string(),
                 "driver": a.driver,
                 "fp32_gflops": a.fp32_gflops,
+                "index": d,
+                "count": task.adapters.len(),
             })
             .to_string();
-            let mut client = Client::start(&task.gpu.worker, adapter.clone())
-                .map_err(|e| self.die(format!("{e:#}")))?;
+            // The job's memory limit is shared out evenly among its GPUs.
+            let limit_bytes = self.limit_bytes / task.adapters.len().max(1) as u64;
+            let client = Client::start(&task.gpu.worker, adapter.clone());
+            let mut client = match client {
+                Ok(c) => c,
+                Err(e) => return Err(Stop::Fail(self.die(d, format!("{e:#}")))),
+            };
             let open = Req::Open {
                 key,
-                limit_bytes: self.limit_bytes,
+                limit_bytes,
                 info,
+                tag: d as u32,
             };
             let resp = client.call(&open, self.deadline, &self.cancel);
-            self.client = Some(client);
-            match self.answer(resp)? {
-                Resp::Info(info) => self.info = info,
-                _ => return Err(Stop::Fail(self.die("the GPU worker answered oddly".into()))),
+            self.devices[d].client = Some(client);
+            match self.answer(d, resp)? {
+                Resp::Info(info) => self.devices[d].info = info,
+                _ => return Err(Stop::Fail(self.die(d, ODD.into()))),
             }
         }
-        let client = self.client.as_mut().expect("started");
+        let client = self.devices[d].client.as_mut().expect("started");
         let resp = client.call(&req, self.deadline, &self.cancel);
-        self.answer(resp)
+        self.answer(d, resp)
+    }
+
+    /// [`Self::send_to`] the current adapter.
+    fn send(&mut self, req: Req) -> Call<Resp> {
+        self.send_to(self.current, req)
     }
 
     /// Turns a worker's answer into what the call returns.
-    fn answer(&mut self, resp: std::result::Result<Resp, Gone>) -> Call<Resp> {
+    fn answer(&mut self, d: usize, resp: std::result::Result<Resp, Gone>) -> Call<Resp> {
         match resp {
             Ok(Resp::Fail(msg)) => Err(Stop::Fail(msg)),
-            Ok(Resp::Dead(msg)) => Err(Stop::Fail(self.die(msg))),
+            Ok(Resp::Dead(msg)) => Err(Stop::Fail(self.die(d, msg))),
             Ok(r) => Ok(r),
             Err(Gone::Timeout) => {
-                self.killed = true;
-                self.client = None;
+                self.stop_all();
                 Err(Stop::Abort(Trap::Interrupt.into()))
             }
             Err(Gone::Cancelled) => {
-                self.killed = true;
-                self.client = None;
+                self.stop_all();
                 Err(Stop::Abort(wasmtime::Error::msg(
                     crate::executor::CANCELLED,
                 )))
             }
-            Err(Gone::Failed(msg)) => Err(Stop::Fail(self.die(msg))),
+            Err(Gone::Failed(msg)) => Err(Stop::Fail(self.die(d, msg))),
         }
     }
 
-    /// The device is gone for good: later calls fail with `msg`.
-    fn die(&mut self, msg: String) -> String {
-        self.client = None;
-        self.dead = Some(msg.clone());
+    /// The task ends: every worker goes.
+    fn stop_all(&mut self) {
+        self.killed = true;
+        for dev in &mut self.devices {
+            if let Some(mut c) = dev.client.take() {
+                c.kill();
+            }
+        }
+    }
+
+    /// Adapter `d`'s device is gone for good: later calls on it fail with
+    /// `msg`.
+    fn die(&mut self, d: usize, msg: String) -> String {
+        if let Some(dev) = self.devices.get_mut(d) {
+            dev.client = None;
+            dev.dead = Some(msg.clone());
+        }
         msg
     }
 
-    fn value(&mut self, req: Req) -> Call<i32> {
-        match self.send(req)? {
+    fn value_of(r: Resp) -> Call<i32> {
+        match r {
             Resp::Value(v) => Ok(v),
-            _ => Err("the GPU worker answered oddly".into()),
+            _ => Err(ODD.into()),
         }
     }
 
     /// A call that waits on the GPU, counted as time spent waiting.
-    fn timed(&mut self, req: Req) -> Call<Resp> {
+    fn timed_to(&mut self, d: usize, req: Req) -> Call<Resp> {
         let start = Instant::now();
-        let r = self.send(req);
+        let r = self.send_to(d, req);
         self.busy += start.elapsed();
         r
     }
@@ -253,10 +329,45 @@ fn with_state<T: 'static>(
         }
         Ok(Err(Stop::Abort(e))) => Err(e),
         Err(_) => {
-            st.error = st.die("the GPU host failed".into());
+            let msg = "the GPU host failed".to_string();
+            for d in 0..st.devices.len() {
+                st.die(d, msg.clone());
+            }
+            st.error = msg;
             Ok(-1)
         }
     }
+}
+
+/// Reads a UTF-8 string out of the module's memory.
+fn text(data: &[u8], ptr: i32, len: i32, what: &str) -> Call<String> {
+    std::str::from_utf8(&data[range(data, ptr, len)?])
+        .map(str::to_string)
+        .map_err(|_| Stop::Fail(format!("{what} is not UTF-8")))
+}
+
+/// Reads `n` little-endian `i32`s.
+fn ints(data: &[u8], ptr: i32, n: usize) -> Call<Vec<i32>> {
+    let r = range(data, ptr, (n * 4) as i32)?;
+    Ok(data[r]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
+        .collect())
+}
+
+fn dim(v: i32) -> Call<u32> {
+    u32::try_from(v).map_err(|_| Stop::from("negative size or count"))
+}
+
+/// A texture region: mip level, x, y, z, width, height, depth.
+fn region(r: [i32; 7]) -> Call<[u32; 7]> {
+    let mut out = [0u32; 7];
+    for (o, v) in out.iter_mut().zip(r) {
+        *o = dim(v)?;
+    }
+    Ok(out)
 }
 
 /// Adds the `pumasi_webgpu` imports. Every module can import them; they
@@ -274,15 +385,42 @@ pub fn add_to_linker<T: 'static>(
                 if st.task.is_none() {
                     return Err(NO_GPU.into());
                 }
-                if st.info.is_empty() {
+                let cur = st.current;
+                if st.devices[cur].info.is_empty() {
                     // Opens the device (the first call does).
                     st.send(Req::Wait)?;
                 }
-                let info = st.info.clone();
+                let info = st.devices[cur].info.clone();
                 let n = info.len().min(to_len(cap)?);
                 let r = range(data, ptr, n as i32)?;
                 data[r].copy_from_slice(&info.as_bytes()[..n]);
                 Ok(info.len() as i32)
+            })
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "adapters",
+        move |mut c: Caller<'_, T>| -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |_, st| Ok(st.devices.len() as i32))
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "select",
+        move |mut c: Caller<'_, T>, index: i32| -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |_, st| {
+                if st.task.is_none() {
+                    return Err(NO_GPU.into());
+                }
+                let i = usize::try_from(index)
+                    .ok()
+                    .filter(|i| *i < st.devices.len())
+                    .ok_or_else(|| {
+                        format!("the task has {} GPUs, numbered from 0", st.devices.len())
+                    })?;
+                st.current = i;
+                Ok(0)
             })
         },
     )?;
@@ -309,13 +447,9 @@ pub fn add_to_linker<T: 'static>(
               entry_len: i32|
               -> wasmtime::Result<i32> {
             with_state(&mut c, get, |data, st| {
-                let src = std::str::from_utf8(&data[range(data, src, src_len)?])
-                    .map_err(|_| "the shader is not UTF-8")?
-                    .to_string();
-                let entry = std::str::from_utf8(&data[range(data, entry, entry_len)?])
-                    .map_err(|_| "the entry point is not UTF-8")?
-                    .to_string();
-                st.value(Req::Shader { src, entry })
+                let src = text(data, src, src_len, "the shader")?;
+                let entry = text(data, entry, entry_len, "the entry point")?;
+                GpuState::value_of(st.send(Req::Shader { src, entry })?)
             })
         },
     )?;
@@ -325,7 +459,7 @@ pub fn add_to_linker<T: 'static>(
         move |mut c: Caller<'_, T>, size: i64| -> wasmtime::Result<i32> {
             with_state(&mut c, get, |_, st| {
                 let size = u64::try_from(size).map_err(|_| "negative size")?;
-                st.value(Req::Buffer { size })
+                GpuState::value_of(st.send(Req::Buffer { size })?)
             })
         },
     )?;
@@ -341,11 +475,15 @@ pub fn add_to_linker<T: 'static>(
             with_state(&mut c, get, |data, st| {
                 let offset = offset(off)?;
                 let r = range(data, src, len)?;
-                st.value(Req::Write {
-                    buf,
-                    offset,
-                    data: data[r].to_vec(),
-                })
+                let d = st.device_of(buf)?;
+                GpuState::value_of(st.send_to(
+                    d,
+                    Req::Write {
+                        buf,
+                        offset,
+                        data: data[r].to_vec(),
+                    },
+                )?)
             })
         },
     )?;
@@ -362,12 +500,13 @@ pub fn add_to_linker<T: 'static>(
                 let offset = offset(off)?;
                 let r = range(data, dst, len)?;
                 let len = r.len() as u64;
-                match st.timed(Req::Read { buf, offset, len })? {
-                    Resp::Data(d) if d.len() == r.len() => {
-                        data[r].copy_from_slice(&d);
+                let d = st.device_of(buf)?;
+                match st.timed_to(d, Req::Read { buf, offset, len })? {
+                    Resp::Data(v) if v.len() == r.len() => {
+                        data[r].copy_from_slice(&v);
                         Ok(0)
                     }
-                    _ => Err("the GPU worker answered oddly".into()),
+                    _ => Err(ODD.into()),
                 }
             })
         },
@@ -388,31 +527,23 @@ pub fn add_to_linker<T: 'static>(
                 if count > 64 {
                     return Err("at most 64 buffers per dispatch".into());
                 }
-                let r = range(data, bufs, (count * 4) as i32)?;
-                let bufs: Vec<i32> = data[r]
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| i32::from_le_bytes(*c))
-                    .collect();
-                let dim =
-                    |v: i32| u32::try_from(v).map_err(|_| Stop::from("negative workgroup count"));
+                let bufs = ints(data, bufs, count)?;
                 let (x, y, z) = (dim(x)?, dim(y)?, dim(z)?);
+                let d = st.device_of(shader)?;
                 // A dispatch can wait for older ones (the worker bounds
                 // what is queued), so it counts as waiting too.
-                match st.timed(Req::Dispatch {
-                    shader,
-                    bufs,
-                    x,
-                    y,
-                    z,
-                })? {
-                    Resp::Value(v) => {
-                        st.dispatches += 1;
-                        Ok(v)
-                    }
-                    _ => Err("the GPU worker answered oddly".into()),
-                }
+                let v = GpuState::value_of(st.timed_to(
+                    d,
+                    Req::Dispatch {
+                        shader,
+                        bufs,
+                        x,
+                        y,
+                        z,
+                    },
+                )?)?;
+                st.dispatches += 1;
+                Ok(v)
             })
         },
     )?;
@@ -420,9 +551,21 @@ pub fn add_to_linker<T: 'static>(
         m,
         "wait",
         move |mut c: Caller<'_, T>| -> wasmtime::Result<i32> {
-            with_state(&mut c, get, |_, st| match st.timed(Req::Wait)? {
-                Resp::Value(v) => Ok(v),
-                _ => Err("the GPU worker answered oddly".into()),
+            with_state(&mut c, get, |_, st| {
+                if st.task.is_none() {
+                    return Err(NO_GPU.into());
+                }
+                let open: Vec<usize> = (0..st.devices.len())
+                    .filter(|d| st.devices[*d].client.is_some())
+                    .collect();
+                if open.is_empty() {
+                    // Opens the current device, as it always did.
+                    return GpuState::value_of(st.timed_to(st.current, Req::Wait)?);
+                }
+                for d in open {
+                    GpuState::value_of(st.timed_to(d, Req::Wait)?)?;
+                }
+                Ok(0)
             })
         },
     )?;
@@ -430,7 +573,198 @@ pub fn add_to_linker<T: 'static>(
         m,
         "release",
         move |mut c: Caller<'_, T>, handle: i32| -> wasmtime::Result<i32> {
-            with_state(&mut c, get, |_, st| st.value(Req::Release { handle }))
+            with_state(&mut c, get, |_, st| {
+                let d = st.device_of(handle)?;
+                GpuState::value_of(st.send_to(d, Req::Release { handle })?)
+            })
+        },
+    )?;
+    // Drawing (1.16).
+    linker.func_wrap(
+        m,
+        "texture",
+        move |mut c: Caller<'_, T>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |data, st| {
+                let json = text(data, ptr, len, "the texture descriptor")?;
+                GpuState::value_of(st.send(Req::Texture { json })?)
+            })
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "sampler",
+        move |mut c: Caller<'_, T>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |data, st| {
+                let json = text(data, ptr, len, "the sampler descriptor")?;
+                GpuState::value_of(st.send(Req::Sampler { json })?)
+            })
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "render_shader",
+        move |mut c: Caller<'_, T>,
+              src: i32,
+              src_len: i32,
+              json: i32,
+              json_len: i32|
+              -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |data, st| {
+                let src = text(data, src, src_len, "the shader")?;
+                let json = text(data, json, json_len, "the render shader descriptor")?;
+                GpuState::value_of(st.send(Req::RenderShader { src, json })?)
+            })
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "write_texture",
+        move |mut c: Caller<'_, T>,
+              tex: i32,
+              mip: i32,
+              x: i32,
+              y: i32,
+              z: i32,
+              w: i32,
+              h: i32,
+              depth: i32,
+              src: i32,
+              len: i32|
+              -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |data, st| {
+                let region = region([mip, x, y, z, w, h, depth])?;
+                let r = range(data, src, len)?;
+                let d = st.device_of(tex)?;
+                GpuState::value_of(st.send_to(
+                    d,
+                    Req::WriteTexture {
+                        tex,
+                        region,
+                        data: data[r].to_vec(),
+                    },
+                )?)
+            })
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "read_texture",
+        move |mut c: Caller<'_, T>,
+              tex: i32,
+              mip: i32,
+              x: i32,
+              y: i32,
+              z: i32,
+              w: i32,
+              h: i32,
+              depth: i32,
+              dst: i32,
+              len: i32|
+              -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |data, st| {
+                let region = region([mip, x, y, z, w, h, depth])?;
+                let r = range(data, dst, len)?;
+                let d = st.device_of(tex)?;
+                match st.timed_to(d, Req::ReadTexture { tex, region })? {
+                    Resp::Data(v) if v.len() == r.len() => {
+                        data[r].copy_from_slice(&v);
+                        Ok(0)
+                    }
+                    Resp::Data(v) => Err(Stop::Fail(format!(
+                        "the region takes {} bytes, not {}",
+                        v.len(),
+                        r.len()
+                    ))),
+                    _ => Err(ODD.into()),
+                }
+            })
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "bind_group",
+        move |mut c: Caller<'_, T>,
+              shader: i32,
+              group: i32,
+              entries: i32,
+              n: i32|
+              -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |data, st| {
+                let count = to_len(n)?;
+                if count > 64 {
+                    return Err("at most 64 entries per bind group".into());
+                }
+                let raw = ints(data, entries, count * 2)?;
+                let entries: Vec<(u32, i32)> = raw
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[b, h]| Ok((dim(*b)?, *h)))
+                    .collect::<Call<_>>()?;
+                let group = dim(group)?;
+                let d = st.device_of(shader)?;
+                GpuState::value_of(st.send_to(
+                    d,
+                    Req::BindGroup {
+                        shader,
+                        group,
+                        entries,
+                    },
+                )?)
+            })
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "dispatch_groups",
+        move |mut c: Caller<'_, T>,
+              shader: i32,
+              groups: i32,
+              n: i32,
+              x: i32,
+              y: i32,
+              z: i32|
+              -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |data, st| {
+                let count = to_len(n)?;
+                if count > 8 {
+                    return Err("at most 8 bind groups".into());
+                }
+                let groups = ints(data, groups, count)?;
+                let (x, y, z) = (dim(x)?, dim(y)?, dim(z)?);
+                let d = st.device_of(shader)?;
+                let v = GpuState::value_of(st.timed_to(
+                    d,
+                    Req::DispatchGroups {
+                        shader,
+                        groups,
+                        x,
+                        y,
+                        z,
+                    },
+                )?)?;
+                st.dispatches += 1;
+                Ok(v)
+            })
+        },
+    )?;
+    linker.func_wrap(
+        m,
+        "render",
+        move |mut c: Caller<'_, T>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
+            with_state(&mut c, get, |data, st| {
+                let json = text(data, ptr, len, "the render pass")?;
+                // The pass runs on the GPU its render shader lives on.
+                let pipeline = serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|v| v.get("pipeline")?.as_i64())
+                    .and_then(|v| i32::try_from(v).ok())
+                    .ok_or("the render pass names no pipeline")?;
+                let d = st.device_of(pipeline)?;
+                let draws = GpuState::value_of(st.timed_to(d, Req::Render { json })?)?;
+                st.draws += draws as u64;
+                Ok(0)
+            })
         },
     )?;
     Ok(())

@@ -134,6 +134,8 @@ pub(crate) struct GpuRuntime {
     /// Runs that hold part of their GPU (1.10), in hundredths; the others
     /// in `busy` hold their GPUs whole.
     pub shares: std::collections::HashMap<TaskRef, u32>,
+    /// How the agent shares its GPUs between parts (1.16: MPS).
+    pub sharing: pumasi_proto::gpu::GpuSharing,
 }
 
 impl GpuRuntime {
@@ -369,6 +371,27 @@ pub(crate) fn pick_gpus(
 }
 
 impl State {
+    /// How a node shares its GPUs between parts (1.16): which have MPS.
+    pub fn on_gpu_sharing(
+        &mut self,
+        id: &str,
+        generation: u64,
+        mut sharing: pumasi_proto::gpu::GpuSharing,
+    ) {
+        let Some(n) = self.nodes.get_mut(id) else {
+            return;
+        };
+        if n.generation != generation {
+            return;
+        }
+        sharing.mps.truncate(64);
+        sharing.note.truncate(300);
+        if n.gpu.sharing != sharing {
+            info!(node = %id, mps = ?sharing.mps, note = %sharing.note, "GPU sharing");
+            n.gpu.sharing = sharing;
+        }
+    }
+
     /// Stores a node's signed WebGPU adapters (phase 14).
     pub fn on_webgpu(&mut self, id: &str, generation: u64, signed: SignedWebGpu) -> Result<()> {
         if !self
@@ -682,17 +705,37 @@ impl State {
             .filter(|n| n.online)
             .map(|n| n.gpu.usage().shared)
             .unwrap_or_default();
+        let sharing = self
+            .nodes
+            .get(&m.id)
+            .filter(|n| n.online)
+            .map(|n| n.gpu.sharing.clone())
+            .unwrap_or_default();
         rec.gpus()
             .iter()
             .map(|g| {
                 let (billed, mut note) = billed_gflops(m, rec, g);
                 let runs = busy.iter().filter(|(_, i)| *i == g.index).count();
+                let mps = sharing.limited(g.index);
                 if let Some(part) = shares.get(&g.index) {
+                    // 1.16: whether the parts' memory is limited (MPS) or
+                    // shared on trust (time slicing).
                     let shared = format!(
-                        "shared by {runs} run{} ({} GPU in use)",
+                        "shared by {runs} run{} ({} GPU in use, {})",
                         if runs == 1 { "" } else { "s" },
-                        pumasi_proto::gpu::format_share(*part)
+                        pumasi_proto::gpu::format_share(*part),
+                        if mps {
+                            "memory limited by MPS"
+                        } else {
+                            "time-sliced, memory on trust"
+                        }
                     );
+                    note = Some(match note {
+                        Some(n) => format!("{n}; {shared}"),
+                        None => shared,
+                    });
+                } else if mps {
+                    let shared = "parts get a memory limit (MPS)".to_string();
                     note = Some(match note {
                         Some(n) => format!("{n}; {shared}"),
                         None => shared,

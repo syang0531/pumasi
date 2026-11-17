@@ -44,7 +44,7 @@ machines.
 | 29 | 1.13 | Upgrades that reach the control plane, and the flaky checks | done |
 | 30 | 1.14 | Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors | done |
 | 31 | 1.15 | Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI | done |
-| 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | planned |
+| 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | done |
 | 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | planned |
 | 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | planned |
 | 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | planned |
@@ -544,6 +544,27 @@ schedule from a phone; a Linux machine with an Intel or AMD GPU shows its
 temperature.
 
 ## 32. GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters (1.16)
+
+Done in 1.16.0 ([release notes](releases/v1.16.0.md),
+[details](architecture.md#phase-32-gpus-116)). What differs from the
+plan: MPS limits come from the client side
+(`CUDA_MPS_PINNED_DEVICE_MEM_LIMIT` and
+`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` in the container, with the daemon's
+pipe directory mounted), which stops accidents rather than a hostile task;
+MPS runs only on Linux, with the agent as root, Docker, a Volta or newer
+GPU and containers that run as root. Windows and WSL have no MPS, so the
+RTX 3080's PC keeps time slicing, and the by-hand check of two half-GPU
+jobs moves to a Linux machine with an NVIDIA GPU (on the 3080 it checks
+that the GPU says "time-sliced, memory on trust"). MIG slices are measured
+and answer the GPU check in a child process each (`pumasi __cuda-slice`),
+because CUDA shows a process only the slice named in its environment
+before it starts. Drawing takes WebGPU's descriptors as JSON with
+WebGPU's names rather than one import per field, and `dispatch_groups`
+binds several groups for compute. Several adapters come from one node,
+are chosen with `select`, and split the job's GPU memory evenly; only
+1.16 agents get such tasks. Components run with WASI preview 2 but without
+a GPU: Wasmtime does not run `wasi:webgpu` yet (wasi-gfx's runtime pins
+its own Wasmtime and wgpu), so WebGPU tasks stay core modules.
 
 Why: parts of GPUs (`gpus = 0.5`) share memory on trust, so one task can
 take all of the RTX 3080's memory from the other; WebGPU offers compute

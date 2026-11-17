@@ -1420,7 +1420,10 @@ modules; each is one or two WebGPU calls (`createShaderModule` plus
 pass with one bind group, `copyBufferToBuffer` plus `mapAsync`), so a
 module written against them moves to the component model's `wasi:webgpu`
 (wasi-gfx) without changing its shaders once Wasmtime runs that. Handles
-are small integers into a per-task table (4096 objects at most).
+are small integers into a per-task table (4096 objects at most). Since
+1.16 there are also imports for textures, samplers, render pipelines,
+bind groups and render passes, and for tasks with several adapters (see
+[phase 32](#phase-32-gpus-116)).
 Failures return -1 and keep the message for `error`; wgpu's validation and
 out-of-memory errors are caught with error scopes, everything else with an
 uncaptured-error handler and the device-lost callback, and a panic inside
@@ -2702,7 +2705,9 @@ free), only on GPUs Docker can use and only when the node's label
 Gang planning and preemption count parts the same way (`Room` holds
 `(gpu, share)` pairs). The assignment adds `PUMASI_GPU_FRACTION`,
 `TF_FORCE_GPU_ALLOW_GROWTH=true` and `XLA_PYTHON_CLIENT_MEM_FRACTION`
-to the task's environment unless it sets them. The run is billed for its
+to the task's environment unless it sets them (since 1.16 the cluster's
+`PUMASI_GPU_FRACTION` always wins, and MPS limits the part's memory where
+it runs; see [phase 32](#phase-32-gpus-116)). The run is billed for its
 share of the GPU's billed FP32 and memory, and the receipt's GPU name says
 `(0.5 GPU)`. The GPU view's note says how many runs share it and how much
 is in use.
@@ -2713,8 +2718,9 @@ When NVML reports a GPU in MIG mode, `nvml.rs` lists its slices instead
 (`nvmlDeviceGetMigDeviceHandleByIndex`, `nvmlDeviceGetAttributes_v2`):
 one `GpuInfo` each, with the slice's UUID (`MIG-...`, which Docker's
 `--gpus device=` takes), memory, and an FP32 figure scaled from its share
-of the GPU's SMs. Slices are not benchmarked, challenged or passed
-through to microVMs.
+of the GPU's SMs. Slices are not passed through to microVMs. Since 1.16
+they are benchmarked and challenged in a child process each (see
+[phase 32](#phase-32-gpus-116)).
 
 ### Compatibility
 
@@ -3404,6 +3410,116 @@ table. A 1.14 dashboard against a 1.15 control plane works as before; a
 1.15 dashboard against a 1.14 control plane falls back on every new call
 and leaves the thresholds and schedules out of its editor.
 
+## Phase 32: GPUs (1.16)
+
+Release 1.16 gives parts of NVIDIA GPUs a memory limit, benchmarks MIG
+slices, lets WebGPU tasks draw and use several adapters, and runs WASI
+preview 2 components. The code is `agent/src/gpu/mps.rs` (MPS),
+`agent/src/gpu/mig.rs` (slices), `agent/src/webgpu/draw.rs` and the new
+requests in `webgpu/worker.rs` (drawing), `webgpu/host.rs` (several
+adapters, the new imports), the `Program` and `Wasi` enums in
+`agent/src/executor.rs` (components), `GpuSharing` in `proto/src/gpu.rs`
+and `cluster/src/gpu.rs`.
+
+### MPS
+
+At startup an agent that has Docker and NVIDIA GPUs calls `Mps::start`.
+It needs Linux, root, a GPU of compute capability 7.0 or newer that is
+neither a MIG slice nor bound to `vfio-pci`, and `nvidia-cuda-mps-control`
+(on `PATH`, in `/usr/bin` or `/usr/local/cuda/bin`, or named by
+`PUMASI_MPS_CONTROL`). If a daemon
+already answers at the default pipe directory (`CUDA_MPS_PIPE_DIRECTORY`,
+else `/tmp/nvidia-mps`) the agent uses it; otherwise it starts one with
+`-d` and pipe and log directories under its data directory, waits for the
+control pipe, checks that `get_server_list` answers, and sends `quit` when
+it exits. The result goes to the control plane as
+`FromAgent::GpuSharing(GpuSharing { mps, note })` (minor 9): the indices
+of the GPUs whose parts get a limit, and why there are none when there
+are none ("MPS needs Linux (Windows and WSL have none)", "MPS needs the
+agent to run as root", ...).
+
+When a part of one of those GPUs is assigned, the agent reads its share
+from `PUMASI_GPU_FRACTION` (which the cluster now always sets itself) and
+`MpsPart::docker_args` adds `--ipc=host`, the pipe directory mounted at
+`/tmp/nvidia-mps`, `CUDA_MPS_PIPE_DIRECTORY`,
+`CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=<MiB>M` (the share of the GPU's
+memory; the container sees one GPU, so its device is 0) and
+`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` (the share, at least 1). The daemon
+serves one user and runs as root here, so an image whose `User` is not
+root runs without the limit, with a line in its stderr. Client variables
+can only tighten what the daemon allows, and a task could unset them in
+its own container, so the limit stops accidents (a framework that takes
+all the memory) rather than a hostile task; MIG is the hard boundary.
+
+The GPU view's note says "shared by N runs (X GPU in use, memory limited
+by MPS)" or "(..., time-sliced, memory on trust)", and an idle GPU whose
+parts would be limited says "parts get a memory limit (MPS)".
+
+### MIG slices
+
+CUDA enumerates at most one MIG slice per process, the one named in
+`CUDA_VISIBLE_DEVICES` before CUDA initializes, and the agent has CUDA
+open for its whole GPUs. So each slice is measured in a child process:
+the agent runs its own binary as `pumasi __cuda-slice measure` (or
+`solve`, with the challenge as JSON on stdin) with the slice's UUID in
+`CUDA_VISIBLE_DEVICES`; the child opens the one device CUDA shows
+(`Gpu::open_visible`), runs the whole-GPU kernels and prints one line. A
+child gets 180 seconds. The measured FP32, bandwidth and hash rate
+replace the share of the parent's figures, and the slice answers GPU
+challenges the same way, so slices are billed and checked like whole
+GPUs.
+
+### Drawing
+
+Each new import is one WebGPU call or pass. Descriptors are JSON with
+WebGPU's names, parsed into structs that refuse unknown fields
+(`TextureDesc`, `SamplerDesc`, `RenderShaderDesc`, `RenderPass`), and
+format, filter, topology and blend names go through wgpu's serde names,
+so `"rgba8unorm"` and `"src-alpha"` read as in the browser. A texture
+keeps its default view; its bytes count against the task's GPU memory
+limit like buffers, and `Release` destroys it. `write_texture` and
+`read_texture` take tightly packed rows; reading copies through a buffer
+with rows padded to 256 bytes and strips the padding. `bind_group` names
+a shader (compute or render), a group index and (binding, handle) pairs;
+`dispatch_groups` and `render` bind the groups at `@group(0..n)`. A
+render pass names its pipeline, colour attachments (texture handles, load
+and store ops, clear colour, optional resolve target), an optional
+depth-stencil attachment, bind groups, vertex buffers, an index buffer,
+viewport, scissor rectangle and a list of draws, and is submitted at once.
+Buffers now also have `VERTEX` and `INDEX` usage.
+
+### Several adapters
+
+A wasm job's `gpus` may be 1 to 8 (`MAX_WEBGPU_PER_TASK`);
+`pick_webgpu_with` takes that many free adapters of one node, hardware
+first, then by FP32. The agent opens one worker session per adapter on
+first use; each session tags its handles with its adapter (`tag << 16 |
+n`), so a call finds the right worker from the handle and refuses handles
+of another adapter. `select(n)` sets the adapter that new objects go to.
+Each adapter gets an equal share of the task's GPU memory limit, `wait`
+waits on every open adapter, and the summary names them all. The control
+plane sends such tasks only to agents of minor 9.
+
+### Components
+
+`is_component` looks at the header's layer field (bytes 6 to 8, `1 0`
+for components). A component is compiled as a `Component` and linked
+with `wasmtime_wasi::p2::add_to_linker_sync`; the store's WASI context is
+a `WasiCtx` and a `ResourceTable` instead of the preview 1 context, built
+from the same arguments, environment, preopened directories and pipes.
+The run instantiates `wasi:cli/command` and calls `run`; an `Err` is
+exit code 1, and a component without that world fails as a task error.
+Fuel, the epoch deadline and memory limits apply as to core modules.
+Components get no `pumasi_webgpu` imports (Wasmtime does not run
+`wasi:webgpu`), so a WebGPU task that sends one fails with that reason.
+
+### Compatibility
+
+`PROTOCOL_MINOR` is 9. `GpuSharing` is sent only to a control plane of
+minor 9; a 1.15 control plane sees time-sliced parts. Agents older than
+1.16 run parts without limits and get no tasks with several adapters.
+The state keeps layout 7.
+
 ## Persistence
 
 `state.redb` in the cluster directory holds: `meta` (admin secret, cluster
@@ -3555,9 +3671,10 @@ remotely; install a current binary on them once.
 - GPUs: Intel and Apple GPUs are used only through WebGPU; AMD GPUs are
   measured and challenged over WebGPU, so an agent without a WebGPU
   adapter for them (no Vulkan driver) still estimates them; passthrough is
-  NVIDIA-only and untested in CI; parts of GPUs share memory on trust
-  (only MIG enforces it) and are Docker-only; MIG slices are estimated,
-  not benchmarked; vGPU is not handled.
+  NVIDIA-only and untested in CI; parts of GPUs get a memory limit only
+  under MPS (Linux, root agent, Volta or newer, root containers) and
+  otherwise share memory on trust, and are Docker-only; vGPU is not
+  handled.
 - MicroVM network: TCP and DNS only (no other UDP, ICMP or IPv6), no
   per-job allow lists or bandwidth caps, egress is not billed, and
   Firecracker without QEMU has no network (its cards need TAP devices;
@@ -3582,16 +3699,15 @@ remotely; install a current binary on them once.
   rollouts of your own binaries are `pumasi upgrade rollout --canary`);
   node settings need an agent run as a service (1.4 or later) that is
   online.
-- WebGPU: compute shaders only (no textures, samplers or render
-  passes), one bind group, one adapter per task, optional features
-  limited to `shader-f16` and subgroups, and core modules only (no
-  `wasi:webgpu` components until Wasmtime runs them).
+- WebGPU: a task's adapters come from one node, optional features are
+  limited to `shader-f16` and subgroups, and WebGPU tasks are core
+  modules only (no `wasi:webgpu` components until Wasmtime runs them).
 - Confidential tier: no NVIDIA confidential computing (no GPUs in
   confidential jobs), no network, x86-64 only, no encrypted scratch disk,
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 30 are done and phases 31 to 36 are planned
+- Roadmap: phases 20 to 32 are done and phases 33 to 36 are planned
   ([roadmap.md](roadmap.md)); phases 18 and 19 (the hub and buying CU)
   are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it
@@ -3621,4 +3737,3 @@ remotely; install a current binary on them once.
   a network or GPUs and the first task of an image still boot cold (a
   snapshot pool would cover those), and warm guests under
   Virtualization.framework and WHPX are checked on real machines only.
-- WASI preview 2 components.

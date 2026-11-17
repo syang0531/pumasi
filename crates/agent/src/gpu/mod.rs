@@ -16,6 +16,8 @@
 pub mod cuda;
 pub mod docker_check;
 pub mod hwmon;
+pub mod mig;
+pub mod mps;
 pub mod nvml;
 pub mod usage;
 pub mod vfio;
@@ -98,16 +100,21 @@ pub fn detect(env: &GpuEnv, notes: &mut Vec<String>) -> Vec<GpuInfo> {
     }
     if env.bench {
         for g in gpus.iter_mut() {
-            // MIG slices run no CUDA by PCI address (and the GPU none at
-            // all in MIG mode): their figures are estimated from the GPU's.
+            // MIG slices are measured in a process of their own (1.16);
+            // when that fails they keep the figures estimated from the
+            // GPU's.
             if g.vendor != GpuVendor::Nvidia
                 || g.driver == "vfio-pci"
-                || g.pci.is_empty()
-                || g.mig()
+                || (g.pci.is_empty() && !g.mig())
             {
                 continue;
             }
-            match cuda::Gpu::open(&g.pci).and_then(|c| c.measure(g.vram_mib)) {
+            let measured = if g.mig() {
+                mig::measure(&g.uuid, g.vram_mib)
+            } else {
+                cuda::Gpu::open(&g.pci).and_then(|c| c.measure(g.vram_mib))
+            };
+            match measured {
                 Ok(m) => {
                     info!(
                         gpu = %g.name,
@@ -168,6 +175,18 @@ pub fn profile(
         microvm_network,
         notes,
     }
+}
+
+/// Answers a GPU challenge on `g`: by its PCI address, or in a process
+/// of its own for a MIG slice (1.16). Empty when the GPU cannot run it.
+pub fn solve_on(g: &GpuInfo, c: &pumasi_proto::gpu::GpuChallenge) -> Vec<u64> {
+    if g.mig() {
+        return mig::solve(&g.uuid, c);
+    }
+    if g.pci.is_empty() {
+        return Vec::new();
+    }
+    solve(&g.pci, c)
 }
 
 /// Answers a GPU challenge on the GPU with this PCI address. Empty when

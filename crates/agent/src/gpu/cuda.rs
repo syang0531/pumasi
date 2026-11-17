@@ -196,6 +196,28 @@ impl Gpu {
                 }
             }
             let dev = found.with_context(|| format!("CUDA does not see the GPU at {pci}"))?;
+            Self::open_device(api, dev)
+        }
+    }
+
+    /// Opens the only device this process sees: a MIG slice, in a process
+    /// started with `CUDA_VISIBLE_DEVICES=MIG-...` (1.16; CUDA shows a
+    /// process one slice at most).
+    pub fn open_visible() -> Result<Self> {
+        let api = Api::load()?;
+        unsafe {
+            let mut n = 0;
+            check((api.device_count)(&mut n), "cuDeviceGetCount")?;
+            ensure!(n >= 1, "CUDA sees no device");
+            let mut d = 0;
+            check((api.device_get)(&mut d, 0), "cuDeviceGet")?;
+            Self::open_device(api, d)
+        }
+    }
+
+    /// Makes a context on `dev` and loads the kernels.
+    unsafe fn open_device(api: Api, dev: CuDevice) -> Result<Self> {
+        unsafe {
             let mut sms = 0;
             check(
                 (api.attribute)(&mut sms, ATTR_MULTIPROCESSOR_COUNT, dev),

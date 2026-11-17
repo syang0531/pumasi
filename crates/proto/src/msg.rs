@@ -605,6 +605,11 @@ pub enum FromAgent {
     /// What the machine measured beyond its last [`FromAgent::Metrics`]
     /// (its CPU package power), sent right after it.
     MetricsExtra(Box<crate::monitor::NodeMetricsExtra>),
+    // Minor 9 (1.16) from here.
+    /// How parts of the node's GPUs share them: which get a memory limit
+    /// (MPS), and why the others do not. Sent after the welcome and when
+    /// it changes.
+    GpuSharing(Box<crate::gpu::GpuSharing>),
 }
 
 // ---------------------------------------------------------------------------

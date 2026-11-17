@@ -143,6 +143,9 @@ pub(crate) enum Req {
         key: AdapterKey,
         limit_bytes: u64,
         info: String,
+        /// The adapter's number among the task's (1.16): its objects'
+        /// handles carry it in their upper bits.
+        tag: u32,
     },
     Shader {
         src: String,
@@ -171,6 +174,44 @@ pub(crate) enum Req {
     Wait,
     Release {
         handle: i32,
+    },
+    // Drawing (1.16): textures, samplers, render shaders, bind groups and
+    // render passes. Descriptors are JSON with WebGPU's own names
+    // ([`super::draw`]).
+    Texture {
+        json: String,
+    },
+    Sampler {
+        json: String,
+    },
+    RenderShader {
+        src: String,
+        json: String,
+    },
+    /// `region`: mip level, x, y, z, width, height, depth.
+    WriteTexture {
+        tex: i32,
+        region: [u32; 7],
+        data: Vec<u8>,
+    },
+    ReadTexture {
+        tex: i32,
+        region: [u32; 7],
+    },
+    BindGroup {
+        shader: i32,
+        group: u32,
+        entries: Vec<(u32, i32)>,
+    },
+    DispatchGroups {
+        shader: i32,
+        groups: Vec<i32>,
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    Render {
+        json: String,
     },
 }
 
@@ -271,20 +312,47 @@ pub(crate) fn serve(
     }
 }
 
-struct Session {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+pub(super) struct Session {
+    pub(super) adapter: wgpu::Adapter,
+    pub(super) device: wgpu::Device,
+    pub(super) queue: wgpu::Queue,
     objects: Vec<Option<Object>>,
-    bytes: u64,
-    limit_bytes: u64,
+    pub(super) bytes: u64,
+    pub(super) limit_bytes: u64,
     /// Errors wgpu raised outside an error scope, and device loss.
     fault: Arc<Mutex<Option<String>>>,
     in_flight: VecDeque<wgpu::SubmissionIndex>,
+    /// The adapter's number among the task's, in every handle's upper
+    /// bits (1.16).
+    tag: u32,
 }
 
-enum Object {
+/// Handles are `tag << HANDLE_BITS | n`, with `n` from 1 to
+/// [`MAX_OBJECTS`], so a task with several GPUs (1.16) can tell which one
+/// an object lives on; a task with one GPU sees the numbers it always did.
+pub const HANDLE_BITS: u32 = 16;
+
+pub(super) enum Object {
     Shader(wgpu::ComputePipeline),
     Buffer(wgpu::Buffer, u64),
+    /// The texture, its default view and the bytes it takes (1.16).
+    Texture(wgpu::Texture, wgpu::TextureView, u64),
+    Sampler(wgpu::Sampler),
+    Render(wgpu::RenderPipeline),
+    Group(wgpu::BindGroup),
+}
+
+impl Object {
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Object::Shader(_) => "a compute shader",
+            Object::Buffer(..) => "a buffer",
+            Object::Texture(..) => "a texture",
+            Object::Sampler(_) => "a sampler",
+            Object::Render(_) => "a render shader",
+            Object::Group(_) => "a bind group",
+        }
+    }
 }
 
 /// The optional features a task's device gets when its adapter has them.
@@ -319,7 +387,10 @@ pub(crate) fn open_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu
 }
 
 /// Runs `f` with an error scope, turning what wgpu caught into a failure.
-fn scoped<R>(device: &wgpu::Device, f: impl FnOnce() -> R) -> std::result::Result<R, String> {
+pub(super) fn scoped<R>(
+    device: &wgpu::Device,
+    f: impl FnOnce() -> R,
+) -> std::result::Result<R, String> {
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let r = f();
@@ -336,39 +407,73 @@ impl Session {
         self.fault.lock().unwrap().clone()
     }
 
-    fn add(&mut self, o: Object) -> std::result::Result<i32, String> {
-        if let Some(i) = self.objects.iter().position(Option::is_none) {
-            self.objects[i] = Some(o);
-            return Ok(i as i32 + 1);
-        }
-        if self.objects.len() >= MAX_OBJECTS {
-            return Err(format!(
-                "too many GPU objects (at most {MAX_OBJECTS}); release some"
-            ));
-        }
-        self.objects.push(Some(o));
-        Ok(self.objects.len() as i32)
+    pub(super) fn add(&mut self, o: Object) -> std::result::Result<i32, String> {
+        let i = match self.objects.iter().position(Option::is_none) {
+            Some(i) => {
+                self.objects[i] = Some(o);
+                i
+            }
+            None => {
+                if self.objects.len() >= MAX_OBJECTS {
+                    return Err(format!(
+                        "too many GPU objects (at most {MAX_OBJECTS}); release some"
+                    ));
+                }
+                self.objects.push(Some(o));
+                self.objects.len() - 1
+            }
+        };
+        Ok(((self.tag << HANDLE_BITS) | (i as u32 + 1)) as i32)
     }
 
-    fn object(&self, handle: i32) -> std::result::Result<&Object, String> {
-        usize::try_from(handle)
-            .ok()
-            .and_then(|h| h.checked_sub(1))
-            .and_then(|i| self.objects.get(i))
-            .and_then(Option::as_ref)
+    /// The slot of `handle` in `objects`.
+    fn index(&self, handle: i32) -> std::result::Result<usize, String> {
+        let h = u32::try_from(handle).map_err(|_| format!("no GPU object {handle}"))?;
+        if h >> HANDLE_BITS != self.tag {
+            return Err(format!(
+                "GPU object {handle} belongs to another of the task's GPUs"
+            ));
+        }
+        ((h & ((1 << HANDLE_BITS) - 1)) as usize)
+            .checked_sub(1)
+            .filter(|i| self.objects.get(*i).is_some_and(Option::is_some))
             .ok_or_else(|| format!("no GPU object {handle}"))
     }
 
-    fn buffer(&self, handle: i32) -> std::result::Result<(&wgpu::Buffer, u64), String> {
+    pub(super) fn object(&self, handle: i32) -> std::result::Result<&Object, String> {
+        let i = self.index(handle)?;
+        Ok(self.objects[i].as_ref().expect("checked"))
+    }
+
+    pub(super) fn buffer(&self, handle: i32) -> std::result::Result<(&wgpu::Buffer, u64), String> {
         match self.object(handle)? {
             Object::Buffer(b, size) => Ok((b, *size)),
-            Object::Shader(_) => Err(format!("{handle} is a shader, not a buffer")),
+            o => Err(format!("{handle} is {}, not a buffer", o.kind())),
         }
+    }
+
+    /// Waits for the oldest submissions while more than
+    /// [`MAX_IN_FLIGHT`] are queued.
+    pub(super) fn submitted(
+        &mut self,
+        index: wgpu::SubmissionIndex,
+    ) -> std::result::Result<(), String> {
+        self.in_flight.push_back(index);
+        while self.in_flight.len() > MAX_IN_FLIGHT {
+            let oldest = self.in_flight.pop_front().expect("not empty");
+            self.wait_until(Some(oldest), || true)?;
+        }
+        Ok(())
+    }
+
+    /// After a wait for everything: nothing is queued any more.
+    pub(super) fn drained(&mut self) {
+        self.in_flight.clear();
     }
 
     /// Waits for the GPU until `done` or a fault. Never gives up on its
     /// own: the agent kills the worker when the task's time is up.
-    fn wait_until(
+    pub(super) fn wait_until(
         &self,
         submission: Option<wgpu::SubmissionIndex>,
         done: impl Fn() -> bool,
@@ -399,7 +504,8 @@ fn handle(
             key,
             limit_bytes,
             info,
-        } => return open(session, &key, limit_bytes, &info, find),
+            tag,
+        } => return open(session, &key, limit_bytes, &info, tag, find),
         req => match session.as_mut() {
             Some(s) => match s.fault() {
                 Some(f) => return Resp::Dead(f),
@@ -423,6 +529,7 @@ fn open(
     key: &AdapterKey,
     limit_bytes: u64,
     info: &str,
+    tag: u32,
     find: &impl Fn(&AdapterKey) -> Option<wgpu::Adapter>,
 ) -> Resp {
     let Some(adapter) = find(key) else {
@@ -461,6 +568,11 @@ fn open(
         "max_compute_invocations_per_workgroup": l.max_compute_invocations_per_workgroup,
         "max_compute_workgroups_per_dimension": l.max_compute_workgroups_per_dimension,
         "max_compute_workgroup_storage_size": l.max_compute_workgroup_storage_size,
+        "max_texture_dimension_2d": l.max_texture_dimension_2d,
+        "max_texture_dimension_3d": l.max_texture_dimension_3d,
+        "max_bind_groups": l.max_bind_groups,
+        "max_color_attachments": l.max_color_attachments,
+        "max_vertex_buffers": l.max_vertex_buffers,
         "memory_limit": limit_bytes,
         "features": feature_names(device.features())
             .iter()
@@ -471,6 +583,7 @@ fn open(
         json.extend(m);
     }
     *session = Some(Session {
+        adapter,
         device,
         queue,
         objects: Vec::new(),
@@ -478,6 +591,7 @@ fn open(
         limit_bytes,
         fault,
         in_flight: VecDeque::new(),
+        tag,
     });
     Resp::Info(serde_json::Value::Object(json).to_string())
 }
@@ -530,8 +644,11 @@ fn call(s: &mut Session, req: Req) -> std::result::Result<Resp, String> {
                 s.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("task"),
                     size,
+                    // Vertex and index buffers for drawing since 1.16.
                     usage: wgpu::BufferUsages::STORAGE
                         | wgpu::BufferUsages::UNIFORM
+                        | wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::INDEX
                         | wgpu::BufferUsages::COPY_SRC
                         | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
@@ -568,8 +685,9 @@ fn call(s: &mut Session, req: Req) -> std::result::Result<Resp, String> {
             if bufs.len() > 64 {
                 return Err("at most 64 buffers per dispatch".into());
             }
-            let Object::Shader(pipeline) = s.object(shader)? else {
-                return Err(format!("{shader} is a buffer, not a shader"));
+            let pipeline = match s.object(shader)? {
+                Object::Shader(p) => p,
+                o => return Err(format!("{shader} is {}, not a compute shader", o.kind())),
             };
             let mut buffers = Vec::with_capacity(bufs.len());
             for h in &bufs {
@@ -602,12 +720,8 @@ fn call(s: &mut Session, req: Req) -> std::result::Result<Resp, String> {
                 }
                 s.queue.submit([enc.finish()])
             })?;
-            s.in_flight.push_back(index);
             // Bounded: the GPU never has more than this queued from us.
-            while s.in_flight.len() > MAX_IN_FLIGHT {
-                let oldest = s.in_flight.pop_front().expect("not empty");
-                s.wait_until(Some(oldest), || true)?;
-            }
+            s.submitted(index)?;
             Ok(Resp::Value(0))
         }
         Req::Wait => {
@@ -616,14 +730,40 @@ fn call(s: &mut Session, req: Req) -> std::result::Result<Resp, String> {
             Ok(Resp::Value(0))
         }
         Req::Release { handle } => {
-            s.object(handle)?;
-            let i = handle as usize - 1;
-            if let Some(Object::Buffer(b, size)) = s.objects[i].take() {
-                b.destroy();
-                s.bytes -= size;
+            let i = s.index(handle)?;
+            match s.objects[i].take() {
+                Some(Object::Buffer(b, size)) => {
+                    b.destroy();
+                    s.bytes -= size;
+                }
+                Some(Object::Texture(t, _, size)) => {
+                    t.destroy();
+                    s.bytes -= size;
+                }
+                _ => {}
             }
             Ok(Resp::Value(0))
         }
+        Req::Texture { json } => super::draw::texture(s, &json),
+        Req::Sampler { json } => super::draw::sampler(s, &json),
+        Req::RenderShader { src, json } => super::draw::render_shader(s, &src, &json),
+        Req::WriteTexture { tex, region, data } => {
+            super::draw::write_texture(s, tex, region, &data)
+        }
+        Req::ReadTexture { tex, region } => super::draw::read_texture(s, tex, region),
+        Req::BindGroup {
+            shader,
+            group,
+            entries,
+        } => super::draw::bind_group(s, shader, group, &entries),
+        Req::DispatchGroups {
+            shader,
+            groups,
+            x,
+            y,
+            z,
+        } => super::draw::dispatch_groups(s, shader, &groups, [x, y, z]),
+        Req::Render { json } => super::draw::render(s, &json),
     }
 }
 
@@ -650,6 +790,15 @@ fn read_buffer(
         s.queue.submit([enc.finish()]);
         staging
     })?;
+    map_read(s, &staging)
+}
+
+/// Waits for the GPU to finish what was submitted and copies `staging`
+/// (a `MAP_READ` buffer) out.
+pub(super) fn map_read(
+    s: &mut Session,
+    staging: &wgpu::Buffer,
+) -> std::result::Result<Vec<u8>, String> {
     type Mapped = Arc<Mutex<Option<std::result::Result<(), wgpu::BufferAsyncError>>>>;
     let mapped: Mapped = Default::default();
     {
@@ -659,7 +808,7 @@ fn read_buffer(
         });
     }
     s.wait_until(None, || mapped.lock().unwrap().is_some())?;
-    s.in_flight.clear();
+    s.drained();
     let answer = mapped.lock().unwrap().take();
     match answer {
         Some(Ok(())) => {}

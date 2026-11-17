@@ -33,6 +33,7 @@
 //! This module finds and measures the adapters (FP32, and the GPU
 //! challenge's hash rate with [`hash`], 1.10); [`host`] is the API.
 
+pub mod draw;
 pub mod hash;
 pub mod host;
 pub mod worker;

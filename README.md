@@ -441,8 +441,9 @@ it whenever it is set up; to keep using Docker Desktop on such a machine,
 give the agent `--docker-bin "C:\Program Files\Docker\Docker\resources\bin\docker.exe"`.
 `pumasi docker status` shows the task, whether Docker answers and the end
 of its log; `pumasi docker remove` takes it all away again, in one go
-since 1.17 (it shuts the account's WSL VM down first, so no restart is
-needed). Running `setup` again repairs a machine where someone changed
+since 1.17: it unregisters the distro and shuts the account's WSL VM down
+first, and when Windows still holds the account's profile, a boot task
+removes it at the next restart, so there is nothing to run again. Running `setup` again repairs a machine where someone changed
 the account (disabled, locked out, made an administrator) or the task
 (disabled, another program, a time limit) by hand (1.17). Without WSL,
 `setup` installs it (`wsl --install --no-distribution`); after the restart

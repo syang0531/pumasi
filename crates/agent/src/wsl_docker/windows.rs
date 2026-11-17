@@ -841,10 +841,12 @@ pub async fn remove() -> Result<i32> {
     }
     // The profile holds the distro's registration; Windows unloads it a
     // little after the account's last logon ends. Profiles of an account
-    // someone deleted and made again by hand (`pumasi-wsl.HOST`) go too.
+    // someone deleted and made again by hand (`pumasi-wsl.HOST`) go too
+    // when nothing holds them; only the account's own must go now.
     let script = format!(
         "$sid = try {{ (New-Object System.Security.Principal.NTAccount('{ACCOUNT}')).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ '' }}; \
-         Get-CimInstance Win32_UserProfile | Where-Object {{ ($sid -and $_.SID -eq $sid) -or $_.LocalPath -like '*\\{ACCOUNT}' -or $_.LocalPath -like '*\\{ACCOUNT}.*' }} | Remove-CimInstance -ErrorAction Stop"
+         Get-CimInstance Win32_UserProfile | Where-Object {{ ($sid -and $_.SID -eq $sid) -or (-not $_.Loaded -and ($_.LocalPath -like '*\\{ACCOUNT}' -or $_.LocalPath -like '*\\{ACCOUNT}.*')) }} | \
+         ForEach-Object {{ $p = $_; try {{ $p | Remove-CimInstance -ErrorAction Stop }} catch {{ if ($p.SID -eq $sid) {{ throw }} }} }}"
     );
     // Whatever still runs as the account holds its profile.
     let _ = tool(
@@ -854,7 +856,7 @@ pub async fn remove() -> Result<i32> {
     .await;
     let mut profile_gone = false;
     let mut last_error = String::new();
-    for _ in 0..24 {
+    for _ in 0..8 {
         let mut cmd = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"));
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
         match output(cmd, Duration::from_secs(60)).await {
@@ -870,12 +872,29 @@ pub async fn remove() -> Result<i32> {
     if profile_gone {
         println!("removed the profile of {ACCOUNT} (and with it the distro's registration)");
     } else {
-        println!(
-            "could not remove the profile of {ACCOUNT} yet (it is in use); restart Windows and run `pumasi docker remove` again to finish"
-        );
+        // Windows can keep a batch logon's registry hive loaded after
+        // every process of the account has ended (nothing of Pumasi's
+        // holds it); it lets go at the next restart, when a boot task
+        // removes the profile (1.17).
         println!("{}", profile_holders().await);
         if let Some(line) = last_error.lines().find(|l| !l.trim().is_empty()) {
             println!("  Windows said: {}", line.trim());
+        }
+        match account_sid_string().await {
+            Some(sid) => match schedule_profile_cleanup(&sid).await {
+                Ok(task) => {
+                    profile_gone = true;
+                    println!(
+                        "Windows still holds the profile of {ACCOUNT}; the task {task} removes it at the next restart (nothing else to do)"
+                    );
+                }
+                Err(e) => println!(
+                    "could not remove the profile of {ACCOUNT} yet (it is in use), nor schedule its removal ({e:#}); restart Windows and run `pumasi docker remove` again to finish"
+                ),
+            },
+            None => println!(
+                "could not remove the profile of {ACCOUNT} yet (it is in use); restart Windows and run `pumasi docker remove` again to finish"
+            ),
         }
     }
     if let Err(e) = batch_logon(false) {
@@ -905,6 +924,38 @@ pub async fn remove() -> Result<i32> {
         );
     }
     Ok(if removed && profile_gone { 0 } else { 1 })
+}
+
+/// [`ACCOUNT`]'s SID as text (`S-1-5-21-...`), while the account exists.
+async fn account_sid_string() -> Option<String> {
+    let script = format!(
+        "(New-Object System.Security.Principal.NTAccount('{ACCOUNT}')).Translate([System.Security.Principal.SecurityIdentifier]).Value"
+    );
+    let mut cmd = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"));
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let out = output(cmd, Duration::from_secs(60)).await.ok()?;
+    let sid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && is_sid(&sid)).then_some(sid)
+}
+
+/// Registers [`profile_cleanup_xml`] for `sid`: its name.
+async fn schedule_profile_cleanup(sid: &str) -> Result<String> {
+    let name = profile_cleanup_task(sid);
+    let file = std::env::temp_dir().join(format!("pumasi-profile-cleanup-{sid}.xml"));
+    std::fs::write(&file, utf16_file(&profile_cleanup_xml(sid)))
+        .with_context(|| format!("write {}", file.display()))?;
+    let res = schtasks(&[
+        "/Create",
+        "/TN",
+        &name,
+        "/XML",
+        &file.display().to_string(),
+        "/F",
+    ])
+    .await;
+    let _ = std::fs::remove_file(&file);
+    res.context("register the profile cleanup task")?;
+    Ok(name)
 }
 
 /// What holds the account's profile, for a `remove` that could not

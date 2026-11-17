@@ -937,12 +937,12 @@ jobs:
           if [ "${{ steps.setup.outputs.answer }}" = yes ]; then
             grep -q "unregistered the pumasi-docker distro" remove.txt
             grep -q "shut down the WSL VM of pumasi-wsl" remove.txt
+            # Windows may hold the hive of a batch logon until it restarts;
+            # then a boot task removes the profile, and nothing is left to do.
             if ls -d /c/Users/pumasi-wsl* 2> /dev/null; then
-              echo "a profile is left; what holds it:"
-              pwsh -NoProfile -Command 'Get-Service WSLService, LxssManager -ErrorAction SilentlyContinue | Format-Table -AutoSize; Get-CimInstance Win32_UserProfile | Where-Object LocalPath -like "*pumasi-wsl*" | Format-List LocalPath, Loaded, RefCount, Status, SID; Get-Process wsl*, vmmem*, vmwp -IncludeUserName -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, UserName -AutoSize' || true
-              echo "after restarting the WSL service:"
-              pwsh -NoProfile -Command 'Restart-Service WSLService -Force -ErrorAction SilentlyContinue; Start-Sleep 5; Get-CimInstance Win32_UserProfile | Where-Object LocalPath -like "*pumasi-wsl*" | ForEach-Object { try { $_ | Remove-CimInstance -ErrorAction Stop; "removed $($_.LocalPath)" } catch { "still held: $_" } }' || true
-              exit 1
+              grep -q "removes it at the next restart" remove.txt
+              schtasks //Query //FO LIST | grep -q 'WSL Docker profile S-1-5-' || { echo "a profile is left with no cleanup task"; exit 1; }
+              echo "::notice::Windows held the profile; the boot task removes it"
             fi
             if [ -e 'C:/ProgramData/Pumasi/wsl-docker' ]; then echo "the directory is left"; exit 1; fi
             [ "$code" = 0 ] || { echo "remove did not finish in one go"; exit 1; }

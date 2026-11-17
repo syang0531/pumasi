@@ -3683,10 +3683,20 @@ with no trigger, the same password logon and a ten-minute limit, running
 binary. That program runs `wsl --unregister pumasi-docker` (which deletes
 the distro's disk) and `wsl --shutdown`, logs both, and writes what it did
 to `logs\stopped`. `remove` waits up to four minutes for that file and for
-the task to end, deletes both tasks, then removes the profiles: the
-account's by SID, and any `pumasi-wsl` or `pumasi-wsl.*` profile (left by
-an account someone deleted and made again by hand). It exits 0 only when
-the profile and `C:\ProgramData\Pumasi\wsl-docker` are both gone. Without
+the task to end, deletes both tasks, ends anything still running as the
+account (`taskkill /FI "USERNAME eq pumasi-wsl"`), then removes the
+profiles: the account's by SID, and any unloaded `pumasi-wsl` or
+`pumasi-wsl.*` profile (left by an account someone deleted and made again
+by hand). On GitHub's Windows runners the profile's hive stays loaded
+after all that, with no process of the account left and through a restart
+of the WSL service ("being used by another process"); Windows lets go of
+a batch logon's hive at the next restart. So when the account's own
+profile cannot go within about 40 seconds, `remove` registers
+`\Pumasi\WSL Docker profile <SID>` (`profile_cleanup_xml`): at boot, as
+SYSTEM, it removes the profile with that SID only (an account made again
+with the same name has another) and then deletes itself, or tries again
+at the next boot. `remove` says so and exits 0 once the directory is gone
+and the profile is either removed or scheduled. Without
 WSL (nothing to stop) or without the account it skips the stop task.
 
 ### `docker setup` repairs

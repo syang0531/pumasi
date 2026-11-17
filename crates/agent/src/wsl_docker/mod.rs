@@ -592,6 +592,72 @@ fn account_task_xml(layout: &Layout, what: &str, arg: &str, boot: bool, limit: &
     )
 }
 
+/// Whether `s` looks like a SID in text (`S-1-5-21-1-2-3-1003`).
+pub fn is_sid(s: &str) -> bool {
+    let mut parts = s.split('-');
+    parts.next() == Some("S")
+        && s.len() <= 184
+        && s.split('-').count() >= 3
+        && parts.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The boot task that removes the profile of the deleted account `sid`
+/// (1.17): `\Pumasi\WSL Docker profile S-1-5-21-...`.
+pub fn profile_cleanup_task(sid: &str) -> String {
+    format!(r"\Pumasi\WSL Docker profile {sid}")
+}
+
+/// [`profile_cleanup_task`]: at boot, as SYSTEM, before the profile's
+/// hive is loaded by anything, removes the profile of `sid` and then the
+/// task itself (it tries again at the next boot if that fails). Only that
+/// SID: an account made again with the same name has another.
+pub fn profile_cleanup_xml(sid: &str) -> String {
+    assert!(is_sid(sid), "not a SID: {sid}");
+    let task = profile_cleanup_task(sid);
+    let script = format!(
+        "$p = Get-CimInstance Win32_UserProfile -Filter \"SID='{sid}'\"; if ($p) {{ $p | Remove-CimInstance -ErrorAction Stop }}; schtasks.exe /Delete /TN '{task}' /F"
+    );
+    let args = xml(&format!(
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{}\"",
+        script.replace('"', "\\\"")
+    ));
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Pumasi</Author>
+    <Description>Removes the profile of the deleted {ACCOUNT} account, which Windows held until this restart (pumasi docker remove); deletes itself.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+      <Arguments>{args}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
 /// What differs between the registered task (`schtasks /Query /XML`) and
 /// the one `setup` registers (1.17): someone changed it by hand. Empty
 /// when nothing that matters did.
@@ -903,6 +969,38 @@ mod tests {
 
         let bytes = utf16_file("<a/>");
         assert_eq!(&bytes[..4], &[0xFF, 0xFE, b'<', 0]);
+    }
+
+    #[test]
+    fn profile_cleanup_at_boot() {
+        let sid = "S-1-5-21-3289802278-1561746829-1498425070-1003";
+        assert!(is_sid(sid));
+        for bad in [
+            "",
+            "S-1",
+            "S-1-5-21-x",
+            "S-1-5-21-1'; rm",
+            "s-1-5-18",
+            "S-1-5--1",
+        ] {
+            assert!(!is_sid(bad), "{bad}");
+        }
+        assert_eq!(
+            profile_cleanup_task(sid),
+            format!(r"\Pumasi\WSL Docker profile {sid}")
+        );
+        let x = profile_cleanup_xml(sid);
+        assert!(x.contains("<BootTrigger>"));
+        assert!(x.contains("<UserId>S-1-5-18</UserId>"));
+        assert!(x.contains(&format!("SID=&apos;{sid}&apos;").replace("&apos;", "'")));
+        assert!(x.contains(&format!(
+            "/Delete /TN '\\Pumasi\\WSL Docker profile {sid}' /F"
+        )));
+        // The script's quotes are escaped for the command line, then for XML.
+        assert!(x.contains(
+            "-Command &quot;$p = Get-CimInstance Win32_UserProfile -Filter \\&quot;SID="
+        ));
+        assert!(!x.contains("pumasi-wsl*"), "by SID only");
     }
 
     #[test]

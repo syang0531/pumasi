@@ -1543,7 +1543,7 @@ impl State {
                 nodes: f.nodes.clone(),
                 until_unix: f.until_unix,
                 comment: f.comment.clone(),
-                by: pumasi_proto::monitor::FILE_SILENCE_BY.to_string(),
+                by: pumasi_proto::monitor::file_silence_by(&f.name),
                 created_unix: now,
             })?;
         }
@@ -1557,11 +1557,7 @@ impl State {
         self.monitor
             .silences
             .iter()
-            .filter(|s| {
-                s.until_unix > now
-                    && s.by == pumasi_proto::monitor::FILE_SILENCE_BY
-                    && !keep.contains(&s.id)
-            })
+            .filter(|s| s.until_unix > now && s.from_file() && !keep.contains(&s.id))
             .map(|s| s.id.clone())
             .collect()
     }

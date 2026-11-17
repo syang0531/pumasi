@@ -53,6 +53,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_NetManagement",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Performance",
     "Win32_System_Pipes",
     "Win32_System_Power",
@@ -63,7 +64,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 # 1.6 monitoring: the display adapters (DXGI) for GPU metrics, and WMI on
-# its own thread for temperatures (ACPI thermal zones, LibreHardwareMonitor).
+# its own thread for temperatures (ACPI thermal zones, LibreHardwareMonitor,
+# and since 1.17 Open Hardware Monitor; HWiNFO through System_Memory).
 windows = { version = "0.62", features = ["Win32_Graphics_Dxgi"] }
 wmi = { version = "0.18", default-features = false }
 

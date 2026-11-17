@@ -899,13 +899,63 @@ jobs:
         if: steps.setup.outputs.answer == 'yes'
         timeout-minutes: 30
         run: cargo test -p pumasi-cluster --test e2e docker_tasks_get_files_and_run_only_on_docker_nodes -- --nocapture
+      # 1.17: `setup` puts back what someone changed by hand.
+      - name: pumasi docker setup repairs the account and the task
+        if: steps.setup.outputs.answer == 'yes'
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          # As someone might: disable the account, give it another
+          # password, make it an administrator, disable the task.
+          net user pumasi-wsl //active:no
+          net user pumasi-wsl 'Changed-By-Hand-17!'
+          net localgroup Administrators pumasi-wsl //add
+          schtasks //Change //TN '\Pumasi\WSL Docker' //DISABLE
+          ./target/debug/pumasi docker setup 2>&1 | tee repair.txt
+          grep -q "repaired the local account pumasi-wsl: it was disabled" repair.txt
+          grep -q "repaired the local account pumasi-wsl: it was an administrator" repair.txt
+          grep -q "repairing the scheduled task .*: it was disabled" repair.txt
+          grep -q "answers in the pumasi-docker WSL distro" repair.txt
+          net user pumasi-wsl | tee user.txt
+          grep -Eq "Account active +Yes" user.txt
+          if grep -q "Administrators" user.txt; then echo "still an administrator"; exit 1; fi
+          schtasks //Query //TN '\Pumasi\WSL Docker' //FO LIST | tee task.txt
+          if grep -q "Disabled" task.txt; then echo "the task is still disabled"; exit 1; fi
+      # 1.17: one `remove` leaves nothing behind, no restart needed.
       - name: pumasi docker remove
         if: always()
         shell: bash
         run: |
-          ./target/debug/pumasi docker remove || true
+          set +e
+          ./target/debug/pumasi docker remove 2>&1 | tee remove.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "remove exited $code"
           if net user pumasi-wsl > /dev/null 2>&1; then echo "the account is still there"; exit 1; fi
           if schtasks //Query //TN '\Pumasi\WSL Docker' > /dev/null 2>&1; then echo "the task is still there"; exit 1; fi
+          if schtasks //Query //TN '\Pumasi\WSL Docker stop' > /dev/null 2>&1; then echo "the stop task is still there"; exit 1; fi
+          if [ "${{ steps.setup.outputs.answer }}" = yes ]; then
+            grep -q "unregistered the pumasi-docker distro" remove.txt
+            grep -q "shut down the WSL VM of pumasi-wsl" remove.txt
+            # Windows may hold the hive of a batch logon until it restarts;
+            # then a boot task removes the profile, and nothing is left to do.
+            if ls -d /c/Users/pumasi-wsl* 2> /dev/null; then
+              grep -q "removes it at the next restart" remove.txt
+              schtasks //Query //FO LIST | grep -q 'WSL Docker profile S-1-5-' || { echo "a profile is left with no cleanup task"; exit 1; }
+              echo "::notice::Windows held the profile; the boot task removes it"
+            fi
+            if [ -e 'C:/ProgramData/Pumasi/wsl-docker' ]; then echo "the directory is left"; exit 1; fi
+            [ "$code" = 0 ] || { echo "remove did not finish in one go"; exit 1; }
+          fi
+      - name: pumasi docker setup again after remove
+        if: steps.setup.outputs.answer == 'yes'
+        shell: bash
+        timeout-minutes: 45
+        run: |
+          ./target/debug/pumasi docker setup 2>&1 | tee again.txt
+          grep -q "created the local account pumasi-wsl" again.txt
+          grep -q "answers in the pumasi-docker WSL distro" again.txt
+          ./target/debug/pumasi docker remove
 
   service:
     name: service and upgrade (${{ matrix.os }})

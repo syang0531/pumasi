@@ -900,8 +900,17 @@ impl MetricsPush {
     }
 }
 
-/// Who a silence from a `cluster.toml` is by ([`Silence::by`]).
+/// Who a silence from a `cluster.toml` is by ([`Silence::by`]); since
+/// 1.17 followed by `/NAME` ([`file_silence_by`]), so the file can be
+/// written back with its silences.
 pub const FILE_SILENCE_BY: &str = "cluster.toml";
+
+/// [`Silence::by`] of the `cluster.toml` silence `name` (1.17):
+/// `cluster.toml/NAME`. The name lives there because silences are stored
+/// as they were in 1.15 (no new field, no new storage layout).
+pub fn file_silence_by(name: &str) -> String {
+    format!("{FILE_SILENCE_BY}/{name}")
+}
 
 /// A silence a `cluster.toml` keeps (1.15): `[silences.NAME]`. Its id
 /// comes from its name ([`FileSilence::id`]), so applying the file again
@@ -940,7 +949,7 @@ impl FileSilence {
             && s.nodes == self.nodes
             && s.until_unix == self.until_unix
             && s.comment == self.comment
-            && s.by == FILE_SILENCE_BY
+            && s.by == file_silence_by(&self.name)
     }
 }
 
@@ -952,6 +961,18 @@ pub fn file_silence_id(name: &str) -> String {
 }
 
 impl Silence {
+    /// Whether a `cluster.toml` keeps it (1.15).
+    pub fn from_file(&self) -> bool {
+        self.by == FILE_SILENCE_BY || self.file_name().is_some()
+    }
+
+    /// Its `[silences.NAME]` (1.17), when a `cluster.toml` of 1.17 or later
+    /// made it: the name in [`Silence::by`], checked against the id.
+    pub fn file_name(&self) -> Option<&str> {
+        let name = self.by.strip_prefix(FILE_SILENCE_BY)?.strip_prefix('/')?;
+        (file_silence_id(name) == self.id).then_some(name)
+    }
+
     /// What it covers, by key (1.15).
     pub fn text(&self) -> crate::text::Text {
         use crate::text::Text;
@@ -1224,5 +1245,38 @@ mod tests {
         for b in bad {
             assert!(lint_exposition(b).is_err(), "{b:?} passed");
         }
+    }
+
+    #[test]
+    fn file_silences_carry_their_names() {
+        let f = FileSilence {
+            name: "move".into(),
+            rule: None,
+            nodes: None,
+            until_unix: 100,
+            comment: String::new(),
+        };
+        let mut s = Silence {
+            id: f.id(),
+            rule: None,
+            nodes: None,
+            until_unix: 100,
+            comment: String::new(),
+            by: file_silence_by("move"),
+            created_unix: 1,
+        };
+        assert_eq!(s.by, "cluster.toml/move");
+        assert!(f.same_as(&s));
+        assert_eq!(s.file_name(), Some("move"));
+        assert!(s.from_file());
+        // 1.15 and 1.16 stored no name: still the file's, written again
+        // (with the name) the next time the file is applied.
+        s.by = FILE_SILENCE_BY.into();
+        assert!(s.from_file() && s.file_name().is_none() && !f.same_as(&s));
+        // A name that does not give the id is not believed.
+        s.by = file_silence_by("other");
+        assert!(s.file_name().is_none() && !s.from_file());
+        s.by = "owner".into();
+        assert!(!s.from_file());
     }
 }

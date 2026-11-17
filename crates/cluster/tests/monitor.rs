@@ -642,7 +642,7 @@ async fn probes_silences_and_metrics_over_a_restart() {
 async fn apply_thresholds_silences_keyed_events_and_pushed_metrics() {
     use pumasi_proto::{
         manage::ClusterFile,
-        monitor::{FILE_SILENCE_BY, STORE_LINK, file_silence_id},
+        monitor::{STORE_LINK, file_silence_by, file_silence_id},
     };
     init_tracing();
     let cluster = start_cluster_probing(tempdir("cp-31"), None, Some(Duration::from_millis(300)))
@@ -853,7 +853,9 @@ async fn apply_thresholds_silences_keyed_events_and_pushed_metrics() {
             .iter()
             .find(|s| s.id == file_silence_id("quiet-b"))
             .unwrap_or_else(|| panic!("{v:?}"));
-        assert_eq!(s.by, FILE_SILENCE_BY);
+        // The name rides along (1.17), so the editor can write it back.
+        assert_eq!(s.by, file_silence_by("quiet-b"));
+        assert_eq!(s.file_name(), Some("quiet-b"));
         assert_eq!(s.comment, "moving it");
         if v.silenced == [("node_offline".to_string(), "p31-b".to_string())] {
             break;

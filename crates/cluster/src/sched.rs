@@ -675,7 +675,12 @@ impl State {
             Some(job),
             pumasi_proto::text::Text::new(
                 "task.resumed",
-                [job.to_string(), index.to_string(), name.clone(), format_size(size)],
+                [
+                    job.to_string(),
+                    index.to_string(),
+                    name.clone(),
+                    format_size(size),
+                ],
             ),
         );
     }
@@ -767,7 +772,12 @@ impl State {
                     Some(task.job),
                     pumasi_proto::text::Text::new(
                         "task.checkpoint_failed",
-                        [task.job.to_string(), task.index.to_string(), name.clone(), e.to_string()],
+                        [
+                            task.job.to_string(),
+                            task.index.to_string(),
+                            name.clone(),
+                            e.to_string(),
+                        ],
                     ),
                 );
             }

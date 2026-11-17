@@ -351,7 +351,12 @@ impl State {
             ),
             None => pumasi_proto::text::Text::new(
                 "task.preempted",
-                [t.job.to_string(), t.index.to_string(), name.clone(), reason.to_string()],
+                [
+                    t.job.to_string(),
+                    t.index.to_string(),
+                    name.clone(),
+                    reason.to_string(),
+                ],
             ),
         };
         info!(node = %node_id, task = %t, graceful = grace.is_some(), "{reason}; run moved back to the queue");
@@ -1207,7 +1212,11 @@ fn tuning_diff(
 ) -> Vec<String> {
     use pumasi_proto::monitor::human_duration;
     let mut out = Vec::new();
-    let rep = |r: Option<u64>| r.map_or("once".to_string(), |s| format!("every {}", human_duration(s)));
+    let rep = |r: Option<u64>| {
+        r.map_or("once".to_string(), |s| {
+            format!("every {}", human_duration(s))
+        })
+    };
     if a.repeat_secs != b.repeat_secs {
         out.push(format!(
             "alerts: repeat {} -> {}",
@@ -1216,7 +1225,10 @@ fn tuning_diff(
         ));
     }
     if a.resolved != b.resolved {
-        out.push(format!("alerts: resolved notices {} -> {}", a.resolved, b.resolved));
+        out.push(format!(
+            "alerts: resolved notices {} -> {}",
+            a.resolved, b.resolved
+        ));
     }
     for o in &b.overrides {
         match a.overrides.iter().find(|x| x.nodes == o.nodes) {

@@ -1783,8 +1783,7 @@ async fn metrics_wait(
     wait_secs: u32,
 ) -> Result<AdminResponse> {
     let mut rx = inner.state().monitor.samples.subscribe();
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(u64::from(wait_secs.min(30)));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(wait_secs.min(30)));
     if after_unix > 0 {
         // A node that is not there is an error now rather than after the
         // wait.
@@ -2735,8 +2734,14 @@ async fn upgrade_to_latest(
                     None,
                     None,
                     match version.as_deref() {
-                        Some(v) => pumasi_proto::text::Text::new("rollout.latest.failed", [v.to_string(), reason.to_string()]),
-                        None => pumasi_proto::text::Text::new("rollout.newest.failed", [reason.to_string()]),
+                        Some(v) => pumasi_proto::text::Text::new(
+                            "rollout.latest.failed",
+                            [v.to_string(), reason.to_string()],
+                        ),
+                        None => pumasi_proto::text::Text::new(
+                            "rollout.newest.failed",
+                            [reason.to_string()],
+                        ),
                     },
                 );
             }

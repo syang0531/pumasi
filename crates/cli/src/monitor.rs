@@ -15,9 +15,9 @@ use pumasi_proto::{
     manage::Selector,
     monitor::{
         AlertOverride, AlertPolicy, AlertTuning, AlertTuningView, AlertsView, EventLevel,
-        EventView, FailureRate, LogChunk, MetricsView, NetView, NodeMetricsView, SilenceSpec,
-        WebhookFormat, WebhookSpec, human_bps, human_duration, human_rtt, parse_opt_percent,
-        parse_opt_secs, parse_switch,
+        EventView, FailureRate, LogChunk, MetricsView, NetView, NodeMetricsView, STORE_LINK,
+        SilenceSpec, WebhookFormat, WebhookSpec, human_bps, human_duration, human_rtt,
+        parse_opt_percent, parse_opt_secs, parse_switch,
     },
     msg::{AdminOp, AdminResponse, TaskState},
     store::format_size,
@@ -339,6 +339,25 @@ pub async fn show_metrics(
     let client = connect_admin(home, admin).await?;
     let ask = if node.is_some() { since_secs } else { 0 };
     let m = metrics(&client, node.clone(), ask).await?;
+    // 1.15: what came with the node's last sample (a 1.14 control plane
+    // does not know the call).
+    let extra = match &node {
+        Some(id) => match client
+            .call(AdminOp::MetricsWait {
+                node: Some(id.clone()),
+                since_secs: 0,
+                after_unix: 0,
+                wait_secs: 0,
+            })
+            .await
+        {
+            Ok(AdminResponse::MetricsPush(p)) => {
+                m.nodes.first().and_then(|n| p.extra_of(&n.id).cloned())
+            }
+            _ => None,
+        },
+        None => None,
+    };
     client.close().await;
     if let Output::Json = output {
         println!("{}", serde_json::to_string_pretty(&m)?);
@@ -388,6 +407,9 @@ pub async fn show_metrics(
                 .unwrap_or_else(|| "-".into()),
             p.running
         );
+    }
+    if let Some(w) = extra.and_then(|e| e.cpu_power_w) {
+        println!("cpu package power: {w:.1} W");
     }
     Ok(0)
 }
@@ -972,25 +994,38 @@ pub fn render_net(v: &NetView) -> String {
         .max()
         .unwrap_or(4)
         .clamp(4, 16);
-    let _ = writeln!(out, "round trip (row: from, column: to)");
+    // 1.15: each agent to the control plane's file store, as a column.
+    let store = v.links.iter().any(|l| l.to == STORE_LINK);
+    let cell = |a: &str, b: &str| match v.link(a, b) {
+        Some(l) if l.error.is_some() => "failed".to_string(),
+        Some(l) => l.rtt_us.map(human_rtt).unwrap_or_else(|| "?".into()),
+        None => "".into(),
+    };
+    let _ = writeln!(
+        out,
+        "round trip (row: from, column: to{})",
+        if store {
+            "; store: the control plane's file store"
+        } else {
+            ""
+        }
+    );
     let _ = write!(out, "{:<w$} ", "");
     for n in &nodes {
         let _ = write!(out, " {:>10}", truncate(n, 10));
+    }
+    if store {
+        let _ = write!(out, " {:>10}", "store");
     }
     let _ = writeln!(out);
     for a in &nodes {
         let _ = write!(out, "{:<w$} ", truncate(a, w));
         for b in &nodes {
-            let cell = if a == b {
-                "-".to_string()
-            } else {
-                match v.link(a, b) {
-                    Some(l) if l.error.is_some() => "failed".into(),
-                    Some(l) => l.rtt_us.map(human_rtt).unwrap_or_else(|| "?".into()),
-                    None => "".into(),
-                }
-            };
-            let _ = write!(out, " {cell:>10}");
+            let c = if a == b { "-".to_string() } else { cell(a, b) };
+            let _ = write!(out, " {c:>10}");
+        }
+        if store {
+            let _ = write!(out, " {:>10}", cell(a, STORE_LINK));
         }
         let _ = writeln!(out);
     }
@@ -1005,7 +1040,7 @@ pub fn render_net(v: &NetView) -> String {
             out,
             "{:<16} {:<16} {:>10} {:>12} {:<7} {:<16} {}",
             truncate(&l.from, 16),
-            truncate(&l.to, 16),
+            truncate(if l.to == STORE_LINK { "store" } else { &l.to }, 16),
             l.rtt_us.map(human_rtt).unwrap_or_else(|| "-".into()),
             l.bps.map(human_bps).unwrap_or_else(|| "-".into()),
             match l.direct {

@@ -89,7 +89,11 @@ pub const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("node.removed", "node {0} removed", "노드 {0} 제거됨"),
     ("node.online", "node {0} online", "노드 {0} 온라인"),
-    ("node.paused", "node {0} paused: {1}", "노드 {0} 일시 중지: {1}"),
+    (
+        "node.paused",
+        "node {0} paused: {1}",
+        "노드 {0} 일시 중지: {1}",
+    ),
     (
         "node.resumed",
         "node {0} takes tasks again",
@@ -363,7 +367,11 @@ pub const TEXTS: &[(&str, &str, &str)] = &[
         "{0} of {1} runs failed in the last {2} ({3}%)",
         "최근 {2} 동안 실행 {1}개 중 {0}개 실패 ({3}%)",
     ),
-    ("alert.silenced_firing", "{inner} (silenced)", "{inner} (알림 중지됨)"),
+    (
+        "alert.silenced_firing",
+        "{inner} (silenced)",
+        "{inner} (알림 중지됨)",
+    ),
     ("alert.resolved", "resolved: {inner}", "해결됨: {inner}"),
     (
         "alert.silenced",

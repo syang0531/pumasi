@@ -12,7 +12,7 @@ use pumasi_proto::{
     job::parse_duration_ms,
     manage::Selector,
     monitor::{
-        ALERT_RULES, AlertPolicy, AlertTuningView, AlertsView, EventView, FailureRate, SilenceSpec,
+        ALERT_RULES, AlertPolicy, AlertTuningView, EventView, FailureRate, SilenceSpec,
         WebhookFormat, WebhookSpec, human_duration, is_off, parse_opt_percent, parse_opt_secs,
     },
     msg::{AdminOp, AdminResponse},
@@ -31,22 +31,11 @@ pub struct EventsQuery {
 pub async fn page(ctx: Ctx, Query(q): Query<EventsQuery>) -> Response {
     let l = ctx.l;
     let level = q.level.unwrap_or_default();
-    let events: Vec<EventView> = match ctx
-        .call(AdminOp::Events {
-            after: 0,
-            since_unix: 0,
-            limit: 300,
-        })
-        .await
-    {
-        Ok(AdminResponse::Events(e)) => e,
-        Ok(_) => Vec::new(),
+    let events: Vec<EventView> = match super::events(&ctx, 300).await {
+        Ok(e) => e,
         Err(e) => return ctx.fail(e, false),
     };
-    let alerts = match ctx.call(AdminOp::Alerts).await {
-        Ok(AdminResponse::Alerts(a)) => *a,
-        _ => AlertsView::default(),
-    };
+    let alerts = super::alerts(&ctx).await;
     // Repeat notices, per-node thresholds and silences (1.6).
     let tuning: Option<AlertTuningView> = match ctx.call(AdminOp::AlertTuning).await {
         Ok(AdminResponse::AlertTuning(t)) => Some(*t),

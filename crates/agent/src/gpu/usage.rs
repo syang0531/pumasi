@@ -768,7 +768,8 @@ pub mod windows {
                     if module.is_null() {
                         return None;
                     }
-                    let open = GetProcAddress(module, c"D3DKMTOpenAdapterFromLuid".as_ptr().cast())?;
+                    let open =
+                        GetProcAddress(module, c"D3DKMTOpenAdapterFromLuid".as_ptr().cast())?;
                     let query = GetProcAddress(module, c"D3DKMTQueryAdapterInfo".as_ptr().cast())?;
                     let close = GetProcAddress(module, c"D3DKMTCloseAdapter".as_ptr().cast())?;
                     type Proc = unsafe extern "system" fn() -> isize;

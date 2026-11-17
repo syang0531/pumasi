@@ -2032,12 +2032,9 @@ async fn microvm_streams_5_mib_live() {
     const OUT: usize = 3 << 20;
     const ERR: usize = 2 << 20;
     let line = "0123456789abcdefghijklmnopqrstuvwxyz";
-    let want = |n: usize| -> Vec<u8> {
-        format!("{line}\n").bytes().cycle().take(n).collect()
-    };
+    let want = |n: usize| -> Vec<u8> { format!("{line}\n").bytes().cycle().take(n).collect() };
     // The task stays up long enough for the console to carry all of it.
-    let script =
-        format!("yes {line} | head -c {OUT}; yes {line} | head -c {ERR} >&2; sleep 45");
+    let script = format!("yes {line} | head -c {OUT}; yes {line} | head -c {ERR} >&2; sleep 45");
     let mut sub = docker_job(&["sh", "-c", &script], vec![TaskInput::default()]);
     sub.executor = Executor::Microvm;
     sub.docker.as_mut().unwrap().image = microvm_image();

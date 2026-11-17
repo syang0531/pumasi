@@ -417,7 +417,10 @@ impl State {
                     "rollout.canary",
                     None,
                     None,
-                    pumasi_proto::text::Text::new("rollout.canary", [names.join(", "), by.to_string()]),
+                    pumasi_proto::text::Text::new(
+                        "rollout.canary",
+                        [names.join(", "), by.to_string()],
+                    ),
                 );
             }
         }

@@ -161,7 +161,9 @@ impl State {
             let targets = ready
                 .iter()
                 .copied()
-                .filter(|to| *to != *from && self.files.caches.get(*to).is_some_and(|c| c.addr.is_some()))
+                .filter(|to| {
+                    *to != *from && self.files.caches.get(*to).is_some_and(|c| c.addr.is_some())
+                })
                 .chain(self.net.store_addr.is_some().then_some(&store));
             for to in targets {
                 let age = self
@@ -250,9 +252,9 @@ impl State {
         self.net.last_save = Instant::now();
         self.net.dirty = false;
         let members = &self.members;
-        self.net
-            .links
-            .retain(|(a, b), _| members.contains_key(a) && (b == STORE_LINK || members.contains_key(b)));
+        self.net.links.retain(|(a, b), _| {
+            members.contains_key(a) && (b == STORE_LINK || members.contains_key(b))
+        });
         let all: Vec<(&String, &String, &Link)> =
             self.net.links.iter().map(|((a, b), l)| (a, b, l)).collect();
         if let Err(e) = self.store.put_meta_record(LINKS_META, &all) {

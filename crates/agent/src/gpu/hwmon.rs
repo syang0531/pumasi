@@ -108,7 +108,11 @@ impl Sensors {
         if pci.is_empty() {
             return None;
         }
-        let dir = self.root.join("sys/bus/pci/devices").join(pci).join("hwmon");
+        let dir = self
+            .root
+            .join("sys/bus/pci/devices")
+            .join(pci)
+            .join("hwmon");
         let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
             .ok()?
             .flatten()
@@ -188,7 +192,11 @@ fn gpu_temp(h: &Path) -> Option<f32> {
         .flatten()
         .filter_map(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
-            let i: u32 = n.strip_prefix("temp")?.strip_suffix("_input")?.parse().ok()?;
+            let i: u32 = n
+                .strip_prefix("temp")?
+                .strip_suffix("_input")?
+                .parse()
+                .ok()?;
             Some((i, read_text(&h.join(format!("temp{i}_label")))))
         })
         .collect();
@@ -255,8 +263,16 @@ mod tests {
         let root = dir.path();
         let z = "sys/class/powercap";
         put(root, &format!("{z}/intel-rapl:0/name"), "package-0\n");
-        put(root, &format!("{z}/intel-rapl:0/energy_uj"), "262000000000\n");
-        put(root, &format!("{z}/intel-rapl:0/max_energy_range_uj"), "262143328850\n");
+        put(
+            root,
+            &format!("{z}/intel-rapl:0/energy_uj"),
+            "262000000000\n",
+        );
+        put(
+            root,
+            &format!("{z}/intel-rapl:0/max_energy_range_uj"),
+            "262143328850\n",
+        );
         put(root, &format!("{z}/intel-rapl:0:1/name"), "uncore\n");
         put(root, &format!("{z}/intel-rapl:0:1/energy_uj"), "5000000\n");
         put(root, &format!("{z}/intel-rapl:0:0/name"), "core\n");

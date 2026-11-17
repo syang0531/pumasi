@@ -13,15 +13,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::{
+    PROBE_ALPN,
+    monitor::{PROBE_MAX_BYTES, PROBE_PINGS, ProbeResult},
+};
 use anyhow::{Context, Result, ensure};
 use iroh::{
     Endpoint, EndpointAddr,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
-};
-use crate::{
-    PROBE_ALPN,
-    monitor::{PROBE_MAX_BYTES, PROBE_PINGS, ProbeResult},
 };
 use tokio::io::AsyncWriteExt;
 use tracing::debug;

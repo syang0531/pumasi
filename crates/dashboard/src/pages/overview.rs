@@ -3,7 +3,7 @@
 use axum::response::Response;
 use maud::html;
 use pumasi_proto::{
-    monitor::{AlertsView, EventView, MetricsView},
+    monitor::{EventView, MetricsView},
     msg::{AdminOp, AdminResponse, JobState},
 };
 
@@ -32,21 +32,8 @@ async fn render(ctx: &Ctx) -> anyhow::Result<Response> {
         Ok(AdminResponse::Metrics(m)) => *m,
         _ => MetricsView::default(),
     };
-    let events: Vec<EventView> = match ctx
-        .call(AdminOp::Events {
-            after: 0,
-            since_unix: 0,
-            limit: 8,
-        })
-        .await
-    {
-        Ok(AdminResponse::Events(e)) => e,
-        _ => Vec::new(),
-    };
-    let alerts = match ctx.call(AdminOp::Alerts).await {
-        Ok(AdminResponse::Alerts(a)) => *a,
-        _ => AlertsView::default(),
-    };
+    let events: Vec<EventView> = super::events(ctx, 8).await.unwrap_or_default();
+    let alerts = super::alerts(ctx).await;
     let online = s.nodes.iter().filter(|n| n.online).count();
     let slots: u32 = s
         .nodes

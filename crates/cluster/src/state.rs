@@ -1854,7 +1854,10 @@ impl State {
                     "node.suspended",
                     Some(node_id),
                     None,
-                    pumasi_proto::text::Text::new("node.suspended", [name.clone(), max.to_string()]),
+                    pumasi_proto::text::Text::new(
+                        "node.suspended",
+                        [name.clone(), max.to_string()],
+                    ),
                 );
             }
         }

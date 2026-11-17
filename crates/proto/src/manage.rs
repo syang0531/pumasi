@@ -1383,7 +1383,8 @@ impl ApplySpec {
                     .parse::<Cron>()
                     .with_context(|| format!("schedule {}", s.name))?;
                 if let Some(tz) = &s.tz {
-                    crate::sched::validate_tz(tz).with_context(|| format!("schedule {}", s.name))?;
+                    crate::sched::validate_tz(tz)
+                        .with_context(|| format!("schedule {}", s.name))?;
                 }
             } else {
                 s.validate()
@@ -1535,17 +1536,19 @@ pub fn parse_until(text: &str) -> Result<u64> {
             return Ok(d.timestamp().max(0) as u64);
         }
     }
-    let naive = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
-        .iter()
-        .find_map(|f| NaiveDateTime::parse_from_str(&with_t, f).ok())
-        .or_else(|| {
-            NaiveDate::parse_from_str(t, "%Y-%m-%d")
-                .ok()
-                .and_then(|d| d.and_hms_opt(0, 0, 0))
-        })
-        .with_context(|| {
-            format!("{t:?} is not a date and time like 2026-12-01T09:00:00+09:00")
-        })?;
+    let naive = [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ]
+    .iter()
+    .find_map(|f| NaiveDateTime::parse_from_str(&with_t, f).ok())
+    .or_else(|| {
+        NaiveDate::parse_from_str(t, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+    })
+    .with_context(|| format!("{t:?} is not a date and time like 2026-12-01T09:00:00+09:00"))?;
     let local = chrono::Local
         .from_local_datetime(&naive)
         .earliest()
@@ -1597,7 +1600,9 @@ impl OverrideFile {
         let node_offline_secs = match &self.node_offline {
             None => None,
             Some(Setting::Int(n)) if *n > 0 => Some(Some(*n as u64)),
-            Some(v) => Some(parse_opt_secs(&v.text()).with_context(|| format!("{what}.node_offline"))?),
+            Some(v) => {
+                Some(parse_opt_secs(&v.text()).with_context(|| format!("{what}.node_offline"))?)
+            }
         };
         let disk_percent = match &self.disk {
             None => None,
@@ -1605,7 +1610,9 @@ impl OverrideFile {
         };
         let temp_c = match &self.temperature {
             None => None,
-            Some(v) => Some(parse_degrees(&v.text()).with_context(|| format!("{what}.temperature"))?),
+            Some(v) => {
+                Some(parse_degrees(&v.text()).with_context(|| format!("{what}.temperature"))?)
+            }
         };
         Ok(crate::monitor::AlertOverride {
             nodes,
@@ -1739,7 +1746,10 @@ impl AlertsFile {
         };
         let mut overrides = Vec::new();
         for (name, o) in self.nodes.iter().flatten() {
-            ensure!(!name.trim().is_empty(), "alerts.nodes: a node name cannot be empty");
+            ensure!(
+                !name.trim().is_empty(),
+                "alerts.nodes: a node name cannot be empty"
+            );
             let sel = Selector(vec![SelectorTerm {
                 key: "name".into(),
                 op: SelectorOp::In(vec![name.clone()]),
@@ -2005,9 +2015,9 @@ impl ClusterFile {
         }
         for (name, f) in self.silences {
             let nodes = match &f.nodes {
-                Some(s) => Some(
-                    Selector::nodes(s).with_context(|| format!("silence {name}: nodes"))?,
-                ),
+                Some(s) => {
+                    Some(Selector::nodes(s).with_context(|| format!("silence {name}: nodes"))?)
+                }
                 None => None,
             };
             spec.silences.push(crate::monitor::FileSilence {

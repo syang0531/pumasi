@@ -462,7 +462,11 @@ impl State {
         let events = self.store.load_events(EVENT_RING)?;
         m.next_event_seq = events.last().map_or(1, |e| e.seq + 1);
         if let Some(first) = events.first() {
-            m.event_texts = self.store.load_event_texts(first.seq)?.into_iter().collect();
+            m.event_texts = self
+                .store
+                .load_event_texts(first.seq)?
+                .into_iter()
+                .collect();
         }
         m.events = events.into();
         let now = now_unix();
@@ -907,7 +911,11 @@ impl State {
         } else {
             Text::new(
                 "check.mismatch",
-                [task.job.to_string(), task.index.to_string(), names.join(", ")],
+                [
+                    task.job.to_string(),
+                    task.index.to_string(),
+                    names.join(", "),
+                ],
             )
         };
         let msg = text.en();
@@ -1510,7 +1518,11 @@ impl State {
         let line = format!(
             "silence {}: {} until {}",
             f.name,
-            if current.is_some() { "updated," } else { "created," },
+            if current.is_some() {
+                "updated,"
+            } else {
+                "created,"
+            },
             pumasi_proto::audit::rfc3339(f.until_unix)
         );
         if !dry {

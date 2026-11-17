@@ -619,7 +619,10 @@ impl State {
                     "store.damaged",
                     Some(node),
                     None,
-                    pumasi_proto::text::Text::new("store.damaged.node", [name.clone(), what.join(", ")]),
+                    pumasi_proto::text::Text::new(
+                        "store.damaged.node",
+                        [name.clone(), what.join(", ")],
+                    ),
                 );
             }
         }

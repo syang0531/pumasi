@@ -140,7 +140,14 @@ impl Sampler {
                 .filter_map(|c| c.temperature())
                 .filter(|t| t.is_finite() && *t > 1.0 && *t < 150.0)
                 .fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.max(t))));
-            fill_linux_gpus(&mut gpus, &self.gpus, &mut self.linux, now, package_temp, rapl.uncore_w);
+            fill_linux_gpus(
+                &mut gpus,
+                &self.gpus,
+                &mut self.linux,
+                now,
+                package_temp,
+                rapl.uncore_w,
+            );
         }
         let load1 = if cfg!(windows) {
             0.0
@@ -150,7 +157,9 @@ impl Sampler {
         let memory_total = self.system.total_memory();
         let memory_used = memory_total.saturating_sub(self.system.available_memory());
         let cpu = self.system.global_cpu_usage();
-        let extra = NodeMetricsExtra { cpu_power_w: cpu_power };
+        let extra = NodeMetricsExtra {
+            cpu_power_w: cpu_power,
+        };
         let m = NodeMetrics {
             cpu_percent: if cpu.is_finite() {
                 cpu.clamp(0.0, 100.0)

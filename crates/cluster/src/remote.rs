@@ -147,7 +147,10 @@ impl State {
                 "node.executor_available",
                 Some(id),
                 None,
-                pumasi_proto::text::Text::new("node.executor_available", [name.clone(), e.to_string()]),
+                pumasi_proto::text::Text::new(
+                    "node.executor_available",
+                    [name.clone(), e.to_string()],
+                ),
             );
         }
         self.schedule();

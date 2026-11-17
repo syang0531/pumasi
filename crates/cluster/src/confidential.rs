@@ -674,7 +674,10 @@ impl State {
                 "confidential.keys",
                 Some(node),
                 Some(task.job),
-                pumasi_proto::text::Text::new("confidential.keys", [task.job.to_string(), task.index.to_string()]),
+                pumasi_proto::text::Text::new(
+                    "confidential.keys",
+                    [task.job.to_string(), task.index.to_string()],
+                ),
             ),
             Err(why) => {
                 warn!(node = %node, task = %task, "keys refused: {why}");
@@ -685,7 +688,11 @@ impl State {
                     Some(task.job),
                     pumasi_proto::text::Text::new(
                         "confidential.refused",
-                        [task.job.to_string(), task.index.to_string(), why.to_string()],
+                        [
+                            task.job.to_string(),
+                            task.index.to_string(),
+                            why.to_string(),
+                        ],
                     ),
                 );
             }
@@ -900,7 +907,14 @@ impl State {
                 "node.trust",
                 Some(&id),
                 None,
-                pumasi_proto::text::Text::new(if trusted { "node.trust" } else { "node.untrust" }, [&name]),
+                pumasi_proto::text::Text::new(
+                    if trusted {
+                        "node.trust"
+                    } else {
+                        "node.untrust"
+                    },
+                    [&name],
+                ),
             );
             self.schedule();
         }

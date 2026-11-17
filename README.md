@@ -260,7 +260,7 @@ even when listed. `network = { allow = [...], mbps = 20 }` also caps each
 direction (`network = { mbps = 20 }` caps without a list). Lists are for
 microVMs (a Docker job with one is refused; an `image` job runs as a
 microVM) and not for schedules yet. What a task's guest sent and received
-is on its receipt (`pumasi receipts`, NET), signed by the node and billed
+is on its receipt (`pumasi receipts` lists it), signed by the node and billed
 both ways at the price list's egress rate.
 
 **Warm microVMs (1.14).** Each image is unpacked onto a disk once per node

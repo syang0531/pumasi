@@ -5279,7 +5279,7 @@ fn human_secs(s: u64) -> String {
 
 fn print_receipts(receipts: &[Receipt]) {
     println!(
-        "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10} {:>10}",
+        "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10}",
         "RECEIPT",
         "RUN",
         "NODE",
@@ -5289,8 +5289,7 @@ fn print_receipts(receipts: &[Receipt]) {
         "PEAK MiB",
         "PROVIDER",
         "CU",
-        "GPU CU",
-        "NET"
+        "GPU CU"
     );
     for r in receipts {
         let u = &r.usage;
@@ -5301,7 +5300,7 @@ fn print_receipts(receipts: &[Receipt]) {
             if u.task.check { "c" } else { "" }
         );
         println!(
-            "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10} {:>10}",
+            "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10}",
             r.short_id(),
             run,
             short(&r.node_id()),
@@ -5316,12 +5315,31 @@ fn print_receipts(receipts: &[Receipt]) {
             r.gpu
                 .as_ref()
                 .map(|g| format_rate(g.exact_ucu))
-                .unwrap_or_else(|| "-".into()),
-            r.egress
-                .as_ref()
-                .map(|e| format_size(e.billed_bytes))
                 .unwrap_or_else(|| "-".into())
         );
+    }
+    // What the guests sent and received, for runs with a network (1.18):
+    // the node's signed figure and what it was billed.
+    let net: Vec<_> = receipts
+        .iter()
+        .filter_map(|r| r.egress.as_ref().map(|e| (r.short_id(), e)))
+        .collect();
+    if !net.is_empty() {
+        println!();
+        println!(
+            "{:<13} {:>10} {:>10} {:>10} {:>12}",
+            "RECEIPT", "SENT", "RECEIVED", "NET", "NET CU"
+        );
+        for (id, e) in net {
+            println!(
+                "{:<13} {:>10} {:>10} {:>10} {:>12}",
+                id,
+                format_size(e.net.usage.tx_bytes),
+                format_size(e.net.usage.rx_bytes),
+                format_size(e.billed_bytes),
+                format_rate(e.exact_ucu)
+            );
+        }
     }
     if receipts.is_empty() {
         println!("(no receipts yet)");

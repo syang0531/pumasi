@@ -94,7 +94,16 @@ cleanup() {
     [ -n "${LOOP_PID:-}" ] && kill "$LOOP_PID" 2>/dev/null
     pkill -f "$BIN" 2>/dev/null
   fi
-  [ -n "${LONE_PID:-}" ] && kill "$LONE_PID" 2>/dev/null
+  if [ -n "${LONE_PID:-}" ]; then
+    kill "$LONE_PID" 2>/dev/null
+    # On Windows the lone dashboard restarts into the new binary as a new
+    # process, which would keep its port from the next run of this script.
+    if [ "$OS" = windows ]; then
+      powershell -NoProfile -Command "Get-Process pumasi -ErrorAction SilentlyContinue | Where-Object { \$_.Path -eq '$(nat "$LONE")' } | Stop-Process -Force" 2>/dev/null
+    else
+      pkill -f "$LONE" 2>/dev/null
+    fi
+  fi
 }
 trap cleanup EXIT
 

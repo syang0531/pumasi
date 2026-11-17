@@ -1288,9 +1288,11 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                 Ok(Some(FromAgent::Report { report, stored })) => {
                     // What the node measured of the run (agents from 1.4).
                     if let Some(t) = tail.take() {
-                        inner
-                            .state()
-                            .note_timing(&node_id, generation, report.task, t.timing);
+                        let mut st = inner.state();
+                        st.note_timing(&node_id, generation, report.task, t.timing);
+                        if let Some(net) = t.net {
+                            st.note_net(&node_id, generation, report.task, net);
+                        }
                     }
                     // A stored output must be complete in the store and be
                     // what the report says before the result counts.
@@ -3107,6 +3109,14 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             Ok(AdminResponse::Ok)
         }
         AdminOp::Receipts { id } => Ok(AdminResponse::Receipts(inner.state().receipts(id)?)),
+        AdminOp::ReceiptsFull { id } => Ok(AdminResponse::ReceiptsFull(
+            inner
+                .state()
+                .receipts(id)?
+                .iter()
+                .map(|r| r.encode())
+                .collect(),
+        )),
         AdminOp::Accounts => Ok(AdminResponse::Accounts(inner.state().accounts())),
         AdminOp::Ledger { account, limit } => Ok(AdminResponse::Ledger(
             inner

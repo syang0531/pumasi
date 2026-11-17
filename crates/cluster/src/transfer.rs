@@ -207,6 +207,27 @@ impl AdminClient {
         }
     }
 
+    /// A job's receipts with their egress parts (1.18), or without them
+    /// from an older control plane.
+    pub async fn receipts(
+        &self,
+        id: pumasi_proto::job::JobId,
+    ) -> Result<Vec<pumasi_proto::receipt::Receipt>> {
+        use pumasi_proto::msg::{AdminOp, AdminResponse};
+        if let Ok(AdminResponse::ReceiptsFull(blobs)) =
+            self.call(AdminOp::ReceiptsFull { id }).await
+        {
+            return blobs
+                .iter()
+                .map(|b| pumasi_proto::receipt::Receipt::decode(b).context("corrupt receipt"))
+                .collect();
+        }
+        match self.call(AdminOp::Receipts { id }).await? {
+            AdminResponse::Receipts(r) => Ok(r),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
     /// Submits a job. `upload` (path in `/input`, file) holds the shared
     /// input files that were too large to send with it
     /// ([`pumasi_proto::job::JobFile::load_split`]): they go through the

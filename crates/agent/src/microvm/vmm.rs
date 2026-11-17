@@ -65,6 +65,9 @@ pub struct VmSpec {
     /// A network card whose frames go to this gateway (QEMU and vz; see
     /// [`super::net`]).
     pub net: Option<std::net::SocketAddr>,
+    /// Firecracker: the TAP device the card uses, which the agent joined
+    /// to the gateway at `net` (1.18, see [`super::tap`]).
+    pub tap: Option<String>,
     /// PCI devices bound to `vfio-pci` to pass through (QEMU on Linux
     /// only). The VM then gets a PCI machine (q35) instead of `microvm`.
     pub pci: Vec<String>,
@@ -142,8 +145,10 @@ impl Vmm {
         }
         // Firecracker's cards need TAP devices; QEMU's and vz's reach the
         // gateway without them.
-        if self.backend == Backend::Firecracker && spec.net.is_some() {
-            bail!("Firecracker cannot give a VM a network card here; QEMU can");
+        if self.backend == Backend::Firecracker && spec.net.is_some() && spec.tap.is_none() {
+            bail!(
+                "Firecracker cannot give a VM a network card here (it needs a TAP device, which takes root); QEMU can"
+            );
         }
         match self.backend {
             Backend::Firecracker => self.firecracker(spec, dir),
@@ -209,12 +214,20 @@ impl Vmm {
             smt: bool,
         }
         #[derive(Serialize)]
+        struct NetIface {
+            iface_id: String,
+            guest_mac: String,
+            host_dev_name: String,
+        }
+        #[derive(Serialize)]
         struct Config {
             #[serde(rename = "boot-source")]
             boot_source: BootSource,
             drives: Vec<Drive>,
             #[serde(rename = "machine-config")]
             machine: Machine,
+            #[serde(rename = "network-interfaces", skip_serializing_if = "Vec::is_empty")]
+            net: Vec<NetIface>,
         }
         let mut args = vec!["console=ttyS0", "reboot=k", "panic=1"];
         if cfg!(target_arch = "x86_64") {
@@ -242,6 +255,15 @@ impl Vmm {
                 mem_size_mib: spec.mem_mib,
                 smt: false,
             },
+            net: spec
+                .tap
+                .iter()
+                .map(|t| NetIface {
+                    iface_id: "eth0".into(),
+                    guest_mac: super::net::GUEST_MAC.into(),
+                    host_dev_name: t.clone(),
+                })
+                .collect(),
         };
         let path = dir.join("firecracker.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
@@ -570,6 +592,7 @@ mod tests {
             vcpus: 2,
             mem_mib: 300,
             net: None,
+            tap: None,
             pci: vec![],
             tee: None,
         };
@@ -596,6 +619,7 @@ mod tests {
 
         let net = VmSpec {
             net: Some("127.0.0.1:4567".parse().unwrap()),
+            tap: None,
             ..spec.clone()
         };
         let joined = args(&net);
@@ -639,6 +663,7 @@ mod tests {
             vcpus: 2,
             mem_mib: 300,
             net: Some("127.0.0.1:4567".parse().unwrap()),
+            tap: None,
             pci: vec![],
             tee: None,
         };
@@ -725,6 +750,7 @@ mod tests {
             vcpus: 2,
             mem_mib: 300,
             net: None,
+            tap: None,
             pci: vec![],
             tee: None,
         };
@@ -748,6 +774,7 @@ mod tests {
         let gw: std::net::SocketAddr = "127.0.0.1:4567".parse().unwrap();
         let net = VmSpec {
             net: Some(gw),
+            tap: None,
             ..spec.clone()
         };
         let cmd = vmm.command(&net, dir.path()).unwrap();

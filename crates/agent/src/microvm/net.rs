@@ -1,4 +1,5 @@
-//! Network for microVMs whose job asks for it (`network = true`).
+//! Network for microVMs whose job asks for it (`network = true`, or an
+//! allow list since 1.18).
 //!
 //! The guest gets a virtio-net card whose other end is not a host network
 //! device but this gateway: QEMU sends the card's Ethernet frames over a
@@ -6,38 +7,51 @@
 //! (smoltcp) terminates the guest's connections. The vz backend
 //! (Virtualization.framework) hands its card's frames to a datagram socket
 //! instead (`VZFileHandleNetworkDeviceAttachment`), which the vz helper
-//! joins to the same kind of TCP connection ([`bridge_datagrams`]), so
-//! both backends meet the same gateway and the same policy. For each TCP connection
-//! the guest opens, the gateway opens one from the host to the same
-//! address, if that address is allowed, and copies bytes both ways. DNS
-//! queries to the gateway are answered with the host's resolver.
+//! joins to the same kind of TCP connection ([`bridge_datagrams`]), and
+//! Firecracker's TAP device is joined to it the same way ([`tap`]), so
+//! every backend meets the same gateway and the same policy. For each TCP
+//! connection the guest opens, the gateway opens one from the host to the
+//! same address, if that address is allowed, and copies bytes both ways.
+//! UDP datagrams to allowed addresses go out through a host socket per
+//! flow, and the answers come back to the guest (1.18: QUIC, NTP, DNS to
+//! other servers). DNS queries to the gateway are answered with the host's
+//! resolver.
 //!
 //! What the guest can reach is decided here, on the host, by destination
-//! address: public unicast IPv4 only. Private ranges (RFC 1918, CGNAT),
-//! loopback, link-local (cloud metadata services), multicast, reserved
-//! ranges and every address of the host itself are refused, as is SMTP
-//! (port 25). Other UDP than DNS, ICMP and IPv6 are not forwarded. The
-//! guest cannot get around this from inside: it only ever talks to the
-//! gateway.
+//! address: public unicast IPv4, and public IPv6 when the host has IPv6.
+//! Private ranges (RFC 1918, CGNAT, ULA), loopback, link-local (cloud
+//! metadata services), multicast, reserved ranges and every address of the
+//! host itself are refused, as is SMTP (port 25). A job's allow list
+//! ([`NetSpec`]) narrows that further: names it lists resolve, and their
+//! addresses open for the ports it gives; addresses and ranges it lists
+//! open directly. Its bandwidth cap paces what goes each way, and every
+//! byte is counted ([`Gateway::usage`]). The guest cannot get around this
+//! from inside: it only ever talks to the gateway.
 //!
-//! Guest side: address [`GUEST`]/24, gateway and DNS server [`GATEWAY`].
+//! Guest side: address [`GUEST`]/24, gateway and DNS server [`GATEWAY`];
+//! with IPv6, [`GUEST6`]/64 and gateway [`GATEWAY6`].
 
 use std::{
     collections::{HashMap, VecDeque},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::Arc,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use pumasi_proto::vmnet::{NetSpec, NetUsage, Port};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::{tcp, udp},
     time::Instant as SmolInstant,
     wire::{
-        EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-        IpEndpoint, IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket,
+        EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, IpAddress,
+        IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, Ipv4Packet, Ipv6Packet,
+        TcpPacket, UdpPacket, UdpRepr,
     },
 };
 use tokio::{
@@ -53,6 +67,12 @@ pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 /// The guest's address.
 pub const GUEST: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 pub const PREFIX: u8 = 24;
+/// The gateway's IPv6 address (a unique local one: the guest's traffic
+/// leaves from the host's own addresses).
+pub const GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x5055, 0x4d41, 0, 0, 0, 0, 2);
+/// The guest's IPv6 address.
+pub const GUEST6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x5055, 0x4d41, 0, 0, 0, 0, 0x15);
+pub const PREFIX6: u8 = 64;
 /// The guest card's MAC address (QEMU's default range).
 pub const GUEST_MAC: &str = "52:54:00:12:34:56";
 const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x02];
@@ -61,7 +81,7 @@ const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x02];
 const MTU: usize = 1500;
 /// Largest frame accepted from QEMU (with the Ethernet header and room
 /// for a VLAN tag).
-const MAX_FRAME: usize = 65_536;
+pub(crate) const MAX_FRAME: usize = 65_536;
 /// TCP buffers per connection on the guest side.
 const TCP_BUFFER: usize = 256 * 1024;
 /// Bytes read from a host connection but not yet taken by the guest.
@@ -76,47 +96,48 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(120);
 const DNS_PORT: u16 = 53;
 const MAX_DNS_IN_FLIGHT: usize = 64;
+/// UDP flows (guest address and port, destination) open at once.
+const MAX_UDP_FLOWS: usize = 256;
+/// A UDP flow nothing crossed for this long is closed.
+const UDP_IDLE: Duration = Duration::from_secs(120);
+/// Addresses an allow list's names opened (what DNS answered).
+const MAX_LEARNED: usize = 4096;
 /// Ports never forwarded (outgoing mail would be spam from the provider's
 /// address).
 const BLOCKED_PORTS: &[u16] = &[25];
 
-/// Whether a guest may connect to `ip` (public unicast IPv4, not this
-/// host). See the module docs.
-pub fn public_v4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    !(ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_multicast()
-        || ip.is_broadcast()
-        || ip.is_unspecified()
-        || ip.is_documentation()
-        || o[0] == 0
-        // Shared address space (CGNAT, Tailscale), 100.64.0.0/10.
-        || (o[0] == 100 && (o[1] & 0xc0) == 64)
-        // IETF protocol assignments, 192.0.0.0/24.
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-        // Benchmarking, 198.18.0.0/15.
-        || (o[0] == 198 && (o[1] & 0xfe) == 18)
-        // Reserved, 240.0.0.0/4.
-        || o[0] >= 240)
-}
+pub use pumasi_proto::vmnet::{public_ip, public_v4, public_v6};
 
 /// Whether `ip` is one of this machine's own addresses: only those can be
 /// bound.
-fn host_address(ip: Ipv4Addr) -> bool {
+fn host_address(ip: IpAddr) -> bool {
     std::net::UdpSocket::bind((ip, 0)).is_ok()
 }
 
-/// Decides which destinations the guest may reach.
-pub type Policy = Arc<dyn Fn(Ipv4Addr, u16) -> bool + Send + Sync>;
+/// Whether this machine reaches the IPv6 internet: it has a route to a
+/// public IPv6 address (nothing is sent).
+pub fn host_has_ipv6() -> bool {
+    std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+        .and_then(|s| {
+            s.connect((
+                Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+                53,
+            ))?;
+            s.local_addr()
+        })
+        .is_ok_and(|a| matches!(a.ip(), IpAddr::V6(v6) if public_v6(v6)))
+}
+
+/// Decides which destinations the guest may reach at all; a job's allow
+/// list narrows it.
+pub type Policy = Arc<dyn Fn(IpAddr, u16) -> bool + Send + Sync>;
 
 /// The default policy: public addresses that are not this host's, and
 /// not the blocked ports.
 pub fn default_policy() -> Policy {
-    let seen = std::sync::Mutex::new(HashMap::<Ipv4Addr, bool>::new());
+    let seen = Mutex::new(HashMap::<IpAddr, bool>::new());
     Arc::new(move |ip, port| {
-        if BLOCKED_PORTS.contains(&port) || !public_v4(ip) {
+        if BLOCKED_PORTS.contains(&port) || !public_ip(ip) {
             return false;
         }
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -124,11 +145,190 @@ pub fn default_policy() -> Policy {
     })
 }
 
+/// The policy and a job's allow list together.
+struct Guard {
+    base: Policy,
+    spec: NetSpec,
+    /// Addresses DNS answered for names the list allows, and the ports
+    /// they open (`None`: every port).
+    learned: Mutex<HashMap<IpAddr, Option<Vec<Port>>>>,
+}
+
+impl Guard {
+    fn allows(&self, ip: IpAddr, port: u16) -> bool {
+        if !(self.base)(ip, port) {
+            return false;
+        }
+        if self.spec.allow.is_empty() || self.spec.allows_addr(ip, port) {
+            return true;
+        }
+        match self.learned.lock().unwrap().get(&ip) {
+            Some(None) => true,
+            Some(Some(ports)) => ports.iter().any(|p| p.contains(port)),
+            None => false,
+        }
+    }
+
+    /// Opens what DNS answered for `name`, as far as the list allows it.
+    fn learn(&self, name: &str, ips: &[IpAddr]) {
+        if self.spec.allow.is_empty() {
+            return;
+        }
+        let Some(ports) = self.spec.ports_for_name(name) else {
+            return;
+        };
+        let mut learned = self.learned.lock().unwrap();
+        for ip in ips {
+            if learned.len() >= MAX_LEARNED && !learned.contains_key(ip) {
+                break;
+            }
+            let e = learned.entry(*ip).or_insert_with(|| Some(Vec::new()));
+            match (&mut *e, &ports) {
+                (None, _) => {}
+                (Some(_), None) => *e = None,
+                (Some(have), Some(more)) => {
+                    for p in more {
+                        if !have.contains(p) {
+                            have.push(*p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Paces bytes to a rate: a token bucket that may go into debt, whose
+/// takers wait the debt off.
+struct Bucket {
+    rate: f64,
+    burst: f64,
+    state: Mutex<(f64, std::time::Instant)>,
+}
+
+impl Bucket {
+    fn new(bytes_per_sec: u64) -> Self {
+        let rate = bytes_per_sec.max(1) as f64;
+        let burst = (rate / 4.0).max(32.0 * 1024.0);
+        Self {
+            rate,
+            burst,
+            state: Mutex::new((burst, std::time::Instant::now())),
+        }
+    }
+
+    fn refill(&self, s: &mut (f64, std::time::Instant)) {
+        let now = std::time::Instant::now();
+        s.0 = (s.0 + now.duration_since(s.1).as_secs_f64() * self.rate).min(self.burst);
+        s.1 = now;
+    }
+
+    /// Takes `n` bytes, and says how long to wait before sending more.
+    fn take(&self, n: usize) -> Duration {
+        let mut s = self.state.lock().unwrap();
+        self.refill(&mut s);
+        s.0 -= n as f64;
+        if s.0 >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-s.0 / self.rate)
+        }
+    }
+
+    /// Takes `n` bytes if they are there (datagrams over the cap are
+    /// dropped, as a full link would).
+    fn try_take(&self, n: usize) -> bool {
+        let mut s = self.state.lock().unwrap();
+        self.refill(&mut s);
+        if s.0 >= n as f64 {
+            s.0 -= n as f64;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Counts and paces a guest's traffic.
+#[derive(Default)]
+struct Meter {
+    tx: AtomicU64,
+    rx: AtomicU64,
+    up: Option<Bucket>,
+    down: Option<Bucket>,
+}
+
+impl Meter {
+    fn new(spec: &NetSpec) -> Self {
+        let rate = spec.bytes_per_sec();
+        Self {
+            up: rate.map(Bucket::new),
+            down: rate.map(Bucket::new),
+            ..Default::default()
+        }
+    }
+
+    async fn sent(&self, n: usize) {
+        if let Some(b) = &self.up {
+            let wait = b.take(n);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        }
+        self.tx.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    async fn received(&self, n: usize) {
+        if let Some(b) = &self.down {
+            let wait = b.take(n);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        }
+        self.rx.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    fn try_send(&self, n: usize) -> bool {
+        if self.up.as_ref().is_some_and(|b| !b.try_take(n)) {
+            return false;
+        }
+        self.tx.fetch_add(n as u64, Ordering::Relaxed);
+        true
+    }
+
+    fn try_receive(&self, n: usize) -> bool {
+        if self.down.as_ref().is_some_and(|b| !b.try_take(n)) {
+            return false;
+        }
+        self.rx.fetch_add(n as u64, Ordering::Relaxed);
+        true
+    }
+
+    fn usage(&self) -> NetUsage {
+        NetUsage {
+            tx_bytes: self.tx.load(Ordering::Relaxed),
+            rx_bytes: self.rx.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// How a gateway is set up beyond its policy.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// The job's allow list and cap.
+    pub spec: NetSpec,
+    /// Give the guest IPv6 (the host has it).
+    pub ipv6: bool,
+}
+
 /// A running gateway for one VM. Dropping it ends every connection.
 pub struct Gateway {
     /// Where QEMU connects (`-netdev socket,connect=...`), or the vz
     /// helper's [`bridge_datagrams`].
     pub addr: SocketAddr,
+    /// The guest gets IPv6.
+    pub ipv6: bool,
+    meter: Arc<Meter>,
     task: JoinHandle<()>,
 }
 
@@ -139,15 +339,28 @@ impl Drop for Gateway {
 }
 
 impl Gateway {
-    pub async fn start() -> Result<Self> {
-        Self::start_with(default_policy()).await
+    /// A gateway with the default policy, the job's allow list and cap,
+    /// and IPv6 when the host has it.
+    pub async fn start(spec: NetSpec) -> Result<Self> {
+        let ipv6 = tokio::task::spawn_blocking(host_has_ipv6)
+            .await
+            .unwrap_or(false);
+        Self::start_with(default_policy(), Options { spec, ipv6 }).await
     }
 
-    pub async fn start_with(policy: Policy) -> Result<Self> {
+    pub async fn start_with(policy: Policy, opts: Options) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .context("listen for the VM's network card")?;
         let addr = listener.local_addr()?;
+        let meter = Arc::new(Meter::new(&opts.spec));
+        let guard = Arc::new(Guard {
+            base: policy,
+            spec: opts.spec,
+            learned: Default::default(),
+        });
+        let ipv6 = opts.ipv6;
+        let m = meter.clone();
         let task = tokio::spawn(async move {
             let stream = match tokio::time::timeout(ATTACH_TIMEOUT, listener.accept()).await {
                 Ok(Ok((s, peer))) if peer.ip().is_loopback() => s,
@@ -159,11 +372,36 @@ impl Gateway {
             };
             drop(listener);
             let _ = stream.set_nodelay(true);
-            if let Err(e) = serve(stream, policy).await {
+            if let Err(e) = serve(stream, guard, m, ipv6).await {
                 debug!("VM network ended: {e:#}");
             }
         });
-        Ok(Self { addr, task })
+        Ok(Self {
+            addr,
+            ipv6,
+            meter,
+            task,
+        })
+    }
+
+    /// What the guest's network carried so far.
+    pub fn usage(&self) -> NetUsage {
+        self.meter.usage()
+    }
+
+    /// The settings the guest init brings its card up with.
+    pub fn guest_net(&self) -> pumasi_guest::GuestNet {
+        pumasi_guest::GuestNet {
+            address: GUEST.octets(),
+            prefix: PREFIX,
+            gateway: GATEWAY.octets(),
+            dns: GATEWAY.octets(),
+            v6: self.ipv6.then(|| pumasi_guest::GuestNet6 {
+                address: GUEST6.octets(),
+                prefix: PREFIX6,
+                gateway: GATEWAY6.octets(),
+            }),
+        }
     }
 }
 
@@ -223,6 +461,8 @@ enum Event {
     Failed(u64),
     /// A DNS answer for the guest.
     Dns(IpEndpoint, Vec<u8>),
+    /// A datagram from the host side of a UDP flow.
+    Udp(u64, Vec<u8>),
 }
 
 /// One guest TCP connection.
@@ -249,26 +489,147 @@ impl Drop for Conn {
 }
 
 /// Guest source port, destination address and port.
-type FlowKey = (u16, Ipv4Addr, u16);
+type FlowKey = (u16, IpAddr, u16);
+
+/// One UDP flow: a host socket connected to the destination.
+struct UdpFlow {
+    key: (SocketAddr, SocketAddr),
+    socket: Arc<tokio::net::UdpSocket>,
+    last: std::time::Instant,
+    task: JoinHandle<()>,
+}
+
+impl Drop for UdpFlow {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The IP layer of a frame from the guest: version, source, destination,
+/// protocol and payload. Fragments are not handled (the guest's MTU fits
+/// what it sends).
+fn ip_of(frame: &[u8]) -> Option<(IpAddr, IpAddr, IpProtocol, &[u8])> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    let at = EthernetFrame::<&[u8]>::header_len();
+    match eth.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let ip = Ipv4Packet::new_checked(&frame[at..]).ok()?;
+            if ip.more_frags() || ip.frag_offset() != 0 {
+                return None;
+            }
+            let hl = ip.header_len() as usize;
+            let total = (ip.total_len() as usize).min(frame.len() - at);
+            Some((
+                IpAddr::V4(ip.src_addr()),
+                IpAddr::V4(ip.dst_addr()),
+                ip.next_header(),
+                frame.get(at + hl..at + total)?,
+            ))
+        }
+        EthernetProtocol::Ipv6 => {
+            let ip = Ipv6Packet::new_checked(&frame[at..]).ok()?;
+            let len = (ip.payload_len() as usize).min(frame.len() - at - 40);
+            Some((
+                IpAddr::V6(ip.src_addr()),
+                IpAddr::V6(ip.dst_addr()),
+                ip.next_header(),
+                frame.get(at + 40..at + 40 + len)?,
+            ))
+        }
+        _ => None,
+    }
+}
 
 /// A TCP SYN from the guest: its flow.
 fn syn_flow(frame: &[u8]) -> Option<FlowKey> {
-    let eth = EthernetFrame::new_checked(frame).ok()?;
-    if eth.ethertype() != EthernetProtocol::Ipv4 {
+    let (_, dst, proto, payload) = ip_of(frame)?;
+    if proto != IpProtocol::Tcp {
         return None;
     }
-    let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
-    if ip.next_header() != IpProtocol::Tcp {
-        return None;
-    }
-    let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+    let tcp = TcpPacket::new_checked(payload).ok()?;
     if !tcp.syn() || tcp.ack() {
         return None;
     }
-    Some((tcp.src_port(), ip.dst_addr(), tcp.dst_port()))
+    Some((tcp.src_port(), dst, tcp.dst_port()))
 }
 
-async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
+/// A UDP datagram from the guest: its source, destination and payload.
+fn guest_udp(frame: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
+    let (src, dst, proto, payload) = ip_of(frame)?;
+    if proto != IpProtocol::Udp {
+        return None;
+    }
+    let udp = UdpPacket::new_checked(payload).ok()?;
+    let len = (udp.len() as usize).clamp(8, payload.len());
+    Some((
+        SocketAddr::new(src, udp.src_port()),
+        SocketAddr::new(dst, udp.dst_port()),
+        &payload[8..len],
+    ))
+}
+
+/// An Ethernet frame carrying a datagram from `from` to the guest at `to`.
+fn udp_frame(
+    guest_mac: EthernetAddress,
+    from: SocketAddr,
+    to: SocketAddr,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let (src, dst, ethertype) = match (from.ip(), to.ip()) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => (
+            IpAddress::Ipv4(a),
+            IpAddress::Ipv4(b),
+            EthernetProtocol::Ipv4,
+        ),
+        (IpAddr::V6(a), IpAddr::V6(b)) => (
+            IpAddress::Ipv6(a),
+            IpAddress::Ipv6(b),
+            EthernetProtocol::Ipv6,
+        ),
+        _ => return None,
+    };
+    let udp = UdpRepr {
+        src_port: from.port(),
+        dst_port: to.port(),
+    };
+    let ip = IpRepr::new(
+        src,
+        dst,
+        IpProtocol::Udp,
+        udp.header_len() + payload.len(),
+        64,
+    );
+    let eth = EthernetRepr {
+        src_addr: EthernetAddress(GATEWAY_MAC),
+        dst_addr: guest_mac,
+        ethertype,
+    };
+    let ip_len = ip.header_len() + udp.header_len() + payload.len();
+    if ip_len > MTU {
+        return None;
+    }
+    let mut buf = vec![0u8; eth.buffer_len() + ip_len];
+    eth.emit(&mut EthernetFrame::new_unchecked(&mut buf[..]));
+    let at = eth.buffer_len();
+    let caps = ChecksumCapabilities::default();
+    ip.emit(&mut buf[at..], &caps);
+    let at = at + ip.header_len();
+    udp.emit(
+        &mut UdpPacket::new_unchecked(&mut buf[at..]),
+        &src,
+        &dst,
+        payload.len(),
+        |b| b.copy_from_slice(payload),
+        &caps,
+    );
+    Some(buf)
+}
+
+fn is_gateway(ip: IpAddr) -> bool {
+    ip == IpAddr::V4(GATEWAY) || ip == IpAddr::V6(GATEWAY6)
+}
+
+async fn serve(stream: TcpStream, guard: Arc<Guard>, meter: Arc<Meter>, ipv6: bool) -> Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     // QEMU's socket netdev: each frame is a 4-byte big-endian length and
     // the frame.
@@ -311,6 +672,9 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
     let mut iface = Interface::new(config, &mut dev, now());
     iface.update_ip_addrs(|a| {
         let _ = a.push(IpCidr::new(IpAddress::Ipv4(GATEWAY), PREFIX));
+        if ipv6 {
+            let _ = a.push(IpCidr::new(IpAddress::Ipv6(GATEWAY6), PREFIX6));
+        }
     });
     // Every destination routes through the gateway's own address, which
     // with any-IP makes smoltcp accept packets for any address.
@@ -318,24 +682,38 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
         .routes_mut()
         .add_default_ipv4_route(GATEWAY)
         .map_err(|_| anyhow::anyhow!("no room for the default route"))?;
+    if ipv6 {
+        iface
+            .routes_mut()
+            .add_default_ipv6_route(GATEWAY6)
+            .map_err(|_| anyhow::anyhow!("no room for the IPv6 default route"))?;
+    }
     iface.set_any_ip(true);
     let mut sockets = SocketSet::new(Vec::new());
-    let dns = {
+    let mut dns_socket = |addr: IpAddress| -> Result<SocketHandle> {
         let mut s = udp::Socket::new(
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0; 32 * 600]),
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0; 32 * 1500]),
         );
         s.bind(IpListenEndpoint {
-            addr: Some(IpAddress::Ipv4(GATEWAY)),
+            addr: Some(addr),
             port: DNS_PORT,
         })
         .map_err(|e| anyhow::anyhow!("bind DNS: {e}"))?;
-        sockets.add(s)
+        Ok(sockets.add(s))
     };
+    let mut dns = vec![dns_socket(IpAddress::Ipv4(GATEWAY))?];
+    if ipv6 {
+        dns.push(dns_socket(IpAddress::Ipv6(GATEWAY6))?);
+    }
     let dns_slots = Arc::new(Semaphore::new(MAX_DNS_IN_FLIGHT));
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
     let mut conns: HashMap<u64, Conn> = HashMap::new();
     let mut flows: HashMap<FlowKey, u64> = HashMap::new();
+    let mut udp_flows: HashMap<u64, UdpFlow> = HashMap::new();
+    let mut udp_keys: HashMap<(SocketAddr, SocketAddr), u64> = HashMap::new();
+    let mut guest_mac: Option<EthernetAddress> = None;
+    let mut last_sweep = std::time::Instant::now();
     let mut next_id = 0u64;
     let mut buf = vec![0u8; CHUNK];
 
@@ -393,17 +771,78 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
                     }
                 }
                 Event::Dns(to, answer) => {
-                    let s = sockets.get_mut::<udp::Socket>(dns);
-                    let _ = s.send_slice(&answer, to);
+                    let h = match to.addr {
+                        IpAddress::Ipv6(_) if dns.len() > 1 => dns[1],
+                        _ => dns[0],
+                    };
+                    let _ = sockets.get_mut::<udp::Socket>(h).send_slice(&answer, to);
+                }
+                Event::Udp(id, data) => {
+                    let (Some(flow), Some(mac)) = (udp_flows.get_mut(&id), guest_mac) else {
+                        continue;
+                    };
+                    flow.last = std::time::Instant::now();
+                    let (guest, dst) = flow.key;
+                    if meter.try_receive(data.len())
+                        && let Some(f) = udp_frame(mac, dst, guest, &data)
+                    {
+                        let _ = out_tx.try_send(f);
+                    }
                 }
             }
         }
 
         for f in frames {
+            if let Ok(eth) = EthernetFrame::new_checked(&f[..]) {
+                guest_mac.get_or_insert(eth.src_addr());
+            }
+            // UDP to anywhere but the gateway: out through a host socket
+            // when allowed. Refused datagrams go on to smoltcp, which
+            // answers them with "port unreachable".
+            if let Some((src, dst, payload)) = guest_udp(&f)
+                && !is_gateway(dst.ip())
+                && guard.allows(dst.ip(), dst.port())
+            {
+                let key = (src, dst);
+                let id = match udp_keys.get(&key) {
+                    Some(id) => Some(*id),
+                    None if udp_flows.len() < MAX_UDP_FLOWS => {
+                        match open_udp(dst, next_id, ev_tx.clone()) {
+                            Ok((socket, task)) => {
+                                let id = next_id;
+                                next_id += 1;
+                                udp_keys.insert(key, id);
+                                udp_flows.insert(
+                                    id,
+                                    UdpFlow {
+                                        key,
+                                        socket,
+                                        last: std::time::Instant::now(),
+                                        task,
+                                    },
+                                );
+                                Some(id)
+                            }
+                            Err(e) => {
+                                trace!(%dst, "UDP flow not opened: {e:#}");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                if let Some(flow) = id.and_then(|id| udp_flows.get_mut(&id)) {
+                    flow.last = std::time::Instant::now();
+                    if meter.try_send(payload.len()) {
+                        let _ = flow.socket.try_send(payload);
+                    }
+                }
+                continue;
+            }
             if let Some(key) = syn_flow(&f)
                 && !flows.contains_key(&key)
                 && conns.len() < MAX_CONNECTIONS
-                && policy(key.1, key.2)
+                && guard.allows(key.1, key.2)
             {
                 // A listener for exactly this destination, before smoltcp
                 // sees the SYN. Refused destinations have none, and
@@ -417,7 +856,7 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
                 s.set_timeout(Some(smoltcp::time::Duration::from_secs(600)));
                 s.set_keep_alive(Some(smoltcp::time::Duration::from_secs(60)));
                 if s.listen(IpListenEndpoint {
-                    addr: Some(IpAddress::Ipv4(key.1)),
+                    addr: Some(key.1.into()),
                     port: key.2,
                 })
                 .is_ok()
@@ -429,10 +868,11 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
                     let credit = Arc::new(Semaphore::new(HOST_WINDOW));
                     let task = tokio::spawn(connect(
                         id,
-                        SocketAddrV4::new(key.1, key.2),
+                        SocketAddr::new(key.1, key.2),
                         from_guest,
                         credit.clone(),
                         ev_tx.clone(),
+                        meter.clone(),
                     ));
                     flows.insert(key, id);
                     conns.insert(
@@ -459,23 +899,25 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
         iface.poll(now(), &mut dev, &mut sockets);
 
         // DNS queries.
-        loop {
-            let s = sockets.get_mut::<udp::Socket>(dns);
-            let Ok((n, meta)) = s.recv_slice(&mut buf) else {
-                break;
-            };
-            let query = buf[..n].to_vec();
-            let Ok(slot) = dns_slots.clone().try_acquire_owned() else {
-                continue;
-            };
-            let ev = ev_tx.clone();
-            let policy = policy.clone();
-            tokio::spawn(async move {
-                if let Some(answer) = resolve(&query, &policy).await {
-                    let _ = ev.send(Event::Dns(meta.endpoint, answer));
-                }
-                drop(slot);
-            });
+        for &h in &dns {
+            loop {
+                let s = sockets.get_mut::<udp::Socket>(h);
+                let Ok((n, meta)) = s.recv_slice(&mut buf) else {
+                    break;
+                };
+                let query = buf[..n].to_vec();
+                let Ok(slot) = dns_slots.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let ev = ev_tx.clone();
+                let guard = guard.clone();
+                tokio::spawn(async move {
+                    if let Some(answer) = resolve(&query, &guard, ipv6).await {
+                        let _ = ev.send(Event::Dns(meta.endpoint, answer));
+                    }
+                    drop(slot);
+                });
+            }
         }
 
         // TCP connections.
@@ -542,6 +984,17 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
                 sockets.remove(c.handle);
             }
         }
+        // UDP flows nothing crossed for a while.
+        if last_sweep.elapsed() > Duration::from_secs(1) {
+            last_sweep = std::time::Instant::now();
+            udp_flows.retain(|_, f| {
+                let keep = f.last.elapsed() < UDP_IDLE;
+                if !keep {
+                    udp_keys.remove(&f.key);
+                }
+                keep
+            });
+        }
 
         iface.poll(now(), &mut dev, &mut sockets);
         while let Some(f) = dev.tx.pop_front() {
@@ -550,6 +1003,41 @@ async fn serve(stream: TcpStream, policy: Policy) -> Result<()> {
             let _ = out_tx.try_send(f);
         }
     }
+}
+
+/// A host socket for a guest's UDP flow to `dst`, and the task that
+/// passes its answers on.
+fn open_udp(
+    dst: SocketAddr,
+    id: u64,
+    ev: mpsc::UnboundedSender<Event>,
+) -> Result<(Arc<tokio::net::UdpSocket>, JoinHandle<()>)> {
+    let any: SocketAddr = match dst {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let std = std::net::UdpSocket::bind(any).context("bind")?;
+    std.connect(dst).context("connect")?;
+    std.set_nonblocking(true)?;
+    let socket = Arc::new(tokio::net::UdpSocket::from_std(std)?);
+    let rd = socket.clone();
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            match rd.recv(&mut buf).await {
+                Ok(n) => {
+                    if ev.send(Event::Udp(id, buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+                // ICMP errors for earlier datagrams show up here; the flow
+                // goes on.
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                Err(_) => return,
+            }
+        }
+    });
+    Ok((socket, task))
 }
 
 /// Send and receive buffers of the datagram socket a vz VM's network card
@@ -693,10 +1181,11 @@ impl Drop for AbortOnDrop {
 /// The host side of one guest connection.
 async fn connect(
     id: u64,
-    to: SocketAddrV4,
+    to: SocketAddr,
     mut from_guest: mpsc::Receiver<Vec<u8>>,
     credit: Arc<Semaphore>,
     ev: mpsc::UnboundedSender<Event>,
+    meter: Arc<Meter>,
 ) {
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(to)).await {
         Ok(Ok(s)) => s,
@@ -707,8 +1196,10 @@ async fn connect(
     };
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
+    let m = meter.clone();
     let up = async move {
         while let Some(data) = from_guest.recv().await {
+            m.sent(data.len()).await;
             wr.write_all(&data).await?;
         }
         wr.shutdown().await
@@ -733,6 +1224,9 @@ async fn connect(
                 let _ = ev2.send(Event::Eof(id));
                 return Ok(());
             }
+            // Under a cap, reading waits: the sender's window fills and it
+            // slows down.
+            meter.received(n).await;
             if ev2.send(Event::Data(id, buf[..n].to_vec())).is_err() {
                 return Ok(());
             }
@@ -744,31 +1238,40 @@ async fn connect(
     }
 }
 
-/// Answers a DNS query with the host's resolver: A records only (the
-/// guest has no IPv6), and only addresses the guest may reach.
-async fn resolve(query: &[u8], policy: &Policy) -> Option<Vec<u8>> {
+/// Answers a DNS query with the host's resolver: A records, and AAAA
+/// records when the guest has IPv6, only with addresses the guest may
+/// reach. A name the job's allow list does not have does not exist; the
+/// addresses of one it has open for the ports the list gives.
+async fn resolve(query: &[u8], guard: &Guard, ipv6: bool) -> Option<Vec<u8>> {
     let q = parse_query(query)?;
-    let addrs = if q.qtype == 1 && q.qclass == 1 {
-        match tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::net::lookup_host((q.name.as_str(), 0)),
-        )
-        .await
-        {
-            Ok(Ok(it)) => Some(
-                it.filter_map(|a| match a {
-                    SocketAddr::V4(a) if policy(*a.ip(), 443) || policy(*a.ip(), 80) => {
-                        Some(*a.ip())
-                    }
-                    _ => None,
-                })
+    let want_v6 = match (q.qtype, q.qclass) {
+        (1, 1) => false,
+        (28, 1) => true,
+        _ => return Some(answer(query, &q, Some(&[]))),
+    };
+    if !guard.spec.allows_name(&q.name) {
+        return Some(answer(query, &q, None));
+    }
+    if want_v6 && !ipv6 {
+        return Some(answer(query, &q, Some(&[])));
+    }
+    let addrs = match tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::lookup_host((q.name.as_str(), 0)),
+    )
+    .await
+    {
+        Ok(Ok(it)) => {
+            let ips: Vec<IpAddr> = it
+                .map(|a| a.ip())
+                .filter(|ip| ip.is_ipv6() == want_v6)
+                .filter(|ip| (guard.base)(*ip, 443) || (guard.base)(*ip, 80))
                 .take(16)
-                .collect::<Vec<_>>(),
-            ),
-            _ => None,
+                .collect();
+            guard.learn(&q.name, &ips);
+            Some(ips)
         }
-    } else {
-        Some(Vec::new())
+        _ => None,
     };
     Some(answer(query, &q, addrs.as_deref()))
 }
@@ -822,9 +1325,10 @@ fn parse_query(p: &[u8]) -> Option<Query> {
     })
 }
 
-/// The response to `query`: these A records, or NXDOMAIN for `None`.
-fn answer(query: &[u8], q: &Query, addrs: Option<&[Ipv4Addr]>) -> Vec<u8> {
-    let mut r = Vec::with_capacity(q.end + 16 * 16);
+/// The response to `query`: these A or AAAA records, or NXDOMAIN for
+/// `None`.
+fn answer(query: &[u8], q: &Query, addrs: Option<&[IpAddr]>) -> Vec<u8> {
+    let mut r = Vec::with_capacity(q.end + 16 * 28);
     r.extend_from_slice(&query[..2]);
     // Response, recursion desired (as asked) and available.
     let rd = query[2] & 0x01;
@@ -836,10 +1340,18 @@ fn answer(query: &[u8], q: &Query, addrs: Option<&[Ipv4Addr]>) -> Vec<u8> {
     r.extend_from_slice(&[0, 0, 0, 0]);
     r.extend_from_slice(&query[12..q.end]);
     for a in addrs.unwrap_or_default() {
-        // The name is the question's (a pointer to offset 12), type A,
-        // class IN, a minute to live.
-        r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
-        r.extend_from_slice(&a.octets());
+        // The name is the question's (a pointer to offset 12), class IN,
+        // a minute to live.
+        match a {
+            IpAddr::V4(v4) => {
+                r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                r.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                r.extend_from_slice(&[0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+                r.extend_from_slice(&v6.octets());
+            }
+        }
     }
     r
 }
@@ -853,6 +1365,8 @@ fn rand_seed() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddrV4;
+
     use super::*;
 
     #[test]
@@ -910,13 +1424,20 @@ mod tests {
         assert_eq!(parsed.name, "pypi.org");
         assert_eq!(parsed.qtype, 1);
         assert_eq!(parsed.end, q.len());
-        let ip: Ipv4Addr = "151.101.0.223".parse().unwrap();
+        let ip: IpAddr = "151.101.0.223".parse().unwrap();
         let r = answer(&q, &parsed, Some(&[ip]));
         assert_eq!(&r[..2], &[0x12, 0x34]);
         assert_eq!(r[2] & 0x80, 0x80, "a response");
         assert_eq!(r[3] & 0x0f, 0, "no error");
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "one answer");
-        assert_eq!(&r[r.len() - 4..], &ip.octets());
+        assert_eq!(&r[r.len() - 4..], &[151, 101, 0, 223]);
+        // AAAA records carry 16 bytes.
+        let q6 = query("example.com", 28);
+        let p6 = parse_query(&q6).unwrap();
+        let v6: IpAddr = "2606:2800:220:1::1".parse().unwrap();
+        let r6 = answer(&q6, &p6, Some(&[v6]));
+        assert_eq!(&r6[r6.len() - 16..], &v6_octets(v6));
+        assert_eq!(&r6[r6.len() - 26..r6.len() - 24], &[0, 28], "type AAAA");
         let nx = answer(&q, &parsed, None);
         assert_eq!(nx[3] & 0x0f, 3, "NXDOMAIN");
         assert_eq!(u16::from_be_bytes([nx[6], nx[7]]), 0);
@@ -981,8 +1502,10 @@ mod tests {
             );
             iface.update_ip_addrs(|a| {
                 let _ = a.push(IpCidr::new(IpAddress::Ipv4(GUEST), PREFIX));
+                let _ = a.push(IpCidr::new(IpAddress::Ipv6(GUEST6), PREFIX6));
             });
             iface.routes_mut().add_default_ipv4_route(GATEWAY).unwrap();
+            iface.routes_mut().add_default_ipv6_route(GATEWAY6).unwrap();
             Self {
                 link,
                 dev,
@@ -1043,13 +1566,17 @@ mod tests {
         }
 
         fn tcp(&mut self, to: SocketAddrV4, local_port: u16) -> SocketHandle {
+            self.tcp_to(SocketAddr::V4(to), local_port)
+        }
+
+        fn tcp_to(&mut self, to: SocketAddr, local_port: u16) -> SocketHandle {
             let mut s = tcp::Socket::new(
                 tcp::SocketBuffer::new(vec![0; 65536]),
                 tcp::SocketBuffer::new(vec![0; 65536]),
             );
             s.connect(
                 self.iface.context(),
-                IpEndpoint::new(IpAddress::Ipv4(*to.ip()), to.port()),
+                IpEndpoint::new(to.ip().into(), to.port()),
                 local_port,
             )
             .unwrap();
@@ -1090,8 +1617,11 @@ mod tests {
                 });
             }
         });
-        let policy: Policy = Arc::new(move |ip, p| ip == Ipv4Addr::LOCALHOST && p == port);
-        let gw = Gateway::start_with(policy).await.unwrap();
+        let policy: Policy =
+            Arc::new(move |ip, p| ip == IpAddr::V4(Ipv4Addr::LOCALHOST) && p == port);
+        let gw = Gateway::start_with(policy, Options::default())
+            .await
+            .unwrap();
         let mut g = if datagram {
             #[cfg(unix)]
             {
@@ -1163,5 +1693,252 @@ mod tests {
             0,
             "loopback is not handed out"
         );
+    }
+
+    fn v6_octets(ip: IpAddr) -> [u8; 16] {
+        match ip {
+            IpAddr::V6(v) => v.octets(),
+            IpAddr::V4(_) => unreachable!(),
+        }
+    }
+
+    fn spec(rules: &[&str], mbps: Option<u32>) -> NetSpec {
+        NetSpec {
+            allow: NetSpec::parse_list(rules).unwrap(),
+            mbps,
+        }
+    }
+
+    /// Names in a list open what DNS answered for them, for their ports
+    /// only; the base policy still decides first.
+    #[test]
+    fn allow_lists_learn_from_dns() {
+        let everything: Policy = Arc::new(|ip, _| ip != IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
+        let g = Guard {
+            base: everything,
+            spec: spec(&["pypi.org:443", "*.example.com", "1.1.1.1:53"], None),
+            learned: Default::default(),
+        };
+        let a: IpAddr = "151.101.0.223".parse().unwrap();
+        let b: IpAddr = "93.184.216.34".parse().unwrap();
+        assert!(!g.allows(a, 443), "nothing looked up yet");
+        g.learn("pypi.org", &[a]);
+        g.learn("evil.org", &[b]);
+        assert!(g.allows(a, 443));
+        assert!(!g.allows(a, 80), "only the rule's port");
+        assert!(!g.allows(b, 443), "not on the list");
+        g.learn("www.example.com", &[b]);
+        assert!(g.allows(b, 8080), "every port");
+        assert!(g.allows("1.1.1.1".parse().unwrap(), 53));
+        assert!(!g.allows("1.1.1.1".parse().unwrap(), 443));
+        g.learn("x.example.com", &["9.9.9.9".parse().unwrap()]);
+        assert!(
+            !g.allows("9.9.9.9".parse().unwrap(), 443),
+            "the policy first"
+        );
+    }
+
+    #[test]
+    fn buckets_pace() {
+        let b = Bucket::new(100_000);
+        assert_eq!(b.take(10_000), Duration::ZERO, "within the burst");
+        let wait = b.take(200_000);
+        assert!(
+            wait > Duration::from_millis(1500) && wait < Duration::from_secs(3),
+            "{wait:?}"
+        );
+        assert!(!b.try_take(1), "in debt");
+        let open = Meter::new(&NetSpec::default());
+        assert!(open.try_send(1 << 30));
+        assert_eq!(open.usage().tx_bytes, 1 << 30);
+    }
+
+    async fn udp_echo() -> u16 {
+        let s = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = s.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, from)) = s.recv_from(&mut buf).await {
+                let mut reply = b"echo:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                let _ = s.send_to(&reply, from).await;
+            }
+        });
+        port
+    }
+
+    async fn tcp_echo() -> u16 {
+        let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = server.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// UDP goes out and comes back through the gateway when the list
+    /// allows it, and is counted; what the list leaves out is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_udp_and_an_allow_list() {
+        let uport = udp_echo().await;
+        let tport = tcp_echo().await;
+        // The base policy lets loopback through on both ports (the default
+        // one would refuse it); the list takes the TCP port away again.
+        let policy: Policy = Arc::new(move |ip, p| {
+            ip == IpAddr::V4(Ipv4Addr::LOCALHOST) && (p == uport || p == tport)
+        });
+        let gw = Gateway::start_with(
+            policy,
+            Options {
+                spec: spec(&[&format!("127.0.0.1:{uport}")], None),
+                ipv6: false,
+            },
+        )
+        .await
+        .unwrap();
+        let mut g = FakeGuest::attach(&gw).await;
+        let mut u = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]),
+        );
+        u.bind(41000).unwrap();
+        let uh = g.sockets.add(u);
+        let to = IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::LOCALHOST), uport);
+        let mut reply = None;
+        for i in 0..300 {
+            if i % 50 == 0 {
+                // The first datagram may wait on ARP for the gateway.
+                let _ = g
+                    .sockets
+                    .get_mut::<udp::Socket>(uh)
+                    .send_slice(b"hello quic", to);
+            }
+            g.pump(10).await;
+            let mut b = [0u8; 1500];
+            if let Ok((n, meta)) = g.sockets.get_mut::<udp::Socket>(uh).recv_slice(&mut b) {
+                assert_eq!(meta.endpoint, to, "the answer comes from the server");
+                reply = Some(b[..n].to_vec());
+                break;
+            }
+        }
+        assert_eq!(reply.as_deref(), Some(&b"echo:hello quic"[..]));
+        let used = gw.usage();
+        // Each datagram sent is 10 bytes and each answer 15; one may still
+        // be on its way.
+        assert!(used.tx_bytes >= 10 && used.tx_bytes % 10 == 0, "{used:?}");
+        assert!(used.rx_bytes >= 15 && used.rx_bytes % 15 == 0, "{used:?}");
+        assert!(used.rx_bytes / 15 <= used.tx_bytes / 10, "{used:?}");
+
+        // TCP to the port the list leaves out: a reset.
+        let h = g.tcp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tport), 41001);
+        g.pump(300).await;
+        assert_eq!(
+            g.sockets.get_mut::<tcp::Socket>(h).state(),
+            tcp::State::Closed,
+            "refused with a reset"
+        );
+    }
+
+    /// A cap paces a TCP transfer, and both ways are counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bandwidth_caps_pace_tcp() {
+        let port = tcp_echo().await;
+        let policy: Policy =
+            Arc::new(move |ip, p| ip == IpAddr::V4(Ipv4Addr::LOCALHOST) && p == port);
+        let gw = Gateway::start_with(
+            policy,
+            Options {
+                // 1 Mbit/s: 125 kB a second each way.
+                spec: spec(&[], Some(1)),
+                ipv6: false,
+            },
+        )
+        .await
+        .unwrap();
+        let mut g = FakeGuest::attach(&gw).await;
+        let h = g.tcp(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 42000);
+        let payload = vec![7u8; 200_000];
+        let (mut sent, mut got) = (0, 0);
+        let start = std::time::Instant::now();
+        for _ in 0..4000 {
+            g.pump(5).await;
+            let s = g.sockets.get_mut::<tcp::Socket>(h);
+            if s.can_send() && sent < payload.len() {
+                sent += s.send_slice(&payload[sent..]).unwrap();
+            }
+            while s.can_recv() {
+                let mut b = vec![0; 65536];
+                got += s.recv_slice(&mut b).unwrap();
+            }
+            if got == payload.len() {
+                break;
+            }
+        }
+        assert_eq!(got, payload.len(), "echoed everything");
+        let took = start.elapsed();
+        // (200 kB - 32 kB of burst) at 125 kB/s.
+        assert!(took > Duration::from_millis(1200), "{took:?}");
+        let used = gw.usage();
+        assert_eq!(used.tx_bytes, 200_000);
+        assert_eq!(used.rx_bytes, 200_000);
+    }
+
+    /// With IPv6, the guest reaches IPv6 addresses through the gateway's
+    /// own (neighbor discovery included).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_tcp_over_ipv6() {
+        let Ok(server) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
+            eprintln!("no IPv6 loopback here; skipped");
+            return;
+        };
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = server.accept().await {
+                let _ = s.write_all(b"over v6").await;
+            }
+        });
+        let policy: Policy =
+            Arc::new(move |ip, p| ip == IpAddr::V6(Ipv6Addr::LOCALHOST) && p == port);
+        let gw = Gateway::start_with(
+            policy,
+            Options {
+                spec: NetSpec::default(),
+                ipv6: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(gw.guest_net().v6.is_some());
+        let mut g = FakeGuest::attach(&gw).await;
+        let h = g.tcp_to(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+            43000,
+        );
+        let mut got = Vec::new();
+        for _ in 0..400 {
+            g.pump(5).await;
+            let s = g.sockets.get_mut::<tcp::Socket>(h);
+            while s.can_recv() {
+                let mut b = vec![0; 1024];
+                let n = s.recv_slice(&mut b).unwrap();
+                got.extend_from_slice(&b[..n]);
+            }
+            if got.len() >= 7 {
+                break;
+            }
+        }
+        assert_eq!(got, b"over v6");
+        assert_eq!(gw.usage().rx_bytes, 7);
     }
 }

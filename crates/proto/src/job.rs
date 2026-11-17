@@ -462,6 +462,11 @@ pub struct JobSubmission {
     /// Parts of GPUs and WebGPU features ([`JobExt`] carries them).
     #[serde(skip)]
     pub gpu_ext: crate::gpu::GpuExt,
+    // 1.18 from here, never on the wire inside a submission either.
+    /// A microVM network's allow list and bandwidth cap ([`JobExt`]
+    /// carries them).
+    #[serde(skip)]
+    pub net: crate::vmnet::NetSpec,
 }
 
 /// What postcard leaves out of a [`JobSubmission`], sent beside it in
@@ -474,6 +479,10 @@ pub struct JobSubmission {
 pub struct JobExt {
     pub placement: crate::sched::Placement,
     pub gpu: crate::gpu::GpuExt,
+    /// 1.18: the microVM network's allow list and cap. Sent in
+    /// [`crate::msg::AdminOp::SubmitNet`], which older control planes
+    /// refuse.
+    pub net: crate::vmnet::NetSpec,
 }
 
 impl JobSubmission {
@@ -482,6 +491,7 @@ impl JobSubmission {
         JobExt {
             placement: std::mem::take(&mut self.placement),
             gpu: std::mem::take(&mut self.gpu_ext),
+            net: std::mem::take(&mut self.net),
         }
     }
 
@@ -489,6 +499,7 @@ impl JobSubmission {
     pub fn set_ext(&mut self, ext: JobExt) {
         self.placement = ext.placement;
         self.gpu_ext = ext.gpu;
+        self.net = ext.net;
     }
 
     /// Whether its tasks need a node whose Docker GPUs can draw.
@@ -504,7 +515,8 @@ impl JobSubmission {
         if self.executor != Executor::Image {
             return;
         }
-        if self.tier == Tier::Confidential {
+        if self.tier == Tier::Confidential || !self.net.is_empty() {
+            // Allow lists and caps are the microVM gateway's (1.18).
             self.executor = Executor::Microvm;
         } else if !self.gpu_capabilities.is_empty() || self.gpu_ext.share > 0 {
             // A microVM takes its GPU whole. (Checkpoints work in both
@@ -554,6 +566,14 @@ impl JobSubmission {
             ensure!(
                 !self.docker.as_ref().is_some_and(|d| d.network),
                 "confidential jobs have no network: the node would carry the traffic"
+            );
+        }
+        if !self.net.is_empty() {
+            self.net.validate().context("network")?;
+            ensure!(
+                matches!(self.executor, Executor::Microvm | Executor::Image)
+                    && self.docker.as_ref().is_some_and(|d| d.network),
+                "network allow lists and caps are for microVM jobs with `network`"
             );
         }
         if let Some(g) = &self.gpu {
@@ -731,9 +751,11 @@ pub struct JobFile {
     #[serde(default)]
     pub files: Vec<PathBuf>,
     /// Allow network access (docker and microvm executors). MicroVMs reach
-    /// only the internet, never private addresses.
+    /// only the internet, never private addresses. A list (`["pypi.org:443",
+    /// "*.pythonhosted.org"]`) or a table (`{ allow = [...], mbps = 20 }`)
+    /// narrows a microVM's network to what it names and caps it (1.18).
     #[serde(default)]
-    pub network: bool,
+    pub network: NetworkField,
     /// GPUs each task needs (docker and microvm executors): a number, or
     /// "all" for every GPU of the node.
     pub gpus: Option<GpusField>,
@@ -783,6 +805,59 @@ pub struct JobFile {
     /// and the grace period, and its `/checkpoint` comes back when it runs
     /// again.
     pub checkpoint: Option<crate::sched::CheckpointFile>,
+}
+
+/// `network = true`, `network = ["pypi.org:443"]` or
+/// `network = { allow = ["pypi.org:443"], mbps = 20 }` (1.18).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum NetworkField {
+    On(bool),
+    Allow(Vec<String>),
+    Table(NetworkTable),
+}
+
+impl Default for NetworkField {
+    fn default() -> Self {
+        NetworkField::On(false)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkTable {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    pub mbps: Option<u32>,
+}
+
+impl NetworkField {
+    pub fn enabled(&self) -> bool {
+        !matches!(self, NetworkField::On(false))
+    }
+
+    /// The allow list and cap, checked.
+    pub fn spec(&self) -> Result<crate::vmnet::NetSpec> {
+        let spec = match self {
+            NetworkField::On(_) => crate::vmnet::NetSpec::default(),
+            NetworkField::Allow(list) => {
+                ensure!(
+                    !list.is_empty(),
+                    "`network = []` reaches nothing; leave `network` out instead"
+                );
+                crate::vmnet::NetSpec {
+                    allow: crate::vmnet::NetSpec::parse_list(list)?,
+                    mbps: None,
+                }
+            }
+            NetworkField::Table(t) => crate::vmnet::NetSpec {
+                allow: crate::vmnet::NetSpec::parse_list(&t.allow)?,
+                mbps: t.mbps,
+            },
+        };
+        spec.validate().context("network")?;
+        Ok(spec)
+    }
 }
 
 /// `gpus = 2`, `gpus = "all"` or `gpus = 0.5` (1.10).
@@ -1089,7 +1164,7 @@ impl JobFile {
                     "`command` is only for docker and microvm jobs; use `args`"
                 );
                 ensure!(
-                    !self.network,
+                    !self.network.enabled(),
                     "wasm tasks cannot use the network; use a docker or microvm job"
                 );
                 let m = self.module.as_ref().context("wasm job needs `module`")?;
@@ -1224,10 +1299,15 @@ impl JobFile {
             }
             "job".into()
         });
+        let net = self.network.spec()?;
+        ensure!(
+            net.is_empty() || executor != Executor::Docker,
+            "network allow lists and caps are for microVMs: set executor = \"microvm\" (Docker's network is all or nothing)"
+        );
         let docker = docker_base.map(|image| DockerSpec {
             image,
             command,
-            network: self.network,
+            network: self.network.enabled(),
             gpus: None,
         });
         let gpu_share = match &self.gpus {
@@ -1322,6 +1402,7 @@ impl JobFile {
             None => None,
         };
         let sub = JobSubmission {
+            net,
             placement,
             gpu_ext: crate::gpu::GpuExt {
                 share: gpu_share,
@@ -1619,6 +1700,55 @@ mod tests {
         let net =
             JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\nnetwork = true").unwrap();
         assert!(net.resolve(&dir).unwrap().docker.unwrap().network);
+        // 1.18: an allow list, or a table with a cap.
+        let allow = JobFile::parse(
+            "executor = \"microvm\"\nimage = \"busybox\"\nnetwork = [\"pypi.org:443\", \"*.pythonhosted.org\"]",
+        )
+        .unwrap()
+        .resolve(&dir)
+        .unwrap();
+        assert!(allow.docker.as_ref().unwrap().network);
+        assert_eq!(allow.net.allow.len(), 2);
+        assert!(allow.net.allows_name("files.pythonhosted.org"));
+        assert!(!allow.net.allows_name("example.com"));
+        let capped = JobFile::parse(
+            "executor = \"microvm\"\nimage = \"busybox\"\nnetwork = { allow = [\"10.0.0.0/8\"], mbps = 20 }",
+        )
+        .unwrap()
+        .resolve(&dir)
+        .unwrap();
+        assert_eq!(capped.net.mbps, Some(20));
+        let cap_only =
+            JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\nnetwork = { mbps = 5 }")
+                .unwrap()
+                .resolve(&dir)
+                .unwrap();
+        assert!(cap_only.net.allow.is_empty() && cap_only.net.mbps == Some(5));
+        // Docker cannot narrow its network; an image job becomes a microVM.
+        let docker = JobFile::parse(
+            "executor = \"docker\"\nimage = \"busybox\"\nnetwork = [\"pypi.org:443\"]",
+        )
+        .unwrap();
+        assert!(docker.resolve(&dir).is_err());
+        let mut image = JobFile::parse(
+            "executor = \"image\"\nimage = \"busybox\"\nnetwork = [\"pypi.org:443\"]",
+        )
+        .unwrap()
+        .resolve(&dir)
+        .unwrap();
+        image.narrow_executor();
+        assert_eq!(image.executor, Executor::Microvm);
+        let empty =
+            JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\nnetwork = []").unwrap();
+        assert!(
+            empty.resolve(&dir).is_err(),
+            "an empty list reaches nothing"
+        );
+        let bad = JobFile::parse(
+            "executor = \"microvm\"\nimage = \"busybox\"\nnetwork = [\"pypi.org:http\"]",
+        )
+        .unwrap();
+        assert!(bad.resolve(&dir).is_err());
         let gpu =
             JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\ngpus = \"all\"").unwrap();
         assert_eq!(gpu.resolve(&dir).unwrap().gpu.unwrap().count, 0);

@@ -72,6 +72,15 @@ impl Backend {
         self.client(secret).await?.call(op).await
     }
 
+    /// A job's receipts with their egress parts ([`AdminClient::receipts`]).
+    pub async fn receipts(
+        &self,
+        secret: Secret,
+        id: pumasi_proto::job::JobId,
+    ) -> Result<Vec<pumasi_proto::receipt::Receipt>> {
+        self.client(secret).await?.receipts(id).await
+    }
+
     /// A read a follower may answer ([`AdminClient::read`]).
     pub async fn read(&self, secret: Secret, op: AdminOp) -> Result<AdminResponse> {
         self.client(secret).await?.read(op).await

@@ -570,13 +570,9 @@ pub async fn cancel(ctx: Ctx, headers: HeaderMap, Path(id): Path<String>) -> Res
 pub async fn receipts(ctx: Ctx, Path(id): Path<String>) -> Response {
     let res = async {
         let id = parse_id(&id)?;
-        match ctx.call(AdminOp::Receipts { id }).await? {
-            AdminResponse::Receipts(r) => {
-                let rows: Vec<ReceiptRow> = r.iter().map(ReceiptRow::from).collect();
-                Ok((id, serde_json::to_vec_pretty(&rows)?))
-            }
-            _ => anyhow::bail!("unexpected response"),
-        }
+        let r = ctx.st.backend.receipts(ctx.me.secret, id).await?;
+        let rows: Vec<ReceiptRow> = r.iter().map(ReceiptRow::from).collect();
+        Ok::<_, anyhow::Error>((id, serde_json::to_vec_pretty(&rows)?))
     }
     .await;
     match res {

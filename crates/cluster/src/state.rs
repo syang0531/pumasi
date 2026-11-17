@@ -165,6 +165,10 @@ pub struct JobMeta {
     /// table.
     #[serde(skip)]
     pub gpu_ext: pumasi_proto::gpu::GpuExt,
+    /// A microVM network's allow list and cap (1.18), persisted in their
+    /// own table.
+    #[serde(skip)]
+    pub net: pumasi_proto::vmnet::NetSpec,
 }
 
 /// What a run produced, kept for a check run until the check settles in
@@ -321,6 +325,10 @@ impl NodeRuntime {
     }
 }
 
+/// The most a run's network is billed for without a cap: what a 10 Gbit/s
+/// line carries each way (1.18).
+const EGRESS_LINE_BYTES_PER_SEC: u64 = 10_000_000_000 / 8;
+
 /// A unit of work waiting for a node: a task's own run, or a check run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueueItem {
@@ -347,6 +355,9 @@ pub(crate) struct Need {
     /// An image job that wants a network: a node that would run it in a
     /// microVM must be able to give its microVMs one.
     pub vm_network: bool,
+    /// Its microVM network has an allow list or a cap (1.18): only agents
+    /// that enforce them.
+    pub vm_net_rules: bool,
     /// Private image jobs: the architectures it is ready for.
     pub images: Option<Vec<(String, ImageBlob)>>,
     pub consumer: String,
@@ -651,6 +662,8 @@ impl State {
             snap.job_place.into_iter().collect();
         let mut job_gpu_ext: HashMap<u128, pumasi_proto::gpu::GpuExt> =
             snap.job_gpu_ext.into_iter().collect();
+        let mut job_net: HashMap<u128, pumasi_proto::vmnet::NetSpec> =
+            snap.job_net.into_iter().collect();
         state.load_sched(snap.checkpoints, snap.account_resources);
         state.rollout = state.load_rollout()?;
         state.names = state.load_node_names()?;
@@ -667,6 +680,7 @@ impl State {
             meta.origin = job_origin.remove(&meta.id.0).unwrap_or_default();
             meta.place = job_place.remove(&meta.id.0).unwrap_or_default();
             meta.gpu_ext = job_gpu_ext.remove(&meta.id.0).unwrap_or_default();
+            meta.net = job_net.remove(&meta.id.0).unwrap_or_default();
             meta.gpu = job_gpu.remove(&meta.id.0).or_else(|| {
                 // Jobs from before phase 9 passed `--gpus` to docker: that
                 // was every NVIDIA GPU of the node.
@@ -1144,6 +1158,7 @@ impl State {
         let lost: Vec<TaskRef> = node.running.drain().map(|(t, _)| t).collect();
         node.stopping.clear();
         self.forget_replicas_sent(id);
+        self.forget_cache_sent(id);
         if !lost.is_empty() {
             warn!(node = %id, tasks = lost.len(), "node lost; rescheduling its tasks");
         }
@@ -1271,6 +1286,7 @@ impl State {
         self.tick_queue_timeouts();
         self.tick_files();
         self.tick_replicas();
+        self.tick_caches();
         self.tick_wake();
         self.tick_net();
         self.expire_upgrades();
@@ -1356,6 +1372,7 @@ impl State {
         let sched = sched_of(&sub, schedule);
         let place = std::mem::take(&mut sub.placement);
         let gpu_ext = std::mem::take(&mut sub.gpu_ext);
+        let net = std::mem::take(&mut sub.net);
         let origin = crate::remote::JobOrigin {
             submitted_by: by,
             queue_timeout_ms: sub.queue_timeout_ms,
@@ -1383,6 +1400,7 @@ impl State {
             sched,
             place,
             gpu_ext,
+            net,
             gpu: sub.gpu,
         };
         self.next_seq += 1;
@@ -1534,6 +1552,7 @@ impl State {
         opened: Option<crate::confidential::Opened>,
     ) {
         let timing = self.mgmt.report_timing.remove(&report.task);
+        let net = self.mgmt.report_net.remove(&report.task);
         let Some(node) = self.nodes.get_mut(node_id) else {
             return;
         };
@@ -1582,7 +1601,7 @@ impl State {
             return;
         }
         if let Some(signed) = report.usage.clone() {
-            self.settle_run(node_id, signed, observed_ms, &gpus, share);
+            self.settle_run(node_id, signed, observed_ms, &gpus, share, net);
             self.sample_gpus(node_id, &gpus);
         }
         self.conf.leases.remove(&r);
@@ -1628,6 +1647,7 @@ impl State {
     /// run is done again, without counting against the node.
     pub fn on_report_rejected(&mut self, node_id: &str, generation: u64, task: TaskRef, why: &str) {
         self.mgmt.report_timing.remove(&task);
+        self.mgmt.report_net.remove(&task);
         let Some(node) = self.nodes.get_mut(node_id) else {
             return;
         };
@@ -1697,6 +1717,7 @@ impl State {
         observed_ms: u64,
         gpus: &[u32],
         share: u32,
+        net: Option<pumasi_proto::receipt::SignedNet>,
     ) {
         let r = signed.usage.task;
         let Some(job) = self.jobs.get(&r.job) else {
@@ -1731,6 +1752,38 @@ impl State {
         {
             g.exact_ucu = self.policy.rates.charge_gpu(&metered);
         }
+        // The network's traffic (1.18), signed by the node for this run,
+        // no more than the job's cap (or a 10 Gbit/s line) carries in the
+        // billed time, at the egress rate.
+        let egress = net
+            .filter(|n| {
+                n.verify(&signed.usage.cluster, &signed.usage.node, &r)
+                    .inspect_err(|e| warn!(node = %node_id, task = %r, "network usage: {e:#}"))
+                    .is_ok()
+            })
+            .map(|n| {
+                let per_sec = job
+                    .meta
+                    .net
+                    .bytes_per_sec()
+                    .unwrap_or(EGRESS_LINE_BYTES_PER_SEC);
+                let most = per_sec
+                    .saturating_mul(billed_wall_ms.max(1000))
+                    .saturating_mul(2)
+                    / 1000;
+                let billed_bytes = n.usage.total().min(most);
+                let exact_ucu = if provider == consumer {
+                    0
+                } else {
+                    pumasi_proto::store::egress_charge(billed_bytes, self.policy.rates.egress_gib)
+                };
+                pumasi_proto::receipt::EgressBilling {
+                    net: n,
+                    billed_bytes,
+                    exact_ucu,
+                }
+            });
+        let exact_ucu = exact_ucu.saturating_add(egress.as_ref().map_or(0, |e| e.exact_ucu));
         let amount = self.carry_forward(&consumer, &provider, exact_ucu);
         if signed.usage.executor == Executor::Wasm {
             self.note_run_speed(node_id, signed.usage.fuel_used, billed_wall_ms);
@@ -1745,7 +1798,7 @@ impl State {
             check: r.check,
             recorded_unix: now_unix(),
         };
-        let receipt = Receipt::countersign_gpu(signed, billing, gpu, &self.key);
+        let receipt = Receipt::countersign_full(signed, billing, gpu, egress, &self.key);
         if let Some(task) = self
             .jobs
             .get_mut(&r.job)
@@ -2008,6 +2061,7 @@ impl State {
             gpu_ext: job.meta.gpu_ext.clone(),
             vm_network: executor.runs_images()
                 && job.meta.docker.as_ref().is_some_and(|d| d.network),
+            vm_net_rules: !job.meta.net.is_empty(),
             images,
             consumer,
             can_pay,
@@ -2092,6 +2146,14 @@ impl State {
                         .is_some_and(|d| d.signed.profile.microvm_network))
             {
                 refused.get_or_insert(R::VmNetwork);
+                continue;
+            }
+            // Allow lists and caps need an agent that enforces them (1.18).
+            if e == Executor::Microvm
+                && need.vm_net_rules
+                && self.agent_minor(id) < pumasi_proto::NET_MINOR
+            {
+                refused.get_or_insert(R::OldAgent);
                 continue;
             }
             // Several WebGPU adapters per task need a 1.16 agent.
@@ -2514,6 +2576,9 @@ impl State {
             gpu_capabilities: job.meta.origin.gpu_capabilities.clone(),
             confidential: None,
             checkpoint,
+            net: (run_as == Executor::Microvm && !job.meta.net.is_empty())
+                .then(|| job.meta.net.clone()),
+            account: job.meta.account.clone(),
         };
         let mut assignment = assignment;
         if let Some(c) = conf_task {
@@ -2895,6 +2960,7 @@ mod tests {
         JobSubmission {
             placement: Default::default(),
             gpu_ext: Default::default(),
+            net: Default::default(),
             name: "j".into(),
             executor,
             module: match executor {

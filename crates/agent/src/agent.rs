@@ -1553,6 +1553,10 @@ impl Agent {
                         }
                     }
                 }
+                Ok(Some(ToAgent::Cache(policy))) => {
+                    let store = self.node_store.clone();
+                    tokio::spawn(async move { store.set_policy(*policy).await });
+                }
                 Ok(Some(ToAgent::Hold { roots, sources })) => {
                     // In order: the lock in `hold` is taken before this
                     // returns to the next message.
@@ -1789,6 +1793,7 @@ impl Agent {
                 timing.fetch_ms = fetch_start.elapsed().as_millis() as u64;
             }
             let pull = io.pull.clone();
+            let net_count = io.net_usage.clone();
             io.gpus = gpus;
             io.mps = mps_part;
             io.webgpu = webgpu;
@@ -1950,7 +1955,14 @@ impl Agent {
                 Err(e) => error_report(task, format!("{e:#}")),
             };
             debug!(task = %task, outcome = %report.outcome, "task finished");
-            tails.lock().unwrap().insert(task, ReportTail { timing });
+            // What the network carried, signed like the usage (1.18).
+            let used = net_count.get();
+            let net = (!used.is_empty() && report.usage.is_some())
+                .then(|| pumasi_proto::receipt::SignedNet::sign(&cluster, &task, used, &key));
+            tails
+                .lock()
+                .unwrap()
+                .insert(task, ReportTail { timing, net });
             let sent = out_tx.send(FromAgent::Report {
                 report: Box::new(report),
                 stored,
@@ -2032,6 +2044,7 @@ async fn prepare_io(
     let mut io = TaskIo {
         output: a.output,
         scratch: Some(scratch.path().to_path_buf()),
+        net: a.net.clone(),
         ..Default::default()
     };
     dirs.push(scratch);
@@ -2041,6 +2054,7 @@ async fn prepare_io(
             let used = store
                 .ensure(m.root, &m.label, &a.peers, cluster, cancel)
                 .await?;
+            store.charge(m.root, &a.account);
             mounts.push((m.clone(), used));
         }
         let dir = store.scratch("input")?;
@@ -2065,6 +2079,7 @@ async fn prepare_io(
             let used = store
                 .ensure(img.root, &label, &a.peers, cluster, cancel)
                 .await?;
+            store.charge(img.root, &a.account);
             store.export_all(&used, dir.path()).await?;
             held.push(used);
         }

@@ -46,7 +46,7 @@ machines.
 | 31 | 1.15 | Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI | done |
 | 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | done |
 | 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | done |
-| 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | planned |
+| 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | done |
 | 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | planned |
 | 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | planned |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
@@ -634,6 +634,24 @@ then `setup` on a Windows runner. By hand: `boot-times.ps1` numbers in the
 release notes; a signed binary installs with Smart App Control on.
 
 ## 34. File store and microVM networks: node caches, images from the store, UDP and allow lists (1.18)
+
+Done in 1.18.0 ([release notes](releases/v1.18.0.md),
+[details](architecture.md#phase-34-file-store-and-microvm-networks-118)).
+What differs from the plan: allow lists and caps are for microVMs only;
+Docker's network stays all or nothing, so a Docker job with a list is
+refused and an `executor = "image"` job with one runs as a microVM. The
+cache quotas are node labels (`cache=SIZE` replaces `--store-cache`,
+`cache.account=SIZE` is each account's share) rather than a new kind of
+setting. Images come from the store after the first pull, but a tag
+reference asks the registry for its manifest again after ten minutes, so
+a re-pushed tag is noticed (a digest reference never asks). IPv6 is a
+private prefix behind the gateway that forwards to the host's IPv6; the
+guest prefers IPv4. Firecracker uses TAP devices only when QEMU is not
+installed and the agent runs as root. Egress is billed both ways at the
+egress rate, from a figure the node signs and the control plane bounds by
+the cap and the billed time. Schedules cannot carry allow lists yet (their
+record has no room for them), so they refuse such jobs. The iMac check is
+by hand, as planned.
 
 Why: node caches have only a size cap, private images are pulled from the
 registry again for each job, and microVM networks forward TCP and DNS

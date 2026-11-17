@@ -100,6 +100,25 @@ pub struct TaskIo {
     /// A checkpointing run's `/checkpoint` and how it is asked to stop
     /// (1.9).
     pub checkpoint: Option<CheckpointIo>,
+    /// A microVM network's allow list and cap (1.18).
+    pub net: Option<pumasi_proto::vmnet::NetSpec>,
+    /// What the task's network carried, which the executor writes when the
+    /// run ends (1.18).
+    pub net_usage: NetCount,
+}
+
+/// What a microVM task's network carried, written by the executor.
+#[derive(Debug, Clone, Default)]
+pub struct NetCount(Arc<Mutex<pumasi_proto::vmnet::NetUsage>>);
+
+impl NetCount {
+    pub fn set(&self, usage: pumasi_proto::vmnet::NetUsage) {
+        *self.0.lock().unwrap() = usage;
+    }
+
+    pub fn get(&self) -> pumasi_proto::vmnet::NetUsage {
+        *self.0.lock().unwrap()
+    }
 }
 
 /// A checkpointing run's `/checkpoint`: a directory on this machine that

@@ -159,6 +159,7 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
     JobSubmission {
         placement: Default::default(),
         gpu_ext: Default::default(),
+        net: Default::default(),
         name: "echo".into(),
         executor: Executor::Wasm,
         module: wat::parse_str(ECHO_WAT).unwrap(),
@@ -1368,6 +1369,7 @@ fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
     JobSubmission {
         placement: Default::default(),
         gpu_ext: Default::default(),
+        net: Default::default(),
         name: "docker-test".into(),
         executor: Executor::Docker,
         module: vec![],
@@ -2301,6 +2303,153 @@ async fn microvm_network(client: &AdminClient, node: &pumasi_proto::msg::NodeVie
     server.abort();
 }
 
+/// Phase 34: a microVM job with an allow list reaches what it names, over
+/// TCP and UDP, and nothing else; a private address stays blocked even on
+/// the list; and the receipt carries what the guest sent and received,
+/// signed by the node and billed at the egress rate. Firecracker gets its
+/// network from TAP devices when the agent runs as root (CI runs this test
+/// so); otherwise the test needs QEMU.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_network_allow_lists_udp_and_egress() {
+    let Some(vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    init_tracing();
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let client = admin(&cluster).await;
+    // An egress rate high enough that a few kilobytes cost CU.
+    let rates = CuRates {
+        egress_gib: 1_000_000_000_000,
+        ..CuRates::default()
+    };
+    set_policy(
+        &client,
+        Policy {
+            rates,
+            hold_secs: 1,
+            verify_permille: 0,
+            ..Policy::default()
+        },
+    )
+    .await;
+    deposit(&client, "owner", 1_000_000).await;
+    let mut config = agent_config("bobs-pc", 2, tempdir("p"));
+    config.microvm = Some(vm);
+    let provider = Agent::new(config).await.unwrap();
+    let provider_id = provider.id().to_string();
+    let p = spawn_join(provider, invite(&cluster, "bob"));
+    wait_online(&cluster, 1).await;
+    // The device profile, with its microVM networking, comes after the
+    // node is online.
+    let mut node = None;
+    for _ in 0..50 {
+        node = cluster
+            .status()
+            .nodes
+            .into_iter()
+            .find(|n| n.id == provider_id && n.microvm_network);
+        if node.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if node.is_none() {
+        eprintln!(
+            "skipping: this node's microVMs have no network (Firecracker as a user, no QEMU)"
+        );
+        client.close().await;
+        p.kill().await;
+        cluster.shutdown().await.unwrap();
+        return;
+    }
+
+    // A service on this host's own, private, address: on the allow list,
+    // and still out of reach.
+    let host_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            s.local_addr()
+        })
+        .map(|a| a.ip())
+        .expect("this host's address");
+    let listener = tokio::net::TcpListener::bind((host_ip, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = reached.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((_s, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let script = format!(
+        "wget -q -T 15 -O /dev/null http://example.com/ && echo tcp-allowed; \
+         timeout 10 nslookup example.com 8.8.8.8 >/dev/null 2>&1 && echo udp-allowed; \
+         wget -q -T 5 -O /dev/null http://example.org/ || echo name-denied; \
+         wget -q -T 5 -O /dev/null http://1.1.1.1/ || echo address-denied; \
+         timeout 5 nslookup example.com 1.1.1.1 >/dev/null 2>&1 || echo udp-denied; \
+         wget -q -T 3 -O /dev/null http://{host_ip}:{port}/ || echo private-blocked"
+    );
+    let mut sub = docker_job(&["sh", "-c", &script], vec![TaskInput::default()]);
+    sub.executor = Executor::Microvm;
+    let d = sub.docker.as_mut().unwrap();
+    d.image = microvm_image();
+    d.network = true;
+    sub.net = pumasi_proto::vmnet::NetSpec {
+        allow: pumasi_proto::vmnet::NetSpec::parse_list(&[
+            "example.com:80".to_string(),
+            "8.8.8.8:53".to_string(),
+            host_ip.to_string(),
+        ])
+        .unwrap(),
+        mbps: None,
+    };
+    sub.limits.timeout_ms = 120_000;
+    sub.max_attempts = 1;
+    let id = submit(&client, sub).await;
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    let out = String::from_utf8_lossy(view.tasks[0].stdout.as_deref().unwrap_or_default());
+    assert_eq!(
+        out, "tcp-allowed\nudp-allowed\nname-denied\naddress-denied\nudp-denied\nprivate-blocked\n",
+        "{view:#?}"
+    );
+    assert_eq!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the guest reached this host"
+    );
+    server.abort();
+
+    // The receipt: the node's signed figure, billed both ways.
+    let rs = client.receipts(id).await.unwrap();
+    assert_eq!(rs.len(), 1);
+    let r = &rs[0];
+    r.verify().unwrap();
+    let e = r.egress.as_ref().expect("an egress part on the receipt");
+    let usage = e.net.usage;
+    // A page of example.com one way, requests the other.
+    assert!(usage.rx_bytes > 500, "{usage:?}");
+    assert!(usage.tx_bytes > 50, "{usage:?}");
+    assert_eq!(e.billed_bytes, usage.total(), "no cap, so all of it");
+    assert_eq!(
+        e.exact_ucu,
+        pumasi_proto::store::egress_charge(e.billed_bytes, rates.egress_gib)
+    );
+    assert!(e.exact_ucu > 0);
+    assert!(r.billing.exact_ucu >= e.exact_ucu);
+    assert_eq!(r.billing.amount, view.summary.cost);
+    // An old reader of receipts still gets them, without the egress part.
+    let old = receipts(&client, id).await;
+    assert_eq!(old.len(), 1);
+    assert!(old[0].egress.is_none());
+
+    client.close().await;
+    p.kill().await;
+    cluster.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Phase 8: private registry images
 // ---------------------------------------------------------------------------
@@ -2414,6 +2563,181 @@ async fn microvm_runs_an_image_from_a_private_registry() {
         return;
     };
     private_image_job(Executor::Microvm, &image, &login, |c| c.microvm = Some(vm)).await;
+}
+
+/// What a [`counting_proxy`] saw: every request line, in order.
+type Requests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A TCP proxy in front of `upstream` (a plain HTTP registry) that keeps
+/// each request line it forwards. Returns its port.
+async fn counting_proxy(upstream: String) -> (u16, Requests, JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: Requests = Default::default();
+    let log = seen.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                continue;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let (mut cr, mut cw) = client.into_split();
+                let (mut sr, mut sw) = server.into_split();
+                let up = async move {
+                    let mut buf = vec![0u8; 64 << 10];
+                    let mut line = Vec::new();
+                    loop {
+                        let n = match cr.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        // Request lines start after a CRLF; bodies of GETs
+                        // are empty, and a pull sends nothing else.
+                        for &b in &buf[..n] {
+                            if b == b'\n' {
+                                let l = String::from_utf8_lossy(&line).trim().to_string();
+                                if l.starts_with("GET ") || l.starts_with("HEAD ") {
+                                    log.lock().unwrap().push(l);
+                                }
+                                line.clear();
+                            } else if line.len() < 4096 {
+                                line.push(b);
+                            }
+                        }
+                        if sw.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = sw.shutdown().await;
+                };
+                let down = async move {
+                    let _ = tokio::io::copy(&mut sr, &mut cw).await;
+                    let _ = cw.shutdown().await;
+                };
+                tokio::join!(up, down);
+            });
+        }
+    });
+    (port, seen, task)
+}
+
+/// Phase 34: one job of four tasks on two nodes pulls its private image
+/// from the registry once, into the file store, and both nodes load it
+/// from there; a second job of the same image asks the registry nothing.
+async fn private_image_pulled_once(
+    executor: Executor,
+    image: &str,
+    login: &str,
+    configure: impl Fn(&mut AgentConfig),
+) {
+    init_tracing();
+    // The same image through a proxy that keeps the registry's requests.
+    let (upstream, rest) = image.split_once('/').unwrap();
+    let (port, seen, proxy) = counting_proxy(upstream.replace("localhost", "127.0.0.1")).await;
+    let image = format!("localhost:{port}/{rest}");
+    let cluster = start_cluster(tempdir("c")).await.unwrap();
+    let mut ids = Vec::new();
+    let mut nodes = Vec::new();
+    for name in ["one", "two"] {
+        let mut config = agent_config(name, 2, tempdir(name));
+        configure(&mut config);
+        let agent = Agent::new(config).await.unwrap();
+        ids.push(agent.id().to_string());
+        let ticket = cluster
+            .create_join_ticket(Duration::from_secs(60), None)
+            .unwrap();
+        nodes.push(spawn_join(agent, ticket));
+    }
+    wait_online(&cluster, 2).await;
+    let client = admin(&cluster).await;
+    set_registry_secret(&client, &image, login).await;
+
+    let job = |tasks: u32| {
+        // Long enough that the four overlap, two on each node.
+        let tasks = (0..tasks)
+            .map(|i| TaskInput {
+                args: vec![format!("t{i}")],
+                ..Default::default()
+            })
+            .collect();
+        let mut sub = docker_job(&["sh", "-c", "sleep 3; echo $0"], tasks);
+        sub.executor = executor;
+        sub.docker.as_mut().unwrap().image = image.clone();
+        sub.limits.timeout_ms = 120_000;
+        sub.max_attempts = 1;
+        sub
+    };
+    let id = submit(&client, job(4)).await;
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    let ran: std::collections::BTreeSet<_> =
+        view.tasks.iter().filter_map(|t| t.node.clone()).collect();
+    assert_eq!(ran.len(), 2, "the tasks ran on both nodes: {view:#?}");
+    let first = seen.lock().unwrap().clone();
+    let blobs: Vec<_> = first.iter().filter(|l| l.contains("/blobs/")).collect();
+    assert!(
+        !blobs.is_empty(),
+        "the image came from the registry: {first:#?}"
+    );
+    let unique: std::collections::BTreeSet<_> = blobs.iter().collect();
+    assert_eq!(
+        unique.len(),
+        blobs.len(),
+        "each blob fetched once for four tasks on two nodes: {first:#?}"
+    );
+
+    // Another job of the same image: the store has it.
+    let id = submit(&client, job(2)).await;
+    let view = wait_job(&client, id, 300).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    let after = seen.lock().unwrap().clone();
+    assert_eq!(
+        after.len(),
+        first.len(),
+        "the second job asked the registry: {:#?}",
+        &after[first.len()..]
+    );
+
+    client.close().await;
+    for n in nodes {
+        n.kill().await;
+    }
+    proxy.abort();
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn docker_pulls_a_private_image_once_for_two_nodes() {
+    let Some((image, login)) = private_registry() else {
+        eprintln!("skipping: PUMASI_TEST_REGISTRY is not set");
+        return;
+    };
+    if !docker_available() {
+        eprintln!("skipping: docker is not available");
+        return;
+    }
+    private_image_pulled_once(Executor::Docker, &image, &login, |c| {
+        c.docker = Some("docker".into())
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn microvm_pulls_a_private_image_once_for_two_nodes() {
+    let Some((image, login)) = private_registry() else {
+        eprintln!("skipping: PUMASI_TEST_REGISTRY is not set");
+        return;
+    };
+    let Some(vm) = microvm_config() else {
+        eprintln!("skipping: PUMASI_TEST_VM_DIR is not set");
+        return;
+    };
+    private_image_pulled_once(Executor::Microvm, &image, &login, |c| {
+        c.microvm = Some(vm.clone())
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------

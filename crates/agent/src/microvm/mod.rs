@@ -30,6 +30,8 @@ pub mod ext4;
 pub mod net;
 pub mod pool;
 pub mod setup;
+#[cfg(target_os = "linux")]
+pub mod tap;
 pub mod tee;
 pub mod vmm;
 pub mod vz;
@@ -324,6 +326,20 @@ impl GpuAssets {
     }
 }
 
+/// Firecracker as the VMM of VMs with a network, when this agent can make
+/// TAP devices for it (1.18).
+fn firecracker_tap(vmm: &Vmm) -> Option<Vmm> {
+    #[cfg(target_os = "linux")]
+    {
+        tap::remove_stale();
+        if tap::available() {
+            return Some(vmm.clone());
+        }
+    }
+    let _ = vmm;
+    None
+}
+
 /// A pulled image, ready to boot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImageEntry {
@@ -391,6 +407,9 @@ struct Launched {
     warm: bool,
     /// The network gateway, closed with the VM.
     gateway: Option<net::Gateway>,
+    /// Firecracker's TAP device, removed with the VM (1.18).
+    #[cfg(target_os = "linux")]
+    tap: Option<tap::Tap>,
 }
 
 /// Why a warm guest did not take a task.
@@ -656,12 +675,18 @@ impl MicrovmExecutor {
         // vz's talk to the gateway, so network tasks on Firecracker nodes
         // use QEMU when it is there.
         let net_vmm = match vmm.backend {
-            Backend::Firecracker => assets.qemu.clone().map(|bin| Vmm {
-                backend: Backend::Qemu,
-                bin,
-                accelerated: assets.kvm,
-                tsc_khz: None,
-            }),
+            // Without QEMU, Firecracker itself where the agent may make
+            // TAP devices (root on Linux, 1.18).
+            Backend::Firecracker => assets
+                .qemu
+                .clone()
+                .map(|bin| Vmm {
+                    backend: Backend::Qemu,
+                    bin,
+                    accelerated: assets.kvm,
+                    tsc_khz: None,
+                })
+                .or_else(|| firecracker_tap(&vmm)),
             // QEMU's is set below, after the WHPX probe may change it.
             Backend::Qemu => None,
             Backend::Vz => Some(vmm.clone()),
@@ -794,6 +819,7 @@ impl MicrovmExecutor {
             vcpus: 1,
             mem_mib: MIN_VM_MIB,
             net: None,
+            tap: None,
             pci: vec![],
             tee: None,
         };
@@ -954,7 +980,7 @@ impl MicrovmExecutor {
         };
         let net_vmm = if spec.network {
             Some(self.net_vmm.as_ref().context(
-                    "microVMs on this machine cannot have a network card (Firecracker needs QEMU next to it for that)",
+                    "microVMs on this machine cannot have a network card (Firecracker needs QEMU next to it, or an agent run as root to make TAP devices)",
                 )?)
         } else {
             None
@@ -1068,6 +1094,8 @@ impl MicrovmExecutor {
             start: run_start,
             warm,
             gateway,
+            #[cfg(target_os = "linux")]
+            tap,
         } = launched;
         let dir = scratch.path().to_path_buf();
         let deadline = run_start + Duration::from_millis(limits.timeout_ms);
@@ -1091,7 +1119,11 @@ impl MicrovmExecutor {
                 stop,
             )
             .await;
-        drop(gateway);
+        if let Some(gw) = gateway {
+            io.net_usage.set(gw.usage());
+        }
+        #[cfg(target_os = "linux")]
+        drop(tap);
         let end = end?;
         // Billed time starts at boot (or when a warm guest got the task):
         // pulling an image is not the job's run.
@@ -1187,15 +1219,21 @@ impl MicrovmExecutor {
         let mut run_spec = run_spec.clone();
         let gateway = match net_vmm {
             Some(_) => {
-                run_spec.network = Some(pumasi_guest::GuestNet {
-                    address: net::GUEST.octets(),
-                    prefix: net::PREFIX,
-                    gateway: net::GATEWAY.octets(),
-                    dns: net::GATEWAY.octets(),
-                });
-                Some(net::Gateway::start().await?)
+                let gw = net::Gateway::start(io.net.clone().unwrap_or_default()).await?;
+                run_spec.network = Some(gw.guest_net());
+                Some(gw)
             }
             None => None,
+        };
+        // Firecracker's card is a TAP device joined to the gateway.
+        #[cfg(target_os = "linux")]
+        let tap = match (net_vmm, &gateway) {
+            (Some(v), Some(gw)) if v.backend == Backend::Firecracker => {
+                let t = tap::Tap::create().context("make a TAP device for the VM's network")?;
+                t.bridge(gw.addr)?;
+                Some(t)
+            }
+            _ => None,
         };
         // The scratch disk holds the input files, the checkpoint and what
         // the task writes (its output too); the file is sparse.
@@ -1268,6 +1306,10 @@ impl MicrovmExecutor {
             vcpus,
             mem_mib,
             net: gateway.as_ref().map(|g| g.addr),
+            #[cfg(target_os = "linux")]
+            tap: tap.as_ref().map(|t| t.name.clone()),
+            #[cfg(not(target_os = "linux"))]
+            tap: None,
             pci: vec![],
             tee: None,
         };
@@ -1301,6 +1343,8 @@ impl MicrovmExecutor {
             start: run_start,
             warm: false,
             gateway,
+            #[cfg(target_os = "linux")]
+            tap,
         })
     }
 
@@ -1371,6 +1415,7 @@ impl MicrovmExecutor {
             vcpus: key.vcpus,
             mem_mib: key.mem_mib,
             net: None,
+            tap: None,
             pci: vec![],
             tee: None,
         };
@@ -1479,6 +1524,8 @@ impl MicrovmExecutor {
             start: run_start,
             warm: true,
             gateway: None,
+            #[cfg(target_os = "linux")]
+            tap: None,
         })
     }
 
@@ -1572,6 +1619,7 @@ impl MicrovmExecutor {
             mem_mib: (limits.memory_bytes.div_ceil(1 << 20) + VM_OVERHEAD_MIB + t.extra_mib)
                 .max(MIN_VM_MIB),
             net: None,
+            tap: None,
             pci: vec![],
             tee: tee_vm,
         };
@@ -1912,6 +1960,7 @@ impl MicrovmExecutor {
             vcpus: 1,
             mem_mib: BUILD_VM_MIB,
             net: None,
+            tap: None,
             pci: vec![],
             tee: None,
         };

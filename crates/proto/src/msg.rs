@@ -304,6 +304,14 @@ pub struct TaskAssignment {
     /// The task keeps checkpoints: how to stop it, and what to put back in
     /// its checkpoint directory first.
     pub checkpoint: Option<CheckpointTask>,
+    // Minor 10 (1.18) from here; only agents of minor 10 get microVM tasks
+    // with an allow list or a bandwidth cap.
+    /// What a microVM task's network may reach and how fast; `None` (or
+    /// empty) is every public address, uncapped.
+    pub net: Option<crate::vmnet::NetSpec>,
+    /// The account the task runs for: what it fetches into the node's
+    /// cache counts against that account's share there.
+    pub account: String,
 }
 
 /// How a checkpointing task runs (minor 5).
@@ -400,6 +408,12 @@ pub enum ToAgent {
         task: TaskRef,
         grace_ms: u64,
     },
+    // Minor 10 (1.18) from here.
+    /// How the node keeps its file store cache: its size and each
+    /// account's share (the node's `cache` and `cache.account` labels),
+    /// and what queued tasks will mount, which goes last. Sent after the
+    /// welcome and whenever it changes.
+    Cache(Box<crate::store::CachePolicy>),
 }
 
 /// How a task ended.
@@ -479,6 +493,8 @@ pub struct TaskTiming {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportTail {
     pub timing: TaskTiming,
+    /// What a microVM task's network carried, signed by the node (1.18).
+    pub net: Option<crate::receipt::SignedNet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1231,12 +1247,39 @@ pub enum AdminOp {
     },
     /// The messages of the firing alerts by key.
     AlertTexts,
+    // 1.18 from here.
+    /// [`AdminOp::SubmitExt`] for a job whose microVM network has an allow
+    /// list or a bandwidth cap ([`crate::job::JobExt::net`]). A control
+    /// plane older than 1.18 refuses the call instead of running the job
+    /// with the whole internet.
+    SubmitNet {
+        sub: Box<JobSubmission>,
+        ext: Box<crate::job::JobExt>,
+    },
+    /// [`AdminOp::CheckJob`] with what [`AdminOp::SubmitNet`] carries.
+    CheckJobNet {
+        sub: Box<JobSubmission>,
+        ext: Box<crate::job::JobExt>,
+        upload_bytes: u64,
+    },
+    /// [`AdminOp::Receipts`] with their egress parts
+    /// ([`AdminResponse::ReceiptsFull`]).
+    ReceiptsFull {
+        id: JobId,
+    },
 }
 
 impl AdminOp {
     /// The call that submits `sub`: [`AdminOp::SubmitPlaced`] when it has a
     /// placement, else [`AdminOp::Submit`].
     pub fn submit(mut sub: JobSubmission) -> AdminOp {
+        if !sub.net.is_empty() {
+            let ext = Box::new(sub.take_ext());
+            return AdminOp::SubmitNet {
+                sub: Box::new(sub),
+                ext,
+            };
+        }
         if !sub.gpu_ext.is_empty() {
             let ext = Box::new(sub.take_ext());
             return AdminOp::SubmitExt {
@@ -1256,6 +1299,14 @@ impl AdminOp {
 
     /// The call that checks `sub` ([`AdminOp::CheckJob`]).
     pub fn check_job(mut sub: JobSubmission, upload_bytes: u64) -> AdminOp {
+        if !sub.net.is_empty() {
+            let ext = Box::new(sub.take_ext());
+            return AdminOp::CheckJobNet {
+                sub: Box::new(sub),
+                ext,
+                upload_bytes,
+            };
+        }
         if !sub.gpu_ext.is_empty() {
             let ext = Box::new(sub.take_ext());
             return AdminOp::CheckJobExt {
@@ -1348,11 +1399,16 @@ impl AdminOp {
                 spec.set_more(*more);
                 AdminOp::Apply(spec)
             }
-            AdminOp::SubmitExt { mut sub, ext } => {
+            AdminOp::SubmitExt { mut sub, ext } | AdminOp::SubmitNet { mut sub, ext } => {
                 sub.set_ext(*ext);
                 AdminOp::Submit(sub)
             }
             AdminOp::CheckJobExt {
+                mut sub,
+                ext,
+                upload_bytes,
+            }
+            | AdminOp::CheckJobNet {
                 mut sub,
                 ext,
                 upload_bytes,
@@ -1414,6 +1470,8 @@ pub enum AdminResponse {
     Status(ClusterStatus),
     Job(Box<JobView>),
     Files(Vec<FileEntry>),
+    /// Receipts without their egress part (see [`Receipt::egress`]):
+    /// [`AdminOp::ReceiptsFull`] has it.
     Receipts(Vec<Receipt>),
     Accounts(Vec<AccountView>),
     Ledger(Vec<LedgerEntry>),
@@ -1568,6 +1626,9 @@ pub enum AdminResponse {
     MetricsPush(Box<crate::monitor::MetricsPush>),
     EventsKeyed(Vec<crate::monitor::KeyedEvent>),
     AlertTexts(Vec<crate::monitor::AlertText>),
+    // 1.18 from here.
+    /// Receipts in [`Receipt::encode`]'s encoding, egress parts included.
+    ReceiptsFull(Vec<Vec<u8>>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part
@@ -2118,6 +2179,7 @@ mod tests {
             gpu_capabilities: vec![],
             placement: Default::default(),
             gpu_ext: Default::default(),
+            net: Default::default(),
         };
         assert!(matches!(AdminOp::submit(sub.clone()), AdminOp::Submit(_)));
         // 1.10: a part of a GPU rides with the placement in its own call.

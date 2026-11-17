@@ -1672,6 +1672,12 @@ fn prepare_root(root: &Path, spec: &RunSpec, uid: u32, gid: u32) -> R<()> {
     loopback_up();
     if let Some(net) = &spec.network {
         network_up(net)?;
+        if let Some(v6) = &net.v6
+            && let Err(e) = network6_up(v6)
+        {
+            // An image's kernel without IPv6 still has IPv4.
+            log(&format!("no IPv6: {e}"));
+        }
         if root.join("etc").is_dir() {
             let resolv = root.join("etc/resolv.conf");
             // Images often ship it as a symlink into /run; replace it.
@@ -1745,6 +1751,7 @@ fn network_up(net: &pumasi_guest::GuestNet) -> R<()> {
                 libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &ifr),
                 "bring eth0 up",
             )?;
+            offloads_off(fd);
             let mut rt: libc::rtentry = std::mem::zeroed();
             rt.rt_dst = sockaddr_in([0; 4]);
             rt.rt_genmask = sockaddr_in([0; 4]);
@@ -1754,6 +1761,95 @@ fn network_up(net: &pumasi_guest::GuestNet) -> R<()> {
                 libc::ioctl(fd, libc::SIOCADDRT as _, &rt),
                 "add the default route",
             )?;
+            Ok(())
+        })();
+        libc::close(fd);
+        res
+    }
+}
+
+/// Turns off the card's checksum and segmentation offloads (1.18):
+/// Firecracker's card offers them, and the host's gateway takes only
+/// whole frames with their checksums, as QEMU's card sends them. Cards
+/// without the offloads say so, which changes nothing.
+unsafe fn offloads_off(fd: libc::c_int) {
+    // `struct ethtool_value` and the legacy ethtool commands.
+    #[repr(C)]
+    struct EthtoolValue {
+        cmd: u32,
+        data: u32,
+    }
+    const SIOCETHTOOL: libc::c_ulong = 0x8946;
+    const ETHTOOL_STXCSUM: u32 = 0x17;
+    const ETHTOOL_SSG: u32 = 0x19;
+    const ETHTOOL_STSO: u32 = 0x1f;
+    const ETHTOOL_SGSO: u32 = 0x24;
+    for cmd in [ETHTOOL_STSO, ETHTOOL_SGSO, ETHTOOL_SSG, ETHTOOL_STXCSUM] {
+        let mut v = EthtoolValue { cmd, data: 0 };
+        unsafe {
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            for (i, b) in b"eth0".iter().enumerate() {
+                ifr.ifr_name[i] = *b as libc::c_char;
+            }
+            ifr.ifr_ifru.ifru_data = (&mut v as *mut EthtoolValue).cast();
+            libc::ioctl(fd, SIOCETHTOOL as _, &mut ifr);
+        }
+    }
+}
+
+/// Gives `eth0` its IPv6 address and a default route through the
+/// gateway, the way `ip -6 addr add` and `ip -6 route add default` would.
+fn network6_up(net: &pumasi_guest::GuestNet6) -> R<()> {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(format!("socket: {}", io::Error::last_os_error()));
+        }
+        let res = (|| -> R<()> {
+            let index = libc::if_nametoindex(c"eth0".as_ptr());
+            if index == 0 {
+                return Err(format!("eth0: {}", io::Error::last_os_error()));
+            }
+            // No duplicate address detection: nothing else is on the link,
+            // and the address must work at once.
+            let _ = fs::write("/proc/sys/net/ipv6/conf/eth0/accept_dad", "0");
+            let _ = fs::write("/proc/sys/net/ipv6/conf/eth0/accept_ra", "0");
+            let mut req: libc::in6_ifreq = std::mem::zeroed();
+            req.ifr6_addr.s6_addr = net.address;
+            req.ifr6_prefixlen = net.prefix as u32;
+            req.ifr6_ifindex = index as libc::c_int;
+            if libc::ioctl(fd, libc::SIOCSIFADDR as _, &req) < 0 {
+                return Err(format!(
+                    "set the IPv6 address of eth0: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            // `struct in6_rtmsg` (linux/ipv6_route.h); libc keeps its
+            // fields private.
+            #[repr(C)]
+            struct In6Rtmsg {
+                dst: libc::in6_addr,
+                src: libc::in6_addr,
+                gateway: libc::in6_addr,
+                kind: u32,
+                dst_len: u16,
+                src_len: u16,
+                metric: u32,
+                info: libc::c_ulong,
+                flags: u32,
+                ifindex: libc::c_int,
+            }
+            let mut rt: In6Rtmsg = std::mem::zeroed();
+            rt.gateway.s6_addr = net.gateway;
+            rt.flags = (libc::RTF_UP | libc::RTF_GATEWAY) as u32;
+            rt.metric = 1;
+            rt.ifindex = index as libc::c_int;
+            if libc::ioctl(fd, libc::SIOCADDRT as _, &rt) < 0 {
+                return Err(format!(
+                    "add the IPv6 default route: {}",
+                    io::Error::last_os_error()
+                ));
+            }
             Ok(())
         })();
         libc::close(fd);

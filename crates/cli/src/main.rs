@@ -1868,10 +1868,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Cmd::Receipts { id, export, admin } => {
             let id: JobId = id.parse()?;
             let client = connect_admin(&home, &admin).await?;
-            let AdminResponse::Receipts(receipts) = client.call(AdminOp::Receipts { id }).await?
-            else {
-                bail!("unexpected response");
-            };
+            let receipts = client.receipts(id).await?;
             client.close().await;
             match export {
                 Some(path) => {
@@ -5282,7 +5279,7 @@ fn human_secs(s: u64) -> String {
 
 fn print_receipts(receipts: &[Receipt]) {
     println!(
-        "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10}",
+        "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10} {:>10}",
         "RECEIPT",
         "RUN",
         "NODE",
@@ -5292,7 +5289,8 @@ fn print_receipts(receipts: &[Receipt]) {
         "PEAK MiB",
         "PROVIDER",
         "CU",
-        "GPU CU"
+        "GPU CU",
+        "NET"
     );
     for r in receipts {
         let u = &r.usage;
@@ -5303,7 +5301,7 @@ fn print_receipts(receipts: &[Receipt]) {
             if u.task.check { "c" } else { "" }
         );
         println!(
-            "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10}",
+            "{:<13} {:<10} {:<12} {:<12} {:>14} {:>9} {:>10} {:<10} {:>12} {:>10} {:>10}",
             r.short_id(),
             run,
             short(&r.node_id()),
@@ -5318,6 +5316,10 @@ fn print_receipts(receipts: &[Receipt]) {
             r.gpu
                 .as_ref()
                 .map(|g| format_rate(g.exact_ucu))
+                .unwrap_or_else(|| "-".into()),
+            r.egress
+                .as_ref()
+                .map(|e| format_size(e.billed_bytes))
                 .unwrap_or_else(|| "-".into())
         );
     }

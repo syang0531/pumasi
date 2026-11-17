@@ -132,6 +132,13 @@ pub(crate) struct Mgmt {
     /// What a node said its run's parts took, until the run's report is
     /// applied (1.4).
     pub report_timing: HashMap<TaskRef, pumasi_proto::msg::TaskTiming>,
+    /// What a node said its run's network carried, signed, until the
+    /// run's report is applied (1.18).
+    pub report_net: HashMap<TaskRef, pumasi_proto::receipt::SignedNet>,
+    /// The cache settings each node was sent last (1.18).
+    pub cache_sent: HashMap<String, pumasi_proto::store::CachePolicy>,
+    /// When the queue's mounts were last looked at for them.
+    pub cache_tick: Option<std::time::Instant>,
 }
 
 /// Who made an admin call.

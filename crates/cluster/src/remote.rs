@@ -391,6 +391,7 @@ impl State {
             gpu_ext: sub.gpu_ext.clone(),
             vm_network: sub.executor.runs_images()
                 && sub.docker.as_ref().is_some_and(|d| d.network),
+            vm_net_rules: !sub.net.is_empty(),
             // A private image is pulled into the store after the job is
             // submitted, for the architectures of the nodes that fit.
             images: None,
@@ -475,6 +476,24 @@ impl State {
         }
     }
 
+    /// What a node's run sent and received over its microVM network
+    /// (1.18), kept until the run's report is applied.
+    pub fn note_net(
+        &mut self,
+        node_id: &str,
+        generation: u64,
+        task: TaskRef,
+        net: pumasi_proto::receipt::SignedNet,
+    ) {
+        let running = self
+            .nodes
+            .get(node_id)
+            .is_some_and(|n| n.generation == generation && n.running.contains_key(&task));
+        if running {
+            self.mgmt.report_net.insert(task, net);
+        }
+    }
+
     /// Where each task of a job ran, by name, and how long its parts took.
     pub fn task_details(&self, id: JobId) -> Option<Vec<TaskDetail>> {
         let job = self.jobs.get(&id)?;
@@ -547,6 +566,7 @@ impl State {
             gpu,
             gpu_ext: Default::default(),
             vm_network: false,
+            vm_net_rules: false,
             images: None,
             consumer: account.to_string(),
             can_pay,

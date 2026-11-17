@@ -32,7 +32,7 @@ use pumasi_proto::{
     BLOBS_ALPN,
     blobs::{self, ChunkRangesSeq, Entry, FsStore, Hash},
     msg::FromAgent,
-    store::{BlobHash, Mount, StoredOutput, hash_hex},
+    store::{BlobHash, CachePolicy, Mount, StoredOutput, hash_hex},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -72,13 +72,77 @@ struct Cached {
     used: Instant,
     /// Tasks using it now.
     in_use: u32,
+    /// The account whose task fetched it last (1.18); empty when not known
+    /// (it was cached before the agent restarted, or by an older control
+    /// plane's task).
+    account: String,
+}
+
+/// What the control plane says about the cache (1.18), and the agent's own
+/// size for it.
+#[derive(Debug, Clone, Default)]
+struct Policy {
+    /// `--store-cache`.
+    own_cap: u64,
+    cap: Option<u64>,
+    per_account: Option<u64>,
+    keep: std::collections::HashSet<BlobHash>,
+}
+
+impl Policy {
+    fn cap(&self) -> u64 {
+        self.cap.unwrap_or(self.own_cap)
+    }
+}
+
+/// Which unused collections go, in order, so the cache fits: first what
+/// takes an account over its share, then the least recently used, and
+/// what queued tasks will mount only when nothing else is left.
+fn eviction_order(cache: &HashMap<BlobHash, Cached>, policy: &Policy) -> Vec<BlobHash> {
+    let mut out = Vec::new();
+    let mut gone = std::collections::HashSet::new();
+    let mut idle: Vec<(&BlobHash, &Cached)> = cache.iter().filter(|(_, e)| e.in_use == 0).collect();
+    // Oldest first, and among the kept ones too.
+    idle.sort_by_key(|(r, e)| (policy.keep.contains(*r), e.used));
+    if let Some(share) = policy.per_account {
+        let mut per: HashMap<&str, u64> = HashMap::new();
+        for e in cache.values().filter(|e| !e.account.is_empty()) {
+            *per.entry(e.account.as_str()).or_default() += e.size;
+        }
+        for (root, e) in &idle {
+            let held = per.get_mut(e.account.as_str());
+            if let Some(held) = held
+                && *held > share
+            {
+                *held -= e.size;
+                gone.insert(**root);
+                out.push(**root);
+            }
+        }
+    }
+    let mut total: u64 = cache
+        .iter()
+        .filter(|(r, _)| !gone.contains(*r))
+        .map(|(_, e)| e.size)
+        .sum();
+    let cap = policy.cap();
+    for (root, e) in idle {
+        if total <= cap {
+            break;
+        }
+        if gone.insert(*root) {
+            total -= e.size;
+            out.push(*root);
+        }
+    }
+    out
 }
 
 #[derive(Clone)]
 pub struct NodeStore {
     store: FsStore,
     dir: PathBuf,
-    cap: u64,
+    policy: Arc<Mutex<Policy>>,
     endpoint: Endpoint,
     cache: Arc<Mutex<HashMap<BlobHash, Cached>>>,
     /// One download at a time per collection.
@@ -113,7 +177,10 @@ impl NodeStore {
         let this = Self {
             store,
             dir: dir.to_path_buf(),
-            cap,
+            policy: Arc::new(Mutex::new(Policy {
+                own_cap: cap,
+                ..Default::default()
+            })),
             endpoint,
             cache: Default::default(),
             fetching: Default::default(),
@@ -147,6 +214,7 @@ impl NodeStore {
                         size,
                         used: Instant::now(),
                         in_use: 0,
+                        account: String::new(),
                     },
                 );
             }
@@ -269,6 +337,7 @@ impl NodeStore {
                 size,
                 used: Instant::now(),
                 in_use: 0,
+                account: String::new(),
             });
             e.used = Instant::now();
             e.in_use += 1;
@@ -316,26 +385,61 @@ impl NodeStore {
         }
     }
 
-    /// Drops least recently used collections nobody uses while the cache
-    /// is over its size.
+    /// Counts a cached collection against the account whose task fetched
+    /// it (1.18), and makes room if that takes the account over its
+    /// share.
+    pub fn charge(&self, root: BlobHash, account: &str) {
+        if account.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut c = self.cache.lock().unwrap();
+            match c.get_mut(&root) {
+                Some(e) if e.account != account => {
+                    e.account = account.to_string();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed && self.policy.lock().unwrap().per_account.is_some() {
+            let this = self.clone();
+            tokio::spawn(async move { this.evict().await });
+        }
+    }
+
+    /// Takes the control plane's cache settings (1.18) and evicts what no
+    /// longer fits.
+    pub async fn set_policy(&self, p: CachePolicy) {
+        let changed = {
+            let mut policy = self.policy.lock().unwrap();
+            let keep: std::collections::HashSet<BlobHash> = p.keep.into_iter().collect();
+            let changed = policy.cap != p.cap || policy.per_account != p.per_account;
+            policy.cap = p.cap;
+            policy.per_account = p.per_account;
+            policy.keep = keep;
+            changed
+        };
+        if changed {
+            let p = self.policy.lock().unwrap().clone();
+            info!(
+                cap = p.cap(),
+                per_account = ?p.per_account,
+                "file store cache settings from the cluster"
+            );
+        }
+        self.evict().await;
+    }
+
+    /// Drops collections nobody uses while the cache is over its size or
+    /// an account over its share ([`eviction_order`]).
     async fn evict(&self) {
         let victims: Vec<BlobHash> = {
+            let policy = self.policy.lock().unwrap().clone();
             let mut c = self.cache.lock().unwrap();
-            let mut total: u64 = c.values().map(|e| e.size).sum();
-            let mut order: Vec<(BlobHash, Instant, u64)> = c
-                .iter()
-                .filter(|(_, e)| e.in_use == 0)
-                .map(|(r, e)| (*r, e.used, e.size))
-                .collect();
-            order.sort_by_key(|(_, used, _)| *used);
-            let mut out = Vec::new();
-            for (root, _, size) in order {
-                if total <= self.cap {
-                    break;
-                }
-                total -= size;
-                c.remove(&root);
-                out.push(root);
+            let out = eviction_order(&c, &policy);
+            for root in &out {
+                c.remove(root);
             }
             out
         };
@@ -350,7 +454,7 @@ impl NodeStore {
         }
         info!(
             collections = victims.len(),
-            "file store cache over its size; dropped the least recently used"
+            "file store cache over its size or an account's share; dropped the least recently used"
         );
         self.report(vec![], victims);
     }
@@ -694,5 +798,49 @@ impl Drop for InUse {
             e.in_use = e.in_use.saturating_sub(1);
             e.used = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(size: u64, age_s: u64, account: &str, in_use: u32) -> Cached {
+        Cached {
+            size,
+            used: Instant::now() - Duration::from_secs(age_s),
+            in_use,
+            account: account.into(),
+        }
+    }
+
+    #[test]
+    fn eviction_keeps_queued_work_and_shares() {
+        let r = |n: u8| [n; 32];
+        let mut cache = HashMap::new();
+        cache.insert(r(1), entry(40, 50, "alice", 0));
+        cache.insert(r(2), entry(40, 40, "alice", 0));
+        cache.insert(r(3), entry(40, 30, "bob", 0));
+        cache.insert(r(4), entry(40, 20, "bob", 1));
+        let mut p = Policy {
+            own_cap: 1000,
+            ..Default::default()
+        };
+        assert!(eviction_order(&cache, &p).is_empty(), "it fits");
+        // The cluster's size wins over the agent's own.
+        p.cap = Some(100);
+        assert_eq!(eviction_order(&cache, &p), vec![r(1), r(2)], "oldest first");
+        // What queued tasks mount goes last.
+        p.keep.insert(r(1));
+        assert_eq!(eviction_order(&cache, &p), vec![r(2), r(3)]);
+        // One account over its share loses its own first; one in use stays.
+        let p = Policy {
+            own_cap: 1000,
+            per_account: Some(40),
+            ..Default::default()
+        };
+        // alice had 80 and loses her oldest; bob's 80 includes one in
+        // use, so only his idle one can go.
+        assert_eq!(eviction_order(&cache, &p), vec![r(1), r(3)]);
     }
 }

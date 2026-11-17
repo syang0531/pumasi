@@ -23,6 +23,7 @@
 //! | `in/<job>/<root>` | a collection an unfinished job mounts |
 //! | `up/<root>` | a committed upload not used by a job yet |
 //! | `img/<arch>/<digest>` | a private image pulled into the store |
+//! | `imgc/<arch>/<digest>` | the same image kept for the next job (1.18) |
 //!
 //! Pushed data has no tag until the report or commit that names it, so
 //! the garbage collector also keeps every collection pushed or allowed in
@@ -59,6 +60,17 @@ pub const GRANT_TTL: Duration = Duration::from_secs(3600);
 /// Pushed or allowed collections are kept from garbage collection this
 /// long, until a tag refers to them.
 const PROTECT_RECENT: Duration = Duration::from_secs(2 * 3600);
+/// Private images kept in the store for the next job that runs them
+/// (1.18), the most recently used first.
+const IMAGE_CACHE_MAX: usize = 32;
+/// An image nothing ran for this long leaves the cache.
+const IMAGE_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How long a tag (`:1.36`) is taken to name the digest the registry gave
+/// for it, before the registry is asked again (for the manifest only).
+const IMAGE_REF_FRESH: Duration = Duration::from_secs(10 * 60);
+
+/// An image reference and an architecture.
+type ImageKey = (String, String);
 
 /// What a connecting endpoint is to the cluster.
 #[derive(Debug, Clone, Copy, Default)]
@@ -88,6 +100,11 @@ pub struct FileStore {
     grants: Arc<Mutex<HashMap<EndpointId, Grant>>>,
     /// Collections pushed or allowed recently, and when.
     recent: Arc<Mutex<HashMap<Hash, Instant>>>,
+    /// Private images in the store for the next job (1.18): the digest an
+    /// image reference had for an architecture, and when it was asked.
+    image_refs: Arc<Mutex<HashMap<ImageKey, (String, Instant)>>>,
+    /// When each cached image (by its `imgc/` tag) was last used.
+    image_used: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl std::fmt::Debug for FileStore {
@@ -135,6 +152,8 @@ impl FileStore {
             dir: dir.to_path_buf(),
             grants: Default::default(),
             recent,
+            image_refs: Default::default(),
+            image_used: Default::default(),
         })
     }
 
@@ -459,6 +478,10 @@ impl FileStore {
     /// Pulls `reference` for `arch` with the cluster's registry logins and
     /// keeps it as an image collection (see [`pumasi_proto::store::ImageBlob`])
     /// tagged `img/<owner>/<digest>`.
+    ///
+    /// An image pulled before (for any job) is taken from the store
+    /// instead (1.18): a reference by digest asks the registry nothing, a
+    /// tag only for its manifest once [`IMAGE_REF_FRESH`] has passed.
     pub async fn pull_image(
         &self,
         reference: &str,
@@ -466,8 +489,32 @@ impl FileStore {
         owner: &str,
         creds: HashMap<String, Credentials>,
     ) -> Result<ImageBlob> {
+        let key = (reference.to_string(), arch.to_string());
+        let pinned = reference.contains("@sha256:");
+        let known = self
+            .image_refs
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|(_, at)| pinned || at.elapsed() < IMAGE_REF_FRESH)
+            .map(|(d, _)| d.clone());
+        if let Some(digest) = known
+            && let Some(img) = self.reuse_image(reference, arch, &digest, owner).await
+        {
+            return Ok(img);
+        }
         let reg = Registry::with_credentials(creds)?.for_arch(arch);
         let resolved = reg.resolve(reference).await?;
+        self.image_refs
+            .lock()
+            .unwrap()
+            .insert(key, (resolved.digest.clone(), Instant::now()));
+        if let Some(img) = self
+            .reuse_image(reference, arch, &resolved.digest, owner)
+            .await
+        {
+            return Ok(img);
+        }
         let work = self.scratch()?;
         let res: Result<ImageBlob> = async {
             let mut list: Vec<(String, PathBuf)> = Vec::new();
@@ -496,6 +543,13 @@ impl FileStore {
             let stored = self
                 .import(&list, &img_tag(owner, &resolved.digest))
                 .await?;
+            let cache = img_cache_tag(arch, &resolved.digest);
+            self.tag(&cache, blobs::to_hash(&stored.root)).await?;
+            self.image_used
+                .lock()
+                .unwrap()
+                .insert(cache, Instant::now());
+            self.prune_images().await;
             Ok(ImageBlob {
                 root: stored.root,
                 digest: resolved.digest.clone(),
@@ -505,6 +559,59 @@ impl FileStore {
         .await;
         let _ = std::fs::remove_dir_all(&work);
         res
+    }
+
+    /// The image `digest` for `arch` when it is whole in the store from an
+    /// earlier pull, tagged for `owner` too.
+    async fn reuse_image(
+        &self,
+        reference: &str,
+        arch: &str,
+        digest: &str,
+        owner: &str,
+    ) -> Option<ImageBlob> {
+        let cache = img_cache_tag(arch, digest);
+        let root = self.store.tags().get(&cache).await.ok().flatten()?.hash;
+        if !blobs::missing(&self.store, root).await.ok()?.1 {
+            return None;
+        }
+        self.tag(&img_tag(owner, digest), root).await.ok()?;
+        self.image_used
+            .lock()
+            .unwrap()
+            .insert(cache, Instant::now());
+        info!(image = %reference, %arch, %digest, "private image taken from the store");
+        Some(ImageBlob {
+            root: blobs::from_hash(root),
+            digest: digest.to_string(),
+            reference: reference.to_string(),
+        })
+    }
+
+    /// Drops cached images nothing ran for [`IMAGE_CACHE_TTL`], and the
+    /// least recently used beyond [`IMAGE_CACHE_MAX`]. Jobs keep theirs
+    /// under their own tags.
+    async fn prune_images(&self) {
+        use n0_future::StreamExt;
+        let Ok(mut tags) = self.store.tags().list_prefix(IMG_CACHE_PREFIX).await else {
+            return;
+        };
+        let mut names = Vec::new();
+        while let Some(Ok(t)) = tags.next().await {
+            names.push(String::from_utf8_lossy(t.name.as_ref()).into_owned());
+        }
+        let used = self.image_used.lock().unwrap().clone();
+        // Never used since the control plane started: oldest.
+        names.sort_by_key(|n| std::cmp::Reverse(used.get(n).copied()));
+        for (i, name) in names.iter().enumerate() {
+            let stale = used
+                .get(name)
+                .is_some_and(|t| t.elapsed() > IMAGE_CACHE_TTL);
+            if i >= IMAGE_CACHE_MAX || stale {
+                let _ = self.untag(name).await;
+                self.image_used.lock().unwrap().remove(name);
+            }
+        }
     }
 
     /// A scratch directory inside the store's directory (same disk).
@@ -560,4 +667,11 @@ pub fn up_tag(root: &BlobHash) -> String {
 
 pub fn img_tag(arch: &str, digest: &str) -> String {
     format!("img/{arch}/{digest}")
+}
+
+const IMG_CACHE_PREFIX: &str = "imgc/";
+
+/// A private image kept for the next job that runs it (1.18).
+pub fn img_cache_tag(arch: &str, digest: &str) -> String {
+    format!("{IMG_CACHE_PREFIX}{arch}/{digest}")
 }

@@ -206,6 +206,27 @@ pub enum OutputMode {
     Store,
 }
 
+/// How a node keeps its file store cache (1.18), from its labels:
+/// `cache=SIZE` is the most the cache holds (instead of the agent's
+/// `--store-cache`), and `cache.account=SIZE` the most one account's
+/// collections take of it. What queued tasks will mount goes last.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePolicy {
+    pub cap: Option<u64>,
+    pub per_account: Option<u64>,
+    /// Collections that tasks waiting in the queue mount (datasets,
+    /// private images, checkpoints): evicted only when nothing else is
+    /// left to evict.
+    pub keep: Vec<BlobHash>,
+}
+
+/// The node label that sizes its cache (1.18).
+pub const CACHE_LABEL: &str = "cache";
+/// The node label that sizes each account's share of its cache (1.18).
+pub const CACHE_ACCOUNT_LABEL: &str = "cache.account";
+/// Most collections a [`CachePolicy`] names to keep.
+pub const MAX_CACHE_KEEP: usize = 4096;
+
 /// Output files a task uploaded to the store: a collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredOutput {

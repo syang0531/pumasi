@@ -314,15 +314,20 @@ fn repair_account() -> Result<Vec<&'static str>> {
         NetApiBufferFree, NetUserGetInfo, NetUserSetInfo, USER_INFO_1, USER_INFO_1008,
     };
     let name = wide(ACCOUNT);
-    let mut buf: *mut u8 = std::ptr::null_mut();
-    // SAFETY: NetUserGetInfo allocates `buf`, freed below.
-    let rc = unsafe { NetUserGetInfo(std::ptr::null(), name.as_ptr(), 1, &mut buf) };
+    let mut out = std::mem::MaybeUninit::<*mut u8>::uninit();
+    // SAFETY: NetUserGetInfo allocates the buffer and writes its address
+    // into `out` when it succeeds; the buffer is freed below.
+    let rc = unsafe { NetUserGetInfo(std::ptr::null(), name.as_ptr(), 1, out.as_mut_ptr()) };
     ensure!(
-        rc == 0 && !buf.is_null(),
+        rc == 0,
         "could not read the local account {ACCOUNT} (error {rc})"
     );
-    // SAFETY: level 1 is a USER_INFO_1.
-    let flags = unsafe { (*(buf as *const USER_INFO_1)).usri1_flags };
+    // SAFETY: written by the successful call above.
+    let buf = unsafe { out.assume_init() };
+    let info = std::ptr::NonNull::new(buf.cast::<USER_INFO_1>())
+        .with_context(|| format!("no information on the local account {ACCOUNT}"))?;
+    // SAFETY: level 1 is a USER_INFO_1, valid until freed just after.
+    let flags = unsafe { info.as_ref().usri1_flags };
     // SAFETY: the buffer NetUserGetInfo gave.
     unsafe { NetApiBufferFree(buf.cast()) };
     let (want, mut fixed) = account_flags::repair(flags);
@@ -841,16 +846,24 @@ pub async fn remove() -> Result<i32> {
         "$sid = try {{ (New-Object System.Security.Principal.NTAccount('{ACCOUNT}')).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ '' }}; \
          Get-CimInstance Win32_UserProfile | Where-Object {{ ($sid -and $_.SID -eq $sid) -or $_.LocalPath -like '*\\{ACCOUNT}' -or $_.LocalPath -like '*\\{ACCOUNT}.*' }} | Remove-CimInstance -ErrorAction Stop"
     );
+    // Whatever still runs as the account holds its profile.
+    let _ = tool(
+        "taskkill.exe",
+        &["/F", "/T", "/FI", &format!("USERNAME eq {ACCOUNT}")],
+    )
+    .await;
     let mut profile_gone = false;
+    let mut last_error = String::new();
     for _ in 0..24 {
         let mut cmd = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"));
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-        if output(cmd, Duration::from_secs(60))
-            .await
-            .is_ok_and(|o| o.status.success())
-        {
-            profile_gone = true;
-            break;
+        match output(cmd, Duration::from_secs(60)).await {
+            Ok(o) if o.status.success() => {
+                profile_gone = true;
+                break;
+            }
+            Ok(o) => last_error = String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            Err(e) => last_error = format!("{e:#}"),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -860,6 +873,10 @@ pub async fn remove() -> Result<i32> {
         println!(
             "could not remove the profile of {ACCOUNT} yet (it is in use); restart Windows and run `pumasi docker remove` again to finish"
         );
+        println!("{}", profile_holders().await);
+        if let Some(line) = last_error.lines().find(|l| !l.trim().is_empty()) {
+            println!("  Windows said: {}", line.trim());
+        }
     }
     if let Err(e) = batch_logon(false) {
         println!("{e:#}");
@@ -888,6 +905,21 @@ pub async fn remove() -> Result<i32> {
         );
     }
     Ok(if removed && profile_gone { 0 } else { 1 })
+}
+
+/// What holds the account's profile, for a `remove` that could not
+/// delete it: the profile's state and the account's processes.
+async fn profile_holders() -> String {
+    let script = format!(
+        "Get-CimInstance Win32_UserProfile | Where-Object {{ $_.LocalPath -like '*\\{ACCOUNT}*' }} | ForEach-Object {{ \"  profile $($_.LocalPath): loaded=$($_.Loaded) refcount=$($_.RefCount)\" }}; \
+         Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object {{ $_.UserName -like '*\\{ACCOUNT}' }} | ForEach-Object {{ \"  process $($_.ProcessName) ($($_.Id)) runs as {ACCOUNT}\" }}"
+    );
+    let mut cmd = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"));
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    match output(cmd, Duration::from_secs(60)).await {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
+        Err(e) => format!("  ({e:#})"),
+    }
 }
 
 /// How long `remove` waits for [`STOP_TASK`].

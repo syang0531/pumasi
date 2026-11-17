@@ -868,7 +868,7 @@ mod tests {
         assert!(x.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
         let exe = l.pumasi_exe().display().to_string().replace('&', "&amp;");
         assert!(exe.starts_with(r"C:\Program Data &amp; Co\Pumasi\wsl-docker"));
-        assert!(x.contains(&format!("<Command>{exe}</Command>")), "{x}");
+        assert!(x.contains(&format!("<Command>{exe}</Command>")));
         assert!(x.contains(&format!(
             r"<Arguments>{RUN_ARG} --dir &quot;C:\Program Data &amp; Co\Pumasi\wsl-docker&quot;</Arguments>"
         )));

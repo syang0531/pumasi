@@ -387,6 +387,12 @@ impl DockerExecutor {
             .context("docker load timed out")??;
         let fed = feed.await;
         if !out.status.success() {
+            // Another agent on the same Docker daemon may have loaded the
+            // same image at the same moment; the containerd image store
+            // then refuses the second load with "already exists".
+            if self.has_image(&tag).await.unwrap_or(false) {
+                return Ok((tag, false));
+            }
             bail!(
                 "docker load: {}",
                 String::from_utf8_lossy(&out.stderr).trim()

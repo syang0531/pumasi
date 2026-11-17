@@ -2407,7 +2407,12 @@ async fn microvm_network_allow_lists_udp_and_egress() {
     };
     sub.limits.timeout_ms = 120_000;
     sub.max_attempts = 1;
-    let id = submit(&client, sub).await;
+    // As clients send it: the list travels beside the submission
+    // (`AdminOp::SubmitNet`); `AdminOp::Submit` cannot carry it.
+    let id = match client.call(AdminOp::submit(sub)).await.unwrap() {
+        AdminResponse::Submitted { id } => id,
+        other => panic!("unexpected {other:?}"),
+    };
     let view = wait_job(&client, id, 600).await;
     assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
     let out = String::from_utf8_lossy(view.tasks[0].stdout.as_deref().unwrap_or_default());

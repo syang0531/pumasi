@@ -45,7 +45,7 @@ machines.
 | 30 | 1.14 | Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors | done |
 | 31 | 1.15 | Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI | done |
 | 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | done |
-| 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | planned |
+| 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | done |
 | 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | planned |
 | 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | planned |
 | 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | planned |
@@ -590,6 +590,24 @@ one that asks for more than its half fails with an out-of-memory error
 and the other keeps running; the drawing example on the iMac's AMD GPU.
 
 ## 33. Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker (1.17)
+
+Done in 1.17.0 ([release notes](releases/v1.17.0.md),
+[details](architecture.md#phase-33-windows-117)). What differs from the
+plan: the two items that waited on the outside did not move. No
+`boot-times.ps1` numbers have come from real PCs, so there is no HCS
+backend and nothing to drop yet; it is decided when the numbers come, in
+a release of its own. SignPath has not approved the project, so releases
+stay unsigned and the `sign` job stays ready. `docker remove` finishes in
+one go by running a one-shot task as the hidden account that unregisters
+the distro and shuts its WSL VM down (only the account itself can), and
+`docker setup` repairs the account's flags and group, the task, and the
+distro's `wsl.conf` and start script. CPU temperatures without
+LibreHardwareMonitor come from HWiNFO's shared memory and Open Hardware
+Monitor, plus the thermal zone counters for agents without administrator
+rights; "Distance to TjMax" sensors no longer count as temperatures. The
+phase also took 1.15's leftover: the dashboard's `cluster.toml` editor
+shows the file's silences, the name kept in the silence's `by` field so
+neither the storage layout nor the protocol changes.
 
 Why: phase 27 left HCS waiting for `scripts/windows/boot-times.ps1` on
 real PCs, signing waiting for SignPath Foundation, and `docker remove`

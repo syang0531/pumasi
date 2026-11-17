@@ -127,10 +127,13 @@ test("cluster.toml: thresholds for one node and a silence", async ({ page, reque
   await page.getByRole("button", { name: "Apply", exact: true }).click();
   await expect(page.locator('#apply-result [data-applied="applied"]')).toContainText("silence e2e-quiet");
 
-  // The editor shows the thresholds now, and applying it again changes nothing.
+  // The editor shows the thresholds and the silence now, and applying it
+  // again changes nothing.
   await page.goto(state().base + "/settings");
   const after = await text.inputValue();
   expect(after).toContain('[alerts.nodes.node-b]\ndisk = "97%"\ntemperature = "off"');
+  // And the silence, by its name (1.17).
+  expect(after).toContain(`[silences.e2e-quiet]\nrule = "disk"\nnodes = "name=node-a"\nuntil = ${until}\ncomment = "from the editor"`);
   await page.getByRole("button", { name: "Preview" }).click();
   await expect(page.locator('#apply-result [data-applied="preview"]')).toContainText("Nothing to change");
 

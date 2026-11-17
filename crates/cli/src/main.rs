@@ -153,10 +153,12 @@ enum Cmd {
     Gpu(gpu_cmd::GpuCmd),
     /// Show what this machine's temperature and power sensors read, as the
     /// agent reports them (Macs: the SMC on Intel, IOReport and the HID
-    /// sensors on Apple Silicon).
+    /// sensors on Apple Silicon; Windows: ACPI thermal zones and the
+    /// hardware monitors that run).
     Sensors {
-        /// Also print the raw SMC and IOReport readings (to attach to an
-        /// issue when a Mac shows no temperature).
+        /// Also print the raw readings: the SMC and IOReport on Macs, every
+        /// source's temperatures on Windows (to attach to an issue when a
+        /// machine shows no temperature).
         #[arg(long)]
         raw: bool,
     },
@@ -1284,25 +1286,33 @@ fn main() {
         std::process::exit(pumasi_agent::microvm::vz::run_main(&config));
     }
     // `pumasi __wsl-docker-run --dir DIR`: the scheduled task of `pumasi
-    // docker setup`, which keeps dockerd running in the WSL distro (1.11).
+    // docker setup`, which keeps dockerd running in the WSL distro (1.11);
+    // `__wsl-docker-stop`: the one-shot task of `pumasi docker remove`,
+    // which stops it for good (1.17).
     let mut args = std::env::args_os().skip(1);
-    if args
-        .next()
-        .is_some_and(|a| a == pumasi_agent::wsl_docker::RUN_ARG)
-    {
+    let task = args.next().and_then(|a| {
+        use pumasi_agent::wsl_docker::{RUN_ARG, STOP_ARG};
+        [RUN_ARG, STOP_ARG].into_iter().find(|t| a == *t)
+    });
+    if let Some(task) = task {
         let dir = match (args.next(), args.next()) {
             (Some(flag), Some(dir)) if flag == "--dir" => PathBuf::from(dir),
             _ => {
-                eprintln!(
-                    "usage: pumasi {} --dir DIR",
-                    pumasi_agent::wsl_docker::RUN_ARG
-                );
+                eprintln!("usage: pumasi {task} --dir DIR");
                 std::process::exit(2);
             }
         };
         let code = tokio::runtime::Runtime::new()
             .map_err(anyhow::Error::from)
-            .and_then(|rt| rt.block_on(pumasi_agent::wsl_docker::run_task(&dir)))
+            .and_then(|rt| {
+                rt.block_on(async {
+                    if task == pumasi_agent::wsl_docker::STOP_ARG {
+                        pumasi_agent::wsl_docker::run_stop(&dir).await
+                    } else {
+                        pumasi_agent::wsl_docker::run_task(&dir).await
+                    }
+                })
+            })
             .unwrap_or_else(|e| {
                 eprintln!("error: {e:#}");
                 1
@@ -4949,7 +4959,18 @@ fn sensors(home: &Path, raw: bool) -> Result<()> {
             watts(g.power_w)
         );
     }
-    if raw {
+    if raw && cfg!(windows) {
+        // Every source, each reading (1.17): which monitor is missing.
+        let readings = pumasi_agent::win_temps::raw();
+        if readings.is_empty() {
+            println!(
+                "no temperature sources: no ACPI thermal zones, and no LibreHardwareMonitor, Open Hardware Monitor or HWiNFO (with shared memory) running"
+            );
+        }
+        for r in readings {
+            println!("{}", r.line());
+        }
+    } else if raw {
         let lines = pumasi_agent::sensors::Reader::new().raw();
         if lines.is_empty() {
             println!("no SMC or IOReport readings on this machine");

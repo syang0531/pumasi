@@ -2197,7 +2197,8 @@ Windows temperatures come from WMI on a thread of its own
 `MSAcpi_ThermalZoneTemperature` in `root\WMI` and, when
 LibreHardwareMonitor runs with its WMI provider, its `Sensor` class in
 `root\LibreHardwareMonitor` (CPU and GPU temperatures). sysinfo's own
-WMI reads are not safe across threads, which is why Windows had none.
+WMI reads are not safe across threads, which is why Windows had none. 1.17 adds the thermal zone counters, Open Hardware Monitor and HWiNFO
+([phase 33](#phase-33-windows-117)).
 
 ### The network between nodes
 
@@ -3656,6 +3657,110 @@ keep working and can take a rollout. Upgrade the control plane first; it
 rejects agents newer than itself. Phase 3 agents cannot be upgraded
 remotely; install a current binary on them once.
 
+## Phase 33: Windows (1.17)
+
+Release 1.17 makes `pumasi docker remove` finish in one go, lets `pumasi
+docker setup` repair a machine someone changed by hand, reads Windows CPU
+temperatures from more hardware monitors, and writes the `cluster.toml`
+silences back into the dashboard's editor. The code is
+`agent/src/wsl_docker/` (`remove`, `stop_vm`, `run_stop`,
+`repair_account`, `task_drift`), `agent/src/win_temps.rs` (temperature
+sources, HWiNFO's shared memory) and `file_silence_by` /
+`Silence::file_name` in `proto/src/monitor.rs`. No protocol or storage
+change: the agent protocol stays 14 minor 9 and the stored layout 7.
+
+### `docker remove` in one go
+
+A WSL 2 VM belongs to one user: only `pumasi-wsl` can unregister its
+distro or shut its VM down, and while that VM runs Windows keeps the
+account's profile (and with it the distro's registration) loaded, which
+is why 1.11's `remove` could not delete the profile until a restart. In
+1.17 `remove`, after ending the boot task, gives the account a fresh
+password (nobody keeps the old one), puts back its flags and its "Log on
+as a batch job" right, and registers `\Pumasi\WSL Docker stop`: a task
+with no trigger, the same password logon and a ten-minute limit, running
+`pumasi __wsl-docker-stop --dir DIR` from the account's copy of the
+binary. That program runs `wsl --unregister pumasi-docker` (which deletes
+the distro's disk) and `wsl --shutdown`, logs both, and writes what it did
+to `logs\stopped`. `remove` waits up to four minutes for that file and for
+the task to end, deletes both tasks, then removes the profiles: the
+account's by SID, and any `pumasi-wsl` or `pumasi-wsl.*` profile (left by
+an account someone deleted and made again by hand). It exits 0 only when
+the profile and `C:\ProgramData\Pumasi\wsl-docker` are both gone. Without
+WSL (nothing to stop) or without the account it skips the stop task.
+
+### `docker setup` repairs
+
+`setup` always set a new password, granted the batch right, hid the
+account and registered the task with `/F`; 1.17 adds what that missed and
+says what it found:
+
+- the account's flags (`NetUserGetInfo` level 1): disabled or locked out
+  is cleared, "password never expires" and "cannot change password" are
+  set again (`account_flags::repair`); it is taken out of the
+  Administrators group, named by its well-known SID, since the task is
+  meant to run as a standard user;
+- the registered task (`schtasks /Query /XML`) against the one `setup`
+  writes (`task_drift`): disabled, no boot trigger, no stored-password
+  logon, another program or arguments, a time limit, or stopping on
+  batteries. It is registered again either way;
+- inside the distro, the task's start compares `/etc/wsl.conf` and the
+  start script with what provisioning writes and provisions again when
+  either was edited, like a changed marker does.
+
+A distro whose registration is gone (a profile reset, an account made
+again) was already registered again from its disk by 1.11's task.
+
+### Windows temperatures
+
+`win_temps::Sources` lives on the WMI thread (COM objects stay on the
+thread that made them) and reads, every 10 seconds:
+
+| Source | Query | Needs |
+| --- | --- | --- |
+| `acpi` | `MSAcpi_ThermalZoneTemperature` in `root\WMI` (tenths of a kelvin) | administrator |
+| `zone` | `Win32_PerfFormattedData_Counters_ThermalZoneInformation` in `root\cimv2` (`HighPrecisionTemperature`, tenths of a kelvin, else `Temperature`) | nothing (1.17) |
+| `lhm` | `Sensor` where `SensorType = 'Temperature'` in `root\LibreHardwareMonitor` | it running |
+| `ohm` | the same in `root\OpenHardwareMonitor` | it running (1.17) |
+| `hwinfo` | the file mapping `Global\HWiNFO_SENS_SM2` | HWiNFO with "Shared Memory Support" (1.17) |
+
+The monitors' namespaces are looked for again every 30 reads, since they
+may start after the agent. HWiNFO's mapping is opened, copied (its size
+from `VirtualQuery`) and closed on each read; `hwinfo::parse` checks the
+`HWiS` signature (`DEAD` once HWiNFO stops sharing), bounds the element
+counts and sizes from the header, steps by the header's element sizes
+(HWiNFO 7 appends UTF-8 names to each element), keeps the readings of type
+1 (temperature), names them `sensor: label` with the owner's names where
+given, and converts °F. Readings whose names say they are a distance to
+TjMax or a limit are dropped (`is_temperature`): LibreHardwareMonitor and
+HWiNFO both list "Distance to TjMax" as a temperature, which 1.16 counted
+and which could beat a cool CPU's real temperature. The hottest plausible
+reading (1 to 150 °C) is the node's temperature. `pumasi sensors --raw`
+on Windows prints every reading with its source.
+
+### Silences in the editor
+
+1.15 stored a `cluster.toml` silence with `by = "cluster.toml"`, so the
+editor, which writes the cluster back as a file, could not name it. A
+`Silence` is a postcard record in the state database and in the admin
+protocol, where a new field would change both formats, so 1.17 puts the
+name in `by` instead: `cluster.toml/NAME` (`file_silence_by`).
+`Silence::file_name` believes the name only when `file_silence_id(name)`
+gives the silence's id; `from_file` accepts both forms, so `apply
+--prune` still finds 1.15's silences, and `FileSilence::same_as` wants the
+new form, so applying a file once more rewrites them with their names
+("updated"). The editor writes `[silences.NAME]` with `rule`, `nodes`,
+`until` (RFC 3339, UTC) and `comment`, which reads back as the same
+silence, so Preview right after loading says "Nothing to change".
+
+### HCS and signing
+
+Neither moved: no `scripts/windows/boot-times.ps1` numbers have come from
+real PCs yet, and SignPath Foundation has not approved the project, so
+`release.yml`'s `sign` job is still skipped. Both stay as they were in
+1.11: QEMU with WHPX is the Windows microVM backend, and binaries are
+unsigned (README "Smart App Control").
+
 ## Not yet
 
 - Remote API: no ACME (certificates come from certbot, a proxy or a
@@ -3690,11 +3795,13 @@ remotely; install a current binary on them once.
   the console carries it on vz; Windows GPUs report a
   temperature but no power, and Linux CPU package power needs an agent
   that can read RAPL; DRM fdinfo sees only processes the agent may read;
-  Windows desktops without LibreHardwareMonitor often have no temperature
-  (few boards fill in ACPI thermal zones).
+  Windows desktops without a hardware monitor (LibreHardwareMonitor, Open
+  Hardware Monitor, HWiNFO) often have no temperature (few boards fill in
+  ACPI thermal zones), and the monitors start with a sign-in.
 - Dashboard: the `cluster.toml` editor takes no job files and no
-  `url_env`, never prunes, and does not show the file's silences (use
-  `pumasi apply`); the Upgrade panel's canary
+  `url_env`, never prunes, and shows only the silences a 1.17 or later
+  `cluster.toml` made (older ones once the file is applied again); the
+  Upgrade panel's canary
   checkboxes appear only with a published release to upgrade to (canary
   rollouts of your own binaries are `pumasi upgrade rollout --canary`);
   node settings need an agent run as a service (1.4 or later) that is
@@ -3707,7 +3814,7 @@ remotely; install a current binary on them once.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 32 are done and phases 33 to 36 are planned
+- Roadmap: phases 20 to 33 are done and phases 34 to 36 are planned
   ([roadmap.md](roadmap.md)); phases 18 and 19 (the hub and buying CU)
   are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it
@@ -3718,7 +3825,7 @@ remotely; install a current binary on them once.
   model, "Internal review for 1.0"); no third-party audit yet.
 - Windows: Hyper-V HCS as a faster backend waits for real-PC timings
   (`scripts/windows/boot-times.ps1`), and binaries are unsigned until
-  SignPath Foundation approves the project.
+  SignPath Foundation approves the project (both unchanged in 1.17).
 - The control plane upgrades itself only within one agent protocol (a
   protocol change still needs it upgraded by hand first), and the leader
   steps down by restarting (openraft 0.9 has no leadership transfer).

@@ -440,7 +440,11 @@ in `C:\ProgramData\Pumasi\wsl-docker`. An agent with `--allow-docker` uses
 it whenever it is set up; to keep using Docker Desktop on such a machine,
 give the agent `--docker-bin "C:\Program Files\Docker\Docker\resources\bin\docker.exe"`.
 `pumasi docker status` shows the task, whether Docker answers and the end
-of its log; `pumasi docker remove` takes it all away again. Without WSL,
+of its log; `pumasi docker remove` takes it all away again, in one go
+since 1.17 (it shuts the account's WSL VM down first, so no restart is
+needed). Running `setup` again repairs a machine where someone changed
+the account (disabled, locked out, made an administrator) or the task
+(disabled, another program, a time limit) by hand (1.17). Without WSL,
 `setup` installs it (`wsl --install --no-distribution`); after the restart
 the task sets Docker up on its own.
 
@@ -1148,7 +1152,9 @@ Linux, Apple and AMD GPUs in Macs through IOAccelerator statistics, and any
 GPU on Windows through the GPU Engine performance counters. Windows nodes
 read temperatures through WMI (ACPI thermal zones, and
 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)'s
-sensors while it runs, which most desktop boards need). Macs (1.14) read the
+sensors while it runs, which most desktop boards need; see
+[Windows temperatures](#windows-temperatures) for the other monitors 1.17
+reads). Macs (1.14) read the
 CPU die and GPU temperatures and GPU power from the SMC on Intel Macs and
 from the HID sensors and IOReport on Apple Silicon. On Linux (1.15), AMD
 and Intel discrete GPUs report their temperature and power from hwmon,
@@ -1266,6 +1272,28 @@ Applying the file again finds the same silence by its name; one the file
 no longer lists stays until it ends, unless you pass `--prune`. The Korean
 dashboard shows events and alerts in Korean (from a 1.15 control plane;
 older events stay in English).
+
+### Windows temperatures
+
+Windows has no API for CPU temperatures; reading them takes a kernel
+driver, and Pumasi ships none. Without help an agent reports only the ACPI
+thermal zones the firmware fills (rare on desktop boards). To get CPU
+temperatures, run one of these hardware monitors on the machine; the
+agent reads whichever runs, no option needed (1.17):
+
+| Monitor | What to turn on | Notes |
+| --- | --- | --- |
+| [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) | run it as administrator once, then Options → "Run On Windows Startup" | open source; its WMI sensors (`root\LibreHardwareMonitor`) |
+| [HWiNFO](https://www.hwinfo.com/) | Settings → "Shared Memory Support", and its own "Auto Start" | free for personal use; the free version turns shared memory off after 12 hours until it is turned on again |
+| Open Hardware Monitor | as LibreHardwareMonitor | the older project LibreHardwareMonitor came from; for machines that still have it |
+
+These start with a sign-in, so a machine nobody has signed into since it
+booted reports only its thermal zones. `pumasi sensors --raw` lists every
+source and reading, which shows whether the agent sees the monitor; the
+sensors that say how far a core is from its limit ("Distance to TjMax")
+are left out, since they are not temperatures. Since 1.17 an agent that
+does not run as administrator also reads the thermal zones (through the
+"Thermal Zone Information" counters).
 
 ### Control plane replicas and backups
 
@@ -1579,7 +1607,7 @@ defends against, including the API exposed to the internet.
 | `pumasi upgrade rollout FILE... [--wait] [--force] [--canary ...]` | Roll new agent binaries out to the nodes, signed with the cluster key. `upgrade status` shows each node (and the canary), `upgrade promote [NODE...]` upgrades more nodes past a canary or all of them, `upgrade cancel` stops offering it. |
 | `pumasi vm setup [--guest FILE] [--force] [--gpu-bundle DIR]` | Install the guest kernel, Firecracker (Linux) or QEMU (Windows, as administrator) and the guest init into `~/.pumasi/vm`; `--gpu-bundle` adds the GPU guest kernel and driver for passthrough. |
 | `pumasi vm status` | Show what is installed for microVMs and which VM monitor will be used. |
-| `pumasi docker setup [--port 2376] [--no-wait] [--new-certificates]` / `docker status` / `docker remove` | Windows, administrator: Docker in a WSL 2 distro Pumasi manages, started at boot by a scheduled task before anyone signs in (no Docker Desktop), which agents with `--allow-docker` use; `status` shows the task, the daemon and its log, `remove` takes it all away. |
+| `pumasi docker setup [--port 2376] [--no-wait] [--new-certificates]` / `docker status` / `docker remove` | Windows, administrator: Docker in a WSL 2 distro Pumasi manages, started at boot by a scheduled task before anyone signs in (no Docker Desktop), which agents with `--allow-docker` use; `status` shows the task, the daemon and its log, `remove` takes it all away (in one go, 1.17); `setup` again repairs it. |
 | `pumasi vm run IMAGE [--input DIR] [-e K=V] [--memory-mb N] [--cpus N] [--timeout T] [--network] [-- CMD...]` | Run an image in a microVM on this machine, the way an agent would (`/output` is saved to `pumasi-out/vm`). |
 | `pumasi gpu list [--no-bench] [--json]` / `gpu check [GPU] [--docker-run [--image IMAGE] [--wsl-libs auto\|yes\|no]]` / `gpu webgpu [--software]` | This machine's GPUs and their benchmark; `check` says whether Docker and microVMs can use each one and runs the cluster's GPU check locally, and with `--docker-run` starts a container to see whether CUDA, OptiX and drawing (EGL, OpenGL, Vulkan) work in Docker (saved for the agent: `gpu.graphics`); `webgpu` lists the WebGPU adapters wasm jobs can use. |
 | `pumasi store put NAME PATHS... [--account A]` / `get NAME[@V] \| --job ID [-o DIR]` / `ls [NAME]` / `rm NAME[@V]` / `usage` / `quota ACCOUNT SIZE\|none` | The cluster file store: versioned datasets, job outputs, resumable transfers, quotas. |
@@ -1892,12 +1920,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md). 1.12.0 adds SCIM provisioning, audit log pruning behind a signed checkpoint, limits shared by every dashboard, the CLI behind an HTTPS proxy and followers answering the dashboard's reads: [notes](docs/releases/v1.12.0.md). 1.13.0 upgrades the control plane itself after the agents, replicas one at a time, with a rollback when the new binary does not come back healthy, and fixes the three checks that failed now and then in CI: [notes](docs/releases/v1.13.0.md). 1.14.0 keeps microVMs warm for the next task of an image, lets microVM tasks checkpoint, and reads Mac temperatures and GPU power from the SMC and IOReport: [notes](docs/releases/v1.14.0.md). 1.15.0 puts per-node alert thresholds and silences in `cluster.toml`, edits schedules and secrets in the browser, pushes the dashboard's charts, streams microVM output past 1 MiB, reads Intel and AMD GPU temperatures, measures the network to the file store and shows events in Korean: [notes](docs/releases/v1.15.0.md). 1.16.0 gives parts of NVIDIA GPUs a memory limit with MPS, benchmarks MIG slices, draws over WebGPU with textures and render passes, gives wasm tasks several GPUs and runs WASI preview 2 components: [notes](docs/releases/v1.16.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md). 1.12.0 adds SCIM provisioning, audit log pruning behind a signed checkpoint, limits shared by every dashboard, the CLI behind an HTTPS proxy and followers answering the dashboard's reads: [notes](docs/releases/v1.12.0.md). 1.13.0 upgrades the control plane itself after the agents, replicas one at a time, with a rollback when the new binary does not come back healthy, and fixes the three checks that failed now and then in CI: [notes](docs/releases/v1.13.0.md). 1.14.0 keeps microVMs warm for the next task of an image, lets microVM tasks checkpoint, and reads Mac temperatures and GPU power from the SMC and IOReport: [notes](docs/releases/v1.14.0.md). 1.15.0 puts per-node alert thresholds and silences in `cluster.toml`, edits schedules and secrets in the browser, pushes the dashboard's charts, streams microVM output past 1 MiB, reads Intel and AMD GPU temperatures, measures the network to the file store and shows events in Korean: [notes](docs/releases/v1.15.0.md). 1.16.0 gives parts of NVIDIA GPUs a memory limit with MPS, benchmarks MIG slices, draws over WebGPU with textures and render passes, gives wasm tasks several GPUs and runs WASI preview 2 components: [notes](docs/releases/v1.16.0.md). 1.17.0 removes the WSL Docker in one go and repairs it when changed by hand, and reads Windows CPU temperatures from Open Hardware Monitor and HWiNFO: [notes](docs/releases/v1.17.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane, phase 30 (1.14) old Intel Macs, phase 31 (1.15) what monitoring and the dashboard had left and phase 32 (1.16) GPUs. Phases 33 to 36 (1.17 to 1.20) are planned: Windows, the file store and microVM networks, high availability and the remote API, and result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane, phase 30 (1.14) old Intel Macs, phase 31 (1.15) what monitoring and the dashboard had left, phase 32 (1.16) GPUs and phase 33 (1.17) Windows. Phases 34 to 36 (1.18 to 1.20) are planned: the file store and microVM networks, high availability and the remote API, and result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1932,7 +1960,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 30 | Old Intel Macs: warm microVMs and reused image disks, microVM checkpoints, SMC and Apple Silicon sensors, building for Intel Macs after GitHub's Intel runner | done (1.14) |
 | 31 | Monitoring and the dashboard: per-node thresholds and silences in `cluster.toml`, schedules and secrets in the browser, pushed charts, live microVM output past 1 MiB, Intel and AMD GPU temperatures, the network to the store, Korean events | done (1.15) |
 | 32 | GPUs: memory limits for parts of NVIDIA GPUs (MPS), benchmarked MIG slices, WebGPU textures and render passes, several adapters per task, WASI preview 2 components | done (1.16) |
-| 33 | Windows: an HCS backend if real PCs show it is clearly faster, signed binaries (SignPath), a one-step `docker remove` | planned (1.17) |
+| 33 | Windows: a one-step `docker remove` and a `docker setup` that repairs, CPU temperatures from Open Hardware Monitor and HWiNFO; HCS and signing wait for real-PC numbers and SignPath | done (1.17) |
 | 34 | File store and microVM networks: node cache quotas, private images through the store, UDP, IPv6, per-job allow lists, bandwidth caps, billed egress | planned (1.18) |
 | 35 | High availability and the remote API: the API and CLI reading from followers, limits replicated across failovers, replicas that move, pushed `?wait=`, per-job CPU, memory and CU caps, ACME | planned (1.19) |
 | 36 | Result checks: honeypot tasks with known answers, disk and memory challenges, periodic re-benchmarks, a score per provider | planned (1.20) |
@@ -1967,9 +1995,12 @@ keeps (through the output disk under Firecracker and QEMU; under vz, a
 console slower than the task leaves the rest to the result).
 Windows reports a GPU's temperature but not its power, Linux reports CPU
 package power only to an agent running as root, and Windows desktops
-without LibreHardwareMonitor often have no temperature to report (few
-boards fill in the ACPI thermal zones). The dashboard's `cluster.toml`
-editor does not show the file's silences (the Events page lists them).
+without a hardware monitor (LibreHardwareMonitor, Open Hardware Monitor or
+HWiNFO) often have no temperature to report (few boards fill in the ACPI
+thermal zones). The dashboard's `cluster.toml` editor shows the silences
+a `cluster.toml` made from 1.17 on; older ones appear once the file is
+applied again, and silences made on the Events page or with `alert
+silence` stay off it (the Events page lists them all).
 The control plane upgrades itself only within one agent protocol (a
 protocol change still goes to it by hand first), and replicas from before
 1.13 are upgraded by hand once. The remote API has

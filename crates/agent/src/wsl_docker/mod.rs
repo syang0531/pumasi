@@ -40,7 +40,7 @@ pub mod tls;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{kick, remove, run_task, setup, status};
+pub use windows::{kick, remove, run_stop, run_task, setup, status};
 
 /// `pumasi docker setup`'s options.
 #[derive(Debug, Clone)]
@@ -76,6 +76,11 @@ pub async fn run_task(_dir: &Path) -> Result<i32> {
     anyhow::bail!("{WINDOWS_ONLY}")
 }
 
+#[cfg(not(windows))]
+pub async fn run_stop(_dir: &Path) -> Result<i32> {
+    anyhow::bail!("{WINDOWS_ONLY}")
+}
+
 /// Starts the task again (Windows); nothing elsewhere.
 #[cfg(not(windows))]
 pub fn kick() {}
@@ -88,6 +93,12 @@ pub const ACCOUNT: &str = "pumasi-wsl";
 pub const TASK: &str = r"\Pumasi\WSL Docker";
 /// `pumasi __wsl-docker-run --dir DIR`: what the task runs.
 pub const RUN_ARG: &str = "__wsl-docker-run";
+/// The one-shot task `pumasi docker remove` runs as [`ACCOUNT`] (1.17):
+/// only the account itself can unregister its distro and stop its WSL VM,
+/// which holds the account's profile until it shuts down.
+pub const STOP_TASK: &str = r"\Pumasi\WSL Docker stop";
+/// `pumasi __wsl-docker-stop --dir DIR`: what [`STOP_TASK`] runs.
+pub const STOP_ARG: &str = "__wsl-docker-stop";
 /// Where `dockerd` listens (TLS), inside the VM and, forwarded by WSL, on
 /// the Windows loopback.
 pub const DEFAULT_PORT: u16 = 2376;
@@ -208,6 +219,14 @@ impl Layout {
     }
     pub fn task_xml(&self) -> PathBuf {
         self.root.join("task.xml")
+    }
+    pub fn stop_task_xml(&self) -> PathBuf {
+        self.root.join("stop-task.xml")
+    }
+    /// What [`STOP_ARG`] writes when it is done (in `logs`, which the
+    /// account may write).
+    pub fn stopped_file(&self) -> PathBuf {
+        self.logs().join("stopped")
     }
 }
 
@@ -487,21 +506,54 @@ fn xml(s: &str) -> String {
 /// needs to sign in), never stopped for time, batteries or idleness,
 /// restarted when it fails to start, one instance.
 pub fn task_xml(layout: &Layout) -> String {
+    account_task_xml(
+        layout,
+        &format!(
+            "Keeps dockerd running in the {DISTRO} WSL distro for the Pumasi agent, from boot and before anyone signs in (pumasi docker setup)."
+        ),
+        RUN_ARG,
+        true,
+        "PT0S",
+    )
+}
+
+/// [`STOP_TASK`]: started on demand by `pumasi docker remove`, as
+/// [`ACCOUNT`], for at most ten minutes.
+pub fn stop_task_xml(layout: &Layout) -> String {
+    account_task_xml(
+        layout,
+        &format!(
+            "Unregisters the {DISTRO} WSL distro and shuts its VM down (pumasi docker remove); deleted when it is done."
+        ),
+        STOP_ARG,
+        false,
+        "PT10M",
+    )
+}
+
+fn account_task_xml(layout: &Layout, what: &str, arg: &str, boot: bool, limit: &str) -> String {
     let exe = xml(&layout.pumasi_exe().display().to_string());
-    let args = xml(&format!("{RUN_ARG} --dir \"{}\"", layout.root().display()));
+    let args = xml(&format!("{arg} --dir \"{}\"", layout.root().display()));
     let dir = xml(&layout.root().display().to_string());
+    let what = xml(what);
+    let triggers = if boot {
+        "\n    <BootTrigger>\n      <Enabled>true</Enabled>\n    </BootTrigger>\n  "
+    } else {
+        ""
+    };
+    let restart = if boot {
+        "\n    <RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>999</Count>\n    </RestartOnFailure>"
+    } else {
+        ""
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Author>Pumasi</Author>
-    <Description>Keeps dockerd running in the {DISTRO} WSL distro for the Pumasi agent, from boot and before anyone signs in (pumasi docker setup).</Description>
+    <Description>{what}</Description>
   </RegistrationInfo>
-  <Triggers>
-    <BootTrigger>
-      <Enabled>true</Enabled>
-    </BootTrigger>
-  </Triggers>
+  <Triggers>{triggers}</Triggers>
   <Principals>
     <Principal id="Author">
       <UserId>{ACCOUNT}</UserId>
@@ -525,12 +577,8 @@ pub fn task_xml(layout: &Layout) -> String {
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>5</Priority>
-    <RestartOnFailure>
-      <Interval>PT1M</Interval>
-      <Count>999</Count>
-    </RestartOnFailure>
+    <ExecutionTimeLimit>{limit}</ExecutionTimeLimit>
+    <Priority>5</Priority>{restart}
   </Settings>
   <Actions Context="Author">
     <Exec>
@@ -542,6 +590,72 @@ pub fn task_xml(layout: &Layout) -> String {
 </Task>
 "#
     )
+}
+
+/// What differs between the registered task (`schtasks /Query /XML`) and
+/// the one `setup` registers (1.17): someone changed it by hand. Empty
+/// when nothing that matters did.
+pub fn task_drift(registered: &str, layout: &Layout) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    // Task Scheduler writes the XML back in its own layout; look at the
+    // elements, not the text.
+    let has = |tag: &str, value: &str| registered.contains(&format!("<{tag}>{value}</{tag}>"));
+    if has("Enabled", "false") {
+        out.push("it was disabled");
+    }
+    if !registered.contains("<BootTrigger") {
+        out.push("it lost its boot trigger");
+    }
+    if !has("LogonType", "Password") {
+        out.push("it no longer logs on by itself (stored password)");
+    }
+    if !registered.contains(&format!("{RUN_ARG} --dir")) {
+        out.push("it runs something else");
+    }
+    let exe = xml(&layout.pumasi_exe().display().to_string());
+    if !has("Command", &exe) && !has("Command", &format!("\"{exe}\"")) {
+        out.push("it runs another program");
+    }
+    if !has("ExecutionTimeLimit", "PT0S") {
+        out.push("it has a time limit");
+    }
+    if registered.contains("<DisallowStartIfOnBatteries>true")
+        || registered.contains("<StopIfGoingOnBatteries>true")
+    {
+        out.push("it stops on batteries");
+    }
+    out
+}
+
+/// The account flags `setup` wants (1.17): enabled, not locked out, a
+/// password that never expires and that only Pumasi changes.
+pub mod account_flags {
+    /// `UF_SCRIPT`, `UF_ACCOUNTDISABLE`, `UF_LOCKOUT`,
+    /// `UF_PASSWD_CANT_CHANGE`, `UF_DONT_EXPIRE_PASSWD` (lmaccess.h).
+    pub const SCRIPT: u32 = 0x0001;
+    pub const DISABLED: u32 = 0x0002;
+    pub const LOCKOUT: u32 = 0x0010;
+    pub const CANT_CHANGE: u32 = 0x0040;
+    pub const NEVER_EXPIRES: u32 = 0x1_0000;
+
+    /// The flags to set, and what was wrong, for an account with `flags`.
+    pub fn repair(flags: u32) -> (u32, Vec<&'static str>) {
+        let mut why = Vec::new();
+        if flags & DISABLED != 0 {
+            why.push("it was disabled");
+        }
+        if flags & LOCKOUT != 0 {
+            why.push("it was locked out");
+        }
+        if flags & NEVER_EXPIRES == 0 {
+            why.push("its password could expire");
+        }
+        if flags & CANT_CHANGE == 0 {
+            why.push("its password could be changed by itself");
+        }
+        let want = (flags & !(DISABLED | LOCKOUT)) | SCRIPT | CANT_CHANGE | NEVER_EXPIRES;
+        (want, why)
+    }
 }
 
 /// UTF-16LE with a byte order mark, which `schtasks /XML` reads reliably.
@@ -758,8 +872,57 @@ mod tests {
         assert!(x.contains(&format!(
             r"<Arguments>{RUN_ARG} --dir &quot;C:\Program Data &amp; Co\Pumasi\wsl-docker&quot;</Arguments>"
         )));
+        // Registered as written: no drift.
+        assert!(task_drift(&x, &l).is_empty(), "{:?}", task_drift(&x, &l));
+        let off = x.replace(
+            "<Enabled>true</Enabled>\n    <Hidden>",
+            "<Enabled>false</Enabled>\n    <Hidden>",
+        );
+        assert_eq!(task_drift(&off, &l), ["it was disabled"]);
+        let interactive = x.replace("<LogonType>Password", "<LogonType>InteractiveToken");
+        assert_eq!(
+            task_drift(&interactive, &l),
+            ["it no longer logs on by itself (stored password)"]
+        );
+        let other = x.replace("pumasi.exe</Command>", "evil.exe</Command>");
+        assert_eq!(task_drift(&other, &l), ["it runs another program"]);
+        let limited = x.replace("PT0S", "PT72H");
+        assert_eq!(task_drift(&limited, &l), ["it has a time limit"]);
+        let no_boot = x.replace("<BootTrigger>", "<LogonTrigger>");
+        assert_eq!(task_drift(&no_boot, &l), ["it lost its boot trigger"]);
+
+        // The stop task: on demand, ten minutes, the stop program.
+        let stop = stop_task_xml(&l);
+        assert!(!stop.contains("<BootTrigger>"));
+        assert!(stop.contains("<Triggers></Triggers>"));
+        assert!(stop.contains("<ExecutionTimeLimit>PT10M</ExecutionTimeLimit>"));
+        assert!(!stop.contains("RestartOnFailure"));
+        assert!(stop.contains(&format!("<Arguments>{STOP_ARG} --dir ")));
+        assert!(stop.contains(&format!("<UserId>{ACCOUNT}</UserId>")));
+        assert_eq!(l.stopped_file(), l.logs().join("stopped"));
+
         let bytes = utf16_file("<a/>");
         assert_eq!(&bytes[..4], &[0xFF, 0xFE, b'<', 0]);
+    }
+
+    #[test]
+    fn account_repairs() {
+        use account_flags::*;
+        let good = SCRIPT | CANT_CHANGE | NEVER_EXPIRES;
+        assert_eq!(repair(good), (good, vec![]));
+        let (want, why) = repair(SCRIPT | DISABLED | LOCKOUT);
+        assert_eq!(want, good);
+        assert_eq!(
+            why,
+            [
+                "it was disabled",
+                "it was locked out",
+                "its password could expire",
+                "its password could be changed by itself"
+            ]
+        );
+        // Flags it does not care about stay.
+        assert_eq!(repair(good | 0x0200).0, good | 0x0200);
     }
 
     #[test]

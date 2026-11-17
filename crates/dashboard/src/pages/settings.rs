@@ -8,7 +8,7 @@ use axum::{Form, extract::Path, http::HeaderMap, response::Response};
 use maud::{Markup, html};
 use pumasi_proto::{
     manage::{ApplySpec, ClusterFile, ScheduleView, SelectorOp},
-    monitor::{AlertPolicy, AlertTuning},
+    monitor::{AlertPolicy, AlertTuning, Silence},
     msg::{AdminOp, AdminResponse, NodeView},
     ui::SessionView,
 };
@@ -217,8 +217,8 @@ fn editor(ctx: &Ctx, text: &str) -> Markup {
         section #cluster-file {
             h2 { "cluster.toml" }
             p class="dim" { (l.t(
-                "The cluster's node labels, taints and cordons, its alert rules with thresholds per node ([alerts.nodes.NAME]) or label ([alerts.labels.\"os=windows\"]), and its schedules, as `pumasi apply` reads them. Change a schedule's cron, time zone or overlap here (its job stays); add [silences.NAME] with an until, [accounts.NAME], [webhooks.NAME] or more nodes, press Preview to see what would change, then Apply. New schedules need a job: add them on the Schedules page.",
-                "노드 라벨·테인트·격리, 노드별([alerts.nodes.이름])·라벨별([alerts.labels.\"os=windows\"]) 임계값을 포함한 경보 규칙, 예약 작업을 `pumasi apply`가 읽는 형식으로 보여 줍니다. 예약의 cron·시간대·겹침은 여기서 바꿀 수 있고(작업은 그대로), until을 단 [silences.이름], [accounts.이름], [webhooks.이름]이나 노드를 더하고 미리 보기로 바뀔 내용을 확인한 뒤 적용하세요. 새 예약에는 작업이 필요하니 예약 페이지에서 추가합니다."
+                "The cluster's node labels, taints and cordons, its alert rules with thresholds per node ([alerts.nodes.NAME]) or label ([alerts.labels.\"os=windows\"]), its schedules, and the silences a cluster.toml made ([silences.NAME]), as `pumasi apply` reads them. Change a schedule's cron, time zone or overlap or a silence's until here (its job stays); add [silences.NAME] with an until, [accounts.NAME], [webhooks.NAME] or more nodes, press Preview to see what would change, then Apply. New schedules need a job: add them on the Schedules page.",
+                "노드 라벨·테인트·격리, 노드별([alerts.nodes.이름])·라벨별([alerts.labels.\"os=windows\"]) 임계값을 포함한 경보 규칙, 예약 작업, cluster.toml로 만든 일시 중지([silences.이름])를 `pumasi apply`가 읽는 형식으로 보여 줍니다. 예약의 cron·시간대·겹침과 일시 중지의 until은 여기서 바꿀 수 있고(작업은 그대로), until을 단 [silences.이름], [accounts.이름], [webhooks.이름]이나 노드를 더하고 미리 보기로 바뀔 내용을 확인한 뒤 적용하세요. 새 예약에는 작업이 필요하니 예약 페이지에서 추가합니다."
             )) }
             form #apply-form class="stack" hx-post="/settings/apply" hx-target="#apply-result" {
                 textarea name="text" rows="18" spellcheck="false" { (text) }
@@ -234,8 +234,9 @@ fn editor(ctx: &Ctx, text: &str) -> Markup {
 }
 
 /// The cluster as a `cluster.toml`: every node's labels, taints and
-/// cordon, the alert rules with their per-node thresholds (1.15), and the
-/// schedules without their jobs (1.15), which applying keeps.
+/// cordon, the alert rules with their per-node thresholds (1.15), the
+/// schedules without their jobs (1.15), which applying keeps, and the
+/// silences a `cluster.toml` of 1.17 or later made, by name (1.17).
 async fn export(ctx: &Ctx) -> anyhow::Result<String> {
     let s = status(ctx).await?;
     let policy = match ctx.call(AdminOp::Alerts).await? {
@@ -247,15 +248,21 @@ async fn export(ctx: &Ctx) -> anyhow::Result<String> {
         ctx.call(AdminOp::AlertTexts).await,
         Ok(AdminResponse::AlertTexts(_))
     );
-    let tuning = match ctx.call(AdminOp::AlertTuning).await {
-        Ok(AdminResponse::AlertTuning(t)) if new => Some(t.tuning),
-        _ => None,
+    let (tuning, silences) = match ctx.call(AdminOp::AlertTuning).await {
+        Ok(AdminResponse::AlertTuning(t)) if new => (Some(t.tuning), t.silences),
+        _ => (None, Vec::new()),
     };
     let schedules = match ctx.call(AdminOp::Schedules).await {
         Ok(AdminResponse::Schedules(s)) if tuning.is_some() => s,
         _ => Vec::new(),
     };
-    Ok(cluster_toml(&s.nodes, &policy, tuning.as_ref(), &schedules))
+    Ok(cluster_toml(
+        &s.nodes,
+        &policy,
+        tuning.as_ref(),
+        &schedules,
+        &silences,
+    ))
 }
 
 fn q(s: &str) -> String {
@@ -278,6 +285,7 @@ pub fn cluster_toml(
     p: &AlertPolicy,
     tuning: Option<&AlertTuning>,
     schedules: &[ScheduleView],
+    silences: &[Silence],
 ) -> String {
     let mut out = String::new();
     let mut nodes: Vec<&NodeView> = nodes.iter().collect();
@@ -385,6 +393,31 @@ pub fn cluster_toml(
             let _ = writeln!(out, "tz = {}", q(tz));
         }
         let _ = writeln!(out, "overlap = {}", s.overlap);
+    }
+    // Silences made with `alert silence` or the Events page have no name
+    // and stay out; so do the files' silences from before 1.17 until the
+    // file is applied again.
+    let mut named: Vec<(&str, &Silence)> = silences
+        .iter()
+        .filter_map(|s| Some((s.file_name()?, s)))
+        .collect();
+    named.sort_by_key(|(n, _)| *n);
+    for (name, s) in named {
+        let _ = writeln!(out, "\n[silences.{}]", key(name));
+        if let Some(r) = &s.rule {
+            let _ = writeln!(out, "rule = {}", q(r));
+        }
+        if let Some(n) = &s.nodes {
+            let _ = writeln!(out, "nodes = {}", q(&n.to_string()));
+        }
+        let _ = writeln!(
+            out,
+            "until = {}",
+            pumasi_proto::audit::rfc3339(s.until_unix)
+        );
+        if !s.comment.is_empty() {
+            let _ = writeln!(out, "comment = {}", q(&s.comment));
+        }
     }
     out
 }
@@ -494,7 +527,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            let text = cluster_toml(&[], &p, None, &[]);
+            let text = cluster_toml(&[], &p, None, &[], &[]);
             let spec = apply_spec(&text, true).unwrap();
             assert_eq!(spec.alerts, Some(p), "{text}");
             assert!(spec.dry_run && !spec.prune);
@@ -540,9 +573,53 @@ mod tests {
             sched("nightly", "0 3 * * * (Asia/Seoul)", false),
             sched("hourly", "@hourly", true),
         ];
-        let text = cluster_toml(&[], &AlertPolicy::default(), Some(&tuning), &schedules);
+        use pumasi_proto::monitor::{file_silence_by, file_silence_id};
+        let silence = |name: &str, by: String, rule: Option<&str>, nodes: Option<&str>| Silence {
+            id: file_silence_id(name),
+            rule: rule.map(Into::into),
+            nodes: nodes.map(|n| n.parse().unwrap()),
+            until_unix: 4_102_444_800,
+            comment: if rule.is_some() {
+                "moving \"it\"".into()
+            } else {
+                String::new()
+            },
+            by,
+            created_unix: 1,
+        };
+        let silences = [
+            silence(
+                "move",
+                file_silence_by("move"),
+                Some("node_offline"),
+                Some("name=imac"),
+            ),
+            silence("all", file_silence_by("all"), None, None),
+            // Not the file's: by someone, from before 1.17, a name that
+            // does not match the id.
+            silence("manual", "owner".into(), None, None),
+            silence("old", "cluster.toml".into(), None, None),
+            Silence {
+                id: "00000000".into(),
+                ..silence("forged", file_silence_by("forged"), None, None)
+            },
+        ];
+        let text = cluster_toml(
+            &[],
+            &AlertPolicy::default(),
+            Some(&tuning),
+            &schedules,
+            &silences,
+        );
         let spec = apply_spec(&text, true).unwrap();
         assert_eq!(spec.more().alert_tuning, Some(tuning), "{text}");
+        let mut names: Vec<&str> = spec.silences.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["all", "move"], "{text}");
+        for f in &spec.silences {
+            let s = silences.iter().find(|s| s.id == f.id()).unwrap();
+            assert!(f.same_as(s), "{f:?} {s:?}\n{text}");
+        }
         assert_eq!(spec.keep_jobs.len(), 2, "{text}");
         let nightly = spec.schedules.iter().find(|s| s.name == "nightly").unwrap();
         assert_eq!(nightly.cron, "0 3 * * *");

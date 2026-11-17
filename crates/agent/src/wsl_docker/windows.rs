@@ -276,6 +276,151 @@ fn delete_account() -> Result<bool> {
     }
 }
 
+/// Gives [`ACCOUNT`] a new password when it exists (for the stop task).
+/// False when there is no such account.
+fn set_password(password: &str) -> Result<bool> {
+    use windows_sys::Win32::NetworkManagement::NetManagement::{
+        NERR_UserNotFound, NetUserSetInfo, USER_INFO_1003,
+    };
+    let name = wide(ACCOUNT);
+    let mut pw = wide(password);
+    let info = USER_INFO_1003 {
+        usri1003_password: pw.as_mut_ptr(),
+    };
+    let mut parm = 0u32;
+    // SAFETY: NUL-terminated buffers that outlive the call.
+    let rc = unsafe {
+        NetUserSetInfo(
+            std::ptr::null(),
+            name.as_ptr(),
+            1003,
+            &info as *const _ as *const u8,
+            &mut parm,
+        )
+    };
+    pw.fill(0);
+    match rc {
+        0 => Ok(true),
+        rc if rc == NERR_UserNotFound => Ok(false),
+        rc => bail!("could not set the password of {ACCOUNT} (error {rc})"),
+    }
+}
+
+/// Makes [`ACCOUNT`] what `setup` made it, after someone changed it by
+/// hand (1.17): enabled, not locked out, a password that never expires,
+/// and not an administrator. Answers with what it fixed.
+fn repair_account() -> Result<Vec<&'static str>> {
+    use windows_sys::Win32::NetworkManagement::NetManagement::{
+        NetApiBufferFree, NetUserGetInfo, NetUserSetInfo, USER_INFO_1, USER_INFO_1008,
+    };
+    let name = wide(ACCOUNT);
+    let mut buf: *mut u8 = std::ptr::null_mut();
+    // SAFETY: NetUserGetInfo allocates `buf`, freed below.
+    let rc = unsafe { NetUserGetInfo(std::ptr::null(), name.as_ptr(), 1, &mut buf) };
+    ensure!(
+        rc == 0 && !buf.is_null(),
+        "could not read the local account {ACCOUNT} (error {rc})"
+    );
+    // SAFETY: level 1 is a USER_INFO_1.
+    let flags = unsafe { (*(buf as *const USER_INFO_1)).usri1_flags };
+    // SAFETY: the buffer NetUserGetInfo gave.
+    unsafe { NetApiBufferFree(buf.cast()) };
+    let (want, mut fixed) = account_flags::repair(flags);
+    if want != flags {
+        let info = USER_INFO_1008 {
+            usri1008_flags: want,
+        };
+        let mut parm = 0u32;
+        // SAFETY: a plain struct that outlives the call.
+        let rc = unsafe {
+            NetUserSetInfo(
+                std::ptr::null(),
+                name.as_ptr(),
+                1008,
+                &info as *const _ as *const u8,
+                &mut parm,
+            )
+        };
+        ensure!(
+            rc == 0,
+            "could not repair the local account {ACCOUNT} (error {rc})"
+        );
+    }
+    if leave_administrators()? {
+        fixed.push("it was an administrator");
+    }
+    Ok(fixed)
+}
+
+/// Takes [`ACCOUNT`] out of the Administrators group (whatever this
+/// Windows calls it). True if it was in it.
+fn leave_administrators() -> Result<bool> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_MEMBER_NOT_IN_ALIAS,
+        NetworkManagement::NetManagement::{LOCALGROUP_MEMBERS_INFO_3, NetLocalGroupDelMembers},
+        Security::{
+            CreateWellKnownSid, LookupAccountSidW, SID_NAME_USE, WinBuiltinAdministratorsSid,
+        },
+    };
+    let mut sid = [0u8; 68];
+    let mut sid_len = sid.len() as u32;
+    // SAFETY: a buffer of SECURITY_MAX_SID_SIZE bytes.
+    let ok = unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            std::ptr::null_mut(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+        )
+    };
+    ensure!(ok != 0, "no Administrators SID");
+    let mut group = vec![0u16; 256];
+    let mut domain = vec![0u16; 256];
+    let (mut g_len, mut d_len, mut kind) = (256u32, 256u32, 0 as SID_NAME_USE);
+    // SAFETY: buffers of the lengths given.
+    let ok = unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid.as_mut_ptr().cast(),
+            group.as_mut_ptr(),
+            &mut g_len,
+            domain.as_mut_ptr(),
+            &mut d_len,
+            &mut kind,
+        )
+    };
+    ensure!(ok != 0, "could not name the Administrators group");
+    group.truncate(g_len as usize);
+    group.push(0);
+    let mut member = wide(ACCOUNT);
+    let info = LOCALGROUP_MEMBERS_INFO_3 {
+        lgrmi3_domainandname: member.as_mut_ptr(),
+    };
+    // SAFETY: NUL-terminated buffers that outlive the call.
+    let rc = unsafe {
+        NetLocalGroupDelMembers(
+            std::ptr::null(),
+            group.as_ptr(),
+            3,
+            &info as *const _ as *const u8,
+            1,
+        )
+    };
+    match rc {
+        0 => Ok(true),
+        rc if rc == ERROR_MEMBER_NOT_IN_ALIAS => Ok(false),
+        rc => bail!("could not take {ACCOUNT} out of the Administrators group (error {rc})"),
+    }
+}
+
+/// The registered task's XML, when there is one.
+async fn registered_task(name: &str) -> Option<String> {
+    let mut cmd = Command::new(system32("schtasks.exe"));
+    cmd.args(["/Query", "/TN", name, "/XML"]);
+    let out = output(cmd, Duration::from_secs(60)).await.ok()?;
+    out.status.success().then(|| wsl_text(&out.stdout))
+}
+
 /// Gives the directories their ACLs: everything readable by SYSTEM,
 /// administrators and the account only; the account may change just the
 /// distro's disk and the logs; the client key is SYSTEM's and the
@@ -472,6 +617,10 @@ pub async fn setup(opts: SetupOptions) -> Result<i32> {
     } else {
         println!("reset the password of the local account {ACCOUNT}");
     }
+    // Someone may have changed the account by hand (1.17).
+    for why in repair_account()? {
+        println!("repaired the local account {ACCOUNT}: {why}");
+    }
     batch_logon(true)?;
     tool(
         "reg.exe",
@@ -530,6 +679,14 @@ pub async fn setup(opts: SetupOptions) -> Result<i32> {
     config.write(&layout)?;
     let _ = rootfs_file;
 
+    match registered_task(TASK).await {
+        None => {}
+        Some(xml) => {
+            for why in task_drift(&xml, &layout) {
+                println!("repairing the scheduled task {TASK}: {why}");
+            }
+        }
+    }
     std::fs::write(layout.task_xml(), utf16_file(&task_xml(&layout)))?;
     schtasks(&[
         "/Create",
@@ -655,7 +812,9 @@ pub async fn status() -> Result<i32> {
 }
 
 /// `pumasi docker remove`: the task, the distro (with the account's
-/// profile, which registers it), the account and the files.
+/// profile, which registers it), the account and the files. Since 1.17 in
+/// one go: a one-shot task as the account unregisters the distro and shuts
+/// its WSL VM down first, so nothing holds the profile or the disk.
 pub async fn remove() -> Result<i32> {
     ensure!(
         elevated(),
@@ -665,13 +824,22 @@ pub async fn remove() -> Result<i32> {
     if schtasks(&["/End", "/TN", TASK]).await.is_ok() {
         println!("stopped the task");
     }
+    if account_sid().is_some() && wsl_version().await.is_ok() {
+        match stop_vm(&layout).await {
+            Ok(text) => println!("{text}"),
+            Err(e) => println!("could not stop the WSL VM of {ACCOUNT} first: {e:#}"),
+        }
+    }
+    let _ = schtasks(&["/Delete", "/TN", STOP_TASK, "/F"]).await;
     if schtasks(&["/Delete", "/TN", TASK, "/F"]).await.is_ok() {
         println!("deleted the scheduled task {TASK}");
     }
     // The profile holds the distro's registration; Windows unloads it a
-    // little after the task's logon ends.
+    // little after the account's last logon ends. Profiles of an account
+    // someone deleted and made again by hand (`pumasi-wsl.HOST`) go too.
     let script = format!(
-        "Get-CimInstance Win32_UserProfile | Where-Object {{ $_.LocalPath -like '*\\{ACCOUNT}' }} | Remove-CimInstance -ErrorAction Stop"
+        "$sid = try {{ (New-Object System.Security.Principal.NTAccount('{ACCOUNT}')).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ '' }}; \
+         Get-CimInstance Win32_UserProfile | Where-Object {{ ($sid -and $_.SID -eq $sid) -or $_.LocalPath -like '*\\{ACCOUNT}' -or $_.LocalPath -like '*\\{ACCOUNT}.*' }} | Remove-CimInstance -ErrorAction Stop"
     );
     let mut profile_gone = false;
     for _ in 0..24 {
@@ -713,14 +881,132 @@ pub async fn remove() -> Result<i32> {
     }
     if removed {
         println!("removed {}", layout.root().display());
-        Ok(0)
     } else {
         println!(
             "could not remove {} yet (the WSL VM still holds its disk); restart Windows and delete it",
             layout.root().display()
         );
-        Ok(1)
     }
+    Ok(if removed && profile_gone { 0 } else { 1 })
+}
+
+/// How long `remove` waits for [`STOP_TASK`].
+const STOP_WAIT: Duration = Duration::from_secs(4 * 60);
+
+/// Runs [`STOP_TASK`] as [`ACCOUNT`] (a fresh password, as nobody keeps
+/// the old one) and waits for it: what it wrote.
+async fn stop_vm(layout: &Layout) -> Result<String> {
+    std::fs::create_dir_all(layout.logs())?;
+    std::fs::create_dir_all(layout.bin_dir())?;
+    // The account may not read an administrator's copy of pumasi.exe.
+    let me = std::env::current_exe().context("find this binary")?;
+    if std::fs::copy(&me, layout.pumasi_exe()).is_err() {
+        ensure!(
+            layout.pumasi_exe().is_file(),
+            "no {} for the account to run",
+            layout.pumasi_exe().display()
+        );
+    }
+    let password = new_password();
+    ensure!(
+        set_password(&password)?,
+        "the local account {ACCOUNT} is missing"
+    );
+    repair_account()?;
+    batch_logon(true)?;
+    let _ = std::fs::remove_file(layout.stopped_file());
+    std::fs::write(layout.stop_task_xml(), utf16_file(&stop_task_xml(layout)))?;
+    schtasks(&[
+        "/Create",
+        "/TN",
+        STOP_TASK,
+        "/XML",
+        &layout.stop_task_xml().display().to_string(),
+        "/RU",
+        ACCOUNT,
+        "/RP",
+        &password,
+        "/F",
+    ])
+    .await
+    .context("register the stop task")?;
+    drop(password);
+    schtasks(&["/Run", "/TN", STOP_TASK]).await?;
+    println!("stopping the WSL VM of {ACCOUNT} (as {ACCOUNT})...");
+    let start = Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(layout.stopped_file()) {
+            // The account's logon ends with the task.
+            for _ in 0..30 {
+                if task_running(STOP_TASK).await != Some(true) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            return Ok(text.trim().to_string());
+        }
+        ensure!(
+            start.elapsed() < STOP_WAIT,
+            "the stop task did not finish within {} minutes",
+            STOP_WAIT.as_secs() / 60
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Whether a task runs now; `None` when Task Scheduler does not say.
+async fn task_running(name: &str) -> Option<bool> {
+    let mut cmd = Command::new(system32("schtasks.exe"));
+    cmd.args(["/Query", "/TN", name, "/FO", "CSV", "/NH"]);
+    let out = output(cmd, Duration::from_secs(30)).await.ok()?;
+    out.status
+        .success()
+        .then(|| wsl_text(&out.stdout).contains("\"Running\""))
+}
+
+/// `pumasi __wsl-docker-stop --dir DIR`, [`STOP_TASK`]'s program (as
+/// [`ACCOUNT`]): unregisters the distro, which deletes its disk, and shuts
+/// the account's WSL VM down, then says so in [`Layout::stopped_file`].
+pub async fn run_stop(dir: &Path) -> Result<i32> {
+    let layout = Layout::new(dir);
+    let log: SharedLog = Arc::new(Mutex::new(Log::open(layout.log_file())?));
+    say(
+        &log,
+        &format!(
+            "pumasi {} stops the {DISTRO} distro as {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::var("USERNAME").unwrap_or_default()
+        ),
+    );
+    let mut lines = Vec::new();
+    match wsl_out(&["--list", "--quiet"]).await {
+        Ok(list) if lists_distro(&list.stdout) => {
+            let ok = wsl_logged(&log, &["--unregister", DISTRO], None)
+                .await
+                .unwrap_or(false);
+            lines.push(if ok {
+                format!("unregistered the {DISTRO} distro (its disk is gone)")
+            } else {
+                format!("could not unregister the {DISTRO} distro (see the log)")
+            });
+        }
+        Ok(_) => lines.push(format!("the {DISTRO} distro was not registered")),
+        Err(e) => lines.push(format!("could not list the WSL distros: {e:#}")),
+    }
+    let ok = wsl_logged(&log, &["--shutdown"], None)
+        .await
+        .unwrap_or(false);
+    lines.push(if ok {
+        format!("shut down the WSL VM of {ACCOUNT}")
+    } else {
+        format!("could not shut down the WSL VM of {ACCOUNT} (see the log)")
+    });
+    for l in &lines {
+        say(&log, l);
+    }
+    std::fs::write(layout.stopped_file(), lines.join("\n") + "\n")
+        .with_context(|| format!("write {}", layout.stopped_file().display()))?;
+    Ok(0)
 }
 
 /// Starts the task, at most every two minutes: the agent's way to bring
@@ -931,7 +1217,18 @@ async fn run_once(layout: &Layout, config: &Config, log: &SharedLog) -> Result<b
     let server = tls::read_server(&layout.server_tls())?;
     let marker = provision_marker(&server, gpu);
     let current = wsl_out(&["-d", DISTRO, "-u", "root", "--exec", "cat", MARKER_FILE]).await?;
-    if wsl_text(&current.stdout).trim() != marker {
+    // Someone may have changed wsl.conf or the start script by hand (1.17).
+    let conf = wsl_out(&["-d", DISTRO, "-u", "root", "--exec", "cat", "/etc/wsl.conf"]).await?;
+    let start = wsl_out(&["-d", DISTRO, "-u", "root", "--exec", "cat", START_SCRIPT]).await?;
+    let changed =
+        wsl_text(&conf.stdout) != WSL_CONF || wsl_text(&start.stdout) != start_script(config.port);
+    if wsl_text(&current.stdout).trim() != marker || changed {
+        if changed && wsl_text(&current.stdout).trim() == marker {
+            say(
+                log,
+                "wsl.conf or the start script was changed: setting them up again",
+            );
+        }
         say(log, &format!("setting up the distro ({marker})"));
         let script = provision_script(&server, config.port, gpu, &marker);
         let ok = wsl_logged(

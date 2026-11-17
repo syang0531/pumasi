@@ -504,9 +504,11 @@ dashboard never prunes); the editor shows the thresholds and schedules
 (without their jobs, which `apply` then keeps) but not the silences, whose
 names the control plane does not keep. The guest had no ring buffer: it
 stopped printing after 1 MiB, and now a separate thread reads the output
-files behind the task and prints up to the 4 MiB the result keeps, so a
-slow console never holds the task up; what it has not printed when the
-task ends comes with the result. Windows reports a GPU's temperature
+files behind the task and streams up to the 4 MiB the result keeps. The
+serial console of Firecracker and QEMU turned out too slow for that (a
+few KiB a second, with the vCPU held up while it prints), so on those
+backends the output goes to a region at the end of the output disk that
+the agent reads from the disk file; vz keeps its virtio console. Windows reports a GPU's temperature
 (from `D3DKMTQueryAdapterInfo`, WDDM 2.4 drivers) but not its power, which
 the driver gives only as a share of a limit it does not name. Intel's
 integrated GPUs have no sensors of their own and report the CPU package's

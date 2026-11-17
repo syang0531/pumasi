@@ -10,7 +10,7 @@ use std::{
     collections::HashSet,
     ffi::{CString, OsStr},
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{FileExt, OpenOptionsExt},
@@ -25,7 +25,8 @@ use pumasi_guest::{
     GuestOutcome, GuestResult, INPUT_PREFIX, LIVE_CHUNK, LIVE_MAX_BYTES, MAX_CHECKPOINT_FILES,
     MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES, MAX_STREAM_BYTES, MODE_PARAM, OUTPUT_MARK,
     OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec, SCRATCH_LABEL, SPEC_ENTRY,
-    STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY, StopRequest, live_frame,
+    STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY, StopRequest, live_data_at, live_frame, live_head,
+    live_region_at,
     seal::{
         self, AttestReply, AttestRequest, EVIDENCE_AT, Evidence, Kind, REPLY_AT, SealReader,
         SealWriter, TaskKeys, TeeKind,
@@ -331,38 +332,80 @@ fn pipe() -> R<(File, File)> {
     Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
 
+/// Where live output goes while the task runs.
+#[derive(Clone)]
+enum LiveSink {
+    /// [`live_frame`] lines on the console (1.6; vz, older agents).
+    Console,
+    /// The live region of the output disk `dev`, which starts at `region`
+    /// (1.15).
+    Disk { dev: String, region: u64 },
+}
+
+/// The live region of output disk `dev` if `spec` asks for one and the
+/// disk is large enough to have it past the result.
+fn live_sink(spec: &RunSpec, dev: Option<&str>) -> LiveSink {
+    if !spec.live_disk {
+        return LiveSink::Console;
+    }
+    let found = dev.and_then(|dev| {
+        let len = File::open(dev)
+            .and_then(|mut f| f.seek(io::SeekFrom::End(0)))
+            .ok()?;
+        if len < spec.output_disk_bytes() {
+            return None;
+        }
+        Some(LiveSink::Disk {
+            dev: dev.to_string(),
+            region: live_region_at(len)?,
+        })
+    });
+    found.unwrap_or_else(|| {
+        log("the output disk has no live region; live output goes to the console");
+        LiveSink::Console
+    })
+}
+
 /// Copies the task's output from its pipes to the files at `paths` until
 /// the task has ended and every copy of the pipes is closed, while a
-/// [`Streamer`] sends the files to the console. Answers with the task's
-/// wait status.
-fn pump(pid: libc::pid_t, pipes: [File; 2], paths: [&Path; 2]) -> R<libc::c_int> {
+/// [`Streamer`] sends the files to `sink`. Answers with the task's wait
+/// status.
+fn pump(pid: libc::pid_t, pipes: [File; 2], paths: [&Path; 2], sink: LiveSink) -> R<libc::c_int> {
     let mut files = [
         File::create(paths[0]).ctx("create stdout")?,
         File::create(paths[1]).ctx("create stderr")?,
     ];
-    let streamer = Streamer::start([paths[0].to_path_buf(), paths[1].to_path_buf()]);
+    let streamer = Streamer::start([paths[0].to_path_buf(), paths[1].to_path_buf()], sink);
     let status = copy_pipes(pid, &pipes, &mut files);
     drop(streamer);
     status
 }
 
 /// Sends the first [`LIVE_MAX_BYTES`] of each output file to the console as
-/// [`live_frame`] lines while the task runs (1.6; past the first MiB from
-/// 1.15). It reads the files behind the pump, so a slow console never
-/// holds up the task: whatever it has not sent when the task ends comes
-/// with the result, which continues what was streamed.
+/// [`live_frame`] lines (1.6; past the first MiB from 1.15), or to the
+/// output disk's live region (1.15), while the task runs. It reads the
+/// files behind the pump, so a slow console never holds up the task:
+/// whatever it has not sent when the task ends comes with the result,
+/// which continues what was streamed.
 struct Streamer {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Streamer {
-    fn start(paths: [PathBuf; 2]) -> Self {
+    fn start(paths: [PathBuf; 2], sink: LiveSink) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::Builder::new()
             .name("live".into())
-            .spawn(move || stream_files(&paths, &flag))
+            .spawn(move || match sink {
+                LiveSink::Console => stream_files(&paths, &flag),
+                LiveSink::Disk { dev, region } => {
+                    if let Err(e) = stream_to_disk(&paths, &flag, &dev, region) {
+                        log(&format!("live output stopped: {e}"));
+                    }
+                }
+            })
             .ok();
         Self { stop, thread }
     }
@@ -416,6 +459,67 @@ fn stream_files(paths: &[PathBuf; 2], stop: &std::sync::atomic::AtomicBool) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+}
+
+/// Bytes of one stream written to the live region at a time.
+const LIVE_DISK_CHUNK: usize = 256 * 1024;
+
+/// [`Streamer`] onto the output disk: each stream's new bytes go to its
+/// part of the live region, then the header says how far each goes. The
+/// writes skip the page cache and are synchronous, so the host sees the
+/// data in the disk file before the header that counts it. A partly
+/// filled last block is written again as it grows.
+fn stream_to_disk(
+    paths: &[PathBuf; 2],
+    stop: &std::sync::atomic::AtomicBool,
+    dev: &str,
+    region: u64,
+) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    let disk = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT | libc::O_SYNC)
+        .open(dev)?;
+    let files: [Option<File>; 2] = [File::open(&paths[0]).ok(), File::open(&paths[1]).ok()];
+    let mut sent = [0u64; 2];
+    let mut buf = Aligned::new(LIVE_DISK_CHUNK);
+    let mut head = Aligned::new(4096);
+    while !stop.load(Ordering::Relaxed) {
+        let mut moved = false;
+        for i in 0..2 {
+            let Some(f) = &files[i] else { continue };
+            let len = f.metadata()?.len().min(LIVE_MAX_BYTES);
+            if len <= sent[i] {
+                continue;
+            }
+            let from = sent[i] / 4096 * 4096;
+            let to = len.min(from + LIVE_DISK_CHUNK as u64);
+            let want = (to - from) as usize;
+            let b = buf.as_mut();
+            let mut n = 0;
+            while n < want {
+                match f.read_at(&mut b[n..want], from + n as u64)? {
+                    0 => break,
+                    k => n += k,
+                }
+            }
+            if from + (n as u64) <= sent[i] {
+                continue;
+            }
+            let padded = n.div_ceil(4096) * 4096;
+            b[n..padded].fill(0);
+            disk.write_all_at(&b[..padded], live_data_at(region, i) + from)?;
+            sent[i] = from + n as u64;
+            moved = true;
+        }
+        if moved {
+            head.as_mut().copy_from_slice(&live_head(sent[0], sent[1]));
+            disk.write_all_at(head.as_mut(), region)?;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    Ok(())
 }
 
 /// The pump's loop: the pipes to the files, until both are closed.
@@ -1044,7 +1148,12 @@ fn run_in_root(d: &Disks, mut input: impl TaskInput) -> R<Payload> {
         watch_stop(control);
     }
     let status = match pipes {
-        Some((out_r, err_r)) => pump(pid, [out_r, err_r], [&stdout_path, &stderr_path])?,
+        Some((out_r, err_r)) => pump(
+            pid,
+            [out_r, err_r],
+            [&stdout_path, &stderr_path],
+            live_sink(&spec, d.output.as_deref()),
+        )?,
         None => loop {
             match waitpid(-1) {
                 Ok((p, st)) if p == pid => break st,

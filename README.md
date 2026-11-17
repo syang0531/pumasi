@@ -1935,7 +1935,8 @@ Rosetta 2 (1.14), which goes on after GitHub retires its last Intel runner
 (announced until autumn 2027); from then on the SMC readings, Intel GPUs
 and Virtualization.framework on Intel are checked on real Intel Macs only.
 Live microVM output goes up to the 4 MiB of each stream that the result
-keeps; a console slower than the task leaves the rest to the result.
+keeps (through the output disk under Firecracker and QEMU; under vz, a
+console slower than the task leaves the rest to the result).
 Windows reports a GPU's temperature but not its power, Linux reports CPU
 package power only to an agent running as root, and Windows desktops
 without LibreHardwareMonitor often have no temperature to report (few

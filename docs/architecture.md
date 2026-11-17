@@ -3356,12 +3356,29 @@ The guest's pump used to copy the task's pipes to the output files and
 print each chunk to the console inline, stopping after 1 MiB so that a
 slow serial console could hold the task up only that long. Now the pump
 only copies, and a second thread (started after the fork, so the child is
-forked from a single-threaded init) reads the files by offset behind it
-and prints `live_frame` lines, alternating between stdout and stderr, up
-to `LIVE_MAX_BYTES`, which is now the result's `MAX_STREAM_BYTES` (4 MiB).
-When the task ends the pump stops the thread after its current line; the
-result carries the whole output, which continues the frames already sent,
-so the agent's `LiveTail` needs no change.
+forked from a single-threaded init) reads the files by offset behind it,
+up to `LIVE_MAX_BYTES`, which is now the result's `MAX_STREAM_BYTES`
+(4 MiB). When the task ends the pump stops the thread; the result carries
+the whole output, which continues what was already streamed.
+
+Where the thread sends it depends on the backend. Firecracker's and
+QEMU's 8250 serial port carries about 15 KB/s, and every byte printed is
+time the guest's vCPU spends in the console driver, so 5 MiB of base64
+there takes longer than the task's timeout. The agent therefore sets
+`RunSpec::live_disk` for those backends and makes the output disk
+`LIVE_REGION_BYTES` larger: the last 8 MiB + 4 KiB of the disk hold a
+header (`PUMASI-LIVE-0001`, the two lengths, a checksum) and 4 MiB for
+each stream. The thread writes each stream's new bytes there with
+`O_DIRECT | O_SYNC`, 256 KiB at a time, rewriting a partly filled last
+block as it grows, and then the header; so the disk file on the host
+holds the data before the header counts it. The result's tar starts at
+offset 0 and never reaches the region. The agent's `LiveTail` reads the
+header and the new bytes from the disk file every 200 ms, besides the
+console. A guest that finds its disk smaller than the spec says (an older
+agent) prints `live_frame` lines on the console as before; vz keeps the
+console too, since `hvc0` is a virtio console and a disk image under
+Virtualization.framework may be cached away from the file. Warm guests'
+output disks have the region whichever backend runs them.
 
 ### Sensors
 
@@ -3552,7 +3569,8 @@ remotely; install a current binary on them once.
   affinity sees only running tasks of the same account; CPU quotas count
   whole CPUs a run asks for, not what it uses.
 - Monitoring: live microVM output covers what the result keeps (4 MiB a
-  stream) as fast as the console carries it; Windows GPUs report a
+  stream), through the output disk on Firecracker and QEMU and as fast as
+  the console carries it on vz; Windows GPUs report a
   temperature but no power, and Linux CPU package power needs an agent
   that can read RAPL; DRM fdinfo sees only processes the agent may read;
   Windows desktops without LibreHardwareMonitor often have no temperature

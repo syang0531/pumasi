@@ -213,7 +213,9 @@ fn gpu_temp(h: &Path) -> Option<f32> {
     plausible_temp(t).then_some(t)
 }
 
-#[cfg(test)]
+// Paths with colons (PCI addresses, `intel-rapl:0`) cannot be made on
+// Windows, where none of this is read anyway.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::Duration;

@@ -224,6 +224,13 @@ pub struct RunSpec {
     /// The result on the output disk still has all of it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live: bool,
+    /// With `live`: the output disk ends with a [`LIVE_REGION_BYTES`]
+    /// region, and the live output goes there instead of the console
+    /// (1.15). A serial console carries a few KiB a second, and printing
+    /// more holds the guest up; the host reads the region from the disk
+    /// file while the VM runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_disk: bool,
     /// A checkpointing run (1.14): `/checkpoint` holds the input tar's
     /// [`CHECKPOINT_PREFIX`] files, is writable by any user, and goes back
     /// in the output tar, up to this many bytes. 0: no checkpoint.
@@ -270,10 +277,12 @@ impl RunSpec {
         } else {
             0
         };
+        let live = if self.live_disk { LIVE_REGION_BYTES } else { 0 };
         2 * MAX_STREAM_BYTES
             + self.files_limit()
             + (self.count_limit() as u64 + 16) * 1024
             + checkpoint
+            + live
     }
 }
 
@@ -348,6 +357,53 @@ pub fn parse_live_frame(line: &str) -> Option<(u8, u64, Vec<u8>)> {
     let sum = u32::from_str_radix(parts.next()?, 16).ok()?;
     (parts.next().is_none() && (1..=2).contains(&stream) && sum == fnv1a(&data))
         .then_some((stream, offset, data))
+}
+
+// ---------------------------------------------------------------------------
+// Live output on the output disk (1.15)
+// ---------------------------------------------------------------------------
+
+/// The live region at the end of the output disk: a 4 KiB header, then
+/// [`LIVE_MAX_BYTES`] for stdout and as much for stderr. The guest writes
+/// each stream's data, then the header with how much of each is there.
+pub const LIVE_REGION_BYTES: u64 = 4096 + 2 * LIVE_MAX_BYTES;
+pub const LIVE_MAGIC: &[u8; 16] = b"PUMASI-LIVE-0001";
+
+/// Where the live region starts on an output disk of `disk_bytes`.
+pub fn live_region_at(disk_bytes: u64) -> Option<u64> {
+    disk_bytes
+        .checked_sub(LIVE_REGION_BYTES)
+        .map(|at| at / 4096 * 4096)
+}
+
+/// Where stream `i` (0: stdout, 1: stderr) starts in the live region.
+pub fn live_data_at(region: u64, i: usize) -> u64 {
+    region + 4096 + i as u64 * LIVE_MAX_BYTES
+}
+
+/// The live region's header: how many bytes of stdout and stderr it has.
+pub fn live_head(out: u64, err: u64) -> [u8; 4096] {
+    let mut b = [0u8; 4096];
+    b[..16].copy_from_slice(LIVE_MAGIC);
+    b[16..24].copy_from_slice(&out.to_le_bytes());
+    b[24..32].copy_from_slice(&err.to_le_bytes());
+    let sum = fnv1a(&b[..32]);
+    b[32..36].copy_from_slice(&sum.to_le_bytes());
+    b
+}
+
+/// The lengths in a [`live_head`]; `None` before the guest wrote one.
+pub fn parse_live_head(b: &[u8]) -> Option<[u64; 2]> {
+    if b.len() < 36 || &b[..16] != LIVE_MAGIC {
+        return None;
+    }
+    let sum = u32::from_le_bytes(b[32..36].try_into().ok()?);
+    if sum != fnv1a(&b[..32]) {
+        return None;
+    }
+    let out = u64::from_le_bytes(b[16..24].try_into().ok()?);
+    let err = u64::from_le_bytes(b[24..32].try_into().ok()?);
+    (out <= LIVE_MAX_BYTES && err <= LIVE_MAX_BYTES).then_some([out, err])
 }
 
 fn fnv1a(data: &[u8]) -> u32 {
@@ -439,6 +495,28 @@ mod live_tests {
         assert!(parse_live_frame(&bad).is_none());
         // Text before the prefix (a partial kernel line) does not matter.
         assert!(parse_live_frame(&format!("junk{line}")).is_some());
+    }
+
+    #[test]
+    fn live_region_heads() {
+        let h = live_head(5, LIVE_MAX_BYTES);
+        assert_eq!(parse_live_head(&h), Some([5, LIVE_MAX_BYTES]));
+        assert_eq!(parse_live_head(&[0u8; 4096]), None);
+        let mut bad = h;
+        bad[17] ^= 1;
+        assert_eq!(parse_live_head(&bad), None);
+        assert_eq!(parse_live_head(&live_head(LIVE_MAX_BYTES + 1, 0)), None);
+        let disk = OUTPUT_DISK_BYTES + LIVE_REGION_BYTES;
+        let at = live_region_at(disk).unwrap();
+        assert_eq!(at % 4096, 0);
+        assert!(live_data_at(at, 1) + LIVE_MAX_BYTES <= disk);
+        assert_eq!(live_region_at(4096), None);
+        let spec = RunSpec {
+            live: true,
+            live_disk: true,
+            ..Default::default()
+        };
+        assert_eq!(spec.output_disk_bytes(), disk);
     }
 }
 

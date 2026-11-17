@@ -16,14 +16,27 @@
 //! | input | tar of the run spec, stdin and `/input` files (run mode) | same, `input` |
 //! | output | written by the guest: a tar of the result | starts with [`OUTPUT_MARK`] until the guest overwrites it |
 //! | gpu | the GPU driver for the GPU guest kernel, ext4, read-only (GPU tasks only) | ext4 label [`GPU_LABEL`] |
+//! | control | the host's messages while the VM runs (1.14): a task for a warm guest, a stop request | starts with [`CONTROL_MAGIC`] |
 //!
-//! The mode comes from the kernel command line (`pumasi.mode=build|run|probe`).
+//! The mode comes from the kernel command line (`pumasi.mode=build|run|probe|pool`).
 //! In build mode the guest unpacks the layers onto the empty base disk, so
 //! the untrusted image tarballs are never unpacked on the host. In run mode
 //! it stacks an overlay of the scratch disk on the read-only base, copies
 //! the inputs in, runs the command, and writes the result. In probe mode
 //! it copies the input files to the output, which tells the host that disk
 //! I/O works under its accelerator.
+//!
+//! In pool mode (1.14) the guest boots and mounts its disks like run mode,
+//! prints [`POOL_READY_LINE`] and waits: the host keeps it warm until a task
+//! of the same image comes, then writes the input tar onto the control disk
+//! ([`ControlLayout`]) and the guest goes on as in run mode. A guest runs
+//! one task and powers off, warm or not.
+//!
+//! The control disk also carries a stop request (checkpoints, 1.14): the
+//! guest sends the task `SIGTERM` when it sees [`StopRequest::Term`] and
+//! `SIGKILL` at [`StopRequest::Kill`], then writes the result with what the
+//! task left in `/checkpoint` ([`CHECKPOINT_PREFIX`]). The guest reads the
+//! control disk with `O_DIRECT`, so it sees what the host wrote since.
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +76,108 @@ pub const SPEC_ENTRY: &str = "spec.json";
 pub const STDIN_ENTRY: &str = "stdin";
 /// Prefix of input files; `input/a/b.txt` becomes `/input/a/b.txt`.
 pub const INPUT_PREFIX: &str = "input/";
+
+/// Prefix of the checkpoint files a checkpointing run gets back (input
+/// tar) and leaves (output tar): `checkpoint/a.bin` is `/checkpoint/a.bin`.
+pub const CHECKPOINT_PREFIX: &str = "checkpoint/";
+/// Where the task finds and leaves its checkpoint.
+pub const CHECKPOINT_DIR: &str = "/checkpoint";
+/// Most files a checkpoint keeps.
+pub const MAX_CHECKPOINT_FILES: usize = 100_000;
+
+/// The console line a warm guest prints once its disks are mounted and it
+/// waits for a task, and the one it prints when the task came.
+pub const POOL_READY_LINE: &str = "pumasi-guest: ready";
+pub const POOL_TASK_LINE: &str = "pumasi-guest: task received";
+
+/// The control disk starts with this.
+pub const CONTROL_MAGIC: &[u8; 16] = b"PUMASI-CONTROL01";
+const TASK_MAGIC: &[u8; 16] = b"PUMASI-TASK-0001";
+const STOP_MAGIC: &[u8; 12] = b"PUMASI-STOP\0";
+
+/// Where things are on the control disk. Everything the guest reads is
+/// 4 KiB-aligned (`O_DIRECT`).
+pub struct ControlLayout;
+
+impl ControlLayout {
+    /// The stop request, one block.
+    pub const STOP_AT: u64 = 4096;
+    /// The task header (length and SHA-256 of the input tar), one block.
+    pub const TASK_AT: u64 = 8192;
+    /// The input tar of the task, up to the end of the disk.
+    pub const DATA_AT: u64 = 1 << 20;
+}
+
+/// The control disk's first block, as the host writes it: a warm guest
+/// that gets no task within `idle_secs` (0: no limit) powers off, so a
+/// host that went away without stopping it leaves no VM running for long.
+pub fn control_head(idle_secs: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 4096];
+    b[..16].copy_from_slice(CONTROL_MAGIC);
+    b[16..24].copy_from_slice(&idle_secs.to_le_bytes());
+    b
+}
+
+/// The idle limit in a control disk's first block.
+pub fn control_idle_secs(b: &[u8]) -> Option<u64> {
+    if b.len() < 24 || &b[..16] != CONTROL_MAGIC {
+        return None;
+    }
+    Some(u64::from_le_bytes(b[16..24].try_into().ok()?))
+}
+
+/// The task header block: the input tar of `len` bytes with this SHA-256
+/// is at [`ControlLayout::DATA_AT`].
+pub fn task_header(len: u64, sha256: &[u8; 32]) -> Vec<u8> {
+    let mut b = vec![0u8; 4096];
+    b[..16].copy_from_slice(TASK_MAGIC);
+    b[16..24].copy_from_slice(&len.to_le_bytes());
+    b[24..56].copy_from_slice(sha256);
+    b
+}
+
+/// The length and SHA-256 in a task header, if the block holds one.
+pub fn parse_task_header(b: &[u8]) -> Option<(u64, [u8; 32])> {
+    if b.len() < 56 || &b[..16] != TASK_MAGIC {
+        return None;
+    }
+    let len = u64::from_le_bytes(b[16..24].try_into().ok()?);
+    let hash = b[24..56].try_into().ok()?;
+    Some((len, hash))
+}
+
+/// What the host asks of a running task through the control disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRequest {
+    /// Save a checkpoint and exit: the guest sends `SIGTERM`.
+    Term,
+    /// The grace period is over: the guest sends `SIGKILL` and writes the
+    /// result with whatever is in `/checkpoint`.
+    Kill,
+}
+
+impl StopRequest {
+    pub fn block(self) -> Vec<u8> {
+        let mut b = vec![0u8; 4096];
+        b[..12].copy_from_slice(STOP_MAGIC);
+        b[12] = match self {
+            StopRequest::Term => 1,
+            StopRequest::Kill => 2,
+        };
+        b
+    }
+
+    pub fn parse(b: &[u8]) -> Option<Self> {
+        if b.len() < 13 || &b[..12] != STOP_MAGIC {
+            return None;
+        }
+        match b[12] {
+            1 => Some(StopRequest::Term),
+            2 => Some(StopRequest::Kill),
+            _ => None,
+        }
+    }
+}
 
 /// Entries of the output tar.
 pub const RESULT_ENTRY: &str = "result.json";
@@ -109,6 +224,15 @@ pub struct RunSpec {
     /// The result on the output disk still has all of it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live: bool,
+    /// A checkpointing run (1.14): `/checkpoint` holds the input tar's
+    /// [`CHECKPOINT_PREFIX`] files, is writable by any user, and goes back
+    /// in the output tar, up to this many bytes. 0: no checkpoint.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub checkpoint_limit: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// The guest's network settings: one card (`eth0`), a default route
@@ -141,7 +265,15 @@ impl RunSpec {
     /// The output disk this spec needs: both streams, the files and a tar
     /// header for every file.
     pub fn output_disk_bytes(&self) -> u64 {
-        2 * MAX_STREAM_BYTES + self.files_limit() + (self.count_limit() as u64 + 16) * 1024
+        let checkpoint = if self.checkpoint_limit > 0 {
+            self.checkpoint_limit + (MAX_CHECKPOINT_FILES as u64) * 1024
+        } else {
+            0
+        };
+        2 * MAX_STREAM_BYTES
+            + self.files_limit()
+            + (self.count_limit() as u64 + 16) * 1024
+            + checkpoint
     }
 }
 
@@ -307,5 +439,41 @@ mod live_tests {
         assert!(parse_live_frame(&bad).is_none());
         // Text before the prefix (a partial kernel line) does not matter.
         assert!(parse_live_frame(&format!("junk{line}")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_blocks_round_trip() {
+        let hash = [7u8; 32];
+        let b = task_header(12345, &hash);
+        assert_eq!(b.len(), 4096);
+        assert_eq!(parse_task_header(&b), Some((12345, hash)));
+        assert_eq!(parse_task_header(&control_head(60)), None);
+        assert_eq!(control_idle_secs(&control_head(60)), Some(60));
+        assert_eq!(control_idle_secs(&[0u8; 4096]), None);
+        assert_eq!(parse_task_header(&[0u8; 4096]), None);
+        for r in [StopRequest::Term, StopRequest::Kill] {
+            assert_eq!(StopRequest::parse(&r.block()), Some(r));
+        }
+        assert_eq!(StopRequest::parse(&[0u8; 4096]), None);
+        assert!(control_head(0).starts_with(CONTROL_MAGIC));
+    }
+
+    #[test]
+    fn checkpoints_make_room_on_the_output_disk() {
+        let plain = RunSpec::default();
+        let ckpt = RunSpec {
+            checkpoint_limit: 1 << 30,
+            ..Default::default()
+        };
+        assert_eq!(plain.output_disk_bytes(), OUTPUT_DISK_BYTES);
+        assert!(ckpt.output_disk_bytes() > OUTPUT_DISK_BYTES + (1 << 30));
+        // An older guest's spec has no such field.
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("checkpoint"));
     }
 }

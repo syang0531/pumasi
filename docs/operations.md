@@ -436,6 +436,9 @@ memory, so a failover starts them afresh.
 - Disk: the control plane's database grows with jobs (bounded by
   `--keep-jobs`) and the audit log (kept forever unless pruned, below);
   the file store with datasets (bounded by quotas).
+- Temperatures: `pumasi sensors --raw` on a machine shows what it reads
+  (on Macs since 1.14, from the SMC or IOReport); a machine with nothing
+  there never fires the temperature alert.
 
 ### The audit log
 
@@ -554,6 +557,12 @@ sleep mid-task takes `pumasi service set -- --allow-sleep`.
 `pumasi status`, `pumasi top`, `pumasi store usage`. A full disk on the
 control plane: lower `--keep-jobs`, remove datasets, or move
 `PUMASI_HOME` to a bigger disk while it is stopped.
+
+A microVM node keeps up to two booted guests waiting for the next task
+of an image it just ran (1.14), within a quarter of its memory. On a
+machine short of memory, `pumasi service set -- --warm-vms 0` (or
+`PUMASI_WARM_VMS=0`) turns that off; a guest that does not take its task
+turns it off on that node by itself, with a warning in the agent's log.
 
 ## 8. Before a release
 

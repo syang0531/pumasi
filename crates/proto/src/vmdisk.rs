@@ -11,8 +11,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use pumasi_guest::{
-    DISK_ROLE_ENTRY, GuestOutcome, GuestResult, INPUT_PREFIX, OUTPUT_PREFIX, RESULT_ENTRY,
-    ROLE_INPUT, ROLE_LAYERS, RunSpec, SPEC_ENTRY, STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY,
+    CHECKPOINT_PREFIX, DISK_ROLE_ENTRY, GuestOutcome, GuestResult, INPUT_PREFIX,
+    MAX_CHECKPOINT_FILES, OUTPUT_PREFIX, RESULT_ENTRY, ROLE_INPUT, ROLE_LAYERS, RunSpec,
+    SPEC_ENTRY, STDERR_ENTRY, STDIN_ENTRY, STDOUT_ENTRY,
 };
 
 use crate::{
@@ -94,6 +95,20 @@ pub fn write_input_tar<W: Write>(
     own: &[FileEntry],
     staged: &[(String, PathBuf, u64)],
 ) -> Result<W> {
+    write_input_tar_with(out, spec, stdin, shared, own, staged, &[])
+}
+
+/// [`write_input_tar`] with a checkpointing run's last checkpoint (1.14):
+/// path in `/checkpoint`, file, size.
+pub fn write_input_tar_with<W: Write>(
+    out: W,
+    spec: &RunSpec,
+    stdin: &[u8],
+    shared: &[FileEntry],
+    own: &[FileEntry],
+    staged: &[(String, PathBuf, u64)],
+    checkpoint: &[(String, PathBuf, u64)],
+) -> Result<W> {
     let mut b = tar::Builder::new(out);
     b.mode(tar::HeaderMode::Deterministic);
     tar_entry(&mut b, DISK_ROLE_ENTRY, ROLE_INPUT.as_bytes())?;
@@ -112,6 +127,15 @@ pub fn write_input_tar<W: Write>(
         validate_rel_path(&f.path)?;
         tar_entry(&mut b, &format!("{INPUT_PREFIX}{}", f.path), &f.data)?;
     }
+    for (rel, file, size) in checkpoint {
+        validate_rel_path(rel)?;
+        let mut h = tar::Header::new_gnu();
+        h.set_size(*size);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        let f = std::fs::File::open(file).with_context(|| format!("read {}", file.display()))?;
+        b.append_data(&mut h, format!("{CHECKPOINT_PREFIX}{rel}"), f.take(*size))?;
+    }
     Ok(b.into_inner()?)
 }
 
@@ -128,6 +152,18 @@ pub struct GuestOutput {
 /// read into memory, within the caps, or with `kept` written as plain
 /// files under that directory (within the file store's caps).
 pub fn parse_output(r: impl Read, kept: Option<&Path>) -> Result<GuestOutput> {
+    parse_output_with(r, kept, None)
+}
+
+/// [`parse_output`] that also writes a checkpointing run's
+/// `/checkpoint` files under `checkpoint` (1.14), within the file
+/// store's caps. Without it they are skipped.
+pub fn parse_output_with(
+    r: impl Read,
+    kept: Option<&Path>,
+    checkpoint: Option<&Path>,
+) -> Result<GuestOutput> {
+    let (mut ckpt_total, mut ckpt_files) = (0u64, 0usize);
     let mut ar = tar::Archive::new(r);
     let mut result = None;
     let (mut stdout, mut stderr, mut files) = (Vec::new(), Vec::new(), Vec::new());
@@ -152,6 +188,22 @@ pub fn parse_output(r: impl Read, kept: Option<&Path>) -> Result<GuestOutput> {
             stdout = read(&mut entry, MAX_OUTPUT_BYTES as u64)?;
         } else if name == STDERR_ENTRY {
             stderr = read(&mut entry, MAX_OUTPUT_BYTES as u64)?;
+        } else if let Some(rel) = name.strip_prefix(CHECKPOINT_PREFIX) {
+            let Some(dir) = checkpoint else { continue };
+            let size = entry.header().size()?;
+            if validate_rel_path(rel).is_err()
+                || ckpt_total + size > MAX_STORE_OUTPUT_BYTES
+                || ckpt_files >= MAX_CHECKPOINT_FILES
+            {
+                continue;
+            }
+            let target = dir.join(rel);
+            if let Some(p) = target.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let mut f = std::fs::File::create(&target)?;
+            ckpt_total += std::io::copy(&mut Read::take(&mut entry, size), &mut f)?;
+            ckpt_files += 1;
         } else if let Some(rel) = name.strip_prefix(OUTPUT_PREFIX) {
             if validate_rel_path(rel).is_err() {
                 continue;
@@ -225,5 +277,78 @@ pub fn outcome_of(o: &GuestOutcome, memory_bytes: u64) -> Outcome {
             Outcome::Trap(format!("out of memory (limit {} MiB)", memory_bytes >> 20))
         }
         GuestOutcome::Failed(msg) => Outcome::Error(format!("microVM: {msg}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoints_cross_the_disks() {
+        let dir = std::env::temp_dir().join(format!("pumasi-vmdisk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("saved.bin");
+        std::fs::write(&saved, b"step 41").unwrap();
+        let spec = RunSpec {
+            checkpoint_limit: 1 << 20,
+            ..Default::default()
+        };
+        let tar = write_input_tar_with(
+            Vec::new(),
+            &spec,
+            b"",
+            &[],
+            &[],
+            &[],
+            &[("state/saved.bin".into(), saved.clone(), 7)],
+        )
+        .unwrap();
+        let mut names = Vec::new();
+        for e in tar::Archive::new(tar.as_slice()).entries().unwrap() {
+            names.push(e.unwrap().path().unwrap().display().to_string());
+        }
+        assert!(names.contains(&"checkpoint/state/saved.bin".to_string()));
+        // A checkpoint path may not leave the directory.
+        assert!(
+            write_input_tar_with(
+                Vec::new(),
+                &spec,
+                b"",
+                &[],
+                &[],
+                &[],
+                &[("../x".into(), saved, 7)]
+            )
+            .is_err()
+        );
+
+        // What a guest writes back.
+        let mut b = tar::Builder::new(Vec::new());
+        tar_entry(&mut b, "checkpoint/state/saved.bin", b"step 42").unwrap();
+        tar_entry(&mut b, "checkpoint/../escape", b"no").unwrap_or(());
+        tar_entry(&mut b, "output/r.txt", b"r").unwrap();
+        let result = serde_json::to_vec(&GuestResult {
+            outcome: GuestOutcome::Signaled(15),
+            stdout_dropped: 0,
+            stderr_dropped: 0,
+            files_dropped: 0,
+        })
+        .unwrap();
+        tar_entry(&mut b, RESULT_ENTRY, &result).unwrap();
+        let out_tar = b.into_inner().unwrap();
+        let back = dir.join("back");
+        let out = parse_output_with(out_tar.as_slice(), None, Some(&back)).unwrap();
+        assert_eq!(out.files.len(), 1);
+        assert_eq!(
+            std::fs::read(back.join("state/saved.bin")).unwrap(),
+            b"step 42"
+        );
+        assert!(!dir.join("escape").exists());
+        // Without a checkpoint directory the files are skipped.
+        let out = parse_output(out_tar.as_slice(), None).unwrap();
+        assert_eq!(out.files.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

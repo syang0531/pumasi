@@ -2058,6 +2058,15 @@ impl State {
             if !n.executors.contains(&e) {
                 continue;
             }
+            // A checkpointing run as a microVM needs an agent that passes
+            // the stop signal into the guest (1.14).
+            if e == Executor::Microvm
+                && need.checkpoint
+                && self.agent_minor(id) < pumasi_proto::MICROVM_CHECKPOINT_MINOR
+            {
+                refused.get_or_insert(R::OldAgent);
+                continue;
+            }
             if e == Executor::Microvm
                 && need.vm_network
                 && !(n.perf.protocol >= DEVICES_PROTOCOL
@@ -5718,6 +5727,35 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn checkpointing_microvm_runs_need_a_1_14_agent() {
+        let mut st = state();
+        let mut sub = job(Executor::Image, 1);
+        sub.deterministic = false;
+        sub.placement.checkpoint = Some(Checkpoint { grace_ms: 5_000 });
+        let id = st.submit(sub).unwrap();
+        // An image job with checkpoints stays an image job (1.14).
+        assert_eq!(st.jobs[&id].meta.executor, Executor::Image);
+        // A microVM-only node of 1.9 to 1.13 keeps checkpoints for Docker
+        // only: nothing for it.
+        let (a_id, mut a_rx) = join(&mut st, "a", vec![Executor::Microvm], None);
+        let g = st.nodes[&a_id].generation;
+        st.on_minor(&a_id, g, pumasi_proto::GPU_MINOR);
+        st.schedule();
+        assert!(assigned(&mut a_rx).is_empty());
+        st.on_minor(&a_id, g, pumasi_proto::MICROVM_CHECKPOINT_MINOR);
+        st.schedule();
+        let got = assigned(&mut a_rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].executor, Executor::Microvm);
+        assert!(got[0].checkpoint.is_some());
+        // A plain microVM job with checkpoints is accepted too.
+        let mut vm = job(Executor::Microvm, 1);
+        vm.deterministic = false;
+        vm.placement.checkpoint = Some(Checkpoint { grace_ms: 5_000 });
+        st.submit(vm).unwrap();
     }
 
     #[test]

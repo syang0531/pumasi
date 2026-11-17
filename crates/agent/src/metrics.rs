@@ -31,6 +31,8 @@ pub struct Sampler {
     nvml: Option<crate::gpu::nvml::Sampler>,
     /// The GPUs NVML does not cover (1.6).
     usage: crate::gpu::usage::GpuUsage,
+    /// The SMC, IOReport and the HID sensors by name (Macs, 1.14).
+    mac: crate::sensors::Reader,
     samples: u64,
 }
 
@@ -55,6 +57,7 @@ impl Sampler {
             usage: crate::gpu::usage::GpuUsage::new(&gpus),
             gpus,
             nvml,
+            mac: crate::sensors::Reader::new(),
             samples: 0,
         }
     }
@@ -96,6 +99,28 @@ impl Sampler {
             .fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.max(t))));
         #[cfg(windows)]
         let temp_c = temp_c.or_else(|| self.wmi.hottest());
+        // Macs: the CPU die and the GPUs from the SMC or IOReport (1.14).
+        let mac = if cfg!(target_os = "macos") {
+            let named: Vec<(String, f32)> = self
+                .components
+                .iter()
+                .flat_map(|c| c.iter())
+                .filter_map(|c| Some((c.label().to_string(), c.temperature()?)))
+                .collect();
+            self.mac.read(named.iter().map(|(n, t)| (n.as_str(), *t)))
+        } else {
+            crate::sensors::MacSensors::default()
+        };
+        let temp_c = match (temp_c, mac.cpu_temp) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let mut gpus = self.gpu_metrics();
+        fill_mac_gpus(
+            &mut gpus,
+            |i| self.gpus.iter().find(|g| g.index == i).map(|g| g.vendor),
+            &mac,
+        );
         let load1 = if cfg!(windows) {
             0.0
         } else {
@@ -118,7 +143,7 @@ impl Sampler {
             net_rx,
             net_tx,
             temp_c,
-            gpus: self.gpu_metrics(),
+            gpus,
             running,
         }
     }
@@ -314,9 +339,61 @@ fn amd_sysfs(g: &GpuInfo) -> Option<GpuMetrics> {
     })
 }
 
+/// Gives a Mac's GPUs the temperature and power its sensors read, where
+/// nothing else did: an Intel GPU the integrated readings, any other GPU
+/// (AMD or NVIDIA in an Intel Mac, Apple's own) the discrete ones.
+fn fill_mac_gpus(
+    metrics: &mut [GpuMetrics],
+    vendor_of: impl Fn(u32) -> Option<GpuVendor>,
+    mac: &crate::sensors::MacSensors,
+) {
+    for m in metrics.iter_mut() {
+        let Some(vendor) = vendor_of(m.index) else {
+            continue;
+        };
+        let (temp, power) = match vendor {
+            GpuVendor::Intel => (mac.igpu_temp, mac.igpu_power),
+            _ => (mac.gpu_temp, mac.gpu_power),
+        };
+        m.temp_c = m.temp_c.or(temp);
+        m.power_w = m.power_w.or(power);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_gpus_get_their_sensors() {
+        let vendor_of = |i| match i {
+            0 => Some(GpuVendor::Intel),
+            1 => Some(GpuVendor::Amd),
+            _ => None,
+        };
+        let mut m = vec![
+            GpuMetrics {
+                index: 0,
+                ..Default::default()
+            },
+            GpuMetrics {
+                index: 1,
+                temp_c: Some(70.0),
+                ..Default::default()
+            },
+        ];
+        let mac = crate::sensors::MacSensors {
+            igpu_temp: Some(50.0),
+            igpu_power: Some(1.5),
+            gpu_temp: Some(61.0),
+            gpu_power: Some(21.0),
+            ..Default::default()
+        };
+        fill_mac_gpus(&mut m, vendor_of, &mac);
+        assert_eq!((m[0].temp_c, m[0].power_w), (Some(50.0), Some(1.5)));
+        // What the GPU's own statistics said stays.
+        assert_eq!((m[1].temp_c, m[1].power_w), (Some(70.0), Some(21.0)));
+    }
 
     #[test]
     fn samples_this_machine() {

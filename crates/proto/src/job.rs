@@ -506,12 +506,10 @@ impl JobSubmission {
         }
         if self.tier == Tier::Confidential {
             self.executor = Executor::Microvm;
-        } else if !self.gpu_capabilities.is_empty()
-            || self.placement.checkpoint.is_some()
-            || self.gpu_ext.share > 0
-        {
-            // Checkpoints need Docker's stop signal (microVMs have none
-            // yet), and a microVM takes its GPU whole.
+        } else if !self.gpu_capabilities.is_empty() || self.gpu_ext.share > 0 {
+            // A microVM takes its GPU whole. (Checkpoints work in both
+            // since 1.14; the control plane sends a checkpointing run to a
+            // microVM only on agents that keep its checkpoint.)
             self.executor = Executor::Docker;
         }
     }
@@ -1590,10 +1588,11 @@ mod tests {
         );
         assert!(!sub.deterministic);
 
-        // Checkpoints need Docker or WASM, and a run that may stop.
+        // Checkpoints work in microVMs too (1.14), and need a run that may
+        // stop.
         let vm = JobFile::parse("executor = \"microvm\"\nimage = \"busybox\"\ncheckpoint = true")
             .unwrap();
-        assert!(vm.resolve(&dir).and_then(|s| s.validate()).is_err());
+        assert!(vm.resolve(&dir).and_then(|s| s.validate()).is_ok());
         let long = JobFile::parse("image = \"busybox\"\ncheckpoint = { grace = \"2h\" }").unwrap();
         assert!(long.resolve(&dir).and_then(|s| s.validate()).is_err());
         let typo = JobFile::parse("image = \"busybox\"\nspread = { by = \"zone\", mx = 2 }");

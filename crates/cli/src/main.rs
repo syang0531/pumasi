@@ -1149,6 +1149,12 @@ struct AgentOpts {
     /// host folder Pumasi puts in a container.
     #[arg(long, value_enum, default_value = "auto")]
     docker_wsl_libs: GraphicsArg,
+    /// Do not start NVIDIA's MPS server for parts of GPUs (`gpus = 0.5`).
+    /// With it (Linux, an agent running as root, Volta or newer), each
+    /// part gets a memory limit and its share of the GPU's threads;
+    /// without it parts are time-sliced and share memory on trust.
+    #[arg(long)]
+    no_gpu_mps: bool,
     /// Also run image jobs in microVMs. Each task gets its own VM and
     /// kernel, so this is safe on machines you share with a cluster.
     /// Needs `pumasi vm setup` first.
@@ -1250,6 +1256,15 @@ fn parse_hours(s: &str) -> Result<Hours, String> {
 
 fn main() {
     pumasi_proto::build_info();
+    // `pumasi __cuda-slice measure|solve`: a MIG slice's benchmark or GPU
+    // check, in a process CUDA shows only that slice (1.16).
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == pumasi_agent::gpu::mig::SLICE_ARG)
+    {
+        let mode = std::env::args().nth(2).unwrap_or_default();
+        std::process::exit(pumasi_agent::gpu::mig::serve(&mode));
+    }
     // `pumasi __webgpu-worker`: one wasm task's GPU work, in a process the
     // agent can kill at the task's timeout (1.10).
     if std::env::args_os()
@@ -2516,6 +2531,7 @@ async fn agent(
         store_cache_bytes: opts.store_cache.as_deref().map(parse_size).transpose()?,
         gpu_graphics: opts.gpu_graphics.forced(),
         docker_wsl_libs: opts.docker_wsl_libs.forced(),
+        gpu_mps: !opts.no_gpu_mps,
         power: pumasi_agent::PowerOptions::system(
             opts.allow_sleep,
             opts.wake_on_lan,
@@ -4294,10 +4310,10 @@ async fn exec_local(
                 );
             };
             eprintln!("[pumasi] GPU: {}", a.describe());
-            Some(pumasi_agent::webgpu::WebGpuTask {
-                gpu: Arc::new(gpu),
-                adapter: a.index,
-            })
+            Some(pumasi_agent::webgpu::WebGpuTask::one(
+                Arc::new(gpu),
+                a.index,
+            ))
         }
         None => None,
     };

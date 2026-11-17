@@ -32,8 +32,30 @@ pub const WEBGPU_MODULE: &str = "pumasi_webgpu";
 /// The functions of [`WEBGPU_MODULE`], for documentation and tests. Every
 /// call returns a negative number on failure and `error` gives the reason.
 pub const WEBGPU_IMPORTS: &[&str] = &[
-    "adapter", "shader", "buffer", "write", "read", "dispatch", "wait", "release", "error",
+    "adapter",
+    "shader",
+    "buffer",
+    "write",
+    "read",
+    "dispatch",
+    "wait",
+    "release",
+    "error",
+    // 1.16: several adapters, and drawing.
+    "adapters",
+    "select",
+    "texture",
+    "sampler",
+    "render_shader",
+    "write_texture",
+    "read_texture",
+    "bind_group",
+    "dispatch_groups",
+    "render",
 ];
+
+/// Most WebGPU adapters one wasm task may ask for (`gpus = 8`, 1.16).
+pub const MAX_WEBGPU_PER_TASK: u32 = 8;
 
 /// Slots of adapters that are not one of the node's listed GPUs start
 /// here, so they never collide with GPU indices in the busy set.
@@ -291,11 +313,12 @@ impl SignedWebGpu {
 }
 
 impl GpuRequest {
-    /// Checks a GPU request of a wasm job: one WebGPU adapter per task.
+    /// Checks a GPU request of a wasm job: one WebGPU adapter per task, or
+    /// up to [`MAX_WEBGPU_PER_TASK`] since 1.16.
     pub fn validate_webgpu(&self) -> Result<()> {
         ensure!(
-            self.count == 1,
-            "a wasm task uses one GPU (gpus = 1), through WebGPU"
+            (1..=MAX_WEBGPU_PER_TASK).contains(&self.count),
+            "a wasm task uses 1 to {MAX_WEBGPU_PER_TASK} GPUs (gpus = 1), through WebGPU"
         );
         ensure!(
             self.min_vram_mib == 0,
@@ -309,8 +332,9 @@ impl GpuRequest {
         self.vendor.is_none_or(|v| v == a.vendor)
     }
 
-    /// Picks a WebGPU adapter for one wasm task, leaving out busy slots:
-    /// hardware before software, then the fastest. Returns its slot.
+    /// Picks `count` WebGPU adapters for one wasm task, leaving out busy
+    /// slots: hardware before software, then the fastest. Returns their
+    /// slots, in the order the module numbers them.
     pub fn pick_webgpu(&self, adapters: &[WebGpuAdapter], busy: &HashSet<u32>) -> Option<Vec<u32>> {
         self.pick_webgpu_with(adapters, None, &[], busy)
     }
@@ -324,12 +348,19 @@ impl GpuRequest {
         features: &[WebGpuFeature],
         busy: &HashSet<u32>,
     ) -> Option<Vec<u32>> {
-        adapters
+        let mut fit: Vec<&WebGpuAdapter> = adapters
             .iter()
             .filter(|a| self.matches_webgpu(a) && !busy.contains(&a.slot()))
             .filter(|a| features.is_empty() || extra.is_some_and(|e| e.has(a.index, features)))
-            .max_by_key(|a| (!a.software(), a.fp32_gflops, std::cmp::Reverse(a.index)))
-            .map(|a| vec![a.slot()])
+            .collect();
+        let want = self.count.max(1) as usize;
+        if fit.len() < want {
+            return None;
+        }
+        fit.sort_by_key(|a| {
+            std::cmp::Reverse((!a.software(), a.fp32_gflops, std::cmp::Reverse(a.index)))
+        });
+        Some(fit[..want].iter().map(|a| a.slot()).collect())
     }
 }
 
@@ -379,14 +410,27 @@ mod tests {
         };
         assert_eq!(amd.pick_webgpu(&adapters, &HashSet::new()), None);
         assert!(req.validate_webgpu().is_ok());
-        assert!(
-            GpuRequest {
-                count: 2,
-                ..req.clone()
-            }
-            .validate_webgpu()
-            .is_err()
+        // Several adapters (1.16): the fastest first, all of them free.
+        let two = GpuRequest {
+            count: 2,
+            ..req.clone()
+        };
+        assert!(two.validate_webgpu().is_ok());
+        assert_eq!(
+            two.pick_webgpu(&adapters, &HashSet::new()),
+            Some(vec![0, WEBGPU_SLOT_BASE])
         );
+        assert_eq!(two.pick_webgpu(&adapters, &HashSet::from([0])), None);
+        for count in [0, MAX_WEBGPU_PER_TASK + 1] {
+            assert!(
+                GpuRequest {
+                    count,
+                    ..req.clone()
+                }
+                .validate_webgpu()
+                .is_err()
+            );
+        }
         assert!(
             GpuRequest {
                 min_vram_mib: 1024,

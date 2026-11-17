@@ -82,7 +82,7 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 8;
+pub const PROTOCOL_MINOR: u32 = 9;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
@@ -122,6 +122,12 @@ pub const MICROVM_CHECKPOINT_MINOR: u32 = 7;
 /// measures beyond its metrics ([`msg::FromAgent::MetricsExtra`]: the CPU
 /// package's power) after each sample.
 pub const METRICS_EXTRA_MINOR: u32 = 8;
+/// The first minor with the 1.16 GPUs: the agent runs wasm tasks with
+/// several WebGPU adapters (older ones take one), says which of its GPUs
+/// give parts of them a memory limit through NVIDIA's MPS
+/// ([`msg::FromAgent::GpuSharing`]), and benchmarks and answers challenges
+/// for MIG slices.
+pub const GPU_SHARING_MINOR: u32 = 9;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

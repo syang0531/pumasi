@@ -179,6 +179,7 @@ async fn spawn_agent_with(
         webgpu: None,
         gpu_graphics: None,
         docker_wsl_libs: None,
+        gpu_mps: false,
         power: Default::default(),
         max_cpu_percent: None,
         availability: None,

@@ -36,9 +36,11 @@ use crate::tempdir::TempDir;
 use rand010::SeedableRng;
 use wasmtime::{
     Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, Trap,
+    component::{Component, ResourceTable},
 };
 use wasmtime_wasi::{
-    FsPerms, HostMonotonicClock, HostWallClock, I32Exit, WasiCtxBuilder,
+    FsPerms, HostMonotonicClock, HostWallClock, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView,
+    WasiView,
     p1::{self, WasiP1Ctx},
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
 };
@@ -79,6 +81,8 @@ pub struct TaskIo {
     pub image: Option<LocalImage>,
     /// The GPUs the cluster gave this task.
     pub gpus: Vec<pumasi_proto::gpu::GpuInfo>,
+    /// A part of an NVIDIA GPU that runs under MPS (1.16), on Docker.
+    pub mps: Option<crate::gpu::mps::MpsPart>,
     /// Where the task's output goes while it runs (phase 11).
     pub live: Option<LiveOutput>,
     /// The WebGPU adapter of a wasm task that asked for a GPU (phase 14).
@@ -322,9 +326,49 @@ pub struct LocalImage {
 }
 
 struct StoreState {
-    wasi: WasiP1Ctx,
+    wasi: Wasi,
     limits: PeakLimiter,
     gpu: crate::webgpu::GpuState,
+}
+
+/// The WASI a store's program sees: preview 1 for core modules, preview 2
+/// for components (1.16). A store runs one program, so it holds one.
+enum Wasi {
+    P1(Box<WasiP1Ctx>),
+    P2(Box<WasiCtx>, ResourceTable),
+}
+
+impl StoreState {
+    fn p1(&mut self) -> &mut WasiP1Ctx {
+        match &mut self.wasi {
+            Wasi::P1(c) => c,
+            Wasi::P2(..) => unreachable!("a component's store has no preview 1 context"),
+        }
+    }
+}
+
+impl WasiView for StoreState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        match &mut self.wasi {
+            Wasi::P2(ctx, table) => WasiCtxView { ctx, table },
+            Wasi::P1(_) => unreachable!("a core module's store has no preview 2 context"),
+        }
+    }
+}
+
+/// A compiled program: a core module (WASI preview 1) or a component
+/// (WASI preview 2, 1.16).
+#[derive(Clone)]
+enum Program {
+    Module(Module),
+    Component(Component),
+}
+
+/// Whether `bytes` are a component rather than a core module: both start
+/// with `\0asm`, and the component model's layer field (bytes 6 and 7)
+/// is 1 where a core module has 0.
+pub fn is_component(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[..4] == b"\0asm" && bytes[6..8] == [1, 0]
 }
 
 /// Enforces the store limits and remembers the largest memory granted.
@@ -423,7 +467,9 @@ fn derive_seed(seed: &[u8; 32], purpose: &str) -> [u8; 32] {
 pub struct WasmExecutor {
     engine: Engine,
     linker: Arc<Linker<StoreState>>,
-    modules: Arc<Mutex<HashMap<ModuleHash, Module>>>,
+    /// The preview 2 imports components get (1.16).
+    component_linker: Arc<wasmtime::component::Linker<StoreState>>,
+    modules: Arc<Mutex<HashMap<ModuleHash, Program>>>,
     _ticker: Arc<Ticker>,
 }
 
@@ -445,8 +491,10 @@ impl WasmExecutor {
         let engine = Engine::new(&config)?;
 
         let mut linker = Linker::new(&engine);
-        p1::add_to_linker_sync(&mut linker, |s: &mut StoreState| &mut s.wasi)?;
+        p1::add_to_linker_sync(&mut linker, StoreState::p1)?;
         crate::webgpu::add_to_linker(&mut linker, |s: &mut StoreState| &mut s.gpu)?;
+        let mut component_linker = wasmtime::component::Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut component_linker)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         // The epoch ticker drives every store's wall-clock deadline.
@@ -466,6 +514,7 @@ impl WasmExecutor {
         Ok(Self {
             engine,
             linker: Arc::new(linker),
+            component_linker: Arc::new(component_linker),
             modules: Default::default(),
             _ticker: Arc::new(Ticker(stop)),
         })
@@ -485,8 +534,15 @@ impl WasmExecutor {
         if self.has_module(&hash) {
             return Ok(());
         }
-        let module =
-            Module::new(&self.engine, bytes).map_err(|e| anyhow::anyhow!("invalid module: {e}"))?;
+        let module = if is_component(bytes) {
+            Component::new(&self.engine, bytes)
+                .map(Program::Component)
+                .map_err(|e| anyhow::anyhow!("invalid component: {e}"))?
+        } else {
+            Module::new(&self.engine, bytes)
+                .map(Program::Module)
+                .map_err(|e| anyhow::anyhow!("invalid module: {e}"))?
+        };
         let mut cache = self.modules.lock().unwrap();
         if cache.len() >= MODULE_CACHE_CAP {
             // Simple bound; eviction order does not matter much here.
@@ -626,7 +682,18 @@ impl WasmExecutor {
         if let Err(e) = preopened {
             return RunResult::error(&format!("preopen directories: {e}"), start);
         }
-        let wasi = builder.build_p1();
+        let component = matches!(module, Program::Component(_));
+        if component && io.webgpu.is_some() {
+            return RunResult::error(
+                "components have no GPU yet: build a core module (wasm32-wasip1) for WebGPU, until Wasmtime runs wasi:webgpu",
+                start,
+            );
+        }
+        let wasi = if component {
+            Wasi::P2(Box::new(builder.build()), ResourceTable::new())
+        } else {
+            Wasi::P1(Box::new(builder.build_p1()))
+        };
 
         let memory = usize::try_from(limits.memory_bytes).unwrap_or(usize::MAX);
         let store_limits = StoreLimitsBuilder::new()
@@ -670,9 +737,26 @@ impl WasmExecutor {
         store.set_epoch_deadline(1);
 
         let result = (|| -> wasmtime::Result<()> {
-            let instance = self.linker.instantiate(&mut store, &module)?;
-            let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
-            start.call(&mut store, ())
+            match &module {
+                Program::Module(module) => {
+                    let instance = self.linker.instantiate(&mut store, module)?;
+                    let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+                    start.call(&mut store, ())
+                }
+                Program::Component(component) => {
+                    let command = wasmtime_wasi::p2::bindings::sync::Command::instantiate(
+                        &mut store,
+                        component,
+                        &self.component_linker,
+                    )?;
+                    // `wasi:cli/run` returns an error without a code: the
+                    // program failed, as exit status 1 says elsewhere.
+                    match command.wasi_cli_run().call_run(&mut store)? {
+                        Ok(()) => Ok(()),
+                        Err(()) => Err(I32Exit(1).into()),
+                    }
+                }
+            }
         })();
 
         let fuel_used = fuel_budget.saturating_sub(store.get_fuel().unwrap_or(0));
@@ -749,6 +833,10 @@ fn classify(e: wasmtime::Error) -> Outcome {
     if msg.contains("_start")
         || msg.contains("unknown import")
         || msg.contains("incompatible import")
+        // A component that needs what the sandbox does not give, or that
+        // is not a command (1.16).
+        || msg.contains("matching implementation was not found")
+        || msg.contains("wasi:cli/run")
     {
         return Outcome::Error(msg);
     }
@@ -983,6 +1071,115 @@ mod tests {
         (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))
     "#;
 
+    /// A component (1.16) that exports `wasi:cli/run` and answers `ok`,
+    /// `err`, or spins, as `body` (a core function returning 0 or 1) says.
+    fn run_component(body: &str) -> String {
+        format!(
+            r#"(component
+              (core module $m (func (export "run") (result i32) {body}))
+              (core instance $i (instantiate $m))
+              (func $run (result (result)) (canon lift (core func $i "run")))
+              (instance $r (export "run" (func $run)))
+              (export "wasi:cli/run@0.2.0" (instance $r)))"#
+        )
+    }
+
+    #[test]
+    fn components_run_with_preview_2() {
+        let ok = wat::parse_str(run_component("i32.const 0")).unwrap();
+        assert!(is_component(&ok));
+        assert!(!is_component(&wat::parse_str(SPIN).unwrap()));
+        let r = exec_wat(
+            &run_component("i32.const 0"),
+            TaskInput::default(),
+            Limits::default(),
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(0),
+            "{}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let r = exec_wat(
+            &run_component("i32.const 1"),
+            TaskInput::default(),
+            Limits::default(),
+        );
+        assert_eq!(r.outcome, Outcome::Exited(1));
+        // Fuel and the timeout hold for components too.
+        let spin = run_component("(loop br 0) i32.const 0");
+        let r = exec_wat(
+            &spin,
+            TaskInput::default(),
+            Limits {
+                fuel: Some(100_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.outcome, Outcome::OutOfFuel);
+        let r = exec_wat(
+            &spin,
+            TaskInput::default(),
+            Limits {
+                timeout_ms: 200,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.outcome, Outcome::Timeout);
+        // A component that is not a command cannot run.
+        let r = exec_wat(
+            r#"(component (core module $m) (core instance (instantiate $m)))"#,
+            TaskInput::default(),
+            Limits::default(),
+        );
+        assert!(matches!(r.outcome, Outcome::Error(_)), "{:?}", r.outcome);
+    }
+
+    /// The sample module built for `wasm32-wasip2` (a component) answers
+    /// what the `wasm32-wasip1` build does, stdin and files included.
+    #[test]
+    fn the_sample_component_matches_the_core_module() {
+        let core = include_bytes!("../../../examples/montecarlo/montecarlo.wasm");
+        let comp = include_bytes!("../../../examples/montecarlo/montecarlo-component.wasm");
+        assert!(is_component(comp) && !is_component(core));
+        let ex = WasmExecutor::new().unwrap();
+        let run = |bytes: &[u8], input: &TaskInput, seed| {
+            let hash = pumasi_proto::module_hash(bytes);
+            ex.load_module(hash, bytes).unwrap();
+            ex.run(
+                &hash,
+                "montecarlo",
+                input,
+                &[],
+                &Limits::default(),
+                seed,
+                Default::default(),
+            )
+        };
+        let sample = TaskInput {
+            args: vec!["sample".into(), "3".into(), "20000".into()],
+            ..Default::default()
+        };
+        let reduce = TaskInput {
+            args: vec!["reduce".into()],
+            stdin: b"1 785 1000\n2 786 1000\n".to_vec(),
+            ..Default::default()
+        };
+        for input in [&sample, &reduce] {
+            let a = run(core, input, None);
+            let b = run(comp, input, Some([7; 32]));
+            assert_eq!(a.outcome, Outcome::Exited(0));
+            assert_eq!(
+                b.outcome,
+                Outcome::Exited(0),
+                "{}",
+                String::from_utf8_lossy(&b.stderr)
+            );
+            assert_eq!(a.stdout, b.stdout);
+            assert!(b.peak_memory_bytes.unwrap() > 0);
+        }
+    }
+
     #[test]
     fn deterministic_mode_and_peak_memory() {
         let bytes = wat::parse_str(ENTROPY_WAT).unwrap();
@@ -1028,6 +1225,11 @@ mod tests {
     /// Exit codes name the failed step; failures print the host's message
     /// on stderr; success prints the adapter's JSON.
     fn gpu_wat(shader: &str, buffer_bytes: u32) -> String {
+        gpu_wat_on(shader, buffer_bytes, 0)
+    }
+
+    /// [`gpu_wat`] on the task's GPU number `gpu` (1.16: `select`).
+    fn gpu_wat_on(shader: &str, buffer_bytes: u32, gpu: u32) -> String {
         let src = shader.replace('\n', "\\n");
         let len = shader.len();
         format!(
@@ -1042,6 +1244,7 @@ mod tests {
       (import "pumasi_webgpu" "wait" (func $wait (result i32)))
       (import "pumasi_webgpu" "release" (func $release (param i32) (result i32)))
       (import "pumasi_webgpu" "error" (func $error (param i32 i32) (result i32)))
+      (import "pumasi_webgpu" "select" (func $select (param i32) (result i32)))
       (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
       (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
       (memory (export "memory") 1)
@@ -1054,6 +1257,9 @@ mod tests {
         (call $exit (local.get $code)))
       (func (export "_start")
         (local $sh i32) (local $b i32) (local $i i32) (local $n i32)
+        (if (i32.const {gpu})
+          (then (if (i32.lt_s (call $select (i32.const {gpu})) (i32.const 0))
+            (then (call $fail (i32.const 11))))))
         (local.set $n (call $adapter (i32.const 16000) (i32.const 4000)))
         (if (i32.lt_s (local.get $n) (i32.const 0)) (then (call $fail (i32.const 2))))
         (local.set $sh (call $shader (i32.const 1024) (i32.const {len}) (i32.const 4000) (i32.const 4)))
@@ -1121,10 +1327,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             return None;
         }
         eprintln!("WebGPU adapter: {}", gpu.adapters()[0].describe());
-        Some(crate::webgpu::WebGpuTask {
-            gpu: Arc::new(gpu),
-            adapter: 0,
-        })
+        Some(crate::webgpu::WebGpuTask::one(Arc::new(gpu), 0))
     }
 
     fn run_gpu(wat: &str, gpu: Option<crate::webgpu::WebGpuTask>, limits: Limits) -> RunResult {
@@ -1178,7 +1381,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             String::from_utf8_lossy(&r.stderr)
         );
         let info: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
-        assert_eq!(info["name"], gpu.info().unwrap().name.as_str());
+        assert_eq!(info["name"], gpu.info(0).unwrap().name.as_str());
         assert!(info["max_buffer_size"].as_u64().unwrap() >= 1024);
 
         // WGSL errors come back with the compiler's message.
@@ -1257,6 +1460,58 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             "stderr: {}",
             String::from_utf8_lossy(&r.stderr)
         );
+    }
+
+    /// A task with two GPUs (1.16) works on the one it selects; the
+    /// adapter JSON says which. Both are the same adapter here, opened as
+    /// two devices.
+    #[test]
+    fn webgpu_tasks_can_have_several_gpus() {
+        let Some(one) = test_gpu() else { return };
+        let two = crate::webgpu::WebGpuTask {
+            gpu: one.gpu.clone(),
+            adapters: vec![0, 0],
+        };
+        let r = run_gpu(
+            &gpu_wat_on(TRIPLE_WGSL, 1024, 1),
+            Some(two.clone()),
+            Limits::default(),
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let info: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+        assert_eq!(info["index"], 1);
+        assert_eq!(info["count"], 2);
+        // The memory limit is shared out between the two.
+        let limits = Limits {
+            memory_bytes: 1 << 20,
+            ..Default::default()
+        };
+        let r = run_gpu(
+            &gpu_wat_on(TRIPLE_WGSL, 768 << 10, 1),
+            Some(two.clone()),
+            limits,
+        );
+        assert_eq!(r.outcome, Outcome::Exited(4));
+        // A third GPU does not exist.
+        let r = run_gpu(
+            &gpu_wat_on(TRIPLE_WGSL, 1024, 2),
+            Some(two),
+            Limits::default(),
+        );
+        assert_eq!(r.outcome, Outcome::Exited(11));
+        assert!(String::from_utf8_lossy(&r.stderr).contains("2 GPUs"));
+        // One GPU: `select(1)` fails the same way.
+        let r = run_gpu(
+            &gpu_wat_on(TRIPLE_WGSL, 1024, 1),
+            Some(one),
+            Limits::default(),
+        );
+        assert_eq!(r.outcome, Outcome::Exited(11));
     }
 
     #[test]

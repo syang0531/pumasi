@@ -1418,6 +1418,10 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     let mut st = inner.state();
                     st.on_metrics_extra(&node_id, generation, *x);
                 }
+                Ok(Some(FromAgent::GpuSharing(x))) => {
+                    let mut st = inner.state();
+                    st.on_gpu_sharing(&node_id, generation, *x);
+                }
                 Ok(Some(FromAgent::Logs { task, stdout, stderr })) => {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);

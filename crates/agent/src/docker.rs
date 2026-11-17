@@ -203,6 +203,17 @@ impl DockerExecutor {
         pick_digest(image, String::from_utf8_lossy(&out.stdout).trim())
     }
 
+    /// The user an image runs as (`Config.User`; empty: root).
+    async fn image_user(&self, image: &str) -> Option<String> {
+        let out = self
+            .cli(&["image", "inspect", "--format", "{{.Config.User}}", image])
+            .await
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
     /// Removes containers this agent left behind (e.g. after a crash).
     pub async fn cleanup_stale(&self) {
         let filter = format!("label=pumasi.agent={}", self.label);
@@ -505,7 +516,20 @@ impl DockerExecutor {
         );
         let mut args = create_args(&name, &self.label, spec, input, limits, self.cpu_cap);
         let image_at = args.len() - 1 - spec.command.len() - input.args.len();
-        let gpu_args = gpu_args(&io.gpus, &io.gpu_capabilities, self.wsl_libs);
+        let mut gpu_args = gpu_args(&io.gpus, &io.gpu_capabilities, self.wsl_libs);
+        // A part of an NVIDIA GPU runs as an MPS client (1.16), when its
+        // image runs as root: the daemon serves root's containers.
+        let mut mps_note = None;
+        if let Some(part) = &io.mps {
+            let user = self.image_user(&spec.image).await.unwrap_or_default();
+            if crate::gpu::mps::runs_as_root(&user) {
+                gpu_args.extend(part.docker_args());
+            } else {
+                mps_note = Some(format!(
+                    "\n[pumasi] the image runs as user {user:?}, and MPS serves root's containers: this part of the GPU shares its memory on trust\n"
+                ));
+            }
+        }
         args.splice(image_at..image_at, gpu_args);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let created = self.cli(&arg_refs).await?;
@@ -595,6 +619,9 @@ impl DockerExecutor {
         }
         let stdout = out_task.await.unwrap_or_default();
         let mut stderr = err_task.await.unwrap_or_default();
+        if let Some(note) = mps_note {
+            stderr.extend_from_slice(note.as_bytes());
+        }
 
         let outcome = match stopped {
             Some(o) => o,

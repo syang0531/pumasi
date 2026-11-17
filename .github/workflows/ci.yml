@@ -36,7 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-          targets: wasm32-wasip1
+          targets: wasm32-wasip1, wasm32-wasip2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
@@ -80,6 +80,19 @@ jobs:
           cargo run --release -p pumasi-cli -- exec \
             examples/montecarlo/montecarlo.wasm sample 1 100000 < /dev/null > committed.txt
           diff sample.txt committed.txt
+      # 1.16: the same sample as a WASI preview 2 component, freshly built
+      # and as committed, gives the same answer as the core module.
+      - name: The sample as a component (WASI preview 2)
+        shell: bash
+        run: |
+          cargo build --release --target wasm32-wasip2 --manifest-path examples/montecarlo/Cargo.toml
+          cargo run --release -p pumasi-cli -- exec \
+            examples/montecarlo/target/wasm32-wasip2/release/montecarlo.wasm sample 1 100000 \
+            < /dev/null > component.txt
+          diff sample.txt component.txt
+          cargo run --release -p pumasi-cli -- exec \
+            examples/montecarlo/montecarlo-component.wasm sample 1 100000 < /dev/null > committed-component.txt
+          diff sample.txt committed-component.txt
 
   # WebGPU (phase 14): the same wasm modules on each OS's GPU API (Vulkan
   # with lavapipe on Linux, DX12 on Windows, Metal on macOS), checked
@@ -150,6 +163,17 @@ jobs:
           cp out/matmul.json "report/matmul-${{ matrix.os }}.json"
           grep "^adapter: " matmul.txt | head -n1 > "report/adapter-${{ matrix.os }}.txt"
           grep "^blur " blur.txt > "report/blur-${{ matrix.os }}.txt"
+      # 1.16: textures, samplers, render passes and two bind groups,
+      # checked against the CPU's drawing of the same picture.
+      - name: Drawing on the GPU, checked against the CPU
+        if: env.HAS_GPU == 'true'
+        shell: bash
+        run: |
+          bin=target/release/pumasi
+          mods=examples/webgpu/target/wasm32-wasip1/release
+          "$bin" exec --gpu --webgpu-software --memory-mb 512 --out out "$mods/render.wasm" 256 | tee render.txt
+          grep -q ": ok$" render.txt
+          test -s out/render.ppm
       # 1.10: the task's timeout stops a shader that never ends (the GPU
       # work runs in a worker process the agent kills), on each OS's API.
       - name: A shader that never ends stops at the task's timeout

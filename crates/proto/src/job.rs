@@ -1801,8 +1801,15 @@ mod tests {
             .unwrap();
         assert_eq!(wasm.gpu.as_ref().map(|g| g.count), Some(1));
         wasm.validate().unwrap();
+        // Several adapters since 1.16, up to eight.
+        let two = JobFile::parse("module = \"m.wasm\"\ngpus = 2")
+            .unwrap()
+            .resolve(&dir)
+            .unwrap();
+        assert_eq!(two.gpu.as_ref().map(|g| g.count), Some(2));
+        two.validate().unwrap();
         for bad in [
-            "module = \"m.wasm\"\ngpus = 2",
+            "module = \"m.wasm\"\ngpus = 9",
             "module = \"m.wasm\"\ngpus = \"all\"",
             "module = \"m.wasm\"\ngpus = 1\ngpu = { min_vram_gb = 4 }",
             "module = \"m.wasm\"\ngpus = 1\ndeterministic = true",

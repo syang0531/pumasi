@@ -317,21 +317,33 @@ agent's GPUs out of the cluster.
 a Docker task part of one GPU: tasks share it, time-sliced by the driver,
 while their parts add up to at most one, and each pays for its part (the
 receipt says `RTX 3080 (0.5 GPU)`). The task gets `PUMASI_GPU_FRACTION`
-and the settings that keep TensorFlow and JAX to their part of the memory;
-memory is shared on trust, so PyTorch code should call
-`torch.cuda.set_per_process_memory_fraction` as
-`examples/pytorch-cuda/train.py` does. A whole-GPU task waits for a GPU no
+and the settings that keep TensorFlow and JAX to their part of the memory.
+Since 1.16 a part of an NVIDIA GPU (Volta or newer) on a Linux agent
+running as root runs under NVIDIA's MPS server, which the agent starts
+(`nvidia-cuda-mps-control`, from the driver packages): the part gets its
+share of the GPU's memory as a hard limit (an allocation past it fails
+with an out-of-memory error, and the other parts keep running) and its
+share of the GPU's threads. Elsewhere (Windows and WSL have no MPS, an
+agent as another user, `--no-gpu-mps`, an image that runs as another user)
+parts are time-sliced and share memory on trust, so PyTorch code should
+call `torch.cuda.set_per_process_memory_fraction` as
+`examples/pytorch-cuda/train.py` does; `pumasi node` says which a GPU
+does. MPS stops accidents, not a hostile task, which could unset the
+limit inside its own container; MIG slices are the hard boundary. A whole-GPU task waits for a GPU no
 part is on, and `pumasi label NODE gpu.share=off` keeps a node's GPUs
 whole. An NVIDIA GPU in MIG mode is listed as its slices, each a GPU of
-its own with its own memory.
+its own with its own memory, benchmarked and checked like a whole GPU
+since 1.16.
 
 ### WebGPU: any GPU from a wasm job (experimental)
 
 A wasm job that asks for `gpus = 1` gets one GPU through WebGPU: the agent
 opens it with [wgpu](https://wgpu.rs) on whatever the machine has (Vulkan
 on Linux, Metal on macOS, DX12 on Windows, OpenGL as a fallback), and the
-module runs WGSL compute shaders on it through a small host API, the
-`pumasi_webgpu` imports. It is the only way to use GPUs without CUDA:
+module runs WGSL compute shaders on it, and since 1.16 draws with
+textures, samplers and render passes, through a small host API, the
+`pumasi_webgpu` imports. `gpus = 2` (up to 8, 1.16) gives a task several
+adapters of one node. It is the only way to use GPUs without CUDA:
 Intel and AMD integrated GPUs, the GPUs of old Intel Macs, Apple Silicon.
 The sandbox stays the same: no network, no files outside `/input` and
 `/output`, and the job's memory limit and timeout cover the GPU too.
@@ -349,14 +361,15 @@ pumasi run examples/webgpu/matmul.toml --output
 
 ```toml
 module = "matmul.wasm"
-gpus = 1                              # one WebGPU adapter per task
+gpus = 1                              # one WebGPU adapter per task (up to 8, 1.16)
 gpu = { vendor = "intel" }            # optional: nvidia, amd, intel, apple, any
 ```
 
-The two examples in `examples/webgpu` (a tiled matrix multiplication and
-a Gaussian blur of a PPM image) check the GPU's answer against the same
-computation on the CPU and print both speeds; `src/lib.rs` there is a
-small Rust wrapper of the host API to copy. The calls are:
+The examples in `examples/webgpu` (a tiled matrix multiplication, a
+Gaussian blur of a PPM image and, since 1.16, `render`, which draws
+blended triangles over a sampled texture) check the GPU's answer against
+the same computation on the CPU and print both speeds; `src/lib.rs` there
+is a small Rust wrapper of the host API to copy. The calls are:
 
 | Import (`pumasi_webgpu`) | Does |
 | --- | --- |
@@ -367,7 +380,16 @@ small Rust wrapper of the host API to copy. The calls are:
 | `dispatch(shader, bufs, n, x, y, z)` | runs x*y*z workgroups with `n` buffers bound at `@group(0) @binding(0..n)` |
 | `wait()` / `release(handle)` | wait for every dispatch; free a shader or buffer |
 | `error(ptr, cap) -> len` | why the last call failed (WGSL compile errors included) |
+| `adapters() -> n` / `select(index)` | 1.16: how many GPUs the task has; which one new objects go to (objects stay on theirs) |
+| `texture(json, len)` / `sampler(json, len) -> handle` | 1.16: from a `GPUTextureDescriptor` / `GPUSamplerDescriptor` as JSON |
+| `render_shader(src, len, json, len) -> handle` | 1.16: a render pipeline from WGSL and a `GPURenderPipelineDescriptor` as JSON |
+| `write_texture` / `read_texture(tex, mip, x, y, z, w, h, d, ptr, len)` | 1.16: copy tightly packed texels to and from a texture region |
+| `bind_group(shader, group, entries, n) -> handle` | 1.16: `n` (binding, handle) pairs of buffers, textures and samplers for one group |
+| `dispatch_groups(shader, groups, n, x, y, z)` | 1.16: a compute dispatch with bind groups at `@group(0..n)` |
+| `render(json, len)` | 1.16: one render pass (attachments, bind groups, vertex and index buffers, draws) |
 
+Descriptors use WebGPU's own names (`{"size":[256,256],"format":"rgba8unorm"}`,
+`"topology":"triangle-list"`), with handles where WebGPU takes objects.
 Every call returns a negative number when it fails. They map one to one
 onto WebGPU, so modules can move to the component model's `wasi:webgpu`
 (wasi-gfx) once Wasmtime runs it. Agents offer WebGPU only with
@@ -1615,18 +1637,18 @@ A job runs on one of three executors with the same file format and commands:
 
 | | `wasm` (default) | `docker` | `microvm` |
 | --- | --- | --- | --- |
-| Runs | a `wasm32-wasip1` module | any Linux OCI image | any Linux OCI image |
+| Runs | a `wasm32-wasip1` module or a `wasm32-wasip2` component (1.16) | any Linux OCI image | any Linux OCI image |
 | Where | every node | only nodes started with `--allow-docker` (providers also need an invite with `--allow-docker`) | nodes started with `--allow-microvm`, providers included |
 | Isolation | Wasmtime sandbox, safe for untrusted code | container, only for machines and people you trust | a VM with its own kernel per task |
 | Network | never | off by default, `network = true` to allow | off by default, `network = true` reaches public addresses only |
-| GPUs | `gpus = 1`: any GPU through WebGPU (nodes with `--allow-webgpu`, experimental) | `gpus = N`, `gpus = 0.5` (part of one) or `gpu = {...}` (NVIDIA, AMD on Linux) | `gpus = N`, passed through with VFIO (Linux, experimental) |
+| GPUs | `gpus = 1` (up to 8): any GPU through WebGPU (nodes with `--allow-webgpu`, experimental) | `gpus = N`, `gpus = 0.5` (part of one) or `gpu = {...}` (NVIDIA, AMD on Linux) | `gpus = N`, passed through with VFIO (Linux, experimental) |
 | Files | `/input`, `/output` | `/input`, `/output` | `/input`, `/output` |
 
 WASM job:
 
 ```toml
 name = "estimate-pi"                  # optional, defaults to the module name
-module = "montecarlo.wasm"            # a wasm32-wasip1 command module
+module = "montecarlo.wasm"            # a wasm32-wasip1 command module, or a wasm32-wasip2 component
 shards = 16                           # N tasks; {shard} and {shards} are substituted
 args = ["sample", "{shard}", "5000000"]
 env = { MODE = "fast" }               # optional
@@ -1726,7 +1748,11 @@ stdin = "b.png"
 ```
 
 Any language that targets `wasm32-wasip1` works for WASM jobs (Rust, C/C++,
-Zig, Go, TinyGo, ...). A per-task `files = [...]` in a `[[task]]` adds files
+Zig, Go, TinyGo, ...), and since 1.16 so do WASI preview 2 components
+(`wasm32-wasip2`, or anything that exports `wasi:cli/run`), with the same
+sandbox, limits and deterministic mode; `examples/montecarlo/montecarlo-component.wasm`
+is the sample built that way. Components have no GPU yet: the WebGPU
+imports are for core modules until Wasmtime runs `wasi:webgpu`. A per-task `files = [...]` in a `[[task]]` adds files
 only that task sees.
 
 In deterministic mode (the default for WASM jobs) the clocks start at
@@ -1866,12 +1892,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md). 1.12.0 adds SCIM provisioning, audit log pruning behind a signed checkpoint, limits shared by every dashboard, the CLI behind an HTTPS proxy and followers answering the dashboard's reads: [notes](docs/releases/v1.12.0.md). 1.13.0 upgrades the control plane itself after the agents, replicas one at a time, with a rollback when the new binary does not come back healthy, and fixes the three checks that failed now and then in CI: [notes](docs/releases/v1.13.0.md). 1.14.0 keeps microVMs warm for the next task of an image, lets microVM tasks checkpoint, and reads Mac temperatures and GPU power from the SMC and IOReport: [notes](docs/releases/v1.14.0.md). 1.15.0 puts per-node alert thresholds and silences in `cluster.toml`, edits schedules and secrets in the browser, pushes the dashboard's charts, streams microVM output past 1 MiB, reads Intel and AMD GPU temperatures, measures the network to the file store and shows events in Korean: [notes](docs/releases/v1.15.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md). 1.12.0 adds SCIM provisioning, audit log pruning behind a signed checkpoint, limits shared by every dashboard, the CLI behind an HTTPS proxy and followers answering the dashboard's reads: [notes](docs/releases/v1.12.0.md). 1.13.0 upgrades the control plane itself after the agents, replicas one at a time, with a rollback when the new binary does not come back healthy, and fixes the three checks that failed now and then in CI: [notes](docs/releases/v1.13.0.md). 1.14.0 keeps microVMs warm for the next task of an image, lets microVM tasks checkpoint, and reads Mac temperatures and GPU power from the SMC and IOReport: [notes](docs/releases/v1.14.0.md). 1.15.0 puts per-node alert thresholds and silences in `cluster.toml`, edits schedules and secrets in the browser, pushes the dashboard's charts, streams microVM output past 1 MiB, reads Intel and AMD GPU temperatures, measures the network to the file store and shows events in Korean: [notes](docs/releases/v1.15.0.md). 1.16.0 gives parts of NVIDIA GPUs a memory limit with MPS, benchmarks MIG slices, draws over WebGPU with textures and render passes, gives wasm tasks several GPUs and runs WASI preview 2 components: [notes](docs/releases/v1.16.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane, phase 30 (1.14) old Intel Macs and phase 31 (1.15) what monitoring and the dashboard had left. Phases 32 to 36 (1.16 to 1.20) are planned: GPUs, Windows, the file store and microVM networks, high availability and the remote API, and result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane, phase 30 (1.14) old Intel Macs, phase 31 (1.15) what monitoring and the dashboard had left and phase 32 (1.16) GPUs. Phases 33 to 36 (1.17 to 1.20) are planned: Windows, the file store and microVM networks, high availability and the remote API, and result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1905,7 +1931,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 29 | Upgrades that reach the control plane (replicas one at a time, with rollback) and the dashboard service; the Intel Mac, Windows and HA restart failures in CI; soaks on Windows | done (1.13) |
 | 30 | Old Intel Macs: warm microVMs and reused image disks, microVM checkpoints, SMC and Apple Silicon sensors, building for Intel Macs after GitHub's Intel runner | done (1.14) |
 | 31 | Monitoring and the dashboard: per-node thresholds and silences in `cluster.toml`, schedules and secrets in the browser, pushed charts, live microVM output past 1 MiB, Intel and AMD GPU temperatures, the network to the store, Korean events | done (1.15) |
-| 32 | GPUs: memory limits for parts of NVIDIA GPUs (MPS), benchmarked MIG slices, WebGPU textures and render passes, several adapters per task, WASI preview 2 components | planned (1.16) |
+| 32 | GPUs: memory limits for parts of NVIDIA GPUs (MPS), benchmarked MIG slices, WebGPU textures and render passes, several adapters per task, WASI preview 2 components | done (1.16) |
 | 33 | Windows: an HCS backend if real PCs show it is clearly faster, signed binaries (SignPath), a one-step `docker remove` | planned (1.17) |
 | 34 | File store and microVM networks: node cache quotas, private images through the store, UDP, IPv6, per-job allow lists, bandwidth caps, billed egress | planned (1.18) |
 | 35 | High availability and the remote API: the API and CLI reading from followers, limits replicated across failovers, replicas that move, pushed `?wait=`, per-job CPU, memory and CU caps, ACME | planned (1.19) |
@@ -1915,9 +1941,11 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 Known gaps: agents older than the release that added control plane
 replicas follow only the replica they joined. WebGPU is experimental: it is
-checked on software rasterizers in CI and on real GPUs by hand, offers
-compute shaders only (no textures or samplers, one bind group). Parts of
-GPUs share memory on trust (only MIG slices enforce it). Accounts
+checked on software rasterizers in CI and on real GPUs by hand, and
+components cannot use it (core modules only, until Wasmtime runs
+`wasi:webgpu`). Parts of GPUs share memory on trust except under MPS
+(Linux, NVIDIA Volta or newer, an agent as root), which limits programs
+that do not unset it; only MIG slices are a hard boundary. Accounts
 exist only inside one cluster (SSO signs people in and SCIM takes access
 away, but SCIM never creates accounts and there is no SAML), and CU are not connected to real payments. GPUs are checked on real hardware by hand, not in CI (hosted
 runners have none); VFIO passthrough is experimental and NVIDIA-only

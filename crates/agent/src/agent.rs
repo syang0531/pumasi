@@ -1066,13 +1066,22 @@ impl Agent {
                     tick.tick().await;
                     let n = running.lock().unwrap().len() as u32;
                     let sampler = sampler.clone();
-                    let Ok(m) =
+                    let Ok((m, extra)) =
                         tokio::task::spawn_blocking(move || sampler.lock().unwrap().sample(n))
                             .await
                     else {
                         continue;
                     };
                     if out_tx.send(FromAgent::Metrics(Box::new(m))).is_err() {
+                        break;
+                    }
+                    // What goes beyond the metrics, for a 1.15 control
+                    // plane (right after, so it joins this sample).
+                    if cp_minor >= pumasi_proto::METRICS_EXTRA_MINOR
+                        && out_tx
+                            .send(FromAgent::MetricsExtra(Box::new(extra)))
+                            .is_err()
+                    {
                         break;
                     }
                 }

@@ -50,6 +50,11 @@ job = "python-wordcount/job.toml"
 account = "alice"
 overlap = false                    # skip a run while the last one is going
 
+# A schedule without `job` (1.15) keeps the job it has: change its cron,
+# time zone or overlap without the job file (as the dashboard's editor does).
+# [schedules.weekly-report]
+# cron = "0 9 * * 1"
+
 # Alert rules. The section is the whole policy: a rule left out takes its
 # default (shown here), "off" or false turns it off.
 [alerts]
@@ -62,6 +67,28 @@ temperature = 90                   # °C, CPU or GPU
 perf_drop = "25%"                  # a new benchmark this much slower
 smart = true                       # a drive failing SMART or worn out
 check_mismatch = true              # a check run disagreeing with a provider
+# 1.15: how notices go, and thresholds for some nodes. Any of these keys
+# makes them the whole tuning (left out: once, resolved notices, no
+# overrides); with none, `apply` leaves the tuning alone.
+repeat = "4h"                      # send a firing alert again this often ("off": once)
+resolved = true                    # and a notice when it stops
+
+[alerts.nodes.laptop]              # by node name
+node_offline = "off"               # a laptop comes and goes
+temperature = 95
+
+[alerts.labels."os=windows"]       # by node selector
+disk = "95%"
+
+# Silences kept in the file (1.15): until is a date-time (in this
+# machine's time zone without an offset) or a date, at most 90 days out.
+# An ended one is skipped; `apply --prune` removes the ones not listed.
+#
+# [silences.desktop-move]
+# rule = "node_offline"            # left out: every rule
+# nodes = "name=desktop"           # left out: everything
+# until = 2026-12-01T09:00:00
+# comment = "moving the desktop"
 
 # Where alerts go: a Slack or Mattermost incoming webhook, a Discord
 # webhook, or any URL that takes JSON (format: slack, discord, json;

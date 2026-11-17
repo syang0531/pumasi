@@ -673,9 +673,14 @@ impl State {
             "task.resumed",
             Some(node),
             Some(job),
-            format!(
-                "task {job}/{index} resumes on {name} from its checkpoint ({})",
-                format_size(size)
+            pumasi_proto::text::Text::new(
+                "task.resumed",
+                [
+                    job.to_string(),
+                    index.to_string(),
+                    name.clone(),
+                    format_size(size),
+                ],
             ),
         );
     }
@@ -711,12 +716,15 @@ impl State {
             "task.checkpoint",
             Some(node),
             Some(t.job),
-            format!(
-                "task {}/{} saved a checkpoint on {name}: {} files, {}",
-                t.job,
-                t.index,
-                c.files,
-                format_size(c.size)
+            pumasi_proto::text::Text::new(
+                "task.checkpoint",
+                [
+                    t.job.to_string(),
+                    t.index.to_string(),
+                    name.clone(),
+                    c.files.to_string(),
+                    format_size(c.size),
+                ],
             ),
         );
     }
@@ -762,9 +770,14 @@ impl State {
                     "task.checkpoint_failed",
                     Some(node_id),
                     Some(task.job),
-                    format!(
-                        "task {}/{} on {name} stopped without a new checkpoint: {e}",
-                        task.job, task.index
+                    pumasi_proto::text::Text::new(
+                        "task.checkpoint_failed",
+                        [
+                            task.job.to_string(),
+                            task.index.to_string(),
+                            name.clone(),
+                            e.to_string(),
+                        ],
                     ),
                 );
             }
@@ -817,9 +830,9 @@ impl State {
                 "task.checkpoint_failed",
                 Some(&id),
                 Some(t.job),
-                format!(
-                    "task {}/{} on {name} did not stop and save its checkpoint in time; cancelled",
-                    t.job, t.index
+                pumasi_proto::text::Text::new(
+                    "task.checkpoint_timeout",
+                    [t.job.to_string(), t.index.to_string(), name.clone()],
                 ),
             );
             self.requeue_run(t, "did not stop in time");

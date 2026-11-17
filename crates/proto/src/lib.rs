@@ -18,6 +18,7 @@ pub mod msg;
 pub mod net;
 pub mod perf;
 pub mod power;
+pub mod probe;
 pub mod receipt;
 pub mod registry;
 pub mod release;
@@ -27,6 +28,7 @@ pub mod sched;
 pub mod scim;
 pub mod sso;
 pub mod store;
+pub mod text;
 pub mod ticket;
 pub mod ui;
 pub mod vmdisk;
@@ -80,7 +82,7 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 7;
+pub const PROTOCOL_MINOR: u32 = 8;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
@@ -116,6 +118,10 @@ pub const GPU_MINOR: u32 = 6;
 /// `/checkpoint` crosses the VM's disks. Older agents get no checkpointing
 /// run as a microVM (an image job with checkpoints runs on Docker there).
 pub const MICROVM_CHECKPOINT_MINOR: u32 = 7;
+/// The first minor with the 1.15 monitoring: the agent sends what it
+/// measures beyond its metrics ([`msg::FromAgent::MetricsExtra`]: the CPU
+/// package's power) after each sample.
+pub const METRICS_EXTRA_MINOR: u32 = 8;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

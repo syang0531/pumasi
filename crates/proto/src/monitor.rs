@@ -850,6 +850,121 @@ pub fn human_bps(bps: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// 1.15: CPU power, the network to the file store, messages by key, alert
+// settings in cluster.toml, charts pushed by the control plane
+// ---------------------------------------------------------------------------
+
+/// What an agent measures beyond [`NodeMetrics`] (1.15, minor 8), sent
+/// right after each sample to a control plane that knows it. Kept apart so
+/// [`NodeMetrics`] keeps its layout for older peers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeMetricsExtra {
+    /// The CPU package's power draw, in watts: the SMC or IOReport on
+    /// Macs, RAPL on Linux (Intel, and AMD from Zen on).
+    pub cpu_power_w: Option<f32>,
+}
+
+/// The `to` of a link an agent measured to the control plane's file store
+/// (1.15) in [`NetView::links`]. Node names cannot start with `@`.
+pub const STORE_LINK: &str = "@store";
+
+/// An event with its message by key (1.15), for the Korean dashboard.
+/// `text` is `None` for events stored by an older control plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyedEvent {
+    pub event: EventView,
+    pub text: Option<crate::text::Text>,
+}
+
+/// A firing alert's message by key (1.15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertText {
+    pub rule: String,
+    pub subject: String,
+    pub text: crate::text::Text,
+}
+
+/// The answer to [`crate::msg::AdminOp::MetricsWait`] (1.15): the metrics
+/// as [`crate::msg::AdminOp::Metrics`] gives them, and what each node
+/// measures beyond them, by node id.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetricsPush {
+    pub view: MetricsView,
+    pub extra: Vec<(String, NodeMetricsExtra)>,
+}
+
+impl MetricsPush {
+    /// What node `id` measures beyond [`NodeMetrics`].
+    pub fn extra_of(&self, id: &str) -> Option<&NodeMetricsExtra> {
+        self.extra.iter().find(|(n, _)| n == id).map(|(_, e)| e)
+    }
+}
+
+/// Who a silence from a `cluster.toml` is by ([`Silence::by`]).
+pub const FILE_SILENCE_BY: &str = "cluster.toml";
+
+/// A silence a `cluster.toml` keeps (1.15): `[silences.NAME]`. Its id
+/// comes from its name ([`FileSilence::id`]), so applying the file again
+/// finds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSilence {
+    pub name: String,
+    pub rule: Option<String>,
+    pub nodes: Option<Selector>,
+    pub until_unix: u64,
+    pub comment: String,
+}
+
+impl FileSilence {
+    /// Eight hex digits from the name.
+    pub fn id(&self) -> String {
+        file_silence_id(&self.name)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        crate::manage::validate_schedule_name(&self.name)
+            .map_err(|e| anyhow::anyhow!("{e:#}").context("silence name"))?;
+        SilenceSpec {
+            rule: self.rule.clone(),
+            nodes: self.nodes.clone(),
+            secs: 60,
+            comment: self.comment.clone(),
+        }
+        .validate()
+    }
+
+    /// Whether `s` is this silence, as stored.
+    pub fn same_as(&self, s: &Silence) -> bool {
+        s.id == self.id()
+            && s.rule == self.rule
+            && s.nodes == self.nodes
+            && s.until_unix == self.until_unix
+            && s.comment == self.comment
+            && s.by == FILE_SILENCE_BY
+    }
+}
+
+/// The id of the `cluster.toml` silence `name`.
+pub fn file_silence_id(name: &str) -> String {
+    use sha2::Digest;
+    let h = sha2::Sha256::digest(format!("pumasi/silence/{name}").as_bytes());
+    h[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+impl Silence {
+    /// What it covers, by key (1.15).
+    pub fn text(&self) -> crate::text::Text {
+        use crate::text::Text;
+        match (&self.rule, &self.nodes) {
+            (None, None) => Text::new("silence.all", [""; 0]),
+            (None, Some(s)) => Text::new("silence.all_on", [s.to_string()]),
+            (Some(r), None) => Text::new("silence.rule", [r]),
+            (Some(r), Some(s)) => Text::new("silence.rule_on", [r.clone(), s.to_string()]),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Prometheus text format
 // ---------------------------------------------------------------------------
 

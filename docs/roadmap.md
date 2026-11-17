@@ -43,7 +43,7 @@ machines.
 | 28 | 1.12 | Operations: limits, audit log pruning, SCIM, the CLI behind an HTTPS proxy | done |
 | 29 | 1.13 | Upgrades that reach the control plane, and the flaky checks | done |
 | 30 | 1.14 | Old Intel Macs: faster microVMs, microVM checkpoints, Mac sensors | done |
-| 31 | 1.15 | Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI | planned |
+| 31 | 1.15 | Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI | done |
 | 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | planned |
 | 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | planned |
 | 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | planned |
@@ -485,6 +485,38 @@ task resumes after the iMac sleeps, and the dashboard shows its CPU
 temperature.
 
 ## 31. Monitoring and the dashboard: what 1.6 and 1.7 left in the CLI (1.15)
+
+Done in 1.15.0 ([release notes](releases/v1.15.0.md),
+[details](architecture.md#phase-31-monitoring-and-the-dashboard-115)).
+What differs from the plan: postcard keeps existing messages as they are,
+so the new data travels in new calls rather than new fields: the alert
+tuning and silences of a `cluster.toml` go in `ApplyMore`, each event's
+message key in `EventsKeyed`, the firing alerts' keys in `AlertTexts`, and
+the extra sensor readings in a `MetricsExtra` message beside each sample
+(which also carries the Mac's and RAPL's CPU package power to the
+dashboard, left over from phase 30). Pushed charts are a long poll
+(`MetricsWait`) that the control plane answers when the node's next sample
+arrives, not a new stream; the dashboard's server-sent events follow it,
+and fall back to the 2-second poll against an older control plane. A
+silence in the file gets its id from its name, so `apply` finds it again,
+and only `apply --prune` removes one the file no longer lists (the
+dashboard never prunes); the editor shows the thresholds and schedules
+(without their jobs, which `apply` then keeps) but not the silences, whose
+names the control plane does not keep. The guest had no ring buffer: it
+stopped printing after 1 MiB, and now a separate thread reads the output
+files behind the task and streams up to the 4 MiB the result keeps. The
+serial console of Firecracker and QEMU turned out too slow for that (a
+few KiB a second, with the vCPU held up while it prints), so on those
+backends the output goes to a region at the end of the output disk that
+the agent reads from the disk file; vz keeps its virtio console. Windows reports a GPU's temperature
+(from `D3DKMTQueryAdapterInfo`, WDDM 2.4 drivers) but not its power, which
+the driver gives only as a share of a limit it does not name. Intel's
+integrated GPUs have no sensors of their own and report the CPU package's
+temperature and RAPL's `uncore` power. RAPL counters are readable by root
+only on most distributions, so an agent running as another user reports no
+CPU power on Linux. Per-node thresholds name nodes by the `name` label,
+which cannot hold spaces. The by-hand checks (a phone, a Linux machine with
+an Intel or AMD GPU) are in the phase's QA list.
 
 Why: phases 22 and 23 left several things CLI-only or partial, and the
 Korean dashboard still shows events in English.

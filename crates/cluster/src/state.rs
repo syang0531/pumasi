@@ -929,7 +929,11 @@ impl State {
             info.name, member.role, member.account
         );
         self.members.insert(id.to_string(), member);
-        self.event(EventLevel::Info, "node.joined", Some(id), None, msg.clone());
+        let text = pumasi_proto::text::Text::new(
+            "node.joined",
+            [info.name.clone(), out.0.to_string(), out.1.clone()],
+        );
+        self.event(EventLevel::Info, "node.joined", Some(id), None, text);
         let who = crate::audit::Actor {
             name: format!("node:{}", info.name),
             role: "node".into(),
@@ -951,7 +955,7 @@ impl State {
             "node.removed",
             Some(id),
             None,
-            format!("node {name} removed"),
+            pumasi_proto::text::Text::new("node.removed", [&name]),
         );
         self.members.remove(id);
         self.devices.remove(id);
@@ -1067,7 +1071,7 @@ impl State {
             "node.online",
             Some(id),
             None,
-            format!("node {name} online"),
+            pumasi_proto::text::Text::new("node.online", [&name]),
         );
         self.schedule();
         generation
@@ -1098,14 +1102,14 @@ impl State {
                 "node.paused",
                 Some(id),
                 None,
-                format!("node {name} paused: {reason}"),
+                pumasi_proto::text::Text::new("node.paused", [name.clone(), reason]),
             ),
             None => self.event(
                 EventLevel::Info,
                 "node.resumed",
                 Some(id),
                 None,
-                format!("node {name} takes tasks again"),
+                pumasi_proto::text::Text::new("node.resumed", [&name]),
             ),
         }
         // `--on-pause requeue`: its runs stop and go elsewhere.
@@ -1143,8 +1147,8 @@ impl State {
         }
         let name = self.node_name(id);
         let msg = match lost.len() {
-            0 => format!("node {name} offline"),
-            n => format!("node {name} offline; {n} runs moved back to the queue"),
+            0 => pumasi_proto::text::Text::new("node.offline", [&name]),
+            n => pumasi_proto::text::Text::new("node.offline.moved", [name.clone(), n.to_string()]),
         };
         // A node that said it sleeps is asleep, not lost.
         if !self.asleep(id) {
@@ -1408,17 +1412,21 @@ impl State {
             self.modules.insert(h, Arc::new(b));
         }
         info!(job = %id, name = %meta.name, tasks = tasks.len(), account = %meta.account, priority = meta.sched.priority, "job submitted");
-        let msg = format!(
-            "job {id} ({}) submitted by {}: {} tasks, account {}{}",
-            meta.name,
-            meta.origin.submitted_by,
-            tasks.len(),
-            meta.account,
-            meta.docker
-                .as_ref()
-                .map(|d| format!(", image {}", d.image))
-                .unwrap_or_default()
-        );
+        let mut args = vec![
+            id.to_string(),
+            meta.name.clone(),
+            meta.origin.submitted_by.clone(),
+            tasks.len().to_string(),
+            meta.account.clone(),
+        ];
+        let key = match &meta.docker {
+            Some(d) => {
+                args.push(d.image.clone());
+                "job.submitted.image"
+            }
+            None => "job.submitted",
+        };
+        let msg = pumasi_proto::text::Text::new(key, args);
         self.jobs.insert(id, Job { meta, tasks });
         self.monitor.active_jobs.insert(id);
         self.event(EventLevel::Info, "job.submitted", None, Some(id), msg);
@@ -1846,7 +1854,10 @@ impl State {
                     "node.suspended",
                     Some(node_id),
                     None,
-                    format!("node {name} suspended after {max} failed checks"),
+                    pumasi_proto::text::Text::new(
+                        "node.suspended",
+                        [name.clone(), max.to_string()],
+                    ),
                 );
             }
         }
@@ -1926,7 +1937,10 @@ impl State {
                 "task.failed",
                 None,
                 Some(r.job),
-                format!("task {}/{} failed: {why}", r.job, r.index),
+                pumasi_proto::text::Text::new(
+                    "task.failed",
+                    [r.job.to_string(), r.index.to_string(), why.to_string()],
+                ),
             );
         }
     }

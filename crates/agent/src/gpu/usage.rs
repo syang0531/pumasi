@@ -9,7 +9,10 @@
 //! - macOS: the `PerformanceStatistics` of each `IOAccelerator` in the I/O
 //!   registry (`Device Utilization %`, memory in use).
 //! - Windows: the `GPU Engine` and `GPU Adapter Memory` performance
-//!   counters, by adapter LUID, which DXGI maps to the listed GPUs.
+//!   counters, by adapter LUID, which DXGI maps to the listed GPUs; and
+//!   since 1.15 the temperature the display driver reports to the kernel
+//!   (`D3DKMTQueryAdapterInfo` with `KMTQAITYPE_ADAPTERPERFDATA`, what Task
+//!   Manager shows), where the driver gives one (WDDM 2.4 on).
 
 use pumasi_proto::{gpu::GpuInfo, monitor::GpuMetrics};
 
@@ -673,11 +676,154 @@ pub mod windows {
                             mem(&shared, luid)
                         } >> 20,
                         mem_total_mib: g.vram_mib,
-                        temp_c: None,
+                        temp_c: kmt::temperature(luid),
                         power_w: None,
                     })
                 })
                 .collect()
+        }
+    }
+
+    /// The temperature the display driver reports (1.15), by the kernel's
+    /// adapter interface in gdi32: loaded at run time, so a Windows without
+    /// it (or a driver without the data) just reports none.
+    mod kmt {
+        use std::ffi::c_void;
+
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+        };
+
+        #[repr(C)]
+        struct Luid {
+            low: u32,
+            high: i32,
+        }
+
+        /// `D3DKMT_OPENADAPTERFROMLUID`.
+        #[repr(C)]
+        struct OpenAdapter {
+            luid: Luid,
+            adapter: u32,
+        }
+
+        /// `D3DKMT_QUERYADAPTERINFO`.
+        #[repr(C)]
+        struct QueryAdapterInfo {
+            adapter: u32,
+            kind: u32,
+            data: *mut c_void,
+            size: u32,
+        }
+
+        /// `D3DKMT_CLOSEADAPTER`.
+        #[repr(C)]
+        struct CloseAdapter {
+            adapter: u32,
+        }
+
+        /// `D3DKMT_ADAPTER_PERFDATA` (d3dkmthk.h, WDDM 2.4).
+        #[repr(C)]
+        #[derive(Default)]
+        struct PerfData {
+            physical_adapter_index: u32,
+            memory_frequency: u64,
+            max_memory_frequency: u64,
+            max_memory_frequency_oc: u64,
+            memory_bandwidth: u64,
+            pcie_bandwidth: u64,
+            fan_rpm: u32,
+            /// Tenths of a percent of the most it may draw.
+            power: u32,
+            /// Tenths of a degree Celsius.
+            temperature: u32,
+            power_state_override: u8,
+        }
+
+        /// `KMTQAITYPE_ADAPTERPERFDATA`.
+        const ADAPTER_PERF_DATA: u32 = 62;
+
+        type OpenFn = unsafe extern "system" fn(*mut OpenAdapter) -> i32;
+        type QueryFn = unsafe extern "system" fn(*const QueryAdapterInfo) -> i32;
+        type CloseFn = unsafe extern "system" fn(*const CloseAdapter) -> i32;
+
+        struct Api {
+            open: OpenFn,
+            query: QueryFn,
+            close: CloseFn,
+        }
+
+        fn api() -> Option<&'static Api> {
+            static API: std::sync::OnceLock<Option<Api>> = std::sync::OnceLock::new();
+            API.get_or_init(|| {
+                let name: Vec<u16> = "gdi32.dll\0".encode_utf16().collect();
+                // SAFETY: a system DLL from System32, and functions whose
+                // signatures are those of d3dkmthk.h.
+                unsafe {
+                    let module = LoadLibraryExW(
+                        name.as_ptr(),
+                        std::ptr::null_mut(),
+                        LOAD_LIBRARY_SEARCH_SYSTEM32,
+                    );
+                    if module.is_null() {
+                        return None;
+                    }
+                    let open =
+                        GetProcAddress(module, c"D3DKMTOpenAdapterFromLuid".as_ptr().cast())?;
+                    let query = GetProcAddress(module, c"D3DKMTQueryAdapterInfo".as_ptr().cast())?;
+                    let close = GetProcAddress(module, c"D3DKMTCloseAdapter".as_ptr().cast())?;
+                    type Proc = unsafe extern "system" fn() -> isize;
+                    Some(Api {
+                        open: std::mem::transmute::<Proc, OpenFn>(open),
+                        query: std::mem::transmute::<Proc, QueryFn>(query),
+                        close: std::mem::transmute::<Proc, CloseFn>(close),
+                    })
+                }
+            })
+            .as_ref()
+        }
+
+        /// `luid_0xHIGH_0xLOW` as DXGI names it here.
+        pub(super) fn parse_luid(s: &str) -> Option<(i32, u32)> {
+            let rest = s.strip_prefix("luid_0x")?;
+            let (high, low) = rest.split_once("_0x")?;
+            Some((
+                u32::from_str_radix(high, 16).ok()? as i32,
+                u32::from_str_radix(low, 16).ok()?,
+            ))
+        }
+
+        /// The adapter's temperature, when its driver reports one.
+        pub(super) fn temperature(luid: &str) -> Option<f32> {
+            let api = api()?;
+            let (high, low) = parse_luid(luid)?;
+            let mut open = OpenAdapter {
+                luid: Luid { low, high },
+                adapter: 0,
+            };
+            // SAFETY: structures laid out as d3dkmthk.h has them, a buffer
+            // of the size given, and the adapter closed once.
+            unsafe {
+                if (api.open)(&mut open) < 0 {
+                    return None;
+                }
+                let mut perf = PerfData::default();
+                let q = QueryAdapterInfo {
+                    adapter: open.adapter,
+                    kind: ADAPTER_PERF_DATA,
+                    data: &mut perf as *mut PerfData as *mut c_void,
+                    size: std::mem::size_of::<PerfData>() as u32,
+                };
+                let status = (api.query)(&q);
+                (api.close)(&CloseAdapter {
+                    adapter: open.adapter,
+                });
+                if status < 0 {
+                    return None;
+                }
+                let t = perf.temperature as f32 / 10.0;
+                (t > 1.0 && t < 150.0).then_some(t)
+            }
         }
     }
 

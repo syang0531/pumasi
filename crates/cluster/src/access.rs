@@ -125,6 +125,9 @@ fn op_name(op: &AdminOp) -> &'static str {
         FollowerRead(inner) => op_name(inner),
         ControlPlanes => "read the control plane replicas",
         ReleaseChunk { .. } => "download release binaries",
+        ApplyMore { .. } => "apply cluster files",
+        MetricsWait { .. } => "read metrics",
+        EventsKeyed { .. } | AlertTexts => "read events",
     }
 }
 
@@ -179,6 +182,9 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | Resources
             | Placement { .. }
             | ControlPlanes
+            | MetricsWait { .. }
+            | EventsKeyed { .. }
+            | AlertTexts
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -285,7 +291,14 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | TaskExecutors { .. }
         | Placement { .. }
         | Logs { .. }) => op,
-        op @ (Metrics { .. } | Events { .. } | Alerts | AlertTuning | Net) => op,
+        op @ (Metrics { .. }
+        | Events { .. }
+        | Alerts
+        | AlertTuning
+        | Net
+        | MetricsWait { .. }
+        | EventsKeyed { .. }
+        | AlertTexts) => op,
         op @ (Status
         | NodePower
         | Accounts
@@ -443,6 +456,10 @@ pub fn scope(caller: &Caller, resp: AdminResponse) -> AdminResponse {
         AdminResponse::Events(mut v) => {
             v.retain(|e| e.account.as_ref().is_none_or(|a| a == account));
             AdminResponse::Events(v)
+        }
+        AdminResponse::EventsKeyed(mut v) => {
+            v.retain(|e| e.event.account.as_ref().is_none_or(|a| a == account));
+            AdminResponse::EventsKeyed(v)
         }
         other => other,
     }

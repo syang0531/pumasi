@@ -609,6 +609,49 @@ async fn schedules_run_in_their_time_zone() {
     };
     assert_eq!(list[0].cron, "0 9 * * * (Asia/Seoul)");
     assert_eq!(list[0].next_unix, Some(next));
+
+    // 1.15: a cluster.toml schedule without a job keeps the one it has
+    // (the dashboard's editor), and the diff says what changes.
+    let apply = |text: &str, dry_run: bool| {
+        let mut spec = pumasi_proto::manage::ClusterFile::parse(text)
+            .unwrap()
+            .resolve(std::path::Path::new("."), 0)
+            .unwrap();
+        spec.dry_run = dry_run;
+        let c = &client;
+        async move {
+            let AdminResponse::Applied(changes) = c.call(AdminOp::apply(spec)).await.unwrap()
+            else {
+                panic!()
+            };
+            changes
+        }
+    };
+    let same = "[schedules.morning]\ncron = \"0 9 * * *\"\ntz = \"Asia/Seoul\"\n";
+    assert!(apply(same, false).await.is_empty(), "the same: nothing");
+    let moved = "[schedules.morning]\ncron = \"30 8 * * *\"\ntz = \"UTC\"\noverlap = true\n";
+    assert_eq!(
+        apply(moved, true).await,
+        [
+            "schedule morning: updated (cron 0 9 * * * -> 30 8 * * *, time zone Asia/Seoul -> UTC, overlap false -> true)"
+        ]
+    );
+    apply(moved, false).await;
+    let AdminResponse::Schedules(list) = client.call(AdminOp::Schedules).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(list[0].cron, "30 8 * * * (UTC)");
+    assert!(list[0].overlap);
+    assert_eq!(
+        (list[0].job_name.as_str(), list[0].tasks),
+        (spec.job.name.as_str(), 1),
+        "the job stays"
+    );
+    let none = "[schedules.evening]\ncron = \"0 18 * * *\"\n";
+    assert_eq!(
+        apply(none, false).await,
+        ["schedule evening: skipped (no such schedule; give it a job)"]
+    );
     client.close().await;
     cluster.shutdown().await.unwrap();
 }

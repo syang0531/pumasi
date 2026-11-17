@@ -422,12 +422,17 @@ const GUEST_DONE: &[&str] = &[
 /// How long a VMM may keep running after the guest said it was done.
 const AFTER_GUEST_DONE: Duration = Duration::from_secs(3);
 
-/// Follows the guest console for the task's output (1.6): the guest prints
-/// it as [`pumasi_guest::live_frame`] lines, which go to the task's live
-/// output as long as each continues the last. After a lost or damaged line
-/// that stream stops here; the result has all of it.
+/// Follows the task's output while the VM runs. Firecracker and QEMU
+/// guests write it to the live region at the end of the output disk
+/// (1.15, [`pumasi_guest::live_head`]); vz guests, and guests from before
+/// 1.15, print it on the console as [`pumasi_guest::live_frame`] lines,
+/// which go to the task's live output as long as each continues the last.
+/// After a lost or damaged line that stream stops here; the result has
+/// all of it.
 struct LiveTail {
     path: PathBuf,
+    /// The output disk, when the guest was asked for a live region.
+    disk: Option<PathBuf>,
     read: u64,
     partial: Vec<u8>,
     next: [u64; 2],
@@ -439,6 +444,7 @@ impl LiveTail {
     fn new(path: PathBuf, live: LiveOutput) -> Self {
         Self {
             path,
+            disk: None,
             read: 0,
             partial: Vec::new(),
             next: [0; 2],
@@ -447,8 +453,16 @@ impl LiveTail {
         }
     }
 
-    /// Reads what the console got since the last call.
+    fn with_disk(mut self, disk: Option<PathBuf>) -> Self {
+        self.disk = disk;
+        self
+    }
+
+    /// Reads what the console and the output disk got since the last call.
     fn poll(&mut self) {
+        if let Some(disk) = self.disk.clone() {
+            self.poll_disk(&disk);
+        }
         use std::io::{Seek, SeekFrom};
         let Ok(mut f) = std::fs::File::open(&self.path) else {
             return;
@@ -462,6 +476,39 @@ impl LiveTail {
         }
         self.read += new.len() as u64;
         self.feed(&new);
+    }
+
+    /// The new bytes the live region's header counts.
+    fn poll_disk(&mut self, disk: &Path) {
+        let Ok(f) = std::fs::File::open(disk) else {
+            return;
+        };
+        let Some(region) = f
+            .metadata()
+            .ok()
+            .and_then(|m| pumasi_guest::live_region_at(m.len()))
+        else {
+            return;
+        };
+        let mut head = [0u8; 64];
+        if read_exact_at(&f, &mut head, region).is_err() {
+            return;
+        }
+        let Some(lens) = pumasi_guest::parse_live_head(&head) else {
+            return;
+        };
+        for (i, len) in lens.into_iter().enumerate() {
+            if len <= self.next[i] {
+                continue;
+            }
+            let mut data = vec![0u8; (len - self.next[i]) as usize];
+            let at = pumasi_guest::live_data_at(region, i) + self.next[i];
+            if read_exact_at(&f, &mut data, at).is_err() {
+                continue;
+            }
+            self.next[i] = len;
+            self.live.push(i == 1, &data);
+        }
     }
 
     fn feed(&mut self, new: &[u8]) {
@@ -495,6 +542,25 @@ impl LiveTail {
         if self.partial.len() > 64 * 1024 {
             self.partial.clear();
         }
+    }
+}
+
+/// Reads `buf.len()` bytes at `at`.
+fn read_exact_at(f: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(f, buf, at)
+    }
+    #[cfg(windows)]
+    {
+        let mut n = 0;
+        while n < buf.len() {
+            match std::os::windows::fs::FileExt::seek_read(f, &mut buf[n..], at + n as u64)? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                k => n += k,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -909,6 +975,10 @@ impl MicrovmExecutor {
         let image = image?;
         let mut run_spec = run_spec(&image.config, spec, input);
         run_spec.live = io.live.is_some();
+        // A serial console is too slow for more than a little output; vz
+        // guests have a virtio console, and their disk images may be
+        // cached away from the file.
+        run_spec.live_disk = run_spec.live && self.vmm.backend != Backend::Vz;
         if io.keeps_output() {
             run_spec.output_limit = MAX_STORE_OUTPUT_BYTES;
             run_spec.output_files = 1_000_000;
@@ -1017,6 +1087,7 @@ impl MicrovmExecutor {
                 Some(deadline),
                 cancel,
                 io.live.as_ref(),
+                run_spec.live_disk.then_some(output_disk.as_path()),
                 stop,
             )
             .await;
@@ -1616,7 +1687,7 @@ impl MicrovmExecutor {
         live: Option<&LiveOutput>,
     ) -> Result<VmEnd> {
         let running = spawn_vm(vmm, vm, dir)?;
-        self.wait_vm(vmm, running, dir, deadline, cancel, live, None)
+        self.wait_vm(vmm, running, dir, deadline, cancel, live, None, None)
             .await
     }
 
@@ -1633,6 +1704,7 @@ impl MicrovmExecutor {
         deadline: Option<Instant>,
         cancel: &AtomicBool,
         live: Option<&LiveOutput>,
+        live_disk: Option<&Path>,
         stop: Option<StopCtl<'_>>,
     ) -> Result<VmEnd> {
         let RunningVm { mut child, _job } = running;
@@ -1646,7 +1718,10 @@ impl MicrovmExecutor {
         let mut done_since: Option<Instant> = None;
         let mut ticks = 0u32;
         let mut serial_seen = 0u64;
-        let mut tail = live.map(|l| LiveTail::new(console_path(vmm, dir), l.clone()));
+        let mut tail = live.map(|l| {
+            LiveTail::new(console_path(vmm, dir), l.clone())
+                .with_disk(live_disk.map(Path::to_path_buf))
+        });
         // A checkpointing run told to stop: when its grace period ends, and
         // when the host gives up on it.
         let mut grace_end: Option<Instant> = None;
@@ -2028,6 +2103,8 @@ fn pool_output_bytes() -> u64 {
         output_limit: MAX_STORE_OUTPUT_BYTES,
         output_files: 1_000_000,
         checkpoint_limit: MAX_STORE_OUTPUT_BYTES,
+        live: true,
+        live_disk: true,
         ..Default::default()
     }
     .output_disk_bytes()
@@ -2355,6 +2432,40 @@ mod tests {
         t.feed(live_frame(1, 6, b"x").as_bytes());
         t.feed(live_frame(2, 5, b"more").as_bytes());
         assert_eq!(live.take(), (vec![], b"more".to_vec()));
+    }
+
+    #[test]
+    fn live_output_follows_the_output_disk() {
+        use pumasi_guest::{live_data_at, live_head, live_region_at};
+        let dir = TempDir::new("microvm-test").unwrap();
+        let path = dir.path().join("out.img");
+        let spec = RunSpec {
+            live: true,
+            live_disk: true,
+            ..Default::default()
+        };
+        make_output_disk(&path, spec.output_disk_bytes()).unwrap();
+        let region = live_region_at(std::fs::metadata(&path).unwrap().len()).unwrap();
+        let live = LiveOutput::default();
+        let mut t = LiveTail::new(dir.path().join("no-console"), live.clone())
+            .with_disk(Some(path.clone()));
+        // No header yet: nothing.
+        t.poll();
+        assert_eq!(live.take(), (vec![], vec![]));
+        let out: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        write_at(&path, live_data_at(region, 0), &out).unwrap();
+        write_at(&path, live_data_at(region, 1), b"err").unwrap();
+        // Data the header does not count yet is not read.
+        write_at(&path, region, &live_head(3000, 2)).unwrap();
+        t.poll();
+        assert_eq!(live.take(), (out[..3000].to_vec(), b"er".to_vec()));
+        write_at(&path, region, &live_head(5000, 3)).unwrap();
+        t.poll();
+        assert_eq!(live.take(), (out[3000..].to_vec(), b"r".to_vec()));
+        t.poll();
+        assert_eq!(live.take(), (vec![], vec![]));
+        // The result at the start of the disk still reads.
+        assert!(read_output_disk(&path, None).unwrap().is_none());
     }
 
     #[test]

@@ -81,6 +81,10 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
         .route("/schedules/{name}/{action}", post(schedules::action))
         .route("/settings", get(settings::page))
         .route("/settings/apply", post(settings::apply))
+        .route(
+            "/settings/secrets",
+            get(settings::secrets_fragment).post(settings::secret),
+        )
         .route("/settings/sessions/{id}/revoke", post(settings::revoke))
         .route("/events", get(events::page))
         .route("/events/alerts", post(events::save_alerts))
@@ -388,4 +392,67 @@ pub async fn status(ctx: &Ctx) -> anyhow::Result<pumasi_proto::msg::ClusterStatu
 /// Whether the request came from htmx (a button or form).
 pub fn hx(headers: &HeaderMap) -> bool {
     headers.contains_key("hx-request")
+}
+
+/// The newest events, in the page's language (1.15: a Korean page renders
+/// each event's message key; an older control plane, or a key this
+/// dashboard does not know, gives the English message).
+pub async fn events(
+    ctx: &Ctx,
+    limit: u32,
+) -> anyhow::Result<Vec<pumasi_proto::monitor::EventView>> {
+    if ctx.l == Lang::Ko
+        && let Ok(AdminResponse::EventsKeyed(list)) = ctx
+            .call(AdminOp::EventsKeyed {
+                after: 0,
+                since_unix: 0,
+                limit,
+            })
+            .await
+    {
+        return Ok(list
+            .into_iter()
+            .map(|k| {
+                let mut e = k.event;
+                if let Some(m) = k.text.and_then(|t| t.render(true)) {
+                    e.message = m;
+                }
+                e
+            })
+            .collect());
+    }
+    match ctx
+        .call(AdminOp::Events {
+            after: 0,
+            since_unix: 0,
+            limit,
+        })
+        .await?
+    {
+        AdminResponse::Events(e) => Ok(e),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// The firing alerts, their messages in the page's language (1.15).
+pub async fn alerts(ctx: &Ctx) -> pumasi_proto::monitor::AlertsView {
+    let mut alerts = match ctx.call(AdminOp::Alerts).await {
+        Ok(AdminResponse::Alerts(a)) => *a,
+        _ => Default::default(),
+    };
+    if ctx.l == Lang::Ko
+        && !alerts.firing.is_empty()
+        && let Ok(AdminResponse::AlertTexts(texts)) = ctx.call(AdminOp::AlertTexts).await
+    {
+        for a in &mut alerts.firing {
+            if let Some(m) = texts
+                .iter()
+                .find(|t| t.rule == a.rule && t.subject == a.subject)
+                .and_then(|t| t.text.render(true))
+            {
+                a.message = m;
+            }
+        }
+    }
+    alerts
 }

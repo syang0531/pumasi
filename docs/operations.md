@@ -428,17 +428,33 @@ memory, so a failover starts them afresh.
   ops https://hooks.slack.com/...`).
 - Prometheus and Grafana: `--metrics-addr` and `examples/grafana`.
 - `pumasi top`, `pumasi events -f`, and `pumasi net` for the round trip
-  and bandwidth between nodes.
+  and bandwidth between nodes and (1.15) from each node to the control
+  plane's file store: a slow `store` column explains slow inputs.
 - Before you take a machine down on purpose, silence its alerts:
   `pumasi alert silence --on NODE --for 2h --comment "why"`. A laptop
   that comes and goes can have the offline rule off for good:
-  `pumasi alert set --on laptop --node-offline off`.
+  `pumasi alert set --on laptop --node-offline off`. From 1.15 both can
+  live in `cluster.toml` instead (`[alerts.nodes.laptop]` with
+  `node_offline = "off"`, `[silences.NAME]` with an `until`), so the file
+  under version control says why a node is quiet; `apply --dry-run` shows
+  the change and `--prune` removes the silences the file no longer lists.
+  Once a file sets any of `repeat`, `resolved`, `[alerts.nodes]` or
+  `[alerts.labels]`, it owns all of them: a later `pumasi alert set --on`
+  lasts only until the next `apply`.
 - Disk: the control plane's database grows with jobs (bounded by
   `--keep-jobs`) and the audit log (kept forever unless pruned, below);
   the file store with datasets (bounded by quotas).
 - Temperatures: `pumasi sensors --raw` on a machine shows what it reads
-  (on Macs since 1.14, from the SMC or IOReport); a machine with nothing
-  there never fires the temperature alert.
+  (on Macs since 1.14, from the SMC or IOReport; Intel and AMD GPUs on
+  Linux from hwmon and Windows GPUs from the driver since 1.15); a machine
+  with nothing there never fires the temperature alert. The CPU package
+  power on Linux comes from RAPL, which most distributions let only root
+  read: an agent installed as a service runs as root, one started by hand
+  as a user shows no CPU power.
+- Secrets: the dashboard's Settings page (1.15) lists them with when each
+  was set; rotate a registry password there (Rotate, new value) or with
+  `pumasi secret set`. Values are never shown again, so keep the source of
+  truth in your password manager.
 
 ### The audit log
 

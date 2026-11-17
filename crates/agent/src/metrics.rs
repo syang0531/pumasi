@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use pumasi_proto::{
     gpu::{GpuInfo, GpuVendor},
-    monitor::{GpuMetrics, NodeMetrics},
+    monitor::{GpuMetrics, NodeMetrics, NodeMetricsExtra},
 };
 use sysinfo::{Components, Disks, Networks, System};
 
@@ -33,6 +33,8 @@ pub struct Sampler {
     usage: crate::gpu::usage::GpuUsage,
     /// The SMC, IOReport and the HID sensors by name (Macs, 1.14).
     mac: crate::sensors::Reader,
+    /// GPU hwmon and RAPL (Linux, 1.15).
+    linux: crate::gpu::hwmon::Sensors,
     samples: u64,
 }
 
@@ -58,11 +60,13 @@ impl Sampler {
             gpus,
             nvml,
             mac: crate::sensors::Reader::new(),
+            linux: crate::gpu::hwmon::Sensors::default(),
             samples: 0,
         }
     }
 
-    pub fn sample(&mut self, running: u32) -> NodeMetrics {
+    /// One sample, and what goes beyond [`NodeMetrics`] (1.15).
+    pub fn sample(&mut self, running: u32) -> (NodeMetrics, NodeMetricsExtra) {
         self.samples += 1;
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
@@ -121,6 +125,30 @@ impl Sampler {
             |i| self.gpus.iter().find(|g| g.index == i).map(|g| g.vendor),
             &mac,
         );
+        // Linux: hwmon for the GPUs nothing else measured, RAPL for the
+        // CPU package and an Intel GPU inside it (1.15).
+        let mut cpu_power = mac.cpu_power;
+        if cfg!(target_os = "linux") {
+            let now = std::time::Instant::now();
+            let rapl = self.linux.rapl(now);
+            cpu_power = cpu_power.or(rapl.package_w);
+            let package_temp = self
+                .components
+                .iter()
+                .flat_map(|c| c.iter())
+                .filter(|c| c.label().contains("Package id"))
+                .filter_map(|c| c.temperature())
+                .filter(|t| t.is_finite() && *t > 1.0 && *t < 150.0)
+                .fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.max(t))));
+            fill_linux_gpus(
+                &mut gpus,
+                &self.gpus,
+                &mut self.linux,
+                now,
+                package_temp,
+                rapl.uncore_w,
+            );
+        }
         let load1 = if cfg!(windows) {
             0.0
         } else {
@@ -129,7 +157,10 @@ impl Sampler {
         let memory_total = self.system.total_memory();
         let memory_used = memory_total.saturating_sub(self.system.available_memory());
         let cpu = self.system.global_cpu_usage();
-        NodeMetrics {
+        let extra = NodeMetricsExtra {
+            cpu_power_w: cpu_power,
+        };
+        let m = NodeMetrics {
             cpu_percent: if cpu.is_finite() {
                 cpu.clamp(0.0, 100.0)
             } else {
@@ -145,7 +176,8 @@ impl Sampler {
             temp_c,
             gpus,
             running,
-        }
+        };
+        (m, extra)
     }
 
     fn gpu_metrics(&mut self) -> Vec<GpuMetrics> {
@@ -339,6 +371,37 @@ fn amd_sysfs(g: &GpuInfo) -> Option<GpuMetrics> {
     })
 }
 
+/// Gives Linux GPUs the temperature and power hwmon reads where nothing
+/// else did (1.15): their own hwmon, or for an Intel GPU without one (in
+/// the CPU package) the package's temperature and the `uncore` power.
+fn fill_linux_gpus(
+    metrics: &mut [GpuMetrics],
+    gpus: &[GpuInfo],
+    sensors: &mut crate::gpu::hwmon::Sensors,
+    now: std::time::Instant,
+    package_temp: Option<f32>,
+    uncore_w: Option<f32>,
+) {
+    for m in metrics.iter_mut() {
+        if m.temp_c.is_some() && m.power_w.is_some() {
+            continue;
+        }
+        let Some(g) = gpus.iter().find(|g| g.index == m.index) else {
+            continue;
+        };
+        let (temp, power) = if sensors.has_hwmon(&g.pci) {
+            let r = sensors.gpu(&g.pci, now);
+            (r.temp_c, r.power_w)
+        } else if g.vendor == GpuVendor::Intel {
+            (package_temp, uncore_w)
+        } else {
+            (None, None)
+        };
+        m.temp_c = m.temp_c.or(temp);
+        m.power_w = m.power_w.or(power);
+    }
+}
+
 /// Gives a Mac's GPUs the temperature and power its sensors read, where
 /// nothing else did: an Intel GPU the integrated readings, any other GPU
 /// (AMD or NVIDIA in an Intel Mac, Apple's own) the discrete ones.
@@ -400,7 +463,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let mut s = Sampler::new(&dir, Vec::new());
         std::thread::sleep(std::time::Duration::from_millis(250));
-        let m = s.sample(3);
+        let (m, _extra) = s.sample(3);
         assert!(m.memory_total > 0);
         assert!(m.memory_used <= m.memory_total);
         assert!(m.disk_total > 0, "the temp directory's disk is found");

@@ -212,7 +212,7 @@ impl State {
             "upgrade.failed",
             Some(node),
             None,
-            format!("upgrade of {name} failed: {reason}"),
+            pumasi_proto::text::Text::new("upgrade.failed", [name.clone(), reason.to_string()]),
         );
         self.upgrade_failures
             .insert(node.to_string(), (sha256, reason));

@@ -10,7 +10,9 @@ use axum::{
 use maud::{Markup, html};
 use pumasi_proto::{
     manage::NodeEdit,
-    monitor::{MetricsView, NetView, NodeMetricsView, human_bps, human_rtt},
+    monitor::{
+        MetricsView, NetView, NodeMetricsExtra, NodeMetricsView, STORE_LINK, human_bps, human_rtt,
+    },
     msg::{AdminOp, AdminResponse, NodeView},
     power::{NodePowerView, format_mac},
 };
@@ -109,39 +111,50 @@ fn net_matrix(l: Lang, v: &NetView) -> Markup {
         .iter()
         .filter(|n| v.links.iter().any(|x| x.from == **n || x.to == **n))
         .collect();
+    // 1.15: what each agent measured to the control plane's store.
+    let store = v.links.iter().any(|x| x.to == STORE_LINK);
+    let cell = |a: &str, b: &str| -> Markup {
+        html! {
+            @match v.link(a, b) {
+                Some(x) if x.error.is_some() => {
+                    td class="bad" title=(x.error.clone().unwrap_or_default()) { (l.t("failed", "실패")) }
+                }
+                Some(x) => {
+                    td title=(format!("{} · {}", fmt::ago(l, x.unix), match x.direct { Some(false) => "relay", _ => "direct" })) {
+                        (x.rtt_us.map(human_rtt).unwrap_or_default())
+                        @if let Some(b) = x.bps { br; span class="dim" { (human_bps(b)) } }
+                    }
+                }
+                None => { td {} }
+            }
+        }
+    };
     html! {
         section class="card" id="net" {
             h2 { (l.t("Network between nodes", "노드 사이 네트워크")) }
-            @if nodes.is_empty() {
+            @if nodes.is_empty() && !store {
                 p class="empty" { (l.t(
                     "Nothing measured yet. Agents of 1.6 or later measure each other now and then.",
                     "아직 잰 것이 없습니다. 1.6 이상의 에이전트가 가끔 서로를 잽니다.")) }
             } @else {
-                p class="dim" { (l.t("Round trip and bandwidth, row to column.", "왕복 시간과 대역폭 (행에서 열로).")) }
+                p class="dim" { (l.t("Round trip and bandwidth, row to column; the last column is the control plane's file store.",
+                    "왕복 시간과 대역폭 (행에서 열로). 마지막 열은 컨트롤 플레인의 파일 저장소입니다.")) }
                 div class="table-wrap" {
                     table class="matrix" {
-                        thead { tr { th {} @for n in &nodes { th { (n) } } } }
+                        thead { tr {
+                            th {}
+                            @for n in &nodes { th { (n) } }
+                            @if store { th data-store="true" { (l.t("store", "저장소")) } }
+                        } }
                         tbody {
                             @for a in &nodes {
                                 tr {
                                     th { (a) }
                                     @for b in &nodes {
                                         @if a == b { td class="dim" { "-" } }
-                                        @else {
-                                            @match v.link(a, b) {
-                                                Some(x) if x.error.is_some() => {
-                                                    td class="bad" title=(x.error.clone().unwrap_or_default()) { (l.t("failed", "실패")) }
-                                                }
-                                                Some(x) => {
-                                                    td title=(format!("{} · {}", fmt::ago(l, x.unix), match x.direct { Some(false) => "relay", _ => "direct" })) {
-                                                        (x.rtt_us.map(human_rtt).unwrap_or_default())
-                                                        @if let Some(b) = x.bps { br; span class="dim" { (human_bps(b)) } }
-                                                    }
-                                                }
-                                                None => { td {} }
-                                            }
-                                        }
+                                        @else { (cell(a, b)) }
                                     }
+                                    @if store { (cell(a, STORE_LINK)) }
                                 }
                             }
                         }
@@ -355,7 +368,7 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
     };
     let bottom = html! {
         div #charts data-sse=(stream) {
-            (charts_or_empty(l, mv.as_ref(), since))
+            (charts_block(l, mv.as_ref(), None, since, "page"))
         }
         div class="cols" {
             (perf(l, &n))
@@ -466,7 +479,8 @@ fn charts_or_empty(l: Lang, mv: Option<&NodeMetricsView>, since: u64) -> Markup 
 
 /// A node's charts as server-sent events: new ones whenever a sample
 /// arrives (agents send one every few seconds), drawn on the server as
-/// before.
+/// before. From 1.15 the control plane pushes each sample (a long-poll
+/// that it answers when one arrives); an older one is asked every 2 s.
 pub async fn chart_stream(
     ctx: Ctx,
     Path(node): Path<String>,
@@ -482,6 +496,8 @@ pub async fn chart_stream(
         node: String,
         since: u64,
         last: Option<(u64, usize)>,
+        /// Whether the control plane pushes (until a call says otherwise).
+        push: bool,
         first: bool,
     }
     let state = S {
@@ -489,25 +505,51 @@ pub async fn chart_stream(
         node,
         since,
         last: None,
+        push: true,
         first: true,
     };
     let events = n0_future::stream::unfold(state, |mut s| async move {
         loop {
-            if !s.first {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
+            let (mv, extra) = if s.push {
+                let after = if s.first {
+                    0
+                } else {
+                    s.last.map_or(0, |l| l.0)
+                };
+                let op = AdminOp::MetricsWait {
+                    node: Some(s.node.clone()),
+                    since_secs: s.since,
+                    after_unix: after,
+                    wait_secs: 25,
+                };
+                match s.ctx.call(op).await {
+                    Ok(AdminResponse::MetricsPush(p)) => {
+                        let extra = p.extra_of(&s.node).cloned();
+                        let mv = p.view.nodes.into_iter().find(|x| x.id == s.node);
+                        (mv, extra)
+                    }
+                    // An older control plane does not know the call: ask
+                    // every 2 s from now on.
+                    _ => {
+                        s.push = false;
+                        continue;
+                    }
+                }
+            } else {
+                if !s.first {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                let m = metrics(&s.ctx, Some(s.node.clone()), s.since).await;
+                (m.nodes.into_iter().find(|x| x.id == s.node), None)
+            };
             s.first = false;
-            let m = metrics(&s.ctx, Some(s.node.clone()), s.since).await;
-            let mv = m
-                .nodes
-                .into_iter()
-                .find(|x| x.id == s.node || s.node.is_empty());
             let key = mv.as_ref().map(|v| (v.latest_unix, v.series.len()));
             if key.is_some() && key == s.last {
                 continue;
             }
             s.last = key;
-            let html = charts_or_empty(s.ctx.l, mv.as_ref(), s.since)
+            let source = if s.push { "push" } else { "poll" };
+            let html = charts_block(s.ctx.l, mv.as_ref(), extra.as_ref(), s.since, source)
                 .into_string()
                 .replace(['\n', '\r'], " ");
             let ev = Event::default().event("charts").data(html);
@@ -517,6 +559,29 @@ pub async fn chart_stream(
     Sse::new(events)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// The charts with what came with the last sample (1.15: CPU package
+/// power), marked with how they came (`push`, `poll` or `page`) and the
+/// time of the newest sample.
+fn charts_block(
+    l: Lang,
+    mv: Option<&NodeMetricsView>,
+    extra: Option<&NodeMetricsExtra>,
+    since: u64,
+    source: &str,
+) -> Markup {
+    let latest = mv.map_or(0, |m| m.latest_unix);
+    html! {
+        div data-source=(source) data-latest=(latest) {
+            @if let Some(w) = extra.and_then(|e| e.cpu_power_w) {
+                p class="dim" data-cpu-power=(format!("{w:.1}")) {
+                    (l.t("CPU package power", "CPU 패키지 전력")) ": " strong { (format!("{w:.1} W")) }
+                }
+            }
+            (charts_or_empty(l, mv, since))
+        }
+    }
 }
 
 /// When the node takes tasks (1.7): its agent's settings, and a form

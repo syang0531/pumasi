@@ -726,6 +726,9 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | AuditFrom { .. }
         | ControlPlanes
         | ReleaseChunk { .. }
+        | MetricsWait { .. }
+        | EventsKeyed { .. }
+        | AlertTexts
         | ScimView => return None,
         // Unwrapped before anything looks at it.
         FollowerRead(inner) => return describe(inner),
@@ -743,6 +746,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | CheckJobPlaced { .. }
         | SetScheduleExt { .. }
         | ApplyExt { .. }
+        | ApplyMore { .. }
         | SubmitExt { .. }
         | CheckJobExt { .. } => {
             return describe(&op.clone().joined());

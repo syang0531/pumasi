@@ -48,7 +48,7 @@ machines.
 | 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | done |
 | 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | done |
 | 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | done |
-| 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | planned |
+| 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | done |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
 | 19 | | Buying CU with won through the hub (Toss Payments) | on hold |
 
@@ -731,6 +731,46 @@ within 100 ms of a job finishing. By hand: the cloud sessions keep working
 through the tunnel while the owner restarts the leader.
 
 ## 36. Result checks: honeypot tasks, disk and memory challenges, re-benchmarks (1.20)
+
+Done in 1.20.0 ([release notes](releases/v1.20.0.md),
+[details](architecture.md#phase-36-result-checks-120)).
+What differs from the plan: a honeypot is sent right after a task ends,
+one at a time per node, with the chance of the node's trust level (new
+providers 10%, other providers 2%, after a strike 25%, trusted nodes and
+the owner's none); it copies the job name, limits (no fuel cap, a
+timeout of at least 2 minutes), executor and tolerations of that task.
+Built-in honeypots are seeded integer loops (a wasm module, or `sh` on
+one image for Docker and microVMs, `busybox:1.36` by default) and use no
+GPU, so GPU results are checked only by account honeypots; an account's
+own honeypots (`pumasi honeypot add`) go only after that account's tasks
+and only once a trusted machine has run them again with the same answer,
+and cannot use the file store, a network allow list, checkpoints, gangs
+or the confidential tier. A wrong answer forfeits that run and strikes
+the node like a check mismatch (so its re-run rate goes to 100% as
+before), and holds every earning of the node's account for a day
+(`--hold`), not only that provider's receipts; `pumasi honeypot release`
+ends it early. Honeypots are billed like any run (built-ins to the
+owner) so the provider cannot tell them by their pay, and are hidden from
+job lists, events and the account's own view. They hide the work, not
+the moment: a provider that watches for a short task right after each
+real one could guess. The disk challenge (write seeded data with direct
+I/O, read it in an order the cluster picks, follow dependent 4 KiB reads,
+256 MiB at most) and the memory challenge run on providers that speak
+agent minor 11 and have a disk that takes direct I/O; they prove the work
+was done at that speed, not that the data was on the disk, so an agent
+modified to keep it in memory passes. The agent's own memory and disk
+benchmarks now use the challenge's code (benchmark version 2) so that an
+honest node measures what the cluster times. Every figure is timed again
+every 24 hours (`--retime`); a drop past the existing benchmark-drop
+threshold raises that alert, and a timeout is recorded without a strike.
+Until a 1.19 provider is upgraded and timed it has no `disk` label.
+The score is (uptime + 2 x checks + finished runs) / 4 out of 1000,
+uptime with a 7-day half-life and the rest over the node's whole life
+(announced sleep does not count as downtime); placement compares it in
+steps of 100 after spread groups and own machines, before free slots.
+Counts behind the score are written every 5 minutes, so a failover can
+lose up to 5 minutes of them. Honeypots are managed in the CLI only; the
+dashboard shows scores and timings.
 
 Why: the research's answer for work that is not deterministic (Docker,
 microVMs, GPUs) is tasks with known answers, and it is still open: the CPU

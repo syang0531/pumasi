@@ -74,6 +74,10 @@ impl State {
                 blobs.remove(&h);
             }
         }
+        // Honeypots copy their modules and files from jobs (1.20).
+        for h in self.honeypot_blobs() {
+            blobs.remove(&h);
+        }
         let blobs: Vec<ModuleHash> = blobs.into_iter().collect();
         if let Err(e) = self.store.delete_jobs(&rows, &blobs) {
             warn!("could not delete old jobs: {e:#}");

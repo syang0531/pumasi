@@ -414,6 +414,14 @@ pub enum ToAgent {
     /// and what queued tasks will mount, which goes last. Sent after the
     /// welcome and whenever it changes.
     Cache(Box<crate::store::CachePolicy>),
+    // Minor 11 (1.20) from here.
+    /// A step of a disk challenge: answer it with
+    /// [`FromAgent::ChallengeResult`] as fast as possible; the control
+    /// plane times it.
+    DiskChallenge(crate::verify::DiskChallenge),
+    /// Run the memory kernel now and answer with
+    /// [`FromAgent::ChallengeResult`]; the control plane times it.
+    MemoryChallenge(crate::verify::MemoryChallenge),
 }
 
 /// How a task ended.
@@ -626,6 +634,14 @@ pub enum FromAgent {
     /// (MPS), and why the others do not. Sent after the welcome and when
     /// it changes.
     GpuSharing(Box<crate::gpu::GpuSharing>),
+    // Minor 11 (1.20) from here.
+    /// The answer to a [`ToAgent::DiskChallenge`] step or a
+    /// [`ToAgent::MemoryChallenge`] (the kernel's result in the first
+    /// eight bytes, little-endian), or why it could not be done.
+    ChallengeResult {
+        nonce: u64,
+        result: Result<[u8; 32], String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,6 +1311,29 @@ pub enum AdminOp {
         account: String,
         caps: crate::manage::JobCaps,
     },
+    // 1.20 from here.
+    /// Honeypots, their latest runs, the policy and every node's score
+    /// ([`AdminResponse::Verify`]).
+    Verify,
+    /// Changes the honeypot and challenge policy; answers like
+    /// [`AdminOp::Verify`].
+    SetVerifyPolicy(crate::verify::VerifyPolicyPatch),
+    /// Makes a honeypot of a finished task (`task`, or each succeeded
+    /// task of the job up to 16): a trusted node runs it once more to
+    /// confirm its answer does not change. Answers like
+    /// [`AdminOp::Verify`].
+    HoneypotAdd {
+        job: JobId,
+        task: Option<u32>,
+    },
+    HoneypotRemove {
+        id: u32,
+    },
+    /// Releases an account's earnings held after a failed honeypot (they
+    /// still wait out the usual hold period).
+    HoneypotRelease {
+        account: String,
+    },
 }
 
 /// The longest [`AdminOp::JobWait`] and [`AdminOp::LogsWait`] (1.19):
@@ -1677,6 +1716,8 @@ pub enum AdminResponse {
     // 1.19 from here.
     /// Accounts with caps per job, by name.
     JobCaps(Vec<(String, crate::manage::JobCaps)>),
+    // 1.20 from here.
+    Verify(Box<crate::verify::VerifyView>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

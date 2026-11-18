@@ -733,6 +733,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | JobWait { .. }
         | LogsWait { .. }
         | JobCaps
+        | Verify
         | ScimView => return None,
         // Unwrapped before anything looks at it.
         FollowerRead(inner) => return describe(inner),
@@ -746,6 +747,14 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         ScimTokenRevoke { id } => ("scim.token.revoke", id.clone(), none()),
         SetResources { account, quota } => ("resources.set", account.clone(), quota.describe()),
         SetJobCaps { account, caps } => ("job_caps.set", account.clone(), caps.describe()),
+        SetVerifyPolicy(p) => ("honeypot.policy", none(), format!("{p:?}")),
+        HoneypotAdd { job, task } => (
+            "honeypot.add",
+            job.to_string(),
+            task.map_or("every succeeded task".into(), |t| format!("task {t}")),
+        ),
+        HoneypotRemove { id } => ("honeypot.remove", id.to_string(), none()),
+        HoneypotRelease { account } => ("honeypot.release", account.clone(), none()),
         // Joined into the plain calls before they get here.
         SubmitPlaced { .. }
         | CheckJobPlaced { .. }

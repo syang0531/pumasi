@@ -71,6 +71,13 @@ fn init_tracing() {
         .try_init();
 }
 
+fn no_honeypots() -> pumasi_proto::verify::VerifyPolicyPatch {
+    pumasi_proto::verify::VerifyPolicyPatch {
+        honeypots: Some(false),
+        ..Default::default()
+    }
+}
+
 fn config(dir: PathBuf, bind: &str) -> ClusterConfig {
     let mut config = ClusterConfig::new(dir);
     config.name = "ha-cluster".into();
@@ -310,6 +317,8 @@ async fn three_replicas_survive_losing_the_leader() {
         .unwrap();
     // State from before replication: it reaches the replicas in a snapshot.
     call(&client, AdminOp::SetPolicy(policy())).await;
+    // No honeypots: they would bill the owner for runs the test counts.
+    call(&client, AdminOp::SetVerifyPolicy(no_honeypots())).await;
     call(
         &client,
         AdminOp::Deposit {
@@ -659,6 +668,7 @@ async fn followers_answer_reads() {
     // 1.19: jobs, task details and metrics history too. A job no
     // provider runs stays pending, so the leader hands it over.
     call(&admin, AdminOp::SetPolicy(policy())).await;
+    call(&admin, AdminOp::SetVerifyPolicy(no_honeypots())).await;
     call(
         &admin,
         AdminOp::Deposit {
@@ -886,6 +896,8 @@ async fn replicas_upgrade_one_at_a_time() {
         .await
         .unwrap();
     call(&client, AdminOp::SetPolicy(policy())).await;
+    // No honeypots: they would bill the owner for runs the test counts.
+    call(&client, AdminOp::SetVerifyPolicy(no_honeypots())).await;
     call(
         &client,
         AdminOp::Deposit {
@@ -1231,6 +1243,8 @@ async fn pushed_waits_answer_at_once() {
         .await
         .unwrap();
     call(&client, AdminOp::SetPolicy(policy())).await;
+    // No honeypots: they would bill the owner for runs the test counts.
+    call(&client, AdminOp::SetVerifyPolicy(no_honeypots())).await;
     call(
         &client,
         AdminOp::Deposit {

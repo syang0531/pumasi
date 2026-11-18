@@ -3995,6 +3995,116 @@ minute doubling to an hour, and swaps the certificate into the resolver.
 `badNonce` answers are retried. CI runs Pebble with
 `pebble-challtestsrv` as its DNS and orders with both challenges.
 
+## Phase 36: Result checks (1.20)
+
+Release 1.20 slips honeypot tasks with known answers into providers'
+queues, times providers' disk and memory beside their CPU and every
+figure again each day, and keeps a score per node that placement, `pumasi
+node`, `pumasi score`, the dashboard and Prometheus (`pumasi_node_score`)
+show. The stored layout (7) is unchanged: the policy, honeypots, runs,
+per-node counters and held accounts live in meta records
+(`verify_policy`, `honeypots`, `honeypot_runs`, `verify_nodes`,
+`honeypot_held`). The agent protocol stays 14 and goes to minor 11
+(`VERIFY_MINOR`): `ToAgent::DiskChallenge`, `ToAgent::MemoryChallenge`
+and `FromAgent::ChallengeResult` are appended, so older agents are never
+sent them. New admin ops are appended (`Verify`, `SetVerifyPolicy`,
+`HoneypotAdd`, `HoneypotRemove`, `HoneypotRelease`, all answered with
+`AdminResponse::Verify`). The code is `pumasi_proto::verify` (policy,
+views, the score, challenge kernels, built-in honeypots) and
+`pumasi_cluster::verify`.
+
+### Honeypots
+
+A honeypot is an ordinary job submitted with `submitted_by =
+"honeypot"` and a random id, kept for one node (`VerifyState::pinned`;
+other nodes refuse it with `Refusal::Kept`), with a 30-minute queue
+timeout. `maybe_honeypot` runs after a provider's primary report when
+the job's account is not the provider's: no honeypot is in flight for
+that node, and `rand < VerifyPolicy::permille(trust_level)` (Owner and
+Trusted use `trusted_permille`, a node with fewer than `NEW_UNTIL` (10)
+passed checks and honeypots `new_permille`, one with a strike
+`struck_permille`, others `provider_permille`). It copies the task's job
+name, limits (fuel off, timeout at least 120 s), deterministic flag and
+tolerations, and the executor the task ran with. The account's own
+confirmed honeypots of that executor go first; otherwise a built-in one:
+`builtin_wasm(seed)` (a WAT loop of 0.5 to 8 million rounds over a seeded
+data segment printing 16 hex digits) or `builtin_shell(seed)` (`sh -c`
+with a MINSTD-style loop, on `VerifyPolicy::image`). The answer is the
+`output_digest` of exit 0, the expected stdout and the output files, the
+same digest checks compare, so the report is compared without trusting
+the node's own hash. Honeypot jobs skip `can_pay` (the account pays
+whatever its balance), are filtered from `status_for` and `event()`, and
+their modules and file bundles are kept by retention.
+
+`add_honeypots(job, task)` copies up to 16 succeeded tasks (256
+honeypots at most) of a job that is not confidential, uses no store,
+private image, network rules, checkpoints or gangs; the copy keeps the
+module hash, Docker spec, file bundle, limits, GPU request and the
+task's input. `confirm_honeypot` submits it again at `Tier::Trusted`
+under a new id (24-hour queue timeout) and marks it confirmed when the
+digest matches, or records a problem when it does not, so only answers
+that do not depend on the seed, the clock or the machine are used.
+
+`on_honeypot_report` settles a run: a match counts as passed; an agent
+error, a timeout or the node leaving is `Inconclusive` (no blame); a
+mismatch forfeits the run (`forfeit`), adds a strike (`strike`, which
+also takes the node's check rate to 1000 per mille), sets
+`held[account] = now + hold_secs`, raises the `honeypot.failed` event
+(critical) and the `honeypot` alert. `release_holds` skips holds of
+accounts held this way until the time passes or `release_held` removes
+it. The last 50 runs are kept for `pumasi honeypot list`.
+
+### Disk and memory challenges
+
+`want_verify_challenges` asks for both when a provider's benchmark
+arrives, and `retime_due` asks for CPU, disk and memory again every
+`retime_secs` (24 h). `drive_verify_challenges` sends one when the node is
+online, idle (`verify_busy` refuses tasks as `Benchmarking` meanwhile),
+not timing its CPU and not upgrading.
+
+The disk challenge has three steps, each timed by the control plane
+from sending to answer minus the connection's round trip: `Prepare {
+bytes }` (the agent writes `bytes` of BLAKE3-XOF chunks derived from the
+seed to `.pumasi-challenge.tmp` with O_DIRECT, at most `challenge_bytes`
+(256 MiB) and a quarter of free space, and answers with the hash of each
+chunk's last block fold), `Sequential` (reads the chunks in
+`chunk_order(seed, nonce)` and folds every 4 KiB block) and `Random {
+reads }` (follows `random_walk`, where each read's offset comes from the
+previous block's fold, sized for `DISK_MS` at the claimed latency). The
+answers are checked off the state lock (`disk_folds` recomputes the
+data). The memory challenge runs `memory_kernel(seed, bytes, passes)`
+(three streams over `bytes`, `passes` sized for `MEMORY_MS` at the
+claimed bandwidth). The agent's own benchmark folds its disk reads and
+runs the same memory kernel (`BENCH_VERSION` 2), so honest figures match.
+`apply_disk_check` and `apply_memory_check` keep the best timing of the
+same claim; a claim over `INFLATED` (2) times the best timing (plus a
+small allowance) is timed again and on the second timing a strike with a
+`perf.inflated` event, and a wrong answer a strike at once. A retiming
+that falls by the monitor's `perf_drop_percent` raises `perf.drop`. On
+providers `disk_label` is the lower of the timed and the claimed class,
+and only while the stored check is correct and for the current claim.
+
+### Score
+
+`provider_score` combines uptime (online time over time seen, both
+decayed with a 7-day half-life each tick, announced sleep skipped),
+checks (`(passed + 1) * 1000 / (passed + 2 + 4 * strikes)` over checks
+and honeypots passed; 1000 for owner and trusted machines) and completion
+(runs that came back over runs that came back or were lost: the node
+vanished with them, a forged receipt, an agent error) as `(uptime + 2 *
+checks + completion) / 4`; a suspended node scores 0. `best_node` sorts
+by spread group, own or trusted machine, `score / 100`, then free slots.
+The counters are written every 5 minutes when they changed.
+
+### Compatibility
+
+A 1.19 control plane answers the new admin ops with an error, which the
+CLI reports as "is the control plane older than 1.20?"; `pumasi node`
+then leaves the score out. A 1.19 agent is never challenged: it keeps
+its CPU timing, gets no `disk` label while it is a provider, and still
+gets honeypots, which are ordinary tasks. Benchmark version 2 profiles
+from upgraded agents do not raise `perf.drop` against version 1 ones.
+
 ## Not yet
 
 - Remote API: ACME has no DNS-01 (no wildcard certificates) and no
@@ -4046,9 +4156,8 @@ minute doubling to an hour, and swaps the certificate into the resolver.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 35 are done and phase 36 is planned
-  ([roadmap.md](roadmap.md)); phases 18 and 19 (the hub and buying CU)
-  are on hold.
+- Roadmap: phases 20 to 36 are done ([roadmap.md](roadmap.md));
+  phases 18 and 19 (the hub and buying CU) are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it
   (people still appear when they first sign in), filters support only
   `eq` and `and`, no SAML (1.2 added the
@@ -4068,10 +4177,13 @@ minute doubling to an hour, and swaps the certificate into the resolver.
   tickets made before still list the old one.
 - CU cannot be bought or exchanged, and there is no platform fee; both
   belong to the hub.
-- "Honeypot" tasks with known answers (needed for non-deterministic Docker
-  and microVM work, which checks cannot cover). The CPU benchmark
-  challenge keeps the billed speed honest, not the results. Disk and
-  memory figures are not challenged yet, and no scheduling uses them.
+- Result checks: honeypots catch a provider that is often wrong, not one
+  that cheats on a few tasks; they follow a real task, which a watchful
+  provider could notice; built-in ones use no GPU and one image for
+  Docker and microVMs, and account honeypots cannot use the file store.
+  The disk challenge proves the work, not where the data was (an agent
+  modified to keep it in memory passes), and needs direct I/O; the
+  score's counters can lose 5 minutes in a failover.
 - MicroVM: warm guests (1.14) speed up repeated images only; tasks with
   a network or GPUs and the first task of an image still boot cold (a
   snapshot pool would cover those), and warm guests under

@@ -35,5 +35,6 @@ pub mod sso;
 pub mod state;
 pub mod store;
 pub mod transfer;
+pub mod verify;
 
 pub use server::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig, OwnUpgrade};

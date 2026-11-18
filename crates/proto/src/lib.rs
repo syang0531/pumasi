@@ -31,6 +31,7 @@ pub mod store;
 pub mod text;
 pub mod ticket;
 pub mod ui;
+pub mod verify;
 pub mod vmdisk;
 pub mod vmnet;
 pub mod webgpu;
@@ -83,7 +84,7 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 10;
+pub const PROTOCOL_MINOR: u32 = 11;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
@@ -136,6 +137,13 @@ pub const GPU_SHARING_MINOR: u32 = 9;
 /// as the control plane says ([`msg::ToAgent::Cache`]). Older agents get
 /// no microVM tasks with an allow list or a cap.
 pub const NET_MINOR: u32 = 10;
+/// The first minor with the 1.20 result checks: the agent answers disk
+/// and memory challenges ([`msg::ToAgent::DiskChallenge`],
+/// [`msg::ToAgent::MemoryChallenge`], answered with
+/// [`msg::FromAgent::ChallengeResult`]) and measures its own profile with
+/// the challenges' code. Older agents are timed for their CPU only, and a
+/// provider's `disk` label waits for a timing.
+pub const VERIFY_MINOR: u32 = 11;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

@@ -20,7 +20,32 @@ use tokio::process::Command;
 
 /// The CPU time of the calling thread, in milliseconds.
 pub fn thread_cpu_ms() -> Option<u64> {
-    #[cfg(unix)]
+    // macOS: the kernel's own count. `CLOCK_THREAD_CPUTIME_ID` there comes
+    // back in raw Mach ticks under Rosetta 2 (an x86-64 agent on Apple
+    // Silicon), 24 times too small.
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the calling thread's port (no reference is added, so
+        // none is released) and a `thread_basic_info` with its size in
+        // `integer_t`s for the kernel to fill.
+        unsafe {
+            let port = libc::pthread_mach_thread_np(libc::pthread_self());
+            let mut info: libc::thread_basic_info = std::mem::zeroed();
+            let mut count = libc::THREAD_BASIC_INFO_COUNT;
+            let r = libc::thread_info(
+                port,
+                libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                (&mut info as *mut libc::thread_basic_info).cast(),
+                &mut count,
+            );
+            if r != libc::KERN_SUCCESS {
+                return None;
+            }
+            let ms = |t: libc::time_value_t| t.seconds as u64 * 1000 + t.microseconds as u64 / 1000;
+            Some(ms(info.user_time) + ms(info.system_time))
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let mut ts = libc::timespec {
             tv_sec: 0,

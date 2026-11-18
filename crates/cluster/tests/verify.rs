@@ -365,12 +365,9 @@ async fn a_provider_that_fails_honeypots_is_held_and_placed_last() {
         .any(|t| t.node.as_deref() == Some(cheat.as_str()));
     tokio::time::sleep(Duration::from_secs(3)).await;
     let alice = account(&client, "alice").await;
-    assert!(
-        alice.earned > 0 && alice.held == 0,
-        "earned {} held {}",
-        alice.earned,
-        alice.held
-    );
+    let (earned, released) = (alice.earned > 0, alice.held == 0);
+    assert!(earned, "alice earned nothing");
+    assert!(released, "alice's earnings are still held");
     let mallory = account(&client, "mallory").await;
     if cheat_ran {
         assert!(mallory.held > 0, "nothing held");

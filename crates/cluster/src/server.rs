@@ -25,6 +25,7 @@ use iroh::{
 use pumasi_proto::{
     ADMIN_ALPN, AGENT_ALPN, BLOBS_ALPN, HA_PROTOCOL, MIN_AGENT_PROTOCOL, PROTOCOL_VERSION,
     RAFT_ALPN, Secret, blobs,
+    job::JobId,
     msg::{
         AdminOp, AdminRequest, AdminResponse, AgentHello, ClusterStatus, FetchReply, FetchRequest,
         FromAgent, HelloReply, Invite, RELEASE_CHUNK, ReportTail, Role, TaskReport, ToAgent,
@@ -390,6 +391,15 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
         metrics_addr: prometheus.as_ref().map(|(_, a)| *a),
         limits: crate::limits::Limits::new(config.sign_in_per_min),
     });
+    // The limits the leader before kept (1.19).
+    match shared
+        .store
+        .meta_record::<crate::limits::LimitsCopy>(crate::limits::LIMITS_META)
+    {
+        Ok(Some(copy)) => inner.limits.restore(&copy),
+        Ok(None) => {}
+        Err(e) => warn!("could not read the stored request limits: {e:#}"),
+    }
 
     let mut tasks = Vec::new();
     let (store_tx, store_rx) = mpsc::unbounded_channel();
@@ -461,6 +471,18 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
                 if ticks.is_multiple_of(10) {
                     let admin = inner.admin_secret();
                     inner.state().tick_sessions(&admin);
+                }
+                // The shared limits into the replicated state, when they
+                // changed (1.19): one write per interval, however many
+                // requests counted.
+                if ticks.is_multiple_of(4)
+                    && let Some(copy) = inner.limits.copy_if_changed()
+                    && let Err(e) = inner
+                        .state()
+                        .store
+                        .put_meta_record(crate::limits::LIMITS_META, &copy)
+                {
+                    debug!("could not store the request limits: {e:#}");
                 }
                 // Keep the advertised address fresh (relay may change).
                 let fresh = inner.endpoint.addr();
@@ -690,6 +712,20 @@ impl Cluster {
         self.shared.ha().map(|h| h.view())
     }
 
+    /// The replicas' addresses as the membership has them (1.19), this
+    /// replica's included as written there.
+    pub fn membership(&self) -> Vec<EndpointAddr> {
+        self.shared
+            .ha()
+            .map(|h| {
+                h.members()
+                    .into_iter()
+                    .filter_map(|(_, n)| n.addr)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// This replica's own endpoint id.
     pub fn endpoint_id(&self) -> iroh::EndpointId {
         self.shared.endpoint.id()
@@ -903,6 +939,10 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
     let mut last_mirror: Option<Instant> = None;
     let mut replicas: Vec<EndpointAddr> = Vec::new();
     let mut last_versions: Option<Instant> = None;
+    // This replica's address in the membership (1.19): looked at soon
+    // after starting and then every half minute.
+    let mut last_address: Option<Instant> = None;
+    let announcing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut check = tokio::time::interval(Duration::from_millis(500));
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -921,6 +961,28 @@ async fn lead(shared: Arc<Shared>, ha: Arc<Ha>) {
             }
         } else if !leader {
             last_check = None;
+        }
+        if last_address.is_none_or(|t| t.elapsed() >= ha::ADDRESS_EVERY)
+            && !announcing.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            last_address = Some(Instant::now());
+            let (ha, announcing) = (ha.clone(), announcing.clone());
+            tokio::spawn(async move {
+                // Soon, before the leader's silence makes this replica
+                // stand for election: retried every second for a while.
+                for _ in 0..30 {
+                    match ha.announce_address().await {
+                        Ok(true) => {
+                            info!("updated this replica's address in the membership");
+                            break;
+                        }
+                        Ok(false) => break,
+                        Err(e) => debug!("could not update this replica's address: {e:#}"),
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                announcing.store(false, std::sync::atomic::Ordering::Release);
+            });
         }
         let serve = leader && last_quorum.elapsed() < ha::LEASE;
         match (serve, active) {
@@ -1603,9 +1665,15 @@ impl ProtocolHandler for AdminHandler {
                         // leader handed it a moment ago (1.12).
                         if let AdminOp::FollowerRead(op) = &req.op
                             && op.follower_may_answer()
-                            && let Some(cache) = shared.ha().and_then(|h| h.fresh_reads())
-                            && let Some(resp) =
-                                follower_answer(&shared.store, &req.secret, op, &cache)
+                            && let Some(ha) = shared.ha()
+                            && let Some(reads) = ha.fresh_reads()
+                            && let Some(resp) = follower_answer(
+                                &shared.store,
+                                &req.secret,
+                                op,
+                                &reads,
+                                ha.in_step(),
+                            )
                         {
                             write_msg(&mut send, &resp).await?;
                             send.finish()?;
@@ -1749,6 +1817,21 @@ async fn admin_call(inner: &Arc<Inner>, secret: &Secret, op: AdminOp, peer: &str
         }) => metrics_wait(inner, node, since_secs, after_unix, wait_secs)
             .await
             .unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}"))),
+        Ok(AdminOp::JobWait { id, wait_ms }) => job_wait(inner, id, wait_ms).await,
+        Ok(AdminOp::LogsWait {
+            job,
+            index,
+            attempt,
+            stdout_from,
+            stderr_from,
+            wait_ms,
+        }) => logs_wait(
+            inner,
+            (job, index, attempt, stdout_from, stderr_from),
+            wait_ms,
+        )
+        .await
+        .unwrap_or_else(|e| AdminResponse::Error(format!("{e:#}"))),
         Ok(op) => {
             let described = crate::audit::describe(&op);
             let resp = match handle_store_admin(inner, op).await {
@@ -1811,6 +1894,82 @@ async fn metrics_wait(
             extra: st.metrics_extra(node.as_deref()),
         },
     )))
+}
+
+/// Waits for `changes` to move (tasks written, live output) or for the
+/// deadline or the end of the term; `false` when it is time to answer
+/// with what there is. Changes that come close together wake it once.
+async fn wait_change(
+    changes: &mut watch::Receiver<u64>,
+    stopped: &mut watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let woke = tokio::select! {
+        r = tokio::time::timeout_at(deadline, changes.changed()) => matches!(r, Ok(Ok(()))),
+        _ = stopped.changed() => false,
+    };
+    if woke {
+        // Let the writes that come with this one land first.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        changes.borrow_and_update();
+    }
+    woke && !*stopped.borrow()
+}
+
+/// [`AdminOp::JobWait`] (1.19): the job once it has ended, or how it is
+/// when the wait is over.
+async fn job_wait(inner: &Arc<Inner>, id: JobId, wait_ms: u64) -> AdminResponse {
+    let mut changes = inner.state().store.changes();
+    let mut stopped = inner.stopped.subscribe();
+    let wait = Duration::from_millis(wait_ms.min(pumasi_proto::msg::MAX_WAIT_MS));
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let ended = inner
+            .state()
+            .jobs
+            .get(&id)
+            .map(|j| State::summary(j).state.is_terminal());
+        let Some(ended) = ended else {
+            return AdminResponse::Error(format!("no job {id}"));
+        };
+        if ended || !wait_change(&mut changes, &mut stopped, deadline).await {
+            let view = inner.state().job_view(id, false);
+            return match view {
+                Some(v) => AdminResponse::Job(Box::new(v)),
+                None => AdminResponse::Error(format!("no job {id}")),
+            };
+        }
+    }
+}
+
+/// [`AdminOp::LogsWait`] (1.19): the task's output from the offsets once
+/// there is some, the run ended or moved on, or the wait is over.
+async fn logs_wait(
+    inner: &Arc<Inner>,
+    (job, index, attempt, stdout_from, stderr_from): (JobId, u32, u32, u64, u64),
+    wait_ms: u64,
+) -> Result<AdminResponse> {
+    let mut changes = inner.state().store.changes();
+    let mut stopped = inner.stopped.subscribe();
+    let wait = Duration::from_millis(wait_ms.min(pumasi_proto::msg::MAX_WAIT_MS));
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let chunk = inner
+            .state()
+            .logs(job, index, attempt, stdout_from, stderr_from)?;
+        let news = !chunk.stdout.is_empty()
+            || !chunk.stderr.is_empty()
+            || chunk.done
+            || chunk.attempt != attempt
+            || !matches!(
+                chunk.state,
+                pumasi_proto::msg::TaskState::Pending
+                    | pumasi_proto::msg::TaskState::Running { .. }
+            );
+        if news || !wait_change(&mut changes, &mut stopped, deadline).await {
+            return Ok(AdminResponse::Logs(Box::new(chunk)));
+        }
+    }
 }
 
 /// The S3 key calls (1.8): any ticket makes keys that act as itself and
@@ -1957,6 +2116,9 @@ const PUSH_READS_EVERY: Duration = Duration::from_secs(2);
 /// can answer those reads themselves (1.12).
 async fn push_reads(inner: Arc<Inner>) {
     let mut conns = std::collections::HashMap::new();
+    // When this leader saw each job end, so ended jobs stay readable on
+    // followers for a while (1.19).
+    let mut ended: std::collections::HashMap<JobId, Option<Instant>> = Default::default();
     let mut tick = tokio::time::interval(PUSH_READS_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1975,7 +2137,7 @@ async fn push_reads(inner: Arc<Inner>) {
             let Ok(metrics) = st.metrics_view(None, 0) else {
                 continue;
             };
-            pumasi_proto::ha::ReadCache {
+            let cache = pumasi_proto::ha::ReadCache {
                 at_unix_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as u64),
@@ -1983,9 +2145,81 @@ async fn push_reads(inner: Arc<Inner>) {
                 events,
                 events_cut,
                 metrics,
-            }
+            };
+            (cache, read_more(&st, &mut ended))
         };
-        ha.push_reads(cache, &mut conns).await;
+        let (cache, more) = cache;
+        ha.push_reads(cache, more, &mut conns).await;
+    }
+}
+
+/// What followers answer the API's and the CLI's reads with beside the
+/// [`pumasi_proto::ha::ReadCache`] (1.19): the jobs still going and those
+/// that ended in the last ten minutes, each submitter account's capacity,
+/// and the nodes' power states.
+fn read_more(
+    st: &State,
+    ended: &mut std::collections::HashMap<JobId, Option<Instant>>,
+) -> pumasi_proto::ha::ReadMore {
+    use pumasi_proto::ha::{JobRead, READ_CAPACITY_ACCOUNTS, READ_JOBS_DONE_SECS, READ_JOBS_TASKS};
+    let now = Instant::now();
+    let keep = Duration::from_secs(READ_JOBS_DONE_SECS);
+    let status = st.status_for(None);
+    // `None`: seen going; `Some`: seen ending then. Jobs that had ended
+    // before this leader saw them are left to the leader.
+    ended.retain(|id, _| status.jobs.iter().any(|j| j.id == *id));
+    for j in &status.jobs {
+        if !j.state.is_terminal() {
+            ended.insert(j.id, None);
+        } else if let Some(at) = ended.get_mut(&j.id)
+            && at.is_none()
+        {
+            *at = Some(now);
+        }
+    }
+    let mut jobs = Vec::new();
+    let mut tasks = 0usize;
+    // Newest first, as the status lists them.
+    for j in &status.jobs {
+        if j.state.is_terminal()
+            && !matches!(ended.get(&j.id), Some(Some(at)) if now.duration_since(*at) <= keep)
+        {
+            continue;
+        }
+        let Some(view) = st.job_view(j.id, false) else {
+            continue;
+        };
+        tasks += view.tasks.len();
+        if tasks > READ_JOBS_TASKS {
+            break;
+        }
+        jobs.push(JobRead {
+            details: st.task_details(j.id).unwrap_or_default(),
+            executors: st.task_executors(j.id).unwrap_or_default(),
+            view,
+        });
+    }
+    let mut accounts: Vec<String> = st
+        .list_access()
+        .into_iter()
+        .filter_map(|a| match a.role {
+            pumasi_proto::manage::AccessRole::Submitter { account } => Some(account),
+            _ => None,
+        })
+        .collect();
+    accounts.sort();
+    accounts.dedup();
+    accounts.truncate(READ_CAPACITY_ACCOUNTS);
+    pumasi_proto::ha::ReadMore {
+        jobs,
+        capacity: accounts
+            .into_iter()
+            .map(|a| {
+                let c = st.capacity(&a);
+                (a, c)
+            })
+            .collect(),
+        power: st.node_power(),
     }
 }
 
@@ -2033,20 +2267,92 @@ fn follower_caller(store: &Store, secret: &Secret) -> Option<Caller> {
 }
 
 /// A follower's answer to a [`AdminOp::FollowerRead`] from the leader's
-/// cache; `None` sends the caller to the leader (a submitter, whose view
-/// differs, or a read the cache cannot answer in full).
+/// cache; `None` sends the caller to the leader (a read the cache cannot
+/// answer in full, a job it does not have, or one of another account).
+/// `in_step`: this replica has applied (nearly) all the leader's log, so
+/// its own copy of the state can answer metrics history (1.19).
 fn follower_answer(
     store: &Store,
     secret: &Secret,
     op: &AdminOp,
-    cache: &pumasi_proto::ha::ReadCache,
+    reads: &ha::Reads,
+    in_step: bool,
 ) -> Option<AdminResponse> {
     let caller = follower_caller(store, secret)?;
-    if matches!(caller, Caller::Submitter { .. }) {
-        return None;
+    let resp = follower_read(store, &caller, op, reads, in_step)?;
+    Some(access::scope(&caller, resp))
+}
+
+fn follower_read(
+    store: &Store,
+    caller: &Caller,
+    op: &AdminOp,
+    reads: &ha::Reads,
+    in_step: bool,
+) -> Option<AdminResponse> {
+    let cache = &reads.cache;
+    let account = match caller {
+        Caller::Submitter { account, .. } => Some(account.as_str()),
+        _ => None,
+    };
+    // A job the leader handed over, when the caller may read it.
+    let job = |id: &JobId| {
+        let j = reads
+            .more
+            .as_ref()?
+            .jobs
+            .iter()
+            .find(|j| j.view.summary.id == *id)?;
+        account
+            .is_none_or(|a| j.view.summary.account == a)
+            .then_some(j)
+    };
+    match op {
+        AdminOp::Status => {
+            let mut status = cache.status.clone();
+            if let Some(a) = account {
+                // Its own capacity, which a 1.18 leader does not send.
+                let more = reads.more.as_ref()?;
+                status.capacity = Some(more.capacity.iter().find(|(n, _)| n == a)?.1.clone());
+            }
+            return Some(AdminResponse::Status(status));
+        }
+        AdminOp::Job {
+            id,
+            with_output: false,
+        } => return Some(AdminResponse::Job(Box::new(job(id)?.view.clone()))),
+        AdminOp::TaskDetails { id } => {
+            return Some(AdminResponse::TaskDetails(job(id)?.details.clone()));
+        }
+        AdminOp::TaskExecutors { id } => {
+            return Some(AdminResponse::TaskExecutors(job(id)?.executors.clone()));
+        }
+        AdminOp::NodePower => {
+            return Some(AdminResponse::NodePower(reads.more.as_ref()?.power.clone()));
+        }
+        AdminOp::Metrics { node, since_secs } if *since_secs > 0 => {
+            if !in_step {
+                return None;
+            }
+            let AdminResponse::Metrics(mut m) = follower_read(
+                store,
+                caller,
+                &AdminOp::Metrics {
+                    node: node.clone(),
+                    since_secs: 0,
+                },
+                reads,
+                in_step,
+            )?
+            else {
+                return None;
+            };
+            crate::monitor::stored_series(store, &mut m.nodes, *since_secs).ok()?;
+            return Some(AdminResponse::Metrics(m));
+        }
+        _ => {}
     }
     match op {
-        AdminOp::Status => Some(AdminResponse::Status(cache.status.clone())),
         AdminOp::Events {
             after,
             since_unix,
@@ -3088,6 +3394,12 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             }
         }
         AdminOp::NodePower => Ok(AdminResponse::NodePower(inner.state().node_power())),
+        AdminOp::JobCaps => Ok(AdminResponse::JobCaps(inner.state().job_caps_view())),
+        AdminOp::SetJobCaps { account, caps } => {
+            let mut st = inner.state();
+            st.set_job_caps(&account, caps)?;
+            Ok(AdminResponse::JobCaps(st.job_caps_view()))
+        }
         AdminOp::WakeNode { node } => Ok(AdminResponse::Applied(inner.state().wake_node(&node)?)),
         AdminOp::CheckJob { sub, upload_bytes } => {
             let submitter = matches!(caller, Caller::Submitter { .. });

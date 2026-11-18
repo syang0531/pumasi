@@ -357,6 +357,11 @@ impl State {
             "priority {} is above the {cap} account {account} may use (`pumasi quota {account} --max-priority`)",
             sub.priority
         );
+        let task_cpus = match sub.executor {
+            Executor::Wasm => 1,
+            _ => pumasi_proto::economy::vcpus(sub.limits.cpu_millis),
+        };
+        self.check_job_caps(&account, task_cpus, sub.limits.memory_bytes)?;
         let wait = self.check_deps(&sub.after)?;
         let (ext, _) = self.prepare_store(&sub, &account)?;
         // Input files too large to go with the job are stored first.

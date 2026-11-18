@@ -9,7 +9,10 @@ use anyhow::{Context, Result, bail, ensure};
 use pumasi_proto::{
     Secret,
     economy::{MilliCu, validate_account},
-    manage::{AccessRole, AccountPolicy, AccountQuota, ListPatch, PolicyPatch, QuotaView},
+    manage::{
+        AccessRole, AccountPolicy, AccountQuota, JobCaps, JobCapsPatch, ListPatch, PolicyPatch,
+        QuotaView,
+    },
     msg::{AdminOp, AdminResponse},
 };
 use serde::Deserialize;
@@ -287,6 +290,80 @@ struct PatchBody {
     account: Option<String>,
     #[allow(dead_code)]
     usage: Option<Value>,
+    // 1.19: caps per job.
+    #[serde(default, deserialize_with = "given")]
+    max_job_cpus: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "given")]
+    max_job_memory_bytes: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "given")]
+    max_job_cu: Option<Option<MilliCu>>,
+}
+
+/// The caps per job a PATCH body names (1.19).
+pub fn parse_caps_patch(body: &[u8]) -> Result<JobCapsPatch> {
+    let b: PatchBody = serde_json::from_slice(body).context("the body is not a policy change")?;
+    Ok(JobCapsPatch {
+        cpus: b.max_job_cpus,
+        memory_bytes: b.max_job_memory_bytes,
+        cu: b.max_job_cu,
+    })
+}
+
+/// Every account's caps per job; an error from a control plane older than
+/// 1.19.
+pub async fn all_caps(st: &St, secret: Secret) -> Result<Vec<(String, JobCaps)>> {
+    match st.backend.call(secret, AdminOp::JobCaps).await? {
+        AdminResponse::JobCaps(v) => Ok(v),
+        _ => bail!("unexpected response"),
+    }
+}
+
+/// One account's caps per job, `None` from an older control plane.
+pub async fn caps_of(st: &St, secret: Secret, account: &str) -> Option<JobCaps> {
+    let all = all_caps(st, secret).await.ok()?;
+    Some(
+        all.into_iter()
+            .find(|(a, _)| a == account)
+            .map(|(_, c)| c)
+            .unwrap_or_default(),
+    )
+}
+
+/// Changes the caps per job a PATCH names; the caps after it.
+pub async fn patch_caps(
+    st: &St,
+    secret: Secret,
+    account: &str,
+    patch: &JobCapsPatch,
+) -> Result<JobCaps> {
+    let mut caps = all_caps(st, secret)
+        .await
+        .context("this control plane has no caps per job (they came in 1.19)")?
+        .into_iter()
+        .find(|(a, _)| a == account)
+        .map(|(_, c)| c)
+        .unwrap_or_default();
+    patch.apply(&mut caps)?;
+    st.backend
+        .call(
+            secret,
+            AdminOp::SetJobCaps {
+                account: account.to_string(),
+                caps,
+            },
+        )
+        .await?;
+    Ok(caps)
+}
+
+/// Adds the caps per job to an account's JSON (1.19).
+pub fn with_caps(mut v: Value, caps: Option<&JobCaps>) -> Value {
+    if let (Some(c), Some(m)) = (caps, v.as_object_mut()) {
+        m.insert("max_job_cpus".into(), json!(c.cpus));
+        m.insert("max_job_memory_bytes".into(), json!(c.memory_bytes));
+        m.insert("max_job_cu".into(), json!(c.cu));
+    }
+    v
 }
 
 /// Reads a PATCH body for `account`.
@@ -444,7 +521,15 @@ mod tests {
         let patch = &schemas["AccountPolicyPatch"];
         assert_eq!(patch["additionalProperties"], false);
         let fields = keys(&patch["properties"]);
-        assert_eq!(fields, keys(&view));
+        // With a 1.19 control plane the caps per job come along.
+        let with = with_caps(view.clone(), Some(&JobCaps::default()));
+        assert_eq!(fields, keys(&with));
+        let mut both = keys(&schemas["AccountPolicy"]["properties"]);
+        both.extend(keys(
+            &schemas["AccountPolicyView"]["allOf"][1]["properties"],
+        ));
+        both.sort();
+        assert_eq!(both, keys(&with));
         let list = [
             json!(["a"]),
             json!({"add": ["a"]}),
@@ -463,6 +548,11 @@ mod tests {
                 "network" => vec![json!("allow"), json!("deny")],
                 "selector" => vec![json!("zone=lab"), json!("")],
                 "max_timeout_ms" | "max_gpus_per_task" => vec![json!(3), Value::Null],
+                "max_job_cpus" | "max_job_memory_bytes" | "max_job_cu" => {
+                    let body = serde_json::to_vec(&json!({ f: 3 })).unwrap();
+                    assert!(!parse_caps_patch(&body).unwrap().is_empty(), "{f}");
+                    vec![json!(3), Value::Null]
+                }
                 "account" => vec![json!("ci")],
                 "usage" => vec![view["usage"].clone()],
                 "quota" => keys(&schemas["AccountQuota"]["properties"])

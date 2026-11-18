@@ -207,6 +207,92 @@ impl AdminClient {
         }
     }
 
+    /// A job without its output, once it has ended or after `wait` (at
+    /// most [`pumasi_proto::msg::MAX_WAIT_MS`]): the control plane answers
+    /// when it ends (1.19); an older one is asked again and again, more
+    /// slowly each time.
+    pub async fn wait_job(&self, id: JobId, wait: Duration) -> Result<AdminResponse> {
+        let wait = wait.min(Duration::from_millis(pumasi_proto::msg::MAX_WAIT_MS));
+        let deadline = tokio::time::Instant::now() + wait;
+        if wait.is_zero() {
+            return self
+                .call(AdminOp::Job {
+                    id,
+                    with_output: false,
+                })
+                .await;
+        }
+        let pushed = self
+            .call(AdminOp::JobWait {
+                id,
+                wait_ms: wait.as_millis() as u64,
+            })
+            .await;
+        if let Ok(r) = pushed {
+            return Ok(r);
+        }
+        // Older than 1.19 (it closes the stream), or the call failed: the
+        // plain calls say which.
+        let mut pause = Duration::from_millis(250);
+        loop {
+            let r = self
+                .call(AdminOp::Job {
+                    id,
+                    with_output: false,
+                })
+                .await?;
+            let done = match &r {
+                AdminResponse::Job(j) => j.summary.state.is_terminal(),
+                _ => true,
+            };
+            let now = tokio::time::Instant::now();
+            if done || now >= deadline {
+                return Ok(r);
+            }
+            tokio::time::sleep(pause.min(deadline - now)).await;
+            pause = (pause * 2).min(Duration::from_secs(2));
+        }
+    }
+
+    /// A task's output from the offsets, once there is some, the run ended
+    /// or started over, or `wait` passed (1.19). An older control plane
+    /// answers at once and the caller asks again a moment later; `pushed`
+    /// tells which (`false`: wait a little before asking again).
+    pub async fn wait_logs(
+        &self,
+        (job, index, attempt): (JobId, u32, u32),
+        (stdout_from, stderr_from): (u64, u64),
+        wait: Duration,
+        pushed: &mut bool,
+    ) -> Result<AdminResponse> {
+        if *pushed && !wait.is_zero() {
+            let r = self
+                .call(AdminOp::LogsWait {
+                    job,
+                    index,
+                    attempt,
+                    stdout_from,
+                    stderr_from,
+                    wait_ms: wait
+                        .min(Duration::from_millis(pumasi_proto::msg::MAX_WAIT_MS))
+                        .as_millis() as u64,
+                })
+                .await;
+            match r {
+                Ok(r) => return Ok(r),
+                Err(_) => *pushed = false,
+            }
+        }
+        self.call(AdminOp::Logs {
+            job,
+            index,
+            attempt,
+            stdout_from,
+            stderr_from,
+        })
+        .await
+    }
+
     /// A job's receipts with their egress parts (1.18), or without them
     /// from an older control plane.
     pub async fn receipts(

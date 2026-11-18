@@ -86,6 +86,37 @@ const JOIN_PEERS_FILE: &str = "join.peers";
 const MAX_RAFT_FRAME: usize = 512 * 1024 * 1024;
 /// A leader that heard from no majority for this long stops serving.
 pub const LEASE: Duration = Duration::from_secs(3);
+/// How often a replica checks that the membership has its address (1.19).
+pub const ADDRESS_EVERY: Duration = Duration::from_secs(30);
+/// How old a signed address may be when the leader gets it.
+const MOVED_MAX_AGE: Duration = Duration::from_secs(600);
+
+/// What a replica signs when it tells the leader its new address.
+fn moved_bytes(addr: &EndpointAddr, unix_ms: u64) -> Vec<u8> {
+    let mut b = b"pumasi/replica-moved/v1\0".to_vec();
+    b.extend(postcard::to_stdvec(addr).unwrap_or_default());
+    b.extend(unix_ms.to_be_bytes());
+    b
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Whether the address the membership has (`stored`) no longer reaches a
+/// replica that is now at `now`: they share no direct address and no
+/// relay. A replica on the same relay stays reachable through it, so
+/// that alone is no reason to change the membership.
+pub fn moved(stored: &EndpointAddr, now: &EndpointAddr) -> bool {
+    if now.addrs.is_empty() || stored.id != now.id {
+        return false;
+    }
+    let ips: BTreeSet<&std::net::SocketAddr> = now.ip_addrs().collect();
+    let relays: BTreeSet<&iroh::RelayUrl> = now.relay_urls().collect();
+    !(stored.ip_addrs().any(|a| ips.contains(a)) || stored.relay_urls().any(|r| relays.contains(r)))
+}
 
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("log");
 const LOG_META: TableDefinition<&str, &[u8]> = TableDefinition::new("log_meta");
@@ -555,6 +586,22 @@ pub enum RaftReq {
     Turn {
         version: String,
     },
+    // 1.19 from here.
+    /// From a replica whose address changed (it moved, or restarted on
+    /// another port): its new address, signed with its endpoint key, for
+    /// the leader to put in the membership. A replica that moves keeps its
+    /// place without being removed and invited again.
+    Moved {
+        addr: EndpointAddr,
+        unix_ms: u64,
+        sig: Vec<u8>,
+    },
+    /// [`RaftReq::Reads`] with what followers answer the API's and the
+    /// CLI's reads with too. No answer is sent; a 1.18 follower drops it.
+    ReadsMore {
+        cache: Box<pumasi_proto::ha::ReadCache>,
+        more: Box<pumasi_proto::ha::ReadMore>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -575,6 +622,13 @@ pub enum RaftResp {
     Version(pumasi_proto::release::ReplicaVersion),
     /// `Err` says why not yet.
     Turn(Result<(), String>),
+    // 1.19 from here.
+    /// The answer to [`RaftReq::Moved`]: whether the membership has the
+    /// address now, and otherwise the leader to ask.
+    Moved {
+        updated: bool,
+        leader: Option<EndpointAddr>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -769,6 +823,14 @@ impl RaftNetwork<C> for Peer {
 // The replica
 // ---------------------------------------------------------------------------
 
+/// What a follower answers reads from.
+#[derive(Clone)]
+pub struct Reads {
+    pub cache: Arc<pumasi_proto::ha::ReadCache>,
+    /// From a 1.19 leader.
+    pub more: Option<Arc<pumasi_proto::ha::ReadMore>>,
+}
+
 /// This replica's Raft node and what goes with it.
 pub struct Ha {
     pub raft: Raft<C>,
@@ -780,8 +842,9 @@ pub struct Ha {
     invites: Mutex<HashMap<Secret, Instant>>,
     /// Who may send Raft messages before this replica has a membership.
     join_peers: Mutex<HashSet<EndpointId>>,
-    /// On a follower: the leader's latest [`RaftReq::Reads`] (1.12).
-    reads: Mutex<Option<(Instant, Arc<pumasi_proto::ha::ReadCache>)>>,
+    /// On a follower: the leader's latest [`RaftReq::Reads`] (1.12), with
+    /// what [`RaftReq::ReadsMore`] adds (1.19).
+    reads: Mutex<Option<(Instant, Reads)>>,
 }
 
 impl Ha {
@@ -1206,14 +1269,160 @@ impl Ha {
             RaftReq::Reads(cache) => {
                 // Only the leader's word counts.
                 if self.leader_addr().is_some_and(|l| l.id == peer) && peer != self.endpoint.id() {
-                    *self.reads.lock().unwrap() = Some((Instant::now(), Arc::new(*cache)));
+                    let reads = Reads {
+                        cache: Arc::new(*cache),
+                        more: None,
+                    };
+                    *self.reads.lock().unwrap() = Some((Instant::now(), reads));
                 }
                 RaftResp::Mirrored(0)
             }
+            RaftReq::ReadsMore { cache, more } => {
+                if self.leader_addr().is_some_and(|l| l.id == peer) && peer != self.endpoint.id() {
+                    let reads = Reads {
+                        cache: Arc::new(*cache),
+                        more: Some(Arc::new(*more)),
+                    };
+                    *self.reads.lock().unwrap() = Some((Instant::now(), reads));
+                }
+                RaftResp::Mirrored(0)
+            }
+            RaftReq::Moved { addr, unix_ms, sig } => self.moved_to(peer, addr, unix_ms, sig).await,
             RaftReq::Version => RaftResp::Version(tags.version()),
             RaftReq::Turn { version } => RaftResp::Turn(tags.turn(peer, &version)),
             RaftReq::Join { .. } => unreachable!("handled above"),
         }
+    }
+
+    /// A replica's new address ([`RaftReq::Moved`]), on the leader: checked
+    /// against the caller and its signature, then put in the membership.
+    async fn moved_to(
+        &self,
+        peer: EndpointId,
+        addr: EndpointAddr,
+        unix_ms: u64,
+        sig: Vec<u8>,
+    ) -> RaftResp {
+        if addr.id != peer {
+            return RaftResp::Refused("the address is not the caller's".into());
+        }
+        let Ok(sig) = <[u8; 64]>::try_from(sig.as_slice()) else {
+            return RaftResp::Refused("bad signature".into());
+        };
+        let sig = iroh::Signature::from_bytes(&sig);
+        if peer.verify(&moved_bytes(&addr, unix_ms), &sig).is_err() {
+            return RaftResp::Refused("bad signature".into());
+        }
+        let age = unix_ms.abs_diff(self::unix_ms());
+        if age > MOVED_MAX_AGE.as_millis() as u64 {
+            return RaftResp::Refused(
+                "the signed address is too old (are the clocks right?)".into(),
+            );
+        }
+        if !self.is_leader() {
+            return RaftResp::Moved {
+                updated: false,
+                leader: self.leader_addr(),
+            };
+        }
+        match self.set_address(node_id(&peer), addr).await {
+            Ok(()) => RaftResp::Moved {
+                updated: true,
+                leader: None,
+            },
+            Err(e) => RaftResp::Refused(format!("{e:#}")),
+        }
+    }
+
+    /// Puts `addr` in the membership for replica `id` (on the leader).
+    async fn set_address(&self, id: NodeId, addr: EndpointAddr) -> Result<()> {
+        let stored = self
+            .members()
+            .into_iter()
+            .find(|(m, _)| *m == id)
+            .context("not a replica of this cluster")?
+            .1;
+        if stored.addr.as_ref() == Some(&addr) {
+            return Ok(());
+        }
+        let name = addr.id.fmt_short().to_string();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(id, Replica { addr: Some(addr) });
+        self.change_membership(ChangeMembers::SetNodes(nodes))
+            .await
+            .map_err(|e| anyhow::anyhow!("update the address of {name}: {e}"))?;
+        info!(replica = %name, "a control plane replica moved; its address is updated");
+        Ok(())
+    }
+
+    /// Makes sure the membership has an address that reaches this replica
+    /// (1.19): when the one there shares nothing with where this replica is
+    /// now, it tells the leader (or is the leader and writes it). `true`
+    /// when it changed the membership.
+    pub async fn announce_address(&self) -> Result<bool> {
+        let me = self.endpoint.addr();
+        let Some(stored) = self
+            .members()
+            .into_iter()
+            .find(|(id, _)| *id == self.id)
+            .and_then(|(_, n)| n.addr)
+        else {
+            return Ok(false);
+        };
+        if !moved(&stored, &me) {
+            return Ok(false);
+        }
+        if self.is_leader() {
+            self.set_address(self.id, me).await?;
+            return Ok(true);
+        }
+        let unix_ms = self::unix_ms();
+        let sig = self.endpoint.secret_key().sign(&moved_bytes(&me, unix_ms));
+        let req = RaftReq::Moved {
+            addr: me,
+            unix_ms,
+            sig: sig.to_bytes().to_vec(),
+        };
+        // The leader if this replica knows it, else whoever answers.
+        let mut queue: Vec<EndpointAddr> = self
+            .members()
+            .into_iter()
+            .filter(|(id, _)| *id != self.id)
+            .filter_map(|(_, n)| n.addr)
+            .collect();
+        if let Some(l) = self.leader_addr().filter(|l| l.id != self.endpoint.id()) {
+            queue.retain(|a| a.id != l.id);
+            queue.push(l);
+        }
+        let mut tried = HashSet::new();
+        let mut last = anyhow::anyhow!("no other replica to ask");
+        while let Some(target) = queue.pop() {
+            if !tried.insert(target.id) {
+                continue;
+            }
+            match self.ask(target.clone(), &req, Duration::from_secs(5)).await {
+                Ok(RaftResp::Moved { updated: true, .. }) => return Ok(true),
+                Ok(RaftResp::Moved {
+                    updated: false,
+                    leader,
+                }) => {
+                    last = anyhow::anyhow!("{} is not the leader", target.id.fmt_short());
+                    if let Some(l) = leader.filter(|l| l.id != self.endpoint.id()) {
+                        tried.remove(&l.id);
+                        queue.push(l);
+                    }
+                }
+                Ok(RaftResp::Refused(why)) => last = anyhow::anyhow!("{why}"),
+                Ok(other) => last = anyhow::anyhow!("unexpected answer {other:?}"),
+                Err(e) => {
+                    last = e.context(format!(
+                        "{} did not answer (down, or older than 1.19)",
+                        target.id.fmt_short()
+                    ))
+                }
+            }
+        }
+        Err(last)
     }
 
     async fn join(
@@ -1321,14 +1530,14 @@ impl Ha {
 
     /// The leader's read cache, while it is fresh and this replica is a
     /// follower of a known leader (1.12).
-    pub fn fresh_reads(&self) -> Option<Arc<pumasi_proto::ha::ReadCache>> {
+    pub fn fresh_reads(&self) -> Option<Reads> {
         if self.is_leader() || self.leader_addr().is_none() {
             return None;
         }
         let guard = self.reads.lock().unwrap();
-        let (at, cache) = guard.as_ref()?;
+        let (at, reads) = guard.as_ref()?;
         (at.elapsed() < Duration::from_millis(pumasi_proto::ha::READ_CACHE_FRESH_MS))
-            .then(|| cache.clone())
+            .then(|| reads.clone())
     }
 
     /// Sends the read cache to every follower, keeping one connection to
@@ -1337,6 +1546,7 @@ impl Ha {
     pub async fn push_reads(
         &self,
         cache: pumasi_proto::ha::ReadCache,
+        more: pumasi_proto::ha::ReadMore,
         conns: &mut HashMap<EndpointId, Connection>,
     ) {
         let followers: Vec<EndpointAddr> = self
@@ -1346,7 +1556,10 @@ impl Ha {
             .filter_map(|(_, n)| n.addr)
             .collect();
         conns.retain(|id, c| c.close_reason().is_none() && followers.iter().any(|f| f.id == *id));
-        let req = RaftReq::Reads(Box::new(cache));
+        let req = RaftReq::ReadsMore {
+            cache: Box::new(cache),
+            more: Box::new(more),
+        };
         for addr in followers {
             let conn = match conns.get(&addr.id) {
                 Some(c) => c.clone(),

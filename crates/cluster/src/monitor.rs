@@ -424,6 +424,35 @@ impl Default for Monitor {
     }
 }
 
+/// Each node's series over `since_secs` from the points the store holds
+/// (1.19): a follower answers metrics history from its copy of the state.
+/// The step still open on the leader is not stored yet, so a follower's
+/// series ends one step earlier.
+pub(crate) fn stored_series(
+    store: &crate::store::Store,
+    nodes: &mut [pumasi_proto::monitor::NodeMetricsView],
+    since_secs: u64,
+) -> Result<()> {
+    let i = match since_secs {
+        s if s <= TIERS[0].1 => 0,
+        s if s <= TIERS[1].1 => 1,
+        _ => 2,
+    };
+    let mut since = vec![u64::MAX; TIERS.len()];
+    since[i] = now_unix().saturating_sub(since_secs);
+    let points = store.load_points(&since)?;
+    for n in nodes.iter_mut() {
+        n.step_secs = TIERS[i].0 as u32;
+        n.series = points
+            .iter()
+            .filter(|(id, _, _)| *id == n.id)
+            .map(|(_, _, p)| p.clone())
+            .collect();
+        n.series.sort_by_key(|p| p.unix);
+    }
+    Ok(())
+}
+
 fn tier_since(now: u64, retention: u64) -> Vec<u64> {
     TIERS
         .iter()
@@ -777,6 +806,8 @@ impl State {
         {
             return;
         }
+        // `logs -f` waits for this (1.19).
+        self.store.touch();
         let live = self
             .monitor
             .live

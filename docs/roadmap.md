@@ -47,7 +47,7 @@ machines.
 | 32 | 1.16 | GPUs: enforced memory for parts of GPUs, drawing over WebGPU, several adapters | done |
 | 33 | 1.17 | Windows: HCS if it is faster, signed binaries, a cleaner WSL Docker | done |
 | 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | done |
-| 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | planned |
+| 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | done |
 | 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | planned |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
 | 19 | | Buying CU with won through the hub (Toss Payments) | on hold |
@@ -676,6 +676,34 @@ figure on the receipt. By hand: a microVM job on the iMac reaches only
 its allow list.
 
 ## 35. High availability and the remote API: reads from followers, limits that survive a failover, ACME (1.19)
+
+Done in 1.19.0 ([release notes](releases/v1.19.0.md),
+[details](architecture.md#phase-35-high-availability-and-the-remote-api-119)).
+What differs from the plan: the limits are not replicated as they
+change but written down as one compacted record every 2 seconds when
+they changed (2,000 entries of each kind at most, blocks and the
+emptiest buckets first), so a crash can lose up to the last 2 seconds of
+counts; a new leader keeps the stricter of that record and what it
+counted itself. Followers answer jobs from the copy the leader sends
+them: jobs queued or running, and those that ended in the last ten
+minutes while this leader watched (20,000 tasks at most); older jobs and
+task output still come from the leader, and metrics history comes from
+the follower's own store only while it is in step. A submitter's status
+needs its account's capacity in that copy (accounts with live submitter
+tickets, 64 at most). A replica counts as moved when its new address
+shares no direct address and no relay with the stored one; it says so at
+start (every second for 30 seconds) and every 30 seconds after, and may
+start one election before the leader has the new address. `?wait=` and
+`logs -f` wake on any task write or new output, coalesced over 5 ms; a
+1.18 control plane is polled as before. Caps per job bind every job of
+the account whoever submits it, like quotas (the job policy binds only
+submitter tickets); at the CU cap the tasks that have not run fail and
+the running ones finish, so a job can go over by what was running, and
+`apply --prune` leaves caps alone. ACME orders one certificate for all
+`--acme` names with the challenge picked up front (TLS-ALPN-01 on the
+dashboard's port by default, HTTP-01 on a listener of its own that also
+sends browsers to HTTPS); no DNS-01, so no wildcards, and no external
+account binding. The Pebble check runs on Linux CI only.
 
 Why: phase 28 left the API and the CLI reading from the leader, shared
 limits in the leader's memory, and replicas that must be removed and

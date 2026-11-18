@@ -592,8 +592,9 @@ async fn client_of(replica: &Cluster, secret: pumasi_proto::Secret) -> AdminClie
 }
 
 /// 1.12: followers answer the status, events and latest metrics from
-/// what the leader hands them, for admins and viewers; submitters, and
-/// tickets revoked a moment ago, are sent to the leader.
+/// what the leader hands them; tickets revoked a moment ago are sent to
+/// the leader. 1.19: jobs, task details, metrics history, and
+/// submitters' own views too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn followers_answer_reads() {
     init_tracing();
@@ -617,7 +618,7 @@ async fn followers_answer_reads() {
         &admin,
         "robot",
         AccessRole::Submitter {
-            account: "owner".into(),
+            account: "robots".into(),
         },
     )
     .await;
@@ -655,10 +656,91 @@ async fn followers_answer_reads() {
     call(&on_b, AdminOp::Status).await;
     assert_eq!(on_b.connected_to(), a.endpoint_id());
 
-    // A submitter's view differs: the leader answers.
-    let sub_b = client_of(&b, submitter).await;
-    call(&sub_b, AdminOp::FollowerRead(Box::new(AdminOp::Status))).await;
-    assert_eq!(sub_b.connected_to(), a.endpoint_id());
+    // 1.19: jobs, task details and metrics history too. A job no
+    // provider runs stays pending, so the leader hands it over.
+    call(&admin, AdminOp::SetPolicy(policy())).await;
+    call(
+        &admin,
+        AdminOp::Deposit {
+            account: "owner".into(),
+            amount: DEPOSIT,
+            memo: "test".into(),
+        },
+    )
+    .await;
+    let id = submit(&admin, submission(vec![vec!["waits"]])).await;
+    // (A client the follower sent on stays with the leader: a fresh one
+    // each try.)
+    let on_b2 = eventually(20, "the follower answering for the job", || async {
+        let c = client_of(&b, viewer).await;
+        let r = c
+            .call(AdminOp::FollowerRead(Box::new(AdminOp::Job {
+                id,
+                with_output: false,
+            })))
+            .await;
+        match r {
+            Ok(AdminResponse::Job(v)) if c.connected_to() == b.endpoint_id() => {
+                assert_eq!(v.summary.id, id);
+                Ok(c)
+            }
+            other => {
+                let e = format!("{other:?}");
+                c.close().await;
+                Err(e)
+            }
+        }
+    })
+    .await;
+    let r = on_b2
+        .call(AdminOp::FollowerRead(Box::new(AdminOp::TaskDetails { id })))
+        .await
+        .unwrap();
+    assert!(matches!(r, AdminResponse::TaskDetails(_)), "{r:?}");
+    assert_eq!(on_b2.connected_to(), b.endpoint_id());
+    // Metrics history from the follower's own copy.
+    let r = on_b2
+        .call(AdminOp::FollowerRead(Box::new(AdminOp::Metrics {
+            node: None,
+            since_secs: 3600,
+        })))
+        .await
+        .unwrap();
+    assert!(matches!(r, AdminResponse::Metrics(_)), "{r:?}");
+    assert_eq!(on_b2.connected_to(), b.endpoint_id());
+    on_b2.close().await;
+
+    // A submitter's status: the follower answers once it has the
+    // account's capacity, and only with the submitter's own jobs.
+    let sub_b = eventually(20, "the follower answering a submitter", || async {
+        let c = client_of(&b, submitter).await;
+        match c
+            .call(AdminOp::FollowerRead(Box::new(AdminOp::Status)))
+            .await
+        {
+            Ok(AdminResponse::Status(s)) if c.connected_to() == b.endpoint_id() => Ok((c, s)),
+            other => {
+                let e = format!("{other:?}");
+                c.close().await;
+                Err(e)
+            }
+        }
+    })
+    .await;
+    let (sub_b, s) = sub_b;
+    assert!(s.capacity.is_some(), "{s:?}");
+    assert!(
+        s.jobs.iter().all(|j| j.id != id),
+        "the admin's job leaked: {s:?}"
+    );
+    // Someone else's job: not from the follower's cache.
+    let r = sub_b
+        .call(AdminOp::FollowerRead(Box::new(AdminOp::Job {
+            id,
+            with_output: false,
+        })))
+        .await;
+    assert!(!matches!(r, Ok(AdminResponse::Job(_))), "{r:?}");
 
     // A revoked ticket is refused by the follower as soon as the
     // revocation reached its copy of the state.
@@ -1004,4 +1086,237 @@ async fn replicas_upgrade_one_at_a_time() {
     for cl in [a, b, c] {
         cl.shutdown().await.unwrap();
     }
+}
+
+/// Sends failed sign-ins for `ip`; answers whether it is blocked.
+async fn fail_sign_in(client: &AdminClient, ip: &str) -> anyhow::Result<bool> {
+    use pumasi_proto::limit::{LimitOp, LimitReply};
+    match client
+        .call(AdminOp::Limit(Box::new(LimitOp::Failed { ip: ip.into() })))
+        .await?
+    {
+        AdminResponse::Limit(r) => match *r {
+            LimitReply::Blocked(list) => Ok(list.iter().any(|(a, _)| a == ip)),
+            other => panic!("unexpected {other:?}"),
+        },
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// 1.19 gate: the failed sign-ins counted by a leader that is then killed
+/// still count on the new one; and a replica restarted on another address
+/// rejoins without an invite, by telling the leader its new address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn limits_survive_a_new_leader_and_replicas_move() {
+    use pumasi_proto::limit::MAX_FAILURES;
+    init_tracing();
+    let (dir_a, dir_b, dir_c) = (tempdir("lim-a"), tempdir("lim-b"), tempdir("lim-c"));
+    let a = Cluster::start(config(dir_a.clone(), &free_port()))
+        .await
+        .unwrap();
+    let first = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+    let b = Cluster::join_replica(
+        config(dir_b.clone(), &free_port()),
+        &invite_replica(&first).await,
+    )
+    .await
+    .unwrap();
+    let c = Cluster::join_replica(
+        config(dir_c.clone(), &free_port()),
+        &invite_replica(&first).await,
+    )
+    .await
+    .unwrap();
+    wait_replicated(&first, 3).await;
+    first.close().await;
+    let client = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+
+    // A burst of failed sign-ins, short of a block.
+    let ip = "203.0.113.9";
+    let before = MAX_FAILURES - 4;
+    for _ in 0..before {
+        assert!(!fail_sign_in(&client, ip).await.unwrap());
+    }
+    // The leader writes its counts down every 2 s; then it dies.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    a.crash().await;
+
+    // The new leader carries on counting where the old one stopped.
+    let mut blocked = false;
+    let mut sent = 0;
+    eventually(60, "a new leader", || async {
+        if b.is_leader() || c.is_leader() {
+            Ok(())
+        } else {
+            Err("no leader yet".to_string())
+        }
+    })
+    .await;
+    while sent < MAX_FAILURES - before {
+        match fail_sign_in(&client, ip).await {
+            Ok(b) => {
+                sent += 1;
+                blocked = b;
+            }
+            // The client finding the new leader.
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    assert!(
+        blocked,
+        "{before} failures before the failover and {sent} after did not block"
+    );
+
+    // A follower restarted on another port rejoins with no invite: the
+    // leader learns the new address and replicates to it again.
+    let (leader, follower, dir_f) = if b.is_leader() {
+        (b, c, dir_c)
+    } else {
+        (c, b, dir_b)
+    };
+    let id = follower.endpoint_id();
+    follower.crash().await;
+    let new_bind = free_port();
+    let moved = restart(&dir_f, &new_bind).await;
+    assert_eq!(moved.endpoint_id(), id);
+    let port: u16 = new_bind.rsplit(':').next().unwrap().parse().unwrap();
+    eventually(60, "the membership naming the new address", || async {
+        let addrs = leader.membership();
+        match addrs.iter().find(|m| m.id == id) {
+            Some(m) if m.ip_addrs().any(|s| s.port() == port) => Ok(()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    // New writes reach it.
+    call(
+        &client,
+        AdminOp::Deposit {
+            account: "owner".into(),
+            amount: 1,
+            memo: "after the move".into(),
+        },
+    )
+    .await;
+    let want = leader.ha_view().unwrap().applied;
+    eventually(60, "the moved replica catching up", || async {
+        let got = moved.ha_view().unwrap().applied;
+        if got >= want {
+            Ok(())
+        } else {
+            Err(format!("{got:?} < {want:?}"))
+        }
+    })
+    .await;
+
+    client.close().await;
+    for cl in [moved, leader] {
+        cl.shutdown().await.unwrap();
+    }
+}
+
+/// 1.19 gate: `?wait=` (JobWait) and `logs -f` (LogsWait) are answered as
+/// soon as the job ends, not at the next poll.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pushed_waits_answer_at_once() {
+    init_tracing();
+    let a = Cluster::start(config(tempdir("wait"), "127.0.0.1:0"))
+        .await
+        .unwrap();
+    let client = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+    call(&client, AdminOp::SetPolicy(policy())).await;
+    call(
+        &client,
+        AdminOp::Deposit {
+            account: "owner".into(),
+            amount: DEPOSIT,
+            memo: "test".into(),
+        },
+    )
+    .await;
+    // No provider: the job waits until it is cancelled.
+    let id = submit(&client, submission(vec![vec!["never"]])).await;
+
+    // A wait that runs out answers with the job as it is.
+    let t = std::time::Instant::now();
+    match call(&client, AdminOp::JobWait { id, wait_ms: 300 }).await {
+        AdminResponse::Job(v) => assert!(!v.summary.state.is_terminal()),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(
+        t.elapsed() >= Duration::from_millis(250),
+        "{:?}",
+        t.elapsed()
+    );
+
+    let waiter = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+    let logs = AdminClient::connect(&a.admin_ticket(), NetMode::Local)
+        .await
+        .unwrap();
+    let job_wait = tokio::spawn(async move {
+        let r = waiter
+            .call(AdminOp::JobWait {
+                id,
+                wait_ms: 30_000,
+            })
+            .await
+            .unwrap();
+        (r, std::time::Instant::now(), waiter)
+    });
+    let logs_wait = tokio::spawn(async move {
+        let r = logs
+            .call(AdminOp::LogsWait {
+                job: id,
+                index: 0,
+                attempt: 0,
+                stdout_from: 0,
+                stderr_from: 0,
+                wait_ms: 30_000,
+            })
+            .await
+            .unwrap();
+        (r, std::time::Instant::now(), logs)
+    });
+    // Both are waiting on the control plane by now.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!job_wait.is_finished() && !logs_wait.is_finished());
+    call(&client, AdminOp::Cancel { id }).await;
+    let ended = std::time::Instant::now();
+
+    let (r, at, waiter) = job_wait.await.unwrap();
+    match r {
+        AdminResponse::Job(v) => assert_eq!(v.summary.state, JobState::Cancelled, "{v:#?}"),
+        other => panic!("unexpected {other:?}"),
+    }
+    let late = at.saturating_duration_since(ended);
+    assert!(
+        late < Duration::from_millis(100),
+        "JobWait answered {late:?} after the end"
+    );
+    let (r, at, logs) = logs_wait.await.unwrap();
+    assert!(matches!(r, AdminResponse::Logs(_)), "{r:?}");
+    let late = at.saturating_duration_since(ended);
+    assert!(
+        late < Duration::from_millis(100),
+        "LogsWait answered {late:?} after the end"
+    );
+
+    // And the client helper uses the pushed wait.
+    let t = std::time::Instant::now();
+    let r = client.wait_job(id, Duration::from_secs(10)).await.unwrap();
+    assert!(matches!(r, AdminResponse::Job(_)));
+    assert!(t.elapsed() < Duration::from_secs(1));
+
+    for c in [client, waiter, logs] {
+        c.close().await;
+    }
+    a.shutdown().await.unwrap();
 }

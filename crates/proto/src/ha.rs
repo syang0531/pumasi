@@ -71,3 +71,35 @@ pub struct ReadCache {
 pub const READ_CACHE_EVENTS: usize = 500;
 /// A follower answers from a cache at most this old (milliseconds).
 pub const READ_CACHE_FRESH_MS: u64 = 6_000;
+
+/// What a 1.19 leader hands its followers beside the [`ReadCache`], so
+/// they answer what the API and the CLI read too: the jobs that are still
+/// going or just ended, what each account with a submitter ticket sees as
+/// its capacity, and the nodes' power states.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReadMore {
+    /// Running and queued jobs, and jobs that ended in the last
+    /// [`READ_JOBS_DONE_SECS`], newest first, while their tasks add up to
+    /// at most [`READ_JOBS_TASKS`].
+    pub jobs: Vec<JobRead>,
+    /// The capacity in each such account's status.
+    pub capacity: Vec<(String, crate::msg::Capacity)>,
+    pub power: Vec<crate::power::NodePowerView>,
+}
+
+/// One job as [`crate::msg::AdminOp::Job`] (without output),
+/// [`crate::msg::AdminOp::TaskDetails`] and
+/// [`crate::msg::AdminOp::TaskExecutors`] answer it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRead {
+    pub view: crate::msg::JobView,
+    pub details: Vec<crate::msg::TaskDetail>,
+    pub executors: Vec<Option<crate::job::Executor>>,
+}
+
+/// How long after it ended a job stays in [`ReadMore`].
+pub const READ_JOBS_DONE_SECS: u64 = 600;
+/// Tasks the jobs in [`ReadMore`] have at most together.
+pub const READ_JOBS_TASKS: usize = 20_000;
+/// Accounts whose capacity [`ReadMore`] carries at most.
+pub const READ_CAPACITY_ACCOUNTS: usize = 64;

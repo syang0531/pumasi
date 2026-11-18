@@ -31,6 +31,13 @@ storage = "100G"                   # file store space
 cpus = 16
 memory = "64G"
 
+# Caps on each job (1.19), whoever submits it: CPUs and memory one task
+# may ask for, and what one job may spend before its tasks that have not
+# run yet are failed.
+max_job_cpus = 8
+max_job_memory = "32G"
+max_job_cu = 20
+
 [[accounts.alice.label_quotas]]
 selector = "zone=office"
 slots = 4

@@ -1933,7 +1933,8 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Status { admin } => {
             let client = connect_admin(&home, &admin).await?;
-            let AdminResponse::Status(status) = client.call(AdminOp::Status).await? else {
+            // A follower answers when the cluster has replicas (1.19).
+            let AdminResponse::Status(status) = client.read(AdminOp::Status).await? else {
                 bail!("unexpected response");
             };
             let power = node_power(&client).await;
@@ -1950,7 +1951,7 @@ async fn run(cli: Cli) -> Result<i32> {
             let id: JobId = id.parse()?;
             let client = connect_admin(&home, &admin).await?;
             let AdminResponse::Job(view) = client
-                .call(AdminOp::Job {
+                .read(AdminOp::Job {
                     id,
                     with_output: output,
                 })
@@ -3127,14 +3128,17 @@ fn ticket_hint(home: &Path, ticket: &AdminTicket, source: &TicketSource) -> Stri
 
 async fn wait_for_job(client: &AdminClient, id: JobId) -> Result<JobView> {
     let mut last = String::new();
+    let mut first = true;
     loop {
-        let AdminResponse::Job(view) = client
-            .call(AdminOp::Job {
-                id,
-                with_output: false,
-            })
-            .await?
-        else {
+        // The control plane answers as soon as the job ends (1.19); the
+        // line below shows progress every couple of seconds meanwhile.
+        let wait = if first {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(2)
+        };
+        first = false;
+        let AdminResponse::Job(view) = client.wait_job(id, wait).await? else {
             bail!("unexpected response");
         };
         let s = &view.summary;
@@ -3162,7 +3166,6 @@ async fn wait_for_job(client: &AdminClient, id: JobId) -> Result<JobView> {
             };
             return Ok(*full);
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -3360,7 +3363,7 @@ const MAX_TASK_LINES: usize = 100;
 /// run took (1.4). Empty when the control plane is older and does not
 /// answer: the job is then printed without them.
 async fn task_details(client: &AdminClient, id: JobId) -> Vec<pumasi_proto::msg::TaskDetail> {
-    match client.call(AdminOp::TaskDetails { id }).await {
+    match client.read(AdminOp::TaskDetails { id }).await {
         Ok(AdminResponse::TaskDetails(d)) => d,
         _ => Vec::new(),
     }
@@ -3384,7 +3387,7 @@ fn task_times(d: &pumasi_proto::msg::TaskDetail) -> String {
 /// Every node's sleep and wake state (1.5). Empty when the control plane
 /// is older and does not answer.
 async fn node_power(client: &AdminClient) -> Vec<pumasi_proto::power::NodePowerView> {
-    match client.call(AdminOp::NodePower).await {
+    match client.read(AdminOp::NodePower).await {
         Ok(AdminResponse::NodePower(p)) => p,
         _ => Vec::new(),
     }
@@ -3397,7 +3400,7 @@ async fn task_executors(client: &AdminClient, v: &JobView) -> Vec<Option<Executo
         return Vec::new();
     }
     match client
-        .call(AdminOp::TaskExecutors { id: v.summary.id })
+        .read(AdminOp::TaskExecutors { id: v.summary.id })
         .await
     {
         Ok(AdminResponse::TaskExecutors(e)) => e,

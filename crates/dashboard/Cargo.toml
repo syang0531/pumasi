@@ -32,10 +32,14 @@ chrono.workspace = true
 # HTTPS without a proxy (`--tls-cert`), on the same ring provider iroh uses.
 rustls.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# Certificates from Let's Encrypt or another ACME server (`--acme`, 1.19).
+tokio-rustls-acme = { version = "0.9", default-features = false }
+rcgen.workspace = true
+ring.workspace = true
+x509-cert.workspace = true
 
 [dev-dependencies]
 pumasi-agent.workspace = true
 jsonwebtoken.workspace = true
-ring.workspace = true
 wat.workspace = true
 tracing-subscriber.workspace = true

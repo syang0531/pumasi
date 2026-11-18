@@ -1342,6 +1342,11 @@ impl State {
             "priority {} is above the {cap} account {account} may use (`pumasi quota {account} --max-priority`)",
             sub.priority
         );
+        let task_cpus = match sub.executor {
+            Executor::Wasm => 1,
+            _ => pumasi_proto::economy::vcpus(sub.limits.cpu_millis),
+        };
+        self.check_job_caps(&account, task_cpus, sub.limits.memory_bytes)?;
         let wait = self.check_deps(&sub.after)?;
         self.ensure_account(&account)?;
         let (ext, task_exts) = self.prepare_store(&sub, &account)?;
@@ -1807,6 +1812,10 @@ impl State {
             task.cost += amount;
         }
         self.charge(&receipt);
+        // The account's CU cap per job (1.19).
+        if !r.check {
+            self.stop_at_cu_cap(r.job);
+        }
     }
 
     fn on_primary_report(&mut self, node_id: &str, report: TaskReport, digest: [u8; 32]) {
@@ -2353,6 +2362,12 @@ impl State {
                     }
                     crate::sched::GangOutcome::Stale => {}
                 }
+                continue;
+            }
+            // A job that spent its account's CU cap per job runs no more
+            // (1.19): its waiting tasks fail.
+            if !item.check && self.job_over_cu(item.job).is_some() {
+                self.stop_at_cu_cap(item.job);
                 continue;
             }
             let Some(need) = self.need_for(&item) else {

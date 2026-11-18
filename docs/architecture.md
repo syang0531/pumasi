@@ -3883,14 +3883,125 @@ account each cached collection was fetched for (`charge`, from
 accounts over their share first, then the least recently used, kept
 (queued) entries last, entries in use never.
 
+## Phase 35: High availability and the remote API (1.19)
+
+Release 1.19 lets the API and the CLI read from followers, keeps shared
+limits and sign-in blocks across a failover, lets a replica that moved
+put its new address in the membership, pushes `?wait=` and `logs -f`,
+caps CPUs, memory and CU per job, and gets the dashboard's certificate
+with ACME. The agent protocol and the stored layout (7) are unchanged;
+the new data lives in meta records (`limits`, `job_caps`). New admin ops
+are appended to `AdminOp` (`JobWait`, `LogsWait`, `JobCaps`,
+`SetJobCaps`) and Raft messages to `RaftReq` (`Moved`, `ReadsMore`), so
+a 1.18 replica or control plane drops what it cannot decode and clients
+fall back to what 1.18 did.
+
+### Reads from followers
+
+The leader's 2-second push (`RaftReq::Reads`, 1.12) becomes
+`RaftReq::ReadsMore`: the `ReadCache` plus a `ReadMore` with job views,
+task details and executors for every job that is queued or running, or
+that this leader saw end within `READ_JOBS_DONE_SECS` (600 s), up to
+`READ_JOBS_TASKS` (20,000) tasks; the capacity of each account that has
+a live submitter ticket (`READ_CAPACITY_ACCOUNTS`, 64); and node power.
+`follower_may_answer` now admits `Status`, `Events`, `Metrics` with any
+`since`, `Job { with_output: false }`, `TaskDetails`, `TaskExecutors`
+and `NodePower`. `follower_answer` identifies the caller from the
+follower's own copy of the access tables, answers from `ReadMore` (a
+missing job or account capacity is `None`, which sends the call to the
+leader), and runs the answer through `access::scope`, so a submitter
+sees its own account's jobs only. Metrics history is read from the
+follower's store (`monitor::stored_series`) only while `in_step` (its
+applied index within 64 entries of its log); finished steps are
+replicated, so it trails by one step. `AdminClient::read` sends
+`FollowerRead(op)` to a replica the ticket names and falls back to the
+leader; the CLI (`status`, `job`, `events`, `top` and its metrics) and the
+API's GET endpoints use it.
+
+### Limits that survive a failover
+
+`Limits` (1.12) gains a dirty flag set by every call that changes a
+count. The leader's 500 ms tick writes `LimitsCopy` every fourth tick
+when it is dirty: `Buckets::copy` keeps buckets that are not full,
+emptiest first, `Failures::copy` keeps blocks first, each kind capped at
+`MAX_COPIED` (2,000), with ages relative to `at_unix_ms`. It goes through
+`put_meta_record` on the replicating store, so it is one Raft entry per
+2 seconds at most, not one per request. A new leader restores it right
+after building its state: `Buckets::restore` and `Failures::restore`
+keep the lower token level and the worse failure count or longer block of
+the copy and of what it has counted itself, with the time since the copy
+taken off.
+
+### Replicas that move
+
+`ha::moved(stored, now)` is true when the endpoint's current address
+shares no direct socket address and no relay URL with the one in the
+membership. A replica checks at start (each second for 30 tries, then
+every `ADDRESS_EVERY`, 30 s): the leader calls `set_address` directly; a
+follower sends `RaftReq::Moved { addr, unix_ms, sig }` to the leader (or
+to any member, following the leader hint in `RaftResp::Moved`), signed
+over `pumasi/replica-moved/v1\0 || postcard(addr) || unix_ms` with its
+endpoint key. The leader checks that the address is the sender's own,
+the signature, and that it is younger than `MOVED_MAX_AGE` (10 min),
+then changes the membership with `ChangeMembers::SetNodes`; openraft
+rebuilds the replication stream to the new address. The restarted
+replica can time out and start an election before that; it then loses
+or wins it like any other.
+
+### Pushed waits
+
+`Store` carries a `watch::Sender<u64>` bumped by `put_tasks` and by live
+output (`monitor::on_logs`). `AdminOp::JobWait { id, wait_ms }` checks
+the job, waits for a change, the deadline or shutdown, and checks again,
+coalescing changes over 5 ms; `LogsWait` does the same for a task's
+output from given offsets, answering once there is output, the run
+ended or moved to another attempt. Both cap the wait at `MAX_WAIT_MS`
+(90 s). `AdminClient::wait_job` and `wait_logs` try them and fall back to
+polling (250 ms doubling to 2 s) against a 1.18 control plane, which
+closes the stream on an op it does not know. The API's `?wait=` and the
+new `logs?wait=`, `pumasi run` and `pumasi logs -f` use them.
+
+### Caps per job
+
+`JobCaps { cpus, memory_bytes, cu }` per account is kept in the meta
+record `job_caps` and set with `SetJobCaps` (from `pumasi quota
+--max-job-*`, `max_job_*` in `cluster.toml`, sent after `Apply`, the
+dashboard's account page and the policy PATCH). Submission
+(`State::submit_by` and the remote check) refuses a task whose CPUs (1
+for WASM, else the vCPUs its `cpu_millis` round up to) or memory exceed
+the cap, for every job of the account. The scheduler's `Usage` also
+counts per job, so `within_quota` holds a job's runs to the caps.
+After each settled run, `stop_at_cu_cap` compares the job's spending
+with its cap and, once reached, fails the job's pending tasks with an
+error, takes them off the queue and records a `job.cu_cap` event; runs
+under way finish and are billed.
+
+### ACME
+
+`pumasi_dashboard::acme` drives RFC 8555 orders with the low-level
+client of `tokio-rustls-acme` (directory, account, order, authorization,
+challenge, finalize, certificate), with a CSR from `rcgen` and a fresh
+P-256 key per certificate. TLS-ALPN-01: a `ResolvesServerCert` hands the
+challenge certificate to a client that offers only `acme-tls/1` and the
+current certificate to everyone else; `TlsListener` drops `acme-tls/1`
+connections after the handshake. HTTP-01: an axum listener on
+`--acme-http-listen` answers `/.well-known/acme-challenge/{token}` with
+`token.thumbprint` (the RFC 7638 thumbprint of the account key) and
+redirects the rest to HTTPS on one of the certificate's names. The
+account key (per directory) and the certificate (per directory and set
+of names) are kept under `<home>/acme/`; `Acme::run` renews 30 days
+before expiry, checks every 12 hours, retries a failed order after 1
+minute doubling to an hour, and swaps the certificate into the resolver.
+`badNonce` answers are retried. CI runs Pebble with
+`pebble-challtestsrv` as its DNS and orders with both challenges.
+
 ## Not yet
 
-- Remote API: no ACME (certificates come from certbot, a proxy or a
-  tunnel), the CLI behind a proxy needs one that passes WebSocket after
-  CONNECT, shared limits need dashboards run with the admin ticket and
-  reset on a failover, `?wait=` polls the control plane, and policies cannot limit CPU, memory or CU per job
-  (account quotas cover slots, GPUs, CU per day, and since 1.9 CPUs and
-  memory).
+- Remote API: ACME has no DNS-01 (no wildcard certificates) and no
+  external account binding; the CLI behind a proxy needs one that passes
+  WebSocket after CONNECT; shared limits need dashboards run with the
+  admin ticket, and a crash can lose their last 2 seconds; a job can go
+  over its CU cap by the runs under way when it reached it.
 
 - File store: cache quotas are per node and per account (labels), not
   per dataset; the image cache keeps 32 images for a week.
@@ -3935,7 +4046,7 @@ accounts over their share first, then the least recently used, kept
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 34 are done and phases 35 and 36 are planned
+- Roadmap: phases 20 to 35 are done and phase 36 is planned
   ([roadmap.md](roadmap.md)); phases 18 and 19 (the hub and buying CU)
   are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it
@@ -3950,11 +4061,11 @@ accounts over their share first, then the least recently used, kept
 - The control plane upgrades itself only within one agent protocol (a
   protocol change still needs it upgraded by hand first), and the leader
   steps down by restarting (openraft 0.9 has no leadership transfer).
-- High availability: a replica's
-  address in the membership is the one it joined with (a replica that
-  moves must be removed and invited again), and followers answer only
-  the dashboard's status, events and current metrics (the API, the CLI,
-  history and submitters still read from the leader).
+- High availability: followers answer jobs only while they are active
+  or ended within ten minutes of a leader that saw them (older jobs and
+  task output come from the leader), and metrics history only while they
+  are in step; a replica that moved updates its address itself, but
+  tickets made before still list the old one.
 - CU cannot be bought or exchanged, and there is no platform fee; both
   belong to the hub.
 - "Honeypot" tasks with known answers (needed for non-deterministic Docker

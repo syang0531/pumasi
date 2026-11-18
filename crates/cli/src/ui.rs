@@ -52,6 +52,32 @@ pub struct UiArgs {
     /// The certificate's private key (PEM).
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
+    /// Serve HTTPS with a certificate for this name from Let's Encrypt (or
+    /// `--acme-directory`), ordered and renewed by the dashboard itself
+    /// (repeatable; the first is the main name). The name must point at
+    /// this machine, and the CA must reach port 443 (TLS-ALPN-01: listen
+    /// on :443 or forward it here) or port 80 (`--acme-challenge http-01`).
+    #[arg(long, value_name = "DOMAIN", conflicts_with = "tls_cert")]
+    acme: Vec<String>,
+    /// A contact address for the CA (expiry notices).
+    #[arg(long, requires = "acme")]
+    acme_email: Option<String>,
+    /// The ACME directory URL. Default: Let's Encrypt;
+    /// `letsencrypt-staging` for its staging server.
+    #[arg(long, requires = "acme")]
+    acme_directory: Option<String>,
+    /// Also trust this CA (PEM) for the ACME server itself (a private CA
+    /// such as step-ca, or a test server).
+    #[arg(long, requires = "acme")]
+    acme_ca: Option<PathBuf>,
+    /// How to prove the name: `tls-alpn-01` (on the dashboard's HTTPS
+    /// port) or `http-01` (on a plain HTTP listener that also sends
+    /// browsers to HTTPS).
+    #[arg(long, default_value = "tls-alpn-01", requires = "acme")]
+    acme_challenge: pumasi_dashboard::acme::Challenge,
+    /// Where the `http-01` listener binds.
+    #[arg(long, default_value = "0.0.0.0:80", requires = "acme")]
+    acme_http_listen: SocketAddr,
     /// A header with the client's address, trusted only on connections
     /// from this machine (a tunnel or reverse proxy here) and from
     /// `--trusted-proxy` addresses, for limiting failed sign-ins per
@@ -87,6 +113,14 @@ pub struct UiArgs {
     admin: AdminArgs,
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub async fn run(home: &Path, args: UiArgs) -> Result<i32> {
     run_until(home, args, crate::ctrl_c(), false).await
 }
@@ -111,8 +145,29 @@ pub async fn run_until(
     let probe = (ticket.clone(), ticket_hint(home, &ticket, &source));
     let ticket_for_install = ticket.clone();
     let upload_limit = parse_size(&args.max_upload)?;
-    let tls = match (&args.tls_cert, &args.tls_key) {
-        (Some(cert), Some(key)) => Some(pumasi_dashboard::tls_config(cert, key)?),
+    let acme = if args.acme.is_empty() {
+        None
+    } else {
+        let directory = match args.acme_directory.as_deref() {
+            None | Some("letsencrypt") => pumasi_dashboard::acme::LETS_ENCRYPT.to_string(),
+            Some("letsencrypt-staging") => pumasi_dashboard::acme::STAGING.to_string(),
+            Some(url) => url.to_string(),
+        };
+        Some(pumasi_dashboard::acme::Acme::new(
+            pumasi_dashboard::acme::AcmeConfig {
+                domains: args.acme.clone(),
+                email: args.acme_email.clone(),
+                directory,
+                ca: args.acme_ca.clone(),
+                cache: pumasi_dashboard::acme::default_cache(home),
+                challenge: args.acme_challenge,
+                http_listen: args.acme_http_listen,
+            },
+        )?)
+    };
+    let tls = match (&args.tls_cert, &args.tls_key, &acme) {
+        (Some(cert), Some(key), _) => Some(pumasi_dashboard::tls_config(cert, key)?),
+        (_, _, Some(acme)) => Some(acme.server_config()),
         _ => None,
     };
     // Restarted into a new binary: on Windows the old process lets go of
@@ -133,7 +188,7 @@ pub async fn run_until(
     let addr = listener.local_addr()?;
     if !addr.ip().is_loopback() && tls.is_none() && args.api_only && !args.insecure_http {
         anyhow::bail!(
-            "refusing to serve the API on {addr} over plain HTTP: bearer tickets would cross the network unencrypted. Give --tls-cert and --tls-key, listen on 127.0.0.1 behind a tunnel or TLS proxy, or pass --insecure-http"
+            "refusing to serve the API on {addr} over plain HTTP: bearer tickets would cross the network unencrypted. Give --tls-cert and --tls-key or --acme, listen on 127.0.0.1 behind a tunnel or TLS proxy, or pass --insecure-http"
         );
     }
     if !addr.ip().is_loopback() && tls.is_none() {
@@ -158,11 +213,42 @@ pub async fn run_until(
             tls,
             real_ip_header: args.real_ip_header.clone(),
             trusted_proxies: args.trusted_proxy.clone(),
-            public_url: args.public_url.clone(),
+            public_url: args.public_url.clone().or_else(|| {
+                acme.as_ref().map(|a| match addr.port() {
+                    443 => format!("https://{}", a.domain()),
+                    port => format!("https://{}:{port}", a.domain()),
+                })
+            }),
         },
     )
     .await?;
-    let url = ui.url();
+    // Order once the port is open: the CA's TLS-ALPN-01 check comes in
+    // through it.
+    let _acme = acme.as_ref().map(|a| {
+        let a = a.clone();
+        tokio::spawn(async move {
+            if let Err(e) = a.run().await {
+                eprintln!("error: ACME: {e:#}");
+            }
+        })
+    });
+    let _acme = _acme.map(AbortOnDrop);
+    let url = match &acme {
+        // The certificate names the domain, not the address.
+        Some(a) if args.public_url.is_none() => {
+            let path = ui
+                .url()
+                .splitn(4, '/')
+                .nth(3)
+                .unwrap_or_default()
+                .to_string();
+            match addr.port() {
+                443 => format!("https://{}/{path}", a.domain()),
+                port => format!("https://{}:{port}/{path}", a.domain()),
+            }
+        }
+        _ => ui.url(),
+    };
     if let Some(path) = &args.url_file {
         pumasi_proto::net::write_private(path, url.as_bytes())?;
     }

@@ -74,6 +74,11 @@ impl TlsListener {
                     let _slot = slot;
                     let _ = tcp.set_nodelay(true);
                     match tokio::time::timeout(HANDSHAKE, acceptor.accept(tcp)).await {
+                        // A CA checking a TLS-ALPN-01 challenge (1.19) only
+                        // needed the handshake.
+                        Ok(Ok(tls)) if tls.get_ref().1.alpn_protocol() == Some(b"acme-tls/1") => {
+                            tracing::debug!(%peer, "ACME TLS-ALPN-01 check");
+                        }
                         Ok(Ok(tls)) => {
                             let _ = tx.send((tls, peer)).await;
                         }

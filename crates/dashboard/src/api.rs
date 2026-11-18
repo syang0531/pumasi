@@ -106,6 +106,19 @@ async fn call(st: &St, a: &Api, op: AdminOp) -> Result<AdminResponse, Response> 
     st.backend.call(a.0.secret, op).await.map_err(fail)
 }
 
+/// A read a follower may answer (1.19): the status, metrics, events and
+/// jobs come from a replica that is not the leader when there is one.
+async fn read(st: &St, a: &Api, op: AdminOp) -> Result<AdminResponse, Response> {
+    st.backend.read(a.0.secret, op).await.map_err(fail)
+}
+
+async fn simple_read(st: St, a: Api, op: AdminOp) -> Response {
+    match read(&st, &a, op).await {
+        Ok(r) => payload(r),
+        Err(r) => r,
+    }
+}
+
 /// Answers with the response's payload, without the enum's tag.
 fn payload(r: AdminResponse) -> Response {
     let v = match serde_json::to_value(&r) {
@@ -167,7 +180,7 @@ async fn whoami(axum::extract::State(st): S, a: Api) -> Response {
 /// it is asleep, what its agent does about sleep, and whether the cluster
 /// can wake it. Missing for a control plane older than 1.5.
 async fn status(axum::extract::State(st): S, a: Api) -> Response {
-    let status = match call(&st, &a, AdminOp::Status).await {
+    let status = match read(&st, &a, AdminOp::Status).await {
         Ok(r) => r,
         Err(r) => return r,
     };
@@ -176,7 +189,7 @@ async fn status(axum::extract::State(st): S, a: Api) -> Response {
         Ok(v) => v,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    if let Ok(AdminResponse::NodePower(power)) = call(&st, &a, AdminOp::NodePower).await
+    if let Ok(AdminResponse::NodePower(power)) = read(&st, &a, AdminOp::NodePower).await
         && let Some(nodes) = v.get_mut("nodes").and_then(|n| n.as_array_mut())
     {
         for n in nodes {
@@ -199,7 +212,7 @@ struct MetricsQuery {
 }
 
 async fn metrics(axum::extract::State(st): S, a: Api, Query(q): Query<MetricsQuery>) -> Response {
-    simple(
+    simple_read(
         st,
         a,
         AdminOp::Metrics {
@@ -220,7 +233,7 @@ struct EventsQuery {
 }
 
 async fn events(axum::extract::State(st): S, a: Api, Query(q): Query<EventsQuery>) -> Response {
-    simple(
+    simple_read(
         st,
         a,
         AdminOp::Events {
@@ -321,10 +334,10 @@ async fn job(
             }
         }
     };
-    let deadline = tokio::time::Instant::now() + wait;
-    let mut pause = Duration::from_millis(250);
-    loop {
-        let r = match call(
+    // The control plane answers when the job ends (1.19); without a wait
+    // a follower may answer.
+    let r = if wait.is_zero() {
+        read(
             &st,
             &a,
             AdminOp::Job {
@@ -333,23 +346,16 @@ async fn job(
             },
         )
         .await
-        {
-            Ok(r) => r,
-            Err(r) => return r,
-        };
-        let done = match &r {
-            AdminResponse::Job(j) => j.summary.state.is_terminal(),
-            _ => true,
-        };
-        let now = tokio::time::Instant::now();
-        if done || now >= deadline {
-            return match r {
-                AdminResponse::Job(j) => job_json(&st, &a, id, &j).await,
-                r => payload(r),
-            };
+    } else {
+        match st.backend.client(a.0.secret).await {
+            Ok(c) => c.wait_job(id, wait).await.map_err(fail),
+            Err(e) => Err(fail(e)),
         }
-        tokio::time::sleep(pause.min(deadline - now)).await;
-        pause = (pause * 2).min(Duration::from_secs(2));
+    };
+    match r {
+        Ok(AdminResponse::Job(j)) => job_json(&st, &a, id, &j).await,
+        Ok(r) => payload(r),
+        Err(r) => r,
     }
 }
 
@@ -363,7 +369,7 @@ async fn job_json(st: &St, a: &Api, id: JobId, job: &pumasi_proto::msg::JobView)
     };
     if let Ok(AdminResponse::TaskDetails(details)) = st
         .backend
-        .call(a.0.secret, AdminOp::TaskDetails { id })
+        .read(a.0.secret, AdminOp::TaskDetails { id })
         .await
         && let Some(tasks) = v.get_mut("tasks").and_then(|t| t.as_array_mut())
     {
@@ -385,7 +391,7 @@ async fn job_json(st: &St, a: &Api, id: JobId, job: &pumasi_proto::msg::JobView)
     // What each task of an `image` job ran as (1.5): docker or microvm.
     if let Ok(AdminResponse::TaskExecutors(ran)) = st
         .backend
-        .call(a.0.secret, AdminOp::TaskExecutors { id })
+        .read(a.0.secret, AdminOp::TaskExecutors { id })
         .await
         && let Some(tasks) = v.get_mut("tasks").and_then(|t| t.as_array_mut())
     {
@@ -482,10 +488,15 @@ struct LogsQuery {
     stdout_from: u64,
     #[serde(default)]
     stderr_from: u64,
+    /// Long poll (1.19): answer once there is output beyond the offsets,
+    /// the run ended or started over, or after this long (at most
+    /// [`MAX_WAIT`]).
+    wait: Option<String>,
 }
 
 /// A task's output from byte offsets, as text (invalid UTF-8 replaced);
-/// poll with the returned offsets, as `pumasi logs -f` does.
+/// ask again with the returned offsets, as `pumasi logs -f` does, with
+/// `wait=30s` to have the answer come when there is more.
 async fn logs(
     axum::extract::State(st): S,
     a: Api,
@@ -496,19 +507,39 @@ async fn logs(
         Ok(i) => i,
         Err(r) => return r,
     };
-    match call(
-        &st,
-        &a,
-        AdminOp::Logs {
-            job,
-            index,
-            attempt: q.attempt,
-            stdout_from: q.stdout_from,
-            stderr_from: q.stderr_from,
-        },
-    )
-    .await
-    {
+    let wait = match q.wait.as_deref().map(pumasi_proto::job::parse_duration_ms) {
+        None => Duration::ZERO,
+        Some(Ok(ms)) => Duration::from_millis(ms).min(MAX_WAIT),
+        Some(Err(e)) => return error(StatusCode::BAD_REQUEST, &format!("wait: {e:#}")),
+    };
+    let _slot = if wait.is_zero() {
+        None
+    } else {
+        match st.waits.enter(a.0.secret) {
+            Some(s) => Some(s),
+            None => {
+                return crate::limit::slow_down(
+                    Duration::from_secs(1),
+                    "too many ?wait= requests open with this ticket",
+                );
+            }
+        }
+    };
+    let r = match st.backend.client(a.0.secret).await {
+        Ok(c) => {
+            let mut pushed = true;
+            c.wait_logs(
+                (job, index, q.attempt),
+                (q.stdout_from, q.stderr_from),
+                wait,
+                &mut pushed,
+            )
+            .await
+            .map_err(fail)
+        }
+        Err(e) => Err(fail(e)),
+    };
+    match r {
         Ok(AdminResponse::Logs(c)) => Json(json!({
             "attempt": c.attempt,
             "stdout_from": c.stdout_from,
@@ -801,7 +832,10 @@ async fn accounts(axum::extract::State(st): S, a: Api) -> Response {
 /// read any account, a submitter its own.
 async fn account_policy(axum::extract::State(st): S, a: Api, Path(name): Path<String>) -> Response {
     match accounts::get(&st, a.0.secret, &a.0.role, &name).await {
-        Ok(Some(v)) => Json(accounts::view_json(&v)).into_response(),
+        Ok(Some(v)) => {
+            let caps = accounts::caps_of(&st, a.0.secret, &name).await;
+            Json(accounts::with_caps(accounts::view_json(&v), caps.as_ref())).into_response()
+        }
         Ok(None) => error(StatusCode::NOT_FOUND, &format!("no such account: {name}")),
         Err(e) => fail(e),
     }
@@ -818,11 +852,20 @@ async fn patch_account_policy(
     let res = async {
         pumasi_proto::economy::validate_account(&name)?;
         let (policy, quota) = accounts::parse_patch(&name, &body)?;
-        accounts::patch(&st, a.0.secret, &a.0.role, &name, &policy, &quota).await
+        let caps = accounts::parse_caps_patch(&body)?;
+        let v = accounts::patch(&st, a.0.secret, &a.0.role, &name, &policy, &quota).await?;
+        let caps = if caps.is_empty() {
+            accounts::caps_of(&st, a.0.secret, &name).await
+        } else {
+            Some(accounts::patch_caps(&st, a.0.secret, &name, &caps).await?)
+        };
+        anyhow::Ok((v, caps))
     }
     .await;
     match res {
-        Ok(v) => Json(accounts::view_json(&v)).into_response(),
+        Ok((v, caps)) => {
+            Json(accounts::with_caps(accounts::view_json(&v), caps.as_ref())).into_response()
+        }
         Err(e) => fail(e),
     }
 }

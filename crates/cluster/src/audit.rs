@@ -730,6 +730,9 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | MetricsWait { .. }
         | EventsKeyed { .. }
         | AlertTexts
+        | JobWait { .. }
+        | LogsWait { .. }
+        | JobCaps
         | ScimView => return None,
         // Unwrapped before anything looks at it.
         FollowerRead(inner) => return describe(inner),
@@ -742,6 +745,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         ScimTokenCreate { label } => ("scim.token.create", label.clone(), none()),
         ScimTokenRevoke { id } => ("scim.token.revoke", id.clone(), none()),
         SetResources { account, quota } => ("resources.set", account.clone(), quota.describe()),
+        SetJobCaps { account, caps } => ("job_caps.set", account.clone(), caps.describe()),
         // Joined into the plain calls before they get here.
         SubmitPlaced { .. }
         | CheckJobPlaced { .. }

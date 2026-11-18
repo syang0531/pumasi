@@ -4654,7 +4654,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-agent"
-version = "1.18.0"
+version = "1.19.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4697,7 +4697,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-cli"
-version = "1.18.0"
+version = "1.19.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4723,7 +4723,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-cluster"
-version = "1.18.0"
+version = "1.19.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4766,7 +4766,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-dashboard"
-version = "1.18.0"
+version = "1.19.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4783,6 +4783,7 @@ dependencies = [
  "pumasi-cluster",
  "pumasi-proto",
  "rand 0.9.5",
+ "rcgen",
  "ring",
  "rustls",
  "serde",
@@ -4790,16 +4791,18 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
+ "tokio-rustls-acme",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "wat",
+ "x509-cert 0.2.5",
 ]
 
 [[package]]
 name = "pumasi-guest"
-version = "1.18.0"
+version = "1.19.0"
 dependencies = [
  "chacha20poly1305",
  "flate2",
@@ -4816,7 +4819,7 @@ dependencies = [
 
 [[package]]
 name = "pumasi-proto"
-version = "1.18.0"
+version = "1.19.0"
 dependencies = [
  "anyhow",
  "blake3",

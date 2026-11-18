@@ -1884,6 +1884,55 @@ impl Agent {
                     }
                 }))
             });
+            // A periodic checkpoint (1.21) goes to the file store as soon as
+            // the task has saved it, and the control plane keeps the latest.
+            let periodic_done = Arc::new(AtomicBool::new(false));
+            let _periodic = match (a.checkpoint_every_ms, io.checkpoint.as_mut()) {
+                (Some(ms), Some(c)) if !task.check => {
+                    let (tx, mut rx) = mpsc::unbounded_channel::<TempDir>();
+                    let p = crate::executor::PeriodicCheckpoint {
+                        every: Duration::from_millis(ms),
+                        ack_within: Duration::from_millis(
+                            a.checkpoint.as_ref().map_or(30_000, |c| c.grace_ms),
+                        ),
+                        scratch: node_store.scratch_root(),
+                        sink: tx,
+                    };
+                    if a.executor == Executor::Wasm {
+                        tokio::spawn(crate::executor::host_dir_checkpoints(
+                            c.dir.clone(),
+                            p.clone(),
+                            periodic_done.clone(),
+                        ));
+                    }
+                    c.periodic = Some(p);
+                    let node_store = node_store.clone();
+                    let cluster_addr = cluster_addr.clone();
+                    let out_tx = out_tx.clone();
+                    Some(AbortOnDrop(tokio::spawn(async move {
+                        while let Some(dir) = rx.recv().await {
+                            match node_store.push_output(dir.path(), &cluster_addr).await {
+                                Ok(s) => {
+                                    info!(task = %task, files = s.files, bytes = s.size, "periodic checkpoint saved");
+                                    if out_tx
+                                        .send(FromAgent::Checkpointed {
+                                            task,
+                                            checkpoint: s,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(task = %task, "periodic checkpoint not saved: {e:#}")
+                                }
+                            }
+                        }
+                    })))
+                }
+                _ => None,
+            };
             let result: Result<RunResult> = match a.executor {
                 Executor::Wasm => {
                     let Some(hash) = a.module_hash else {
@@ -1924,6 +1973,19 @@ impl Agent {
                 )),
             };
             drop(streamer);
+            periodic_done.store(true, std::sync::atomic::Ordering::Relaxed);
+            // What the run used (1.21), for the job's runs and the hint.
+            let mut run_use = result.as_ref().map(|r| r.usage).unwrap_or_default();
+            if let Ok(r) = result.as_ref()
+                && run_use.peak_memory_bytes.is_none()
+            {
+                run_use.peak_memory_bytes = r.peak_memory_bytes;
+            }
+            if a.executor == Executor::Microvm {
+                let used = net_count.get();
+                run_use.net_rx_bytes = Some(used.rx_bytes);
+                run_use.net_tx_bytes = Some(used.tx_bytes);
+            }
             // A run told to stop sends its checkpoint instead of a result.
             if let Some(c) = io.checkpoint.as_ref().filter(|c| c.stop.delivered()) {
                 let (checkpoint, error) = match result {
@@ -2012,10 +2074,14 @@ impl Agent {
             let used = net_count.get();
             let net = (!used.is_empty() && report.usage.is_some())
                 .then(|| pumasi_proto::receipt::SignedNet::sign(&cluster, &task, used, &key));
-            tails
-                .lock()
-                .unwrap()
-                .insert(task, ReportTail { timing, net });
+            tails.lock().unwrap().insert(
+                task,
+                ReportTail {
+                    timing,
+                    net,
+                    usage: (!run_use.is_empty()).then_some(run_use),
+                },
+            );
             let sent = out_tx.send(FromAgent::Report {
                 report: Box::new(report),
                 stored,
@@ -2156,6 +2222,7 @@ async fn prepare_io(
         io.checkpoint = Some(crate::executor::CheckpointIo {
             dir: dir.path().to_path_buf(),
             stop,
+            periodic: Default::default(),
         });
         dirs.push(dir);
     }

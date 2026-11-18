@@ -457,6 +457,7 @@ impl DockerExecutor {
                 wall_ms: (start.elapsed().as_millis() as u64).saturating_sub(io.pull.ms()),
                 peak_memory_bytes: None,
                 out_dir: None,
+                usage: Default::default(),
             },
         }
     }
@@ -570,6 +571,14 @@ impl DockerExecutor {
         let _job = ProcessJob::new()
             .and_then(|job| job.assign(&child).map(|()| job))
             .ok();
+        // What the container uses (1.21).
+        let sampler = crate::usage::Sampler::docker(self.bin.clone(), name.clone());
+        // Checkpoints asked for while it runs (1.21).
+        let mut periodic = io
+            .checkpoint
+            .as_ref()
+            .and_then(|c| c.periodic.as_ref())
+            .map(|p| (p.clone(), crate::executor::PeriodicState::new(p)));
         let mut stdin = child.stdin.take().expect("piped");
         let stdin_data = input.stdin.clone();
         tokio::spawn(async move {
@@ -604,6 +613,11 @@ impl DockerExecutor {
                         grace_end = Some(Instant::now() + grace);
                         let _ = self.cli(&["kill", "--signal", "TERM", &name]).await;
                     }
+                    if grace_end.is_none()
+                        && let Some((p, state)) = periodic.as_mut()
+                    {
+                        self.periodic_step(&name, p, state).await;
+                    }
                     if cancel.load(Ordering::Relaxed)
                         || grace_end.is_some_and(|g| Instant::now() >= g)
                     {
@@ -618,6 +632,7 @@ impl DockerExecutor {
                 }
             }
         };
+        let usage = sampler.finish().await;
         if let Some(c) = &io.checkpoint
             && c.stop.delivered()
         {
@@ -660,6 +675,7 @@ impl DockerExecutor {
             fuel_used: 0,
             wall_ms: run_start.elapsed().as_millis() as u64,
             peak_memory_bytes: None,
+            usage,
             out_dir,
         })
     }
@@ -757,8 +773,102 @@ impl DockerExecutor {
         Ok(())
     }
 
+    /// One step of a periodic checkpoint (1.21): put the request file in
+    /// the container's `/checkpoint`, and once the task deleted it, copy
+    /// what `/checkpoint` holds and hand it over.
+    async fn periodic_step(
+        &self,
+        name: &str,
+        p: &crate::executor::PeriodicCheckpoint,
+        state: &mut crate::executor::PeriodicState,
+    ) {
+        use crate::executor::PeriodicStep;
+        let request = format!(
+            "{}/{}",
+            pumasi_proto::sched::CHECKPOINT_DIR,
+            pumasi_proto::attempt::CHECKPOINT_REQUEST_FILE
+        );
+        match state.step(Instant::now()) {
+            PeriodicStep::Wait => {}
+            PeriodicStep::Ask => match self.put_request(name).await {
+                Ok(()) => state.asked(Instant::now()),
+                Err(e) => {
+                    debug!(container = %name, "could not ask for a checkpoint: {e:#}");
+                    state.done(Instant::now());
+                }
+            },
+            PeriodicStep::Poll => {
+                let there = self
+                    .cmd()
+                    .args(["cp", &format!("{name}:{request}"), "-"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(true);
+                if there {
+                    return;
+                }
+                let copied = match crate::tempdir::TempDir::new_in(&p.scratch, "checkpoint-copy") {
+                    Ok(t) => self.copy_checkpoint_out(name, t.path()).await.map(|()| t),
+                    Err(e) => Err(e),
+                };
+                match copied {
+                    Ok(t) => {
+                        let _ = p.sink.send(t);
+                    }
+                    Err(e) => debug!(container = %name, "could not copy a checkpoint: {e:#}"),
+                }
+                state.done(Instant::now());
+            }
+        }
+    }
+
+    /// Puts the checkpoint request file in the container's `/checkpoint`.
+    async fn put_request(&self, name: &str) -> Result<()> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let body = b"save a checkpoint, then delete this file\n";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o666);
+            b.append_data(
+                &mut h,
+                format!(
+                    "checkpoint/{}",
+                    pumasi_proto::attempt::CHECKPOINT_REQUEST_FILE
+                ),
+                &body[..],
+            )?;
+            b.finish()?;
+        }
+        let mut child = self
+            .cmd()
+            .args(["cp", "-", &format!("{name}:/")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("docker cp")?;
+        let mut stdin = child.stdin.take().expect("piped");
+        stdin.write_all(&tar_bytes).await?;
+        drop(stdin);
+        let out = tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output())
+            .await
+            .context("docker cp timed out")??;
+        if !out.status.success() {
+            bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
     /// Replaces `dir` with the container's `/checkpoint` (`docker cp
-    /// name:/checkpoint -`), up to the file store's output limit.
+    /// name:/checkpoint -`), up to the file store's output limit, without
+    /// a request file left in it.
     async fn copy_checkpoint_out(&self, name: &str, dir: &std::path::Path) -> Result<()> {
         let mut child = self
             .cmd()
@@ -774,16 +884,21 @@ impl DockerExecutor {
             .spawn()
             .context("docker cp")?;
         let out = child.stdout.take().expect("piped");
-        let dir = dir.to_path_buf();
+        let target = dir.to_path_buf();
         let res = tokio::task::spawn_blocking(move || -> Result<u32> {
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir)?;
+            if target.exists() {
+                std::fs::remove_dir_all(&target)?;
             }
-            std::fs::create_dir_all(&dir)?;
-            extract_dir_tar(tokio_util::io::SyncIoBridge::new(out), &dir, "checkpoint/")
+            std::fs::create_dir_all(&target)?;
+            extract_dir_tar(
+                tokio_util::io::SyncIoBridge::new(out),
+                &target,
+                "checkpoint/",
+            )
         })
         .await;
         let _ = child.kill().await;
+        let _ = std::fs::remove_file(dir.join(pumasi_proto::attempt::CHECKPOINT_REQUEST_FILE));
         match res {
             Ok(Ok(0)) => Ok(()),
             Ok(Ok(dropped)) => bail!(

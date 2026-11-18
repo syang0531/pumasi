@@ -1700,6 +1700,7 @@ fn blank_submission(name: String, executor: Executor, limits: Limits) -> JobSubm
         placement: Default::default(),
         gpu_ext: Default::default(),
         net: Default::default(),
+        run: Default::default(),
     }
 }
 

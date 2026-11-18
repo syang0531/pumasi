@@ -1410,6 +1410,9 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                         if let Some(net) = t.net {
                             st.note_net(&node_id, generation, report.task, net);
                         }
+                        if let Some(u) = t.usage {
+                            st.note_use(&node_id, generation, report.task, u);
+                        }
                     }
                     // A stored output must be complete in the store and be
                     // what the report says before the result counts.
@@ -1481,6 +1484,18 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                     let mut st = inner.state();
                     st.on_heartbeat(&node_id, generation);
                     st.on_stopped(&node_id, generation, task, checkpoint, error);
+                }
+                Ok(Some(FromAgent::Checkpointed { task, checkpoint })) => {
+                    // Like a stopping run's: only when complete in the store.
+                    let ok = checkpoint.size <= MAX_STORE_OUTPUT_BYTES
+                        && matches!(inner.files.stored(&checkpoint.root).await, Ok(got) if got == checkpoint);
+                    let mut st = inner.state();
+                    st.on_heartbeat(&node_id, generation);
+                    if ok {
+                        st.on_checkpointed(&node_id, generation, task, checkpoint);
+                    } else {
+                        warn!(node = %node_id, task = %task, "periodic checkpoint not complete in the store; kept the last one");
+                    }
                 }
                 Ok(Some(FromAgent::Held { roots, failed, scrub })) => {
                     let mut st = inner.state();
@@ -3491,6 +3506,30 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
         AdminOp::Cancel { id } => {
             inner.state().cancel(id)?;
             Ok(AdminResponse::Ok)
+        }
+        AdminOp::JobRuns { id } => Ok(AdminResponse::JobRuns(Box::new(
+            inner.state().job_runs_view(id).context("no such job")?,
+        ))),
+        AdminOp::Rerun { id, which } => {
+            let mut st = inner.state();
+            st.rerun_job(id, &which, caller.name())?;
+            Ok(AdminResponse::JobRuns(Box::new(
+                st.job_runs_view(id).context("no such job")?,
+            )))
+        }
+        AdminOp::Suspend { id } => {
+            let mut st = inner.state();
+            st.suspend_job(id, caller.name())?;
+            Ok(AdminResponse::JobRuns(Box::new(
+                st.job_runs_view(id).context("no such job")?,
+            )))
+        }
+        AdminOp::Resume { id } => {
+            let mut st = inner.state();
+            st.resume_job(id, caller.name())?;
+            Ok(AdminResponse::JobRuns(Box::new(
+                st.job_runs_view(id).context("no such job")?,
+            )))
         }
         AdminOp::RemoveNode { id } => {
             inner.state().remove_node(&id)?;

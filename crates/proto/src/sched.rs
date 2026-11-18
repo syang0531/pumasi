@@ -570,6 +570,22 @@ impl ScheduleExt {
     }
 }
 
+/// What a schedule's job has beyond its [`crate::manage::ScheduleSpec`]
+/// and [`ScheduleExt`] (1.21): what [`crate::job::JobExt`] carries for a
+/// job submitted directly, which a schedule could not keep before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleMore {
+    pub gpu: crate::gpu::GpuExt,
+    pub net: crate::vmnet::NetSpec,
+    pub run: crate::attempt::JobRun,
+}
+
+impl ScheduleMore {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Checks an IANA time zone name.
 pub fn validate_tz(tz: &str) -> Result<()> {
     tz.parse::<chrono_tz::Tz>()

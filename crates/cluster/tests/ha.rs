@@ -138,6 +138,7 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         after: vec![],
         queue_timeout_ms: None,
         gpu_capabilities: vec![],
+        run: Default::default(),
     }
 }
 

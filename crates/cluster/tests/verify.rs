@@ -196,6 +196,7 @@ fn echo(n: usize) -> JobSubmission {
         after: vec![],
         queue_timeout_ms: None,
         gpu_capabilities: vec![],
+        run: Default::default(),
     }
 }
 

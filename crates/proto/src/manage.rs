@@ -1121,6 +1121,23 @@ impl ScheduleSpec {
         self.job.placement = ext.placement;
     }
 
+    /// What the job has that neither postcard nor [`Self::ext`] carries
+    /// (1.21).
+    pub fn more(&self) -> crate::sched::ScheduleMore {
+        crate::sched::ScheduleMore {
+            gpu: self.job.gpu_ext.clone(),
+            net: self.job.net.clone(),
+            run: self.job.run.clone(),
+        }
+    }
+
+    /// Puts back what [`Self::more`] took out.
+    pub fn set_more(&mut self, more: crate::sched::ScheduleMore) {
+        self.job.gpu_ext = more.gpu;
+        self.job.net = more.net;
+        self.job.run = more.run;
+    }
+
     /// The first run after `after` (unix seconds) in its time zone.
     pub fn next_after(&self, after: i64) -> Option<i64> {
         self.cron
@@ -1140,17 +1157,8 @@ impl ScheduleSpec {
             self.job.after.is_empty(),
             "a scheduled job cannot wait for other jobs (`after`)"
         );
-        // A schedule's record has no room for them yet; submit such jobs
-        // directly.
-        ensure!(
-            self.job.gpu_ext.is_empty(),
-            "a scheduled job cannot ask for part of a GPU or for WebGPU features yet"
-        );
-        // Nor for these: a scheduled run would get the whole internet.
-        ensure!(
-            self.job.net.is_empty(),
-            "a scheduled job cannot have a network allow list or bandwidth cap yet; use `network = true`, or submit it directly"
-        );
+        // Parts of GPUs, WebGPU features, allow lists, caps, retries and
+        // periodic checkpoints travel in [`Self::more`] since 1.21.
         Ok(())
     }
 }
@@ -1443,6 +1451,25 @@ impl ApplySpec {
             alert_tuning: self.alert_tuning.clone(),
             silences: self.silences.clone(),
             keep_jobs: self.keep_jobs.clone(),
+        }
+    }
+
+    /// Each schedule's [`ScheduleSpec::more`], for those that have any
+    /// (1.21).
+    pub fn schedules_more(&self) -> Vec<(String, crate::sched::ScheduleMore)> {
+        self.schedules
+            .iter()
+            .map(|s| (s.name.clone(), s.more()))
+            .filter(|(_, m)| !m.is_empty())
+            .collect()
+    }
+
+    /// Puts back what [`Self::schedules_more`] took out.
+    pub fn set_schedules_more(&mut self, more: Vec<(String, crate::sched::ScheduleMore)>) {
+        for (name, m) in more {
+            if let Some(s) = self.schedules.iter_mut().find(|s| s.name == name) {
+                s.set_more(m);
+            }
         }
     }
 
@@ -2224,6 +2251,7 @@ pub fn kept_job() -> JobSubmission {
         placement: Default::default(),
         gpu_ext: Default::default(),
         net: Default::default(),
+        run: Default::default(),
     }
 }
 
@@ -2233,11 +2261,11 @@ mod tests {
     use chrono::{FixedOffset, Utc};
 
     #[test]
-    fn schedules_refuse_allow_lists() {
+    fn schedules_carry_allow_lists_and_retries() {
         let dir = std::env::temp_dir();
-        let job = |net: &str| {
+        let job = |extra: &str| {
             crate::job::JobFile::parse(&format!(
-                "executor = \"microvm\"\nimage = \"busybox\"\nnetwork = {net}"
+                "executor = \"microvm\"\nimage = \"busybox\"\n{extra}"
             ))
             .unwrap()
             .resolve(&dir)
@@ -2250,11 +2278,28 @@ mod tests {
             overlap: false,
             tz: None,
         };
-        spec(job("true")).validate().unwrap();
-        // Its record would drop the list, and the runs would reach
-        // everything.
-        assert!(spec(job("[\"pypi.org:443\"]")).validate().is_err());
-        assert!(spec(job("{ mbps = 5 }")).validate().is_err());
+        let plain = spec(job("network = true"));
+        plain.validate().unwrap();
+        assert!(matches!(
+            crate::msg::AdminOp::set_schedule(plain),
+            crate::msg::AdminOp::SetSchedule(_)
+        ));
+        // 1.21: the list, the cap and retries go in their own call, which
+        // an older control plane refuses instead of dropping them.
+        let listed = spec(job(
+            "network = { allow = [\"pypi.org:443\"], mbps = 5 }\nretries = 2",
+        ));
+        listed.validate().unwrap();
+        let op = crate::msg::AdminOp::set_schedule(listed.clone());
+        assert!(matches!(op, crate::msg::AdminOp::SetScheduleMore { .. }));
+        let bytes = postcard::to_stdvec(&op).unwrap();
+        let back: crate::msg::AdminOp = postcard::from_bytes(&bytes).unwrap();
+        let crate::msg::AdminOp::SetSchedule(got) = back.joined() else {
+            panic!("not a schedule");
+        };
+        assert_eq!(*got, listed);
+        assert_eq!(got.job.net.allow.len(), 1);
+        assert_eq!(got.job.run.retry.as_ref().unwrap().retries, 2);
     }
 
     #[test]

@@ -312,6 +312,11 @@ pub struct TaskAssignment {
     /// The account the task runs for: what it fetches into the node's
     /// cache counts against that account's share there.
     pub account: String,
+    // Minor 12 (1.21) from here; older agents ignore it.
+    /// Ask the checkpointing task for a checkpoint this often while it
+    /// runs ([`crate::attempt::CHECKPOINT_REQUEST_FILE`]), and send each
+    /// with [`FromAgent::Checkpointed`].
+    pub checkpoint_every_ms: Option<u64>,
 }
 
 /// How a checkpointing task runs (minor 5).
@@ -503,6 +508,9 @@ pub struct ReportTail {
     pub timing: TaskTiming,
     /// What a microVM task's network carried, signed by the node (1.18).
     pub net: Option<crate::receipt::SignedNet>,
+    /// What the run used: CPU time, peak memory, disk and network bytes
+    /// (1.21). Shown, not billed.
+    pub usage: Option<crate::attempt::RunUse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,6 +649,14 @@ pub enum FromAgent {
     ChallengeResult {
         nonce: u64,
         result: Result<[u8; 32], String>,
+    },
+    // Minor 12 (1.21) from here; sent only for assignments that asked for
+    // periodic checkpoints ([`TaskAssignment::checkpoint_every_ms`]).
+    /// A checkpoint the running task saved when asked, pushed to the file
+    /// store before this. The run goes on.
+    Checkpointed {
+        task: TaskRef,
+        checkpoint: StoredOutput,
     },
 }
 
@@ -1334,6 +1350,59 @@ pub enum AdminOp {
     HoneypotRelease {
         account: String,
     },
+    // 1.21 from here.
+    /// [`AdminOp::SubmitExt`] for a job with retries or periodic
+    /// checkpoints ([`crate::job::JobExt::run`]). A control plane older
+    /// than 1.21 refuses the call instead of running the job without them.
+    SubmitRun {
+        sub: Box<JobSubmission>,
+        ext: Box<crate::job::JobExt>,
+    },
+    /// [`AdminOp::CheckJob`] with what [`AdminOp::SubmitRun`] carries.
+    CheckJobRun {
+        sub: Box<JobSubmission>,
+        ext: Box<crate::job::JobExt>,
+        upload_bytes: u64,
+    },
+    /// A job's retries, suspension and every task's attempts with what
+    /// each used ([`AdminResponse::JobRuns`]).
+    JobRuns {
+        id: JobId,
+    },
+    /// Runs tasks of a finished (or partly finished) job again under the
+    /// same job id: new attempts, the same inputs. Answers like
+    /// [`AdminOp::JobRuns`].
+    Rerun {
+        id: JobId,
+        which: crate::attempt::RerunWhich,
+    },
+    /// Holds a job: its queued tasks wait, and its running ones save a
+    /// checkpoint where they can and go back to the queue. Answers like
+    /// [`AdminOp::JobRuns`].
+    Suspend {
+        id: JobId,
+    },
+    /// Lets a suspended job's tasks run again. Answers like
+    /// [`AdminOp::JobRuns`].
+    Resume {
+        id: JobId,
+    },
+    /// [`AdminOp::SetScheduleExt`] for a schedule whose job has an allow
+    /// list, a bandwidth cap, part of a GPU, WebGPU features, retries or
+    /// periodic checkpoints ([`crate::sched::ScheduleMore`]).
+    SetScheduleMore {
+        spec: Box<ScheduleSpec>,
+        ext: Box<crate::sched::ScheduleExt>,
+        more: Box<crate::sched::ScheduleMore>,
+    },
+    /// [`AdminOp::ApplyMore`] with schedules that carry what
+    /// [`AdminOp::SetScheduleMore`] does.
+    ApplySched {
+        spec: Box<ApplySpec>,
+        ext: Box<crate::sched::ApplyExt>,
+        more: Box<crate::manage::ApplyMore>,
+        sched: Vec<(String, crate::sched::ScheduleMore)>,
+    },
 }
 
 /// The longest [`AdminOp::JobWait`] and [`AdminOp::LogsWait`] (1.19):
@@ -1345,6 +1414,13 @@ impl AdminOp {
     /// The call that submits `sub`: [`AdminOp::SubmitPlaced`] when it has a
     /// placement, else [`AdminOp::Submit`].
     pub fn submit(mut sub: JobSubmission) -> AdminOp {
+        if !sub.run.is_empty() {
+            let ext = Box::new(sub.take_ext());
+            return AdminOp::SubmitRun {
+                sub: Box::new(sub),
+                ext,
+            };
+        }
         if !sub.net.is_empty() {
             let ext = Box::new(sub.take_ext());
             return AdminOp::SubmitNet {
@@ -1371,6 +1447,14 @@ impl AdminOp {
 
     /// The call that checks `sub` ([`AdminOp::CheckJob`]).
     pub fn check_job(mut sub: JobSubmission, upload_bytes: u64) -> AdminOp {
+        if !sub.run.is_empty() {
+            let ext = Box::new(sub.take_ext());
+            return AdminOp::CheckJobRun {
+                sub: Box::new(sub),
+                ext,
+                upload_bytes,
+            };
+        }
         if !sub.net.is_empty() {
             let ext = Box::new(sub.take_ext());
             return AdminOp::CheckJobNet {
@@ -1404,6 +1488,14 @@ impl AdminOp {
     /// The call that sets a schedule ([`AdminOp::SetSchedule`]).
     pub fn set_schedule(spec: ScheduleSpec) -> AdminOp {
         let ext = spec.ext();
+        let more = spec.more();
+        if !more.is_empty() {
+            return AdminOp::SetScheduleMore {
+                spec: Box::new(spec),
+                ext: Box::new(ext),
+                more: Box::new(more),
+            };
+        }
         if ext.is_empty() {
             AdminOp::SetSchedule(Box::new(spec))
         } else {
@@ -1421,6 +1513,15 @@ impl AdminOp {
     pub fn apply(spec: ApplySpec) -> AdminOp {
         let ext = spec.ext();
         let more = spec.more();
+        let sched = spec.schedules_more();
+        if !sched.is_empty() {
+            return AdminOp::ApplySched {
+                spec: Box::new(spec),
+                ext: Box::new(ext),
+                more: Box::new(more),
+                sched,
+            };
+        }
         if !more.is_empty() {
             return AdminOp::ApplyMore {
                 spec: Box::new(spec),
@@ -1458,6 +1559,26 @@ impl AdminOp {
                 spec.set_ext(*ext);
                 AdminOp::SetSchedule(spec)
             }
+            AdminOp::SetScheduleMore {
+                mut spec,
+                ext,
+                more,
+            } => {
+                spec.set_ext(*ext);
+                spec.set_more(*more);
+                AdminOp::SetSchedule(spec)
+            }
+            AdminOp::ApplySched {
+                mut spec,
+                ext,
+                more,
+                sched,
+            } => {
+                spec.set_ext(*ext);
+                spec.set_more(*more);
+                spec.set_schedules_more(sched);
+                AdminOp::Apply(spec)
+            }
             AdminOp::ApplyExt { mut spec, ext } => {
                 spec.set_ext(*ext);
                 AdminOp::Apply(spec)
@@ -1471,7 +1592,9 @@ impl AdminOp {
                 spec.set_more(*more);
                 AdminOp::Apply(spec)
             }
-            AdminOp::SubmitExt { mut sub, ext } | AdminOp::SubmitNet { mut sub, ext } => {
+            AdminOp::SubmitExt { mut sub, ext }
+            | AdminOp::SubmitNet { mut sub, ext }
+            | AdminOp::SubmitRun { mut sub, ext } => {
                 sub.set_ext(*ext);
                 AdminOp::Submit(sub)
             }
@@ -1481,6 +1604,11 @@ impl AdminOp {
                 upload_bytes,
             }
             | AdminOp::CheckJobNet {
+                mut sub,
+                ext,
+                upload_bytes,
+            }
+            | AdminOp::CheckJobRun {
                 mut sub,
                 ext,
                 upload_bytes,
@@ -1718,6 +1846,8 @@ pub enum AdminResponse {
     JobCaps(Vec<(String, crate::manage::JobCaps)>),
     // 1.20 from here.
     Verify(Box<crate::verify::VerifyView>),
+    // 1.21 from here.
+    JobRuns(Box<crate::attempt::JobRunsView>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part
@@ -2269,6 +2399,7 @@ mod tests {
             placement: Default::default(),
             gpu_ext: Default::default(),
             net: Default::default(),
+            run: Default::default(),
         };
         assert!(matches!(AdminOp::submit(sub.clone()), AdminOp::Submit(_)));
         // 1.10: a part of a GPU rides with the placement in its own call.

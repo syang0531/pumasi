@@ -169,6 +169,10 @@ pub struct JobMeta {
     /// own table.
     #[serde(skip)]
     pub net: pumasi_proto::vmnet::NetSpec,
+    /// Retries, periodic checkpoints and suspension (1.21), persisted in
+    /// their own table.
+    #[serde(skip)]
+    pub run: crate::runs::JobRunRecord,
 }
 
 /// What a run produced, kept for a check run until the check settles in
@@ -379,6 +383,8 @@ pub(crate) struct Need {
     pub place: Option<Box<crate::sched::PlaceNeed>>,
     /// The run keeps checkpoints (1.9): only agents of minor 5.
     pub checkpoint: bool,
+    /// Nodes a retry would rather not go to (1.21).
+    pub avoid: Vec<String>,
 }
 
 /// Why a node cannot take a run, for `queue_timeout` failures and the
@@ -547,6 +553,8 @@ pub struct State {
     pub(crate) sched: crate::sched::SchedState,
     /// Honeypots, disk and memory challenges, scores (1.20).
     pub(crate) verify: crate::verify::VerifyState,
+    /// Attempts, retries waiting out their delay (1.21).
+    pub(crate) runs: crate::runs::RunState,
 }
 
 /// What a run holding part of a GPU (1.10) finds in its environment:
@@ -655,6 +663,7 @@ impl State {
             reps: Default::default(),
             sched: Default::default(),
             verify: Default::default(),
+            runs: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -775,6 +784,7 @@ impl State {
         state.load_sso()?;
         state.load_scim()?;
         state.load_verify()?;
+        state.load_runs()?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(
@@ -1294,6 +1304,7 @@ impl State {
         }
         self.release_holds(now_unix());
         self.tick_schedules(now_unix());
+        self.tick_retries();
         self.tick_queue_timeouts();
         self.tick_files();
         self.tick_replicas();
@@ -1391,6 +1402,10 @@ impl State {
         let place = std::mem::take(&mut sub.placement);
         let gpu_ext = std::mem::take(&mut sub.gpu_ext);
         let net = std::mem::take(&mut sub.net);
+        let run = crate::runs::JobRunRecord {
+            run: std::mem::take(&mut sub.run),
+            suspended: None,
+        };
         let origin = crate::remote::JobOrigin {
             submitted_by: by,
             queue_timeout_ms: sub.queue_timeout_ms,
@@ -1419,6 +1434,7 @@ impl State {
             place,
             gpu_ext,
             net,
+            run,
             gpu: sub.gpu,
         };
         self.next_seq += 1;
@@ -1857,6 +1873,27 @@ impl State {
 
     fn on_primary_report(&mut self, node_id: &str, report: TaskReport, digest: [u8; 32]) {
         let r = report.task;
+        // A failure the job retries (1.21): the task waits for its retry,
+        // keeping what this run printed.
+        if self.on_run_ended(node_id, r, &report.outcome, report.wall_ms) {
+            if let Some(task) = self
+                .jobs
+                .get_mut(&r.job)
+                .and_then(|j| j.tasks.get_mut(r.index as usize))
+            {
+                task.fuel_used = report.fuel_used;
+                task.wall_ms = report.wall_ms;
+                task.stdout = report.stdout;
+                task.stderr = report.stderr;
+                task.output_files = report.files;
+                task.state = TaskState::Pending;
+                task.node = None;
+                if let Err(e) = self.store.put_tasks(r.job.0, &[(r.index, task)]) {
+                    warn!("persist task: {e:#}");
+                }
+            }
+            return;
+        }
         let (trusted, account, version, passes, strikes) = self.node_record(node_id);
         let provider = account.clone();
         let rate = self.policy.sample_permille(passes, strikes);
@@ -2000,18 +2037,28 @@ impl State {
         };
         let max = job.meta.max_attempts;
         let cancelled = job.meta.cancelled;
+        let current = job.tasks.get(r.index as usize).is_some_and(|t| {
+            t.attempts == r.attempt && matches!(t.state, TaskState::Running { .. })
+        });
+        if !current {
+            return;
+        }
+        self.on_run_requeued(r, reason);
+        // Retries and attempts before a rerun do not count either (1.21).
         let free = self
             .mgmt
             .preempted
             .get(&(r.job, r.index, false))
             .copied()
-            .unwrap_or(0);
-        let Some(task) = job.tasks.get_mut(r.index as usize) else {
+            .unwrap_or(0)
+            + self.spent_attempts(r.job, r.index);
+        let Some(task) = self
+            .jobs
+            .get_mut(&r.job)
+            .and_then(|j| j.tasks.get_mut(r.index as usize))
+        else {
             return;
         };
-        if task.attempts != r.attempt || !matches!(task.state, TaskState::Running { .. }) {
-            return;
-        }
         task.node = None;
         let mut retry = false;
         let mut gave_up = None;
@@ -2083,7 +2130,9 @@ impl State {
                 exclude_nodes.push(run.node.clone());
                 exclude_accounts.push(run.account.clone());
             }
-        } else if task.state != TaskState::Pending {
+        } else if task.state != TaskState::Pending || self.run_held_back(item.job, item.index) {
+            // A suspended job's tasks, and retries not yet due, leave the
+            // queue (1.21); resuming and the retry's delay put them back.
             return None;
         }
         let executor = job.meta.executor;
@@ -2134,9 +2183,13 @@ impl State {
             confidential,
             place: None,
             checkpoint: !item.check && job.meta.place.checkpoint.is_some(),
+            avoid: Vec::new(),
         })
         .map(|mut need| {
             need.place = self.place_need(item.job).map(Box::new);
+            if !item.check {
+                need.avoid = self.avoid_nodes(item.job, item.index);
+            }
             need
         })
     }
@@ -2207,6 +2260,13 @@ impl State {
             if e == Executor::Microvm
                 && need.vm_net_rules
                 && self.agent_minor(id) < pumasi_proto::NET_MINOR
+            {
+                refused.get_or_insert(R::OldAgent);
+                continue;
+            }
+            // Periodic checkpoints need an agent that asks for them (1.21).
+            if self.checkpoint_every(need.item.job).is_some()
+                && self.agent_minor(id) < pumasi_proto::RUN_MINOR
             {
                 refused.get_or_insert(R::OldAgent);
                 continue;
@@ -2522,6 +2582,12 @@ impl State {
             None
         };
         let resumed = checkpoint.as_ref().is_some_and(|c| c.restore.is_some());
+        // 1.21: how many times the task was retried, and its checkpoints'
+        // period.
+        let retry_env = self.retry_env(item.job, item.index);
+        let checkpoint_every_ms = checkpoint
+            .as_ref()
+            .and_then(|_| self.checkpoint_every(item.job));
         let job = self.jobs.get_mut(&item.job)?;
         let task = job.tasks.get_mut(item.index as usize)?;
         let node = self.nodes.get_mut(node_id)?;
@@ -2631,6 +2697,11 @@ impl State {
                 if !gpus.is_empty() && need.gpu_ext.share > 0 {
                     share_env(&mut input.env, need.gpu_ext.share);
                 }
+                if let Some(n) = &retry_env {
+                    input
+                        .env
+                        .insert(pumasi_proto::attempt::RETRY_ENV.into(), n.clone());
+                }
                 input
             },
             limits: job.meta.limits,
@@ -2648,6 +2719,7 @@ impl State {
             net: (run_as == Executor::Microvm && !job.meta.net.is_empty())
                 .then(|| job.meta.net.clone()),
             account: job.meta.account.clone(),
+            checkpoint_every_ms,
         };
         let mut assignment = assignment;
         if let Some(c) = conf_task {
@@ -2700,6 +2772,7 @@ impl State {
         if resumed {
             self.note_resumed(item.job, item.index, node_id);
         }
+        self.attempt_started(r, node_id);
         Some(n_gpus)
     }
 
@@ -3059,6 +3132,7 @@ mod tests {
             after: vec![],
             queue_timeout_ms: None,
             gpu_capabilities: vec![],
+            run: Default::default(),
         }
     }
 
@@ -6097,5 +6171,276 @@ mod tests {
             42,
             "the old checkpoint stays"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 1.21: retries, reruns, suspension, schedules with allow lists
+    // -----------------------------------------------------------------------
+
+    use pumasi_proto::attempt::{EndKind, RETRY_ENV, RerunWhich, RetryPolicy};
+
+    /// Reports a run as ended with `outcome`, with a signed receipt.
+    fn end_run(st: &mut State, node: &str, key: &SecretKey, a: &TaskAssignment, outcome: Outcome) {
+        let digest = pumasi_proto::receipt::result_digest(&outcome, b"", &[]);
+        let usage = pumasi_proto::receipt::Usage {
+            cluster: *st.key.public().as_bytes(),
+            node: *key.public().as_bytes(),
+            task: a.task,
+            executor: a.executor,
+            outcome: outcome.clone(),
+            fuel_used: 0,
+            wall_ms: 1,
+            memory_limit_bytes: a.limits.memory_bytes,
+            peak_memory_bytes: None,
+            cpu_millis: a.limits.cpu_millis,
+            result_digest: digest,
+            finished_unix: now_unix(),
+        };
+        let generation = st.nodes[node].generation;
+        st.on_report(
+            node,
+            generation,
+            TaskReport {
+                task: a.task,
+                outcome,
+                stdout: vec![],
+                stderr: vec![],
+                files: vec![],
+                fuel_used: 0,
+                wall_ms: 1,
+                usage: Some(pumasi_proto::receipt::SignedUsage::sign(usage, key)),
+            },
+        );
+    }
+
+    fn retried(tasks: usize, retries: u32, delay_ms: u64) -> JobSubmission {
+        let mut j = job(Executor::Wasm, tasks);
+        j.deterministic = false;
+        j.max_attempts = 1;
+        j.run.retry = Some(RetryPolicy {
+            retries,
+            on: vec![],
+            delay_ms,
+        });
+        j
+    }
+
+    /// The one run assigned to either of two nodes.
+    fn one_of(
+        a: (&str, &mut mpsc::UnboundedReceiver<ToAgent>),
+        b: (&str, &mut mpsc::UnboundedReceiver<ToAgent>),
+    ) -> (String, TaskAssignment) {
+        let mut got: Vec<(String, TaskAssignment)> = assigned(a.1)
+            .into_iter()
+            .map(|x| (a.0.to_string(), x))
+            .chain(assigned(b.1).into_iter().map(|x| (b.0.to_string(), x)))
+            .collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        got.pop().unwrap()
+    }
+
+    /// The gate: a task that fails twice succeeds with retries = 2, and
+    /// each retry goes to a node it has not failed on when there is one.
+    #[test]
+    fn a_task_failing_twice_succeeds_with_two_retries() {
+        let mut st = state();
+        let (a, ka, mut ra) = join_keyed(&mut st, "a", 1);
+        let (b, kb, mut rb) = join_keyed(&mut st, "b", 1);
+        let key_of = |n: &str| if n == a { ka.clone() } else { kb.clone() };
+        let id = st.submit(retried(1, 2, 0)).unwrap();
+        let (n1, r1) = one_of((&a, &mut ra), (&b, &mut rb));
+        assert_eq!(r1.input.env[RETRY_ENV], "0");
+        end_run(&mut st, &n1, &key_of(&n1), &r1, Outcome::Exited(3));
+        assert_eq!(
+            st.jobs[&id].tasks[0].state,
+            TaskState::Running {
+                node: if n1 == a { b.clone() } else { a.clone() }
+            }
+        );
+        let (n2, r2) = one_of((&a, &mut ra), (&b, &mut rb));
+        assert_ne!(n1, n2, "the retry prefers the other node");
+        assert_eq!(r2.input.env[RETRY_ENV], "1");
+        end_run(&mut st, &n2, &key_of(&n2), &r2, Outcome::Exited(3));
+        let (n3, r3) = one_of((&a, &mut ra), (&b, &mut rb));
+        assert_eq!(r3.input.env[RETRY_ENV], "2");
+        finish(&mut st, &n3, &key_of(&n3), &r3);
+        let v = st.job_view(id, false).unwrap();
+        assert_eq!(v.summary.state, JobState::Succeeded, "{v:#?}");
+        let runs = st.job_runs_view(id).unwrap();
+        let t = &runs.tasks[0];
+        assert_eq!(t.attempts.len(), 3, "{t:#?}");
+        assert_eq!(t.retries, 2);
+        assert!(t.attempts[0].retried && t.attempts[1].retried && !t.attempts[2].retried);
+        assert_eq!(t.attempts[0].end, Some(EndKind::Exit(3)));
+        assert_eq!(t.attempts[2].end, Some(EndKind::Succeeded));
+        // A third failure would have ended it: retries are spent.
+        assert!(runs.run.retry.is_some());
+    }
+
+    #[test]
+    fn retries_run_out_and_wait_their_delay() {
+        let mut st = state();
+        let (a, ka, mut ra) = join_keyed(&mut st, "a", 1);
+        let id = st.submit(retried(1, 1, 60_000)).unwrap();
+        let r1 = assigned(&mut ra).pop().unwrap();
+        end_run(&mut st, &a, &ka, &r1, Outcome::Exited(1));
+        // Waits its delay: nothing placed, and the view says when.
+        assert!(assigned(&mut ra).is_empty());
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+        let runs = st.job_runs_view(id).unwrap();
+        assert!(runs.tasks[0].retry_unix.is_some(), "{runs:#?}");
+        st.schedule();
+        assert!(assigned(&mut ra).is_empty(), "held back until due");
+        // Due now.
+        let (at, ..) = *st.runs.delayed.first().unwrap();
+        st.runs.delayed.clear();
+        st.runs.delayed.insert((0, id, 0));
+        st.runs.tasks.get_mut(&(id, 0)).unwrap().retry_at_ms = Some(0);
+        assert!(at > 0);
+        st.tick_retries();
+        st.schedule();
+        let r2 = assigned(&mut ra).pop().expect("the retry runs once due");
+        assert_eq!(r2.input.env[RETRY_ENV], "1");
+        // Out of retries: the second failure ends the job.
+        end_run(&mut st, &a, &ka, &r2, Outcome::Exited(1));
+        assert_eq!(
+            st.job_view(id, false).unwrap().summary.state,
+            JobState::Failed
+        );
+        assert!(assigned(&mut ra).is_empty());
+    }
+
+    #[test]
+    fn retry_on_picks_what_is_retried() {
+        let mut st = state();
+        let (a, ka, mut ra) = join_keyed(&mut st, "a", 1);
+        let mut j = retried(1, 3, 0);
+        j.run.retry.as_mut().unwrap().on = vec![pumasi_proto::attempt::RetryOn::ExitCode(75)];
+        let id = st.submit(j).unwrap();
+        let r = assigned(&mut ra).pop().unwrap();
+        end_run(&mut st, &a, &ka, &r, Outcome::Exited(75));
+        let r = assigned(&mut ra).pop().expect("exit 75 is retried");
+        end_run(&mut st, &a, &ka, &r, Outcome::Exited(1));
+        assert_eq!(
+            st.job_view(id, false).unwrap().summary.state,
+            JobState::Failed,
+            "exit 1 is not"
+        );
+    }
+
+    /// The gate: a rerun runs only the failed tasks.
+    #[test]
+    fn a_rerun_runs_only_the_failed_tasks() {
+        let mut st = state();
+        let (a, ka, mut ra) = join_keyed(&mut st, "a", 3);
+        let mut j = job(Executor::Wasm, 3);
+        j.deterministic = false;
+        j.max_attempts = 1;
+        let id = st.submit(j).unwrap();
+        let got = assigned(&mut ra);
+        assert_eq!(got.len(), 3);
+        for r in &got {
+            let outcome = if r.task.index == 1 {
+                Outcome::Exited(1)
+            } else {
+                Outcome::Exited(0)
+            };
+            end_run(&mut st, &a, &ka, r, outcome);
+        }
+        assert_eq!(
+            st.job_view(id, false).unwrap().summary.state,
+            JobState::Failed
+        );
+        // Only a finished job reruns, and only tasks it has.
+        assert!(
+            st.rerun_job(id, &RerunWhich::Tasks(vec![7]), "owner")
+                .is_err()
+        );
+        let again = st.rerun_job(id, &RerunWhich::Failed, "owner").unwrap();
+        assert_eq!(again, vec![1]);
+        let got = assigned(&mut ra);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].task.index, 1);
+        assert!(!st.job_view(id, false).unwrap().summary.state.is_terminal());
+        finish(&mut st, &a, &ka, &got[0]);
+        let v = st.job_view(id, false).unwrap();
+        assert_eq!(v.summary.state, JobState::Succeeded, "{v:#?}");
+        let runs = st.job_runs_view(id).unwrap();
+        assert_eq!(runs.tasks[0].attempts.len(), 1);
+        assert_eq!(runs.tasks[2].attempts.len(), 1);
+        assert_eq!(runs.tasks[1].attempts.len(), 2);
+        assert!(runs.tasks[1].attempts[1].rerun);
+        // Named tasks rerun too, even ones that succeeded.
+        assert_eq!(
+            st.rerun_job(id, &RerunWhich::Tasks(vec![0]), "owner")
+                .unwrap(),
+            vec![0]
+        );
+        assert_eq!(assigned(&mut ra).len(), 1);
+    }
+
+    #[test]
+    fn a_suspended_job_starts_nothing_until_resumed() {
+        let mut st = state();
+        let (a, _ka, mut ra) = join_keyed(&mut st, "a", 1);
+        let mut j = job(Executor::Wasm, 2);
+        j.deterministic = false;
+        let id = st.submit(j).unwrap();
+        assert_eq!(assigned(&mut ra).len(), 1);
+        st.suspend_job(id, "owner").unwrap();
+        let (got, cancelled) = cancels(&mut ra);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(cancelled.len(), 1, "the running task stops");
+        st.suspend_job(id, "owner").unwrap();
+        assert_eq!(
+            st.job_runs_view(id).unwrap().suspended.unwrap().by,
+            "owner",
+            "again: no change"
+        );
+        st.schedule();
+        assert!(assigned(&mut ra).is_empty());
+        let v = st.job_view(id, false).unwrap();
+        assert!(
+            v.waiting.as_deref().unwrap_or("").contains("suspended"),
+            "{v:#?}"
+        );
+        assert!(st.nodes[&a].running.is_empty());
+        let runs = st.job_runs_view(id).unwrap();
+        assert_eq!(runs.suspended.as_ref().unwrap().by, "owner");
+        st.resume_job(id, "owner").unwrap();
+        assert_eq!(assigned(&mut ra).len(), 1, "it goes on");
+        assert!(st.job_runs_view(id).unwrap().suspended.is_none());
+        st.resume_job(id, "owner").unwrap();
+        assert!(assigned(&mut ra).is_empty(), "again: no change");
+    }
+
+    /// The gate: a schedule's job keeps its allow list and its retries.
+    #[test]
+    fn a_schedule_with_an_allow_list_submits_it() {
+        let mut st = state();
+        let mut j = job(Executor::Microvm, 1);
+        j.docker.as_mut().unwrap().network = true;
+        let net = pumasi_proto::vmnet::NetSpec {
+            allow: pumasi_proto::vmnet::NetSpec::parse_list(&["example.com:443".to_string()])
+                .unwrap(),
+            mbps: Some(10),
+        };
+        j.net = net.clone();
+        j.run.retry = Some(RetryPolicy {
+            retries: 2,
+            on: vec![],
+            delay_ms: 1_000,
+        });
+        let spec = ScheduleSpec {
+            name: "nightly".into(),
+            cron: "0 3 * * *".into(),
+            job: j,
+            overlap: false,
+            tz: None,
+        };
+        st.set_schedule(spec).unwrap();
+        let id = st.run_schedule("nightly", true).unwrap();
+        assert_eq!(st.jobs[&id].meta.net, net);
+        assert_eq!(st.jobs[&id].meta.run.run.retry.as_ref().unwrap().retries, 2);
     }
 }

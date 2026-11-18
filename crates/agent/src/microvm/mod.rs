@@ -940,6 +940,7 @@ impl MicrovmExecutor {
                 wall_ms: (start.elapsed().as_millis() as u64).saturating_sub(io.pull.ms()),
                 peak_memory_bytes: None,
                 out_dir: None,
+                usage: Default::default(),
             },
         }
     }
@@ -1107,6 +1108,8 @@ impl MicrovmExecutor {
             }),
             _ => None,
         };
+        // What the VMM process uses stands for what the guest used (1.21).
+        let sampler = running.child.id().map(crate::usage::Sampler::process);
         let end = self
             .wait_vm(
                 &vmm,
@@ -1124,6 +1127,10 @@ impl MicrovmExecutor {
         }
         #[cfg(target_os = "linux")]
         drop(tap);
+        let usage = match sampler {
+            Some(s) => s.finish().await,
+            None => Default::default(),
+        };
         let end = end?;
         // Billed time starts at boot (or when a warm guest got the task):
         // pulling an image is not the job's run.
@@ -1137,6 +1144,7 @@ impl MicrovmExecutor {
             wall_ms,
             peak_memory_bytes: None,
             out_dir: None,
+            usage,
         };
         if !matches!(end, VmEnd::Exited(_)) {
             debug!(task = %task, console = %console_tail(&dir), "microvm stopped by the host");
@@ -1191,6 +1199,7 @@ impl MicrovmExecutor {
             wall_ms,
             peak_memory_bytes: None,
             out_dir: kept,
+            usage,
         })
     }
 
@@ -1670,6 +1679,7 @@ impl MicrovmExecutor {
             wall_ms,
             peak_memory_bytes: None,
             out_dir: None,
+            usage: Default::default(),
         };
         let status = match end {
             VmEnd::Timeout => return Ok(result(Outcome::Timeout)),

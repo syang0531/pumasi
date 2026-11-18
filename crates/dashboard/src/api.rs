@@ -51,6 +51,10 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
         .route("/jobs", post(submit).layer(uploads))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel))
+        .route("/jobs/{id}/runs", get(job_runs))
+        .route("/jobs/{id}/rerun", post(rerun))
+        .route("/jobs/{id}/suspend", post(suspend))
+        .route("/jobs/{id}/resume", post(resume))
         .route("/jobs/{id}/receipts", get(receipts))
         .route("/jobs/{id}/placement", get(placement))
         .route("/jobs/{id}/outputs.zip", get(outputs_zip))
@@ -458,6 +462,64 @@ async fn submit(
 async fn cancel(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -> Response {
     match job_id(&id) {
         Ok(id) => simple(st, a, AdminOp::Cancel { id }).await,
+        Err(r) => r,
+    }
+}
+
+/// A job's attempts and usage (1.21).
+async fn job_runs(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -> Response {
+    match job_id(&id) {
+        Ok(id) => simple_read(st, a, AdminOp::JobRuns { id }).await,
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RerunBody {
+    #[serde(default)]
+    failed: bool,
+    #[serde(default)]
+    tasks: Vec<u32>,
+}
+
+/// Runs a job's failed tasks, or the ones named, again (1.21).
+async fn rerun(
+    axum::extract::State(st): S,
+    a: Api,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let id = match job_id(&id) {
+        Ok(i) => i,
+        Err(r) => return r,
+    };
+    let which = match serde_json::from_slice::<RerunBody>(&body) {
+        Ok(b) if b.failed && b.tasks.is_empty() => pumasi_proto::attempt::RerunWhich::Failed,
+        Ok(b) if !b.failed && !b.tasks.is_empty() => {
+            pumasi_proto::attempt::RerunWhich::Tasks(b.tasks)
+        }
+        Ok(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "give either \"failed\": true or \"tasks\": [N, ...]",
+            );
+        }
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    simple(st, a, AdminOp::Rerun { id, which }).await
+}
+
+async fn suspend(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -> Response {
+    match job_id(&id) {
+        Ok(id) => simple(st, a, AdminOp::Suspend { id }).await,
+        Err(r) => r,
+    }
+}
+
+async fn resume(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -> Response {
+    match job_id(&id) {
+        Ok(id) => simple(st, a, AdminOp::Resume { id }).await,
         Err(r) => r,
     }
 }

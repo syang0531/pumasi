@@ -686,6 +686,40 @@ curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/re
 <!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" "$PUMASI_URL/api/v1/resources" | jq -e '.[] | select(.account == "lab") | .quota.cpus == 8 and .quota.memory_bytes == 17179869184 and (.quota.labels | length) == 1 and .used.cpus == 0' -->
 <!-- ci: curl -fsS -X PUT -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{}' "$PUMASI_URL/api/v1/accounts/lab/resources" | jq -e '.ok' -->
 
+### Attempts, reruns and suspended jobs (1.21)
+
+Every attempt of each task (its node, how it ended, its wall time and
+`usage`: CPU time, peak memory, disk and network bytes as the node
+measured them, and whether it was retried or rerun), the job's retries
+and periodic checkpoints (`run`), whether it is suspended, the usage of
+all its runs (`total`) and `overasked`, hints for a task that asked for
+far more memory or CPUs than it used:
+
+```sh
+curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/runs"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/runs" | jq -e '(.tasks | length) == 2 and (.tasks[0].attempts | length) >= 1 and .tasks[0].attempts[0].end == "Succeeded" and .suspended == null' -->
+
+Run tasks again under the same job id: `{"failed": true}` for the failed
+and cancelled ones, or `{"tasks": [...]}` for any finished ones. It
+answers like `.../runs`:
+
+```sh
+curl -fsS -X POST -H "Authorization: Bearer $PUMASI_TICKET" -H 'Content-Type: application/json' \
+  -d '{"tasks": [0]}' "$PUMASI_URL/api/v1/jobs/$JOB/rerun"
+```
+<!-- ci: for i in $(seq 1 20); do curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB?wait=30s" | jq -e '.summary.state == "Succeeded"' && break; sleep 1; done -->
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/runs" | jq -e '(.tasks[0].attempts | length) == 2 and .tasks[0].attempts[1].rerun and (.tasks[1].attempts | length) == 1' -->
+
+Hold a job that has not finished (its queued tasks wait, its running
+ones go back to the queue, saving a checkpoint first where the job keeps
+them), and let it go on:
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/suspend"
+curl -fsS -X POST -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/resume"
+```
+
 Every route, with its parameters, is in `$PUMASI_URL/api/openapi.json`
 (OpenAPI 3.1), which code generators and tools such as Postman read.
 

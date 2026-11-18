@@ -721,6 +721,216 @@
         ]
       }
     },
+    "/api/v1/jobs/{id}/runs": {
+      "get": {
+        "summary": "A job's attempts, what its runs used and whether it is suspended (1.21)",
+        "tags": [
+          "jobs"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "`run` is the job's retries and periodic checkpoints; `suspended` who held it and when; `tasks` each task's attempts (node, how it ended, wall time, `usage` with CPU, peak memory, disk and network as the node measured them, whether it was retried), its retries so far, when the next retry starts and `overasked`, hints for a task that asked for far more CPU or memory than it used; `total` sums the usage.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Job id (hex, as `pumasi status` shows it)"
+          }
+        ]
+      }
+    },
+    "/api/v1/jobs/{id}/rerun": {
+      "post": {
+        "summary": "Run a job's tasks again: the failed ones or the ones named (1.21)",
+        "tags": [
+          "jobs"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Job id (hex, as `pumasi status` shows it)"
+          }
+        ],
+        "description": "Each task starts from attempt 1 with its retries again; the job keeps its id. Answers like GET .../runs.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "failed": {
+                    "type": "boolean",
+                    "description": "Run every task that failed or was cancelled"
+                  },
+                  "tasks": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "description": "Run these tasks (indexes)"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/suspend": {
+      "post": {
+        "summary": "Suspend a job: its running tasks go back to the queue and none starts until resumed (1.21)",
+        "tags": [
+          "jobs"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Job id (hex, as `pumasi status` shows it)"
+          }
+        ]
+      }
+    },
+    "/api/v1/jobs/{id}/resume": {
+      "post": {
+        "summary": "Resume a suspended job (1.21)",
+        "tags": [
+          "jobs"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Job id (hex, as `pumasi status` shows it)"
+          }
+        ]
+      }
+    },
     "/api/v1/jobs/{id}/receipts": {
       "get": {
         "summary": "Signed usage receipts",

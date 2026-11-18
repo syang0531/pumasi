@@ -62,7 +62,7 @@ machines.
 | 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | done |
 | 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | done |
 | 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | done |
-| 37 | 1.21 | Cluster management: retries, reruns, suspended jobs, periodic checkpoints, what tasks really use | planned |
+| 37 | 1.21 | Cluster management: retries, reruns, suspended jobs, periodic checkpoints, what tasks really use | done |
 | 38 | 1.22 | Monitoring: energy per task, electricity against earnings, pausing when hot, more alert channels | planned |
 | 39 | 1.23 | Dashboard: what is still CLI-only, and alerts pushed to the phone | planned |
 | 40 | 1.24 | MicroVMs and old Intel Macs: warm guests with networks, snapshots, memory given back, fans | planned |
@@ -822,6 +822,47 @@ caught, and placement that prefers the higher score. By hand: an invited
 provider's score in the dashboard after a day of work.
 
 ## 37. Cluster management: retries, reruns, suspended jobs, periodic checkpoints, what tasks really use (1.21)
+
+Done in 1.21.0 ([release notes](releases/v1.21.0.md),
+[details](architecture.md#phase-37-cluster-management-121)).
+What differs from the plan: `retry_on` also takes `error` (the node could
+not run the task, e.g. its image would not pull), and leaving it out
+means `exit`, `oom`, `timeout` and `error`; `exit` covers WASM traps too.
+A task learns which retry it is from `PUMASI_RETRY` (0 on the first
+run). The delay starts at `retry_delay` (10 s by default) and doubles up
+to an hour; retries do not count against `max_attempts`, and a retry
+goes to a node where the task has not just failed when one can take it,
+else to the same one. OOM is told from the run's outcome (Docker's OOM
+kill, the WASM engine's memory limit). Gangs refuse retries for
+now (a lost gang member already restarts the gang). Reruns take
+`--failed` (failed and cancelled tasks) or any finished task by
+`--task`, also while the rest of the job runs; a rerun task loses its
+output and checkpoint, starts its retries over, and its earlier attempts
+no longer count against `max_attempts`; a job whose inputs were already
+collected from the file store (long after it finished) cannot be rerun
+from them. A suspended job has no state of its own (older clients would
+not decode it): `pumasi job`, the API's `waiting` and the dashboard say
+it is suspended; its running tasks move like a drain (a checkpoint first
+where the job keeps them, else cancelled) and its queue timeout stops
+until it resumes. Periodic checkpoints are asked for with a request file,
+`/checkpoint/.pumasi-checkpoint`, not a signal: SIGTERM already means
+stop, and other signals kill programs that do not catch them. The task
+saves, then deletes the file within its grace period, and the agent
+stores what `/checkpoint` then holds; a task that does not answer is
+asked again next period. They are Docker's and WASM's: microVM jobs
+refuse `checkpoint_every` (an image job with it runs as Docker), and
+agents older than 1.21 are not given such runs. Usage comes from the
+container's cgroup on Linux (v2, or v1) every half second, from `docker
+stats` every 2 seconds elsewhere (so short peaks can be missed), from the
+VMM process (read with sysinfo on every OS, so no Job Objects; it
+includes the VMM's own memory) and the gateway's counts for microVMs,
+and from the engine (peak linear memory, the CPU time of its thread) for
+WASM. The hint says when a task used under a quarter of the memory it
+asked for (256 MiB or more) or of its CPUs (one or more, over at least
+10 s). Schedules carry allow lists, caps, parts of GPUs, retries and
+`checkpoint_every` in a new record beside the schedule
+(`SetScheduleMore`, `ApplySched`). The control plane keeps the last 50
+attempts of a task.
 
 Why: a task that exits non-zero, runs out of memory or times out fails
 its job at once (`max_attempts` covers lost nodes only), and the only

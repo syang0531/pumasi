@@ -61,6 +61,8 @@ pub struct RunResult {
     pub wall_ms: u64,
     /// Highest linear memory reached (WASM only).
     pub peak_memory_bytes: Option<u64>,
+    /// What the run used, as far as this machine could tell (1.21).
+    pub usage: pumasi_proto::attempt::RunUse,
     /// The output files, left on disk when the task's output may go to the
     /// file store ([`TaskIo::output`] other than inline); `files` is then
     /// empty.
@@ -128,6 +130,138 @@ impl NetCount {
 pub struct CheckpointIo {
     pub dir: PathBuf,
     pub stop: Arc<StopSignal>,
+    /// Checkpoints asked for while the run goes on (1.21).
+    pub periodic: Option<PeriodicCheckpoint>,
+}
+
+/// How often to ask a running task for a checkpoint, and where to hand
+/// each one (a directory holding what its `/checkpoint` held).
+#[derive(Debug, Clone)]
+pub struct PeriodicCheckpoint {
+    pub every: Duration,
+    /// How long the task has to save it and delete the request file.
+    pub ack_within: Duration,
+    /// Where to make the directories handed over.
+    pub scratch: PathBuf,
+    pub sink: tokio::sync::mpsc::UnboundedSender<TempDir>,
+}
+
+/// Where a periodic checkpoint is: waiting for its time, or asked for.
+#[derive(Debug)]
+pub(crate) struct PeriodicState {
+    every: Duration,
+    ack_within: Duration,
+    next: Instant,
+    asked: Option<Instant>,
+    polled: Instant,
+}
+
+/// What to do about a periodic checkpoint now.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PeriodicStep {
+    Wait,
+    /// Put the request file in `/checkpoint`.
+    Ask,
+    /// See whether the task deleted the request file.
+    Poll,
+}
+
+impl PeriodicState {
+    pub(crate) fn new(p: &PeriodicCheckpoint) -> Self {
+        let now = Instant::now();
+        Self {
+            every: p.every,
+            ack_within: p.ack_within,
+            next: now + p.every,
+            asked: None,
+            polled: now,
+        }
+    }
+
+    pub(crate) fn step(&mut self, now: Instant) -> PeriodicStep {
+        match self.asked {
+            None if now >= self.next => PeriodicStep::Ask,
+            None => PeriodicStep::Wait,
+            Some(at) if now >= at + self.ack_within => {
+                // The task did not answer in time: no checkpoint this
+                // round; the request stays for the next.
+                tracing::debug!("the task did not save a checkpoint when asked");
+                self.done(now);
+                PeriodicStep::Wait
+            }
+            Some(_) if now >= self.polled + Duration::from_millis(500) => {
+                self.polled = now;
+                PeriodicStep::Poll
+            }
+            Some(_) => PeriodicStep::Wait,
+        }
+    }
+
+    pub(crate) fn asked(&mut self, now: Instant) {
+        self.asked = Some(now);
+        self.polled = now;
+    }
+
+    /// This round is over (saved, given up or failed).
+    pub(crate) fn done(&mut self, now: Instant) {
+        self.asked = None;
+        self.next = now + self.every;
+    }
+}
+
+/// One round of a periodic checkpoint for a run whose `/checkpoint` is a
+/// directory on this machine (WASM): ask, wait for the task to answer,
+/// copy what it saved. Runs until `finished` is set.
+pub async fn host_dir_checkpoints(dir: PathBuf, p: PeriodicCheckpoint, finished: Arc<AtomicBool>) {
+    let request = dir.join(pumasi_proto::attempt::CHECKPOINT_REQUEST_FILE);
+    let mut state = PeriodicState::new(&p);
+    while !finished.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = Instant::now();
+        match state.step(now) {
+            PeriodicStep::Wait => {}
+            PeriodicStep::Ask => {
+                if let Err(e) =
+                    std::fs::write(&request, b"save a checkpoint, then delete this file\n")
+                {
+                    tracing::warn!("could not ask for a checkpoint: {e}");
+                    state.done(now);
+                } else {
+                    state.asked(now);
+                }
+            }
+            PeriodicStep::Poll if !request.exists() => {
+                if finished.load(Ordering::Relaxed) {
+                    break;
+                }
+                let copied = TempDir::new_in(&p.scratch, "checkpoint-copy")
+                    .and_then(|t| copy_tree(&dir, t.path()).map(|()| t));
+                match copied {
+                    Ok(t) => {
+                        let _ = p.sink.send(t);
+                    }
+                    Err(e) => tracing::warn!("could not copy a checkpoint: {e:#}"),
+                }
+                state.done(Instant::now());
+            }
+            PeriodicStep::Poll => {}
+        }
+    }
+}
+
+/// Copies the files under `from` into `to`, leaving out the request file.
+pub(crate) fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    for (rel, path, _) in pumasi_proto::job::dir_files(from)? {
+        if rel == pumasi_proto::attempt::CHECKPOINT_REQUEST_FILE {
+            continue;
+        }
+        let dst = to.join(&rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&path, &dst)?;
+    }
+    Ok(())
 }
 
 /// How the agent asks a checkpointing run to stop: the executor sends the
@@ -755,6 +889,7 @@ impl WasmExecutor {
         });
         store.set_epoch_deadline(1);
 
+        let cpu_before = crate::usage::thread_cpu_ms();
         let result = (|| -> wasmtime::Result<()> {
             match &module {
                 Program::Module(module) => {
@@ -778,6 +913,7 @@ impl WasmExecutor {
             }
         })();
 
+        let cpu_after = crate::usage::thread_cpu_ms();
         let fuel_used = fuel_budget.saturating_sub(store.get_fuel().unwrap_or(0));
         let peak = store.data().limits.peak as u64;
         let gpu_note = store.data().gpu.summary();
@@ -803,6 +939,11 @@ impl WasmExecutor {
             fuel_used,
             wall_ms: start.elapsed().as_millis() as u64,
             peak_memory_bytes: Some(peak),
+            usage: pumasi_proto::attempt::RunUse {
+                cpu_ms: cpu_before.zip(cpu_after).map(|(a, b)| b.saturating_sub(a)),
+                peak_memory_bytes: Some(peak),
+                ..Default::default()
+            },
             out_dir: kept_out,
         }
     }
@@ -873,6 +1014,7 @@ impl RunResult {
             wall_ms: start.elapsed().as_millis() as u64,
             peak_memory_bytes: None,
             out_dir: None,
+            usage: Default::default(),
         }
     }
 }

@@ -237,9 +237,14 @@ enum Cmd {
         #[command(flatten)]
         admin: AdminArgs,
     },
-    /// Show one job and its tasks.
+    /// Show one job and its tasks, with each task's attempts and what its
+    /// runs used. `pumasi job rerun`, `suspend` and `resume` act on it.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Job {
-        id: String,
+        #[command(subcommand)]
+        cmd: Option<JobCmd>,
+        #[arg(required = true, value_name = "ID")]
+        id: Option<String>,
         /// Print each task's stdout and stderr.
         #[arg(long, short)]
         output: bool,
@@ -889,6 +894,38 @@ enum PricesCmd {
         /// Failed checks after which a provider machine gets no tasks.
         #[arg(long)]
         max_strikes: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobCmd {
+    /// Run a finished job's tasks again (1.21): the failed and cancelled
+    /// ones with --failed, or the ones named with --task. Each starts from
+    /// attempt 1 with its retries again; the job keeps its id.
+    Rerun {
+        id: String,
+        /// Run every task that failed or was cancelled.
+        #[arg(long, required_unless_present = "task", conflicts_with = "task")]
+        failed: bool,
+        /// Run this task (repeat for several).
+        #[arg(long, value_name = "N")]
+        task: Vec<u32>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Hold a job (1.21): its running tasks go back to the queue (from
+    /// their checkpoint when they keep one) and none starts until `pumasi
+    /// job resume`.
+    Suspend {
+        id: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Let a suspended job's tasks start again.
+    Resume {
+        id: String,
+        #[command(flatten)]
+        admin: AdminArgs,
     },
 }
 
@@ -1961,13 +1998,15 @@ async fn run(cli: Cli) -> Result<i32> {
             print_status(&status, &power);
             Ok(0)
         }
+        Cmd::Job { cmd: Some(cmd), .. } => job_cmd(&home, cmd).await,
         Cmd::Job {
             id,
             output,
             out,
             admin,
+            ..
         } => {
-            let id: JobId = id.parse()?;
+            let id: JobId = id.context("a job id")?.parse()?;
             let client = connect_admin(&home, &admin).await?;
             let AdminResponse::Job(view) = client
                 .read(AdminOp::Job {
@@ -1980,6 +2019,9 @@ async fn run(cli: Cli) -> Result<i32> {
             };
             let ran = task_executors(&client, &view).await;
             print_job(&view, &task_details(&client, id).await, &ran, output);
+            if let Some(runs) = job_runs(&client, id).await {
+                print_runs(&view, &runs);
+            }
             if let Some(dir) = out {
                 download_outputs(&client, &view, &dir, true).await?;
             }
@@ -3381,6 +3423,152 @@ const MAX_TASK_LINES: usize = 100;
 /// Where each task of a job ran, by name, and how long the parts of its
 /// run took (1.4). Empty when the control plane is older and does not
 /// answer: the job is then printed without them.
+/// `pumasi job rerun|suspend|resume` (1.21).
+async fn job_cmd(home: &Path, cmd: JobCmd) -> Result<i32> {
+    let (id, admin, op) = match cmd {
+        JobCmd::Rerun {
+            id,
+            failed,
+            task,
+            admin,
+        } => {
+            let id: JobId = id.parse()?;
+            let which = if failed {
+                pumasi_proto::attempt::RerunWhich::Failed
+            } else {
+                pumasi_proto::attempt::RerunWhich::Tasks(task)
+            };
+            (id, admin, AdminOp::Rerun { id, which })
+        }
+        JobCmd::Suspend { id, admin } => {
+            let id: JobId = id.parse()?;
+            (id, admin, AdminOp::Suspend { id })
+        }
+        JobCmd::Resume { id, admin } => {
+            let id: JobId = id.parse()?;
+            (id, admin, AdminOp::Resume { id })
+        }
+    };
+    let what = match &op {
+        AdminOp::Rerun { .. } => "rerun",
+        AdminOp::Suspend { .. } => "suspended",
+        _ => "resumed",
+    };
+    let client = connect_admin(home, &admin).await?;
+    let res = client.call(op).await;
+    client.close().await;
+    let res = res.context("(a control plane before 1.21 has no rerun, suspend or resume)")?;
+    match (what, res) {
+        ("rerun", _) => {
+            eprintln!("job {id} runs those tasks again; `pumasi job {id}` follows it");
+        }
+        ("suspended", _) => {
+            eprintln!("suspended job {id}: its tasks wait until `pumasi job resume {id}`")
+        }
+        _ => eprintln!("job {id} {what}"),
+    }
+    Ok(0)
+}
+
+/// A job's attempts and usage (1.21). `None` when the control plane is
+/// older and does not answer.
+pub(crate) async fn job_runs(
+    client: &AdminClient,
+    id: JobId,
+) -> Option<pumasi_proto::attempt::JobRunsView> {
+    match client.read(AdminOp::JobRuns { id }).await {
+        Ok(AdminResponse::JobRuns(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+/// How many tasks get hints about what they asked for and did not use.
+const MAX_HINTS: usize = 5;
+
+/// The part of `pumasi job` that 1.21 adds: retries, suspension, each
+/// task's earlier attempts, what its runs used and what it asked for in
+/// vain.
+pub(crate) fn print_runs(v: &JobView, r: &pumasi_proto::attempt::JobRunsView) {
+    use pumasi_proto::attempt::{AttemptView, EndKind};
+    if !r.run.is_empty() {
+        println!("  runs: {}", r.run.describe());
+    }
+    if let Some(s) = &r.suspended {
+        println!(
+            "  SUSPENDED by {} at {} (`pumasi job resume {}`)",
+            s.by,
+            pumasi_proto::audit::rfc3339(s.since_unix),
+            v.summary.id
+        );
+    }
+    if !r.total.is_empty() {
+        println!("  used: {}", r.total.describe());
+    }
+    let line = |a: &AttemptView| {
+        let node = a
+            .node_name
+            .clone()
+            .unwrap_or_else(|| short(&a.node).to_string());
+        let end = match (&a.end, a.ended_unix) {
+            (Some(e), _) => e.to_string(),
+            (None, None) => "running".into(),
+            (None, Some(_)) => "ended".into(),
+        };
+        let mut l = format!("attempt {} node={node} {end} {}ms", a.attempt, a.wall_ms);
+        if let Some(u) = a.usage.filter(|u| !u.is_empty()) {
+            l.push_str("  ");
+            l.push_str(&u.describe());
+        }
+        // Why, where the end alone does not say it (an error, a trap, a
+        // lost node).
+        let plain = matches!(
+            a.end,
+            Some(EndKind::Succeeded | EndKind::Exit(_) | EndKind::Timeout | EndKind::Cancelled)
+        );
+        if !a.why.is_empty() && !plain {
+            l.push_str(&format!(" ({})", a.why));
+        }
+        if a.retried {
+            l.push_str(" -> retried");
+        }
+        if a.rerun {
+            l.push_str(" [rerun]");
+        }
+        l
+    };
+    let mut hints = 0;
+    for t in &r.tasks {
+        let several = t.attempts.len() > 1;
+        let few = r.tasks.len() <= MAX_TASK_LINES;
+        if several || (few && t.attempts.iter().any(|a| a.usage.is_some())) {
+            println!("  [{}] attempts:", t.index);
+            for a in &t.attempts {
+                println!("      {}", line(a));
+            }
+        }
+        if let Some(at) = t.retry_unix {
+            println!(
+                "  [{}] retry {} at {}",
+                t.index,
+                t.retries,
+                pumasi_proto::audit::rfc3339(at)
+            );
+        }
+        if !t.overasked.is_empty() && hints < MAX_HINTS {
+            hints += 1;
+            for h in &t.overasked {
+                println!("  hint [{}]: {h}", t.index);
+            }
+        }
+    }
+    if r.dropped > 0 {
+        println!("  ({} older attempts not kept)", r.dropped);
+    }
+    if hints > 0 {
+        println!("  (a hint: lower `memory`/`cpus` in job.toml lets more tasks share a node)");
+    }
+}
+
 async fn task_details(client: &AdminClient, id: JobId) -> Vec<pumasi_proto::msg::TaskDetail> {
     match client.read(AdminOp::TaskDetails { id }).await {
         Ok(AdminResponse::TaskDetails(d)) => d,

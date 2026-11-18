@@ -199,6 +199,7 @@ fn submission(args: Vec<Vec<&str>>) -> JobSubmission {
         after: vec![],
         queue_timeout_ms: None,
         gpu_capabilities: vec![],
+        run: Default::default(),
     }
 }
 
@@ -1411,6 +1412,7 @@ fn docker_job(command: &[&str], tasks: Vec<TaskInput>) -> JobSubmission {
         after: vec![],
         queue_timeout_ms: None,
         gpu_capabilities: vec![],
+        run: Default::default(),
     }
 }
 
@@ -2416,7 +2418,7 @@ async fn microvm_network_allow_lists_udp_and_egress() {
     sub.max_attempts = 1;
     // As clients send it: the list travels beside the submission
     // (`AdminOp::SubmitNet`); `AdminOp::Submit` cannot carry it.
-    let id = match client.call(AdminOp::submit(sub)).await.unwrap() {
+    let id = match client.call(AdminOp::submit(sub.clone())).await.unwrap() {
         AdminResponse::Submitted { id } => id,
         other => panic!("unexpected {other:?}"),
     };
@@ -2456,6 +2458,34 @@ async fn microvm_network_allow_lists_udp_and_egress() {
     let old = receipts(&client, id).await;
     assert_eq!(old.len(), 1);
     assert!(old[0].egress.is_none());
+
+    // 1.21: the same job from a schedule keeps its allow list.
+    client
+        .call(AdminOp::set_schedule(pumasi_proto::manage::ScheduleSpec {
+            name: "allowed".into(),
+            cron: "0 3 1 1 *".into(),
+            job: sub,
+            overlap: false,
+            tz: None,
+        }))
+        .await
+        .unwrap();
+    let AdminResponse::Submitted { id } = client
+        .call(AdminOp::RunSchedule {
+            name: "allowed".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a submitted job");
+    };
+    let view = wait_job(&client, id, 600).await;
+    assert_eq!(view.summary.state, JobState::Succeeded, "{view:#?}");
+    let out = String::from_utf8_lossy(view.tasks[0].stdout.as_deref().unwrap_or_default());
+    assert_eq!(
+        out, "tcp-allowed\nudp-allowed\nname-denied\naddress-denied\nudp-denied\nprivate-blocked\n",
+        "{view:#?}"
+    );
 
     client.close().await;
     p.kill().await;

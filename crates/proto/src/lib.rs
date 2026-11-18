@@ -4,6 +4,7 @@
 //! specification users write, the messages agents and the control plane
 //! exchange, the admin API, and the tickets used to join a cluster.
 
+pub mod attempt;
 pub mod audit;
 pub mod blobs;
 pub mod confidential;
@@ -84,7 +85,7 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 11;
+pub const PROTOCOL_MINOR: u32 = 12;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
@@ -144,6 +145,12 @@ pub const NET_MINOR: u32 = 10;
 /// the challenges' code. Older agents are timed for their CPU only, and a
 /// provider's `disk` label waits for a timing.
 pub const VERIFY_MINOR: u32 = 11;
+/// The first minor with the 1.21 runs: the agent asks checkpointing tasks
+/// for a checkpoint on the period the assignment gives
+/// ([`msg::TaskAssignment::checkpoint_every_ms`]) and sends each one
+/// ([`msg::FromAgent::Checkpointed`]), and says what each run used
+/// ([`msg::ReportTail::usage`]).
+pub const RUN_MINOR: u32 = 12;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

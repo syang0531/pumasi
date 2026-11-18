@@ -391,8 +391,10 @@ impl State {
                     n.account == need.consumer
                 };
                 let free = (n.free_slots() + room.freed_slots).saturating_sub(room.taken_slots);
+                // A retry goes elsewhere when it can (1.21).
+                let fresh = !need.avoid.iter().any(|a| a == id.as_str());
                 // The higher score among equals (1.20).
-                (Reverse(spread), pref, self.placement_score(id), free)
+                (fresh, Reverse(spread), pref, self.placement_score(id), free)
             })
             .map(|(id, _)| id.clone())
     }
@@ -698,7 +700,15 @@ impl State {
         );
     }
 
-    fn save_checkpoint(&mut self, t: TaskRef, node: &str, c: StoredOutput) {
+    /// Keeps a run's checkpoint; `announce` adds an event (a stopping run,
+    /// not a periodic checkpoint).
+    pub(crate) fn save_checkpoint(
+        &mut self,
+        t: TaskRef,
+        node: &str,
+        c: StoredOutput,
+        announce: bool,
+    ) {
         let resumed = self
             .sched
             .checkpoints
@@ -723,6 +733,9 @@ impl State {
             warn!("persist checkpoint: {e:#}");
         }
         self.sched.checkpoints.insert((t.job, t.index), r);
+        if !announce {
+            return;
+        }
         let name = self.node_name(node);
         self.event(
             EventLevel::Info,
@@ -773,7 +786,7 @@ impl State {
             });
         if current && !task.check {
             if let Some(c) = checkpoint {
-                self.save_checkpoint(task, node_id, c);
+                self.save_checkpoint(task, node_id, c, true);
             }
             if let Some(e) = &error {
                 let name = self.node_name(node_id);

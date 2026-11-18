@@ -428,6 +428,12 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
         Ok(AdminResponse::Placement(p)) => Some(*p),
         _ => None,
     };
+    // 1.21: attempts, what the runs used, and a suspension.
+    let runs = match ctx.call(AdminOp::JobRuns { id }).await {
+        Ok(AdminResponse::JobRuns(r)) => Some(*r),
+        _ => None,
+    };
+    let suspended = runs.as_ref().and_then(|r| r.suspended.as_ref());
     let s = &v.summary;
     let terminal = s.state.is_terminal();
     let top = html! {
@@ -437,6 +443,17 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
                 @if ctx.me.can_submit() && !terminal {
                     button class="danger" hx-post={"/jobs/" (s.id) "/cancel"} hx-target="#flash"
                         hx-confirm=(l.t("Cancel this job?", "이 작업을 취소할까요?")) { (l.t("Cancel", "취소")) }
+                }
+                @if ctx.me.can_submit() && !terminal && runs.is_some() {
+                    @if suspended.is_some() {
+                        button #resume hx-post={"/jobs/" (s.id) "/resume"} hx-target="#flash" { (l.t("Resume", "재개")) }
+                    } @else {
+                        button class="secondary" #suspend hx-post={"/jobs/" (s.id) "/suspend"} hx-target="#flash"
+                            hx-confirm=(l.t("Suspend this job? Its running tasks go back to the queue.", "이 작업을 일시 정지할까요? 실행 중인 태스크는 대기열로 돌아갑니다.")) { (l.t("Suspend", "일시 정지")) }
+                    }
+                }
+                @if ctx.me.can_submit() && terminal && s.failed > 0 && runs.is_some() {
+                    button class="secondary" #rerun-failed hx-post={"/jobs/" (s.id) "/rerun"} hx-target="#flash" { (l.t("Rerun failed tasks", "실패한 태스크 다시 실행")) }
                 }
                 a class="button secondary" href={"/jobs/" (s.id) "/receipts.json"} download { (l.t("Receipts", "영수증")) }
             }
@@ -491,6 +508,11 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
             (super::tile(l.t("Failed", "실패"), s.failed.to_string(), None))
             (super::tile(l.t("Cost", "비용"), fmt::cu(s.cost), None))
         }
+        @if let Some(sus) = suspended {
+            div class="flash info" #suspended {
+                (l.t("Suspended by", "일시 정지한 사람:")) " " (sus.by) " · " (fmt::time(sus.since_unix))
+            }
+        }
         @if let Some(p) = &v.preparing { div class="flash info" { (p) } }
         @if let Some(w) = &v.waiting { div class="flash info" { (w) } }
         @if let Some(p) = &place {
@@ -508,6 +530,9 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
         (table(&[l.t("Task", "태스크"), l.t("State", "상태"), l.t("Attempts", "시도"), l.t("Node", "노드"), l.t("Queued", "대기"), l.t("Run", "실행"),
                  l.t("Cost", "비용"), l.t("Check", "검증"), l.t("Output files", "출력 파일"), ""],
             rows, l.t("No tasks.", "태스크가 없습니다.")))
+        @if let Some(r) = runs.as_ref().filter(|r| r.tasks.iter().any(|t| !t.attempts.is_empty())) {
+            (attempts_section(l, r, &names))
+        }
         @if let Some(p) = place.as_ref().filter(|p| !p.checkpoints.is_empty()) {
             h2 { (l.t("Checkpoints", "체크포인트")) }
             (table(&[l.t("Task", "태스크"), l.t("Files", "파일"), l.t("Size", "크기"), l.t("Saved", "저장"), l.t("Node", "노드"), l.t("Resumed", "재개")],
@@ -546,6 +571,9 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
                 @if let Some(p) = place.as_ref().filter(|p| !p.placement.is_empty()) {
                     dt { (l.t("Placement", "배치")) } dd #placement { (p.placement.describe()) }
                 }
+                @if let Some(r) = runs.as_ref().filter(|r| !r.run.is_empty()) {
+                    dt { (l.t("Retries", "재시도")) } dd #job-run { (r.run.describe()) }
+                }
                 dt { (l.t("Deterministic", "결정적 실행")) } dd { (if v.deterministic { l.t("yes", "예") } else { l.t("no", "아니요") }) }
                 @if v.network { dt { (l.t("Network", "네트워크")) } dd { (l.t("allowed", "허용")) } }
             }
@@ -553,6 +581,117 @@ async fn render_detail(ctx: &Ctx, id: &str) -> anyhow::Result<Response> {
     };
     let every = if terminal { "30s" } else { "2s" };
     Ok(ctx.page(&s.name, Nav::Jobs, html! {}, Some((every, live)), bottom))
+}
+
+/// Each task's attempts with what they used, and hints for tasks that
+/// asked for far more than they used (1.21).
+fn attempts_section(
+    l: Lang,
+    r: &pumasi_proto::attempt::JobRunsView,
+    names: &[(String, String)],
+) -> Markup {
+    let opt = |v: Option<u64>, f: fn(u64) -> String| v.map(f).unwrap_or_default();
+    let rows: Vec<Markup> = r
+        .tasks
+        .iter()
+        .flat_map(|t| t.attempts.iter().map(move |a| (t, a)))
+        .map(|(t, a)| {
+            let u = a.usage.unwrap_or_default();
+            let node = a.node_name.clone().unwrap_or_else(|| name_of(names, &a.node));
+            let end = match &a.end {
+                Some(e) => e.to_string(),
+                None if a.ended_unix.is_none() => l.t("running", "실행 중").to_string(),
+                None => String::new(),
+            };
+            html! {
+                tr data-attempt={(t.index) "-" (a.attempt)} {
+                    td { "#" (t.index) }
+                    td { (a.attempt)
+                        @if a.retried { " " span class="chip" { (l.t("retried", "재시도함")) } }
+                        @if a.rerun { " " span class="chip" { (l.t("rerun", "재실행")) } }
+                    }
+                    td { (node) }
+                    td class="end" { (end) @if !a.why.is_empty() { br; span class="dim" { (a.why) } } }
+                    td { @if a.wall_ms > 0 { (fmt::ms(a.wall_ms)) } }
+                    td class="cpu" { (opt(u.cpu_ms, pumasi_proto::attempt::format_cpu)) }
+                    td class="peak" { (opt(u.peak_memory_bytes, format_size)) }
+                    td class="disk" { @if u.disk_read_bytes.is_some() || u.disk_write_bytes.is_some() {
+                        (format_size(u.disk_read_bytes.unwrap_or(0))) " / " (format_size(u.disk_write_bytes.unwrap_or(0)))
+                    } }
+                    td class="net" { @if u.net_rx_bytes.is_some() || u.net_tx_bytes.is_some() {
+                        (format_size(u.net_rx_bytes.unwrap_or(0))) " / " (format_size(u.net_tx_bytes.unwrap_or(0)))
+                    } }
+                }
+            }
+        })
+        .collect();
+    let hints: Vec<_> = r
+        .tasks
+        .iter()
+        .filter(|t| !t.overasked.is_empty())
+        .take(5)
+        .collect();
+    html! {
+        h2 { (l.t("Attempts and usage", "시도와 사용량")) }
+        @if !r.total.is_empty() { p class="dim" #job-usage { (l.t("Used in all:", "전체 사용량:")) " " (r.total.describe()) } }
+        @for t in &hints {
+            @for h in &t.overasked {
+                div class="flash info" data-overasked=(t.index) { "#" (t.index) ": " (h) }
+            }
+        }
+        @for t in r.tasks.iter().filter(|t| t.retry_unix.is_some()) {
+            div class="flash info" data-retry=(t.index) {
+                "#" (t.index) ": " (l.t("retry", "재시도")) " " (t.retries) " · " (fmt::time(t.retry_unix.unwrap_or(0)))
+            }
+        }
+        (table(&[l.t("Task", "태스크"), l.t("Attempt", "시도"), l.t("Node", "노드"), l.t("Ended", "종료"), l.t("Run", "실행"),
+                 "CPU", l.t("Peak memory", "최대 메모리"), l.t("Disk read / written", "디스크 읽기 / 쓰기"), l.t("Net in / out", "네트워크 수신 / 송신")],
+            rows, ""))
+        @if r.dropped > 0 { p class="dim" { (r.dropped) " " (l.t("older attempts not kept", "개의 이전 시도는 보관하지 않음")) } }
+    }
+}
+
+pub async fn suspend(ctx: Ctx, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let res = async {
+        let id = parse_id(&id)?;
+        ctx.call(AdminOp::Suspend { id }).await
+    }
+    .await;
+    match res {
+        Ok(_) => ctx.done(ctx.t("Suspended.", "일시 정지했습니다.")),
+        Err(e) => ctx.fail(e, hx(&headers)),
+    }
+}
+
+pub async fn resume(ctx: Ctx, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let res = async {
+        let id = parse_id(&id)?;
+        ctx.call(AdminOp::Resume { id }).await
+    }
+    .await;
+    match res {
+        Ok(_) => ctx.done(ctx.t("Resumed.", "재개했습니다.")),
+        Err(e) => ctx.fail(e, hx(&headers)),
+    }
+}
+
+pub async fn rerun_failed(ctx: Ctx, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let res = async {
+        let id = parse_id(&id)?;
+        ctx.call(AdminOp::Rerun {
+            id,
+            which: pumasi_proto::attempt::RerunWhich::Failed,
+        })
+        .await
+    }
+    .await;
+    match res {
+        Ok(_) => ctx.done(ctx.t(
+            "Running the failed tasks again.",
+            "실패한 태스크를 다시 실행합니다.",
+        )),
+        Err(e) => ctx.fail(e, hx(&headers)),
+    }
 }
 
 pub async fn cancel(ctx: Ctx, headers: HeaderMap, Path(id): Path<String>) -> Response {

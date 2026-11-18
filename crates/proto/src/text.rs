@@ -227,6 +227,27 @@ pub const TEXTS: &[(&str, &str, &str)] = &[
         "task {0}/{1} on {2} did not stop and save its checkpoint in time; cancelled",
         "{2}의 태스크 {0}/{1}: 제때 멈추고 체크포인트를 저장하지 못해 취소함",
     ),
+    // 1.21: retries, reruns and suspended jobs.
+    (
+        "task.retry",
+        "task {0}/{1} on {2} ended ({3}); retry {4} of {5} in {6}",
+        "{2}의 태스크 {0}/{1} 끝남({3}). {6} 뒤 재시도 {4}/{5}",
+    ),
+    (
+        "job.rerun",
+        "job {0}: {1} runs {2} task(s) again",
+        "작업 {0}: {1}이(가) 태스크 {2}개를 다시 실행",
+    ),
+    (
+        "job.suspended",
+        "job {0} suspended by {1}; {2} running task(s) go back to the queue",
+        "작업 {0}을(를) {1}이(가) 일시 정지. 실행 중인 태스크 {2}개를 대기열로 되돌림",
+    ),
+    (
+        "job.resumed",
+        "job {0} resumed by {1}",
+        "작업 {0}을(를) {1}이(가) 재개",
+    ),
     (
         "task.image",
         "task {0}/{1} on {2} runs {3} ({4})",

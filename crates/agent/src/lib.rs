@@ -16,6 +16,7 @@ pub mod sensors;
 pub mod store;
 pub mod tempdir;
 pub mod upgrade;
+pub mod usage;
 pub mod webgpu;
 pub mod win_temps;
 pub mod wsl_docker;

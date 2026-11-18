@@ -864,6 +864,9 @@ impl State {
     }
 
     pub(crate) fn waiting_reason(&self, id: JobId) -> Option<String> {
+        if let Some(why) = self.suspended_reason(id) {
+            return Some(why);
+        }
         if !self.mgmt.waiting.contains(&id) {
             return None;
         }

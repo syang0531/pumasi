@@ -734,6 +734,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | LogsWait { .. }
         | JobCaps
         | Verify
+        | JobRuns { .. }
         | ScimView => return None,
         // Unwrapped before anything looks at it.
         FollowerRead(inner) => return describe(inner),
@@ -755,6 +756,16 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         ),
         HoneypotRemove { id } => ("honeypot.remove", id.to_string(), none()),
         HoneypotRelease { account } => ("honeypot.release", account.clone(), none()),
+        Rerun { id, which } => (
+            "job.rerun",
+            id.to_string(),
+            match which {
+                pumasi_proto::attempt::RerunWhich::Failed => "failed tasks".into(),
+                pumasi_proto::attempt::RerunWhich::Tasks(t) => format!("tasks {t:?}"),
+            },
+        ),
+        Suspend { id } => ("job.suspend", id.to_string(), none()),
+        Resume { id } => ("job.resume", id.to_string(), none()),
         // Joined into the plain calls before they get here.
         SubmitPlaced { .. }
         | CheckJobPlaced { .. }
@@ -764,7 +775,11 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | SubmitExt { .. }
         | SubmitNet { .. }
         | CheckJobNet { .. }
-        | CheckJobExt { .. } => {
+        | CheckJobExt { .. }
+        | SubmitRun { .. }
+        | CheckJobRun { .. }
+        | SetScheduleMore { .. }
+        | ApplySched { .. } => {
             return describe(&op.clone().joined());
         }
         // Sign-ins log themselves, with who it turned out to be.

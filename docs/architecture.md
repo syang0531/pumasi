@@ -2732,8 +2732,8 @@ control plane of minor 6, and adapter challenges only to agents of minor
 6; jobs that need features find adapters only on such agents. Parts of
 GPUs need nothing new from the agent. `JobSubmission::gpu_ext` is
 `#[serde(skip)]` and travels in new admin ops (`SubmitExt`,
-`CheckJobExt`) that a client sends only when it is set; schedules refuse
-it for now.
+`CheckJobExt`) that a client sends only when it is set; schedules refused
+it until 1.21 (`ScheduleMore`, [phase 37](#phase-37-cluster-management-121)).
 
 ## Phase 27: Windows (1.11)
 
@@ -4109,6 +4109,132 @@ its CPU timing, gets no `disk` label while it is a provider, and still
 gets honeypots, which are ordinary tasks. Benchmark version 2 profiles
 from upgraded agents do not raise `perf.drop` against version 1 ones.
 
+## Phase 37: Cluster management (1.21)
+
+Release 1.21 retries failed runs, reruns a job's tasks under the same
+id, suspends and resumes jobs, asks running tasks for checkpoints on a
+period, records every attempt with what its run used, and lets schedules
+carry what 1.10 and 1.18 kept out of them. The code is
+`pumasi_proto::attempt` (job file fields, `RetryPolicy`, `EndKind`,
+`RunUse`, the views), `pumasi_cluster::runs` (the control plane's side)
+and `pumasi_agent::usage` (measurement). The agent protocol stays 14 and
+goes to minor 12 (`RUN_MINOR`); the stored layout (7) is unchanged.
+
+### Wire and storage
+
+`JobSubmission::run` (`JobRun`: the retry policy and
+`checkpoint_every_ms`) is `#[serde(skip)]`, like `gpu_ext` and `net`; it
+travels in `JobExt::run` (appended) through new admin ops a client sends
+only when it is set (`SubmitRun`, `CheckJobRun`), which a 1.20 control
+plane refuses. Schedules carry the job's `gpu_ext`, `net` and `run` as a
+`ScheduleMore` in `SetScheduleMore` and, for `cluster.toml`,
+`ApplySched` (each schedule's `ScheduleMore` by name); `AdminOp::joined`
+turns all of them back into the plain op on the control plane.
+`ScheduleSpec::more()`/`set_more()` split and rejoin them. Three tables
+are appended: `JOB_RUN` (`JobRunRecord`: the job's `JobRun` and its
+`Suspension`), `TASK_RUNS` (`TaskRunsRecord` per task) and
+`SCHEDULE_MORE`; each write is replicated like the other tables.
+`TaskAssignment::checkpoint_every_ms`, `ReportTail::usage` and
+`FromAgent::Checkpointed { task, checkpoint }` are appended; the control
+plane sends a run with `checkpoint_every` only to agents of minor 12
+(`run_as` refuses older ones as `OldAgent`). New admin ops `JobRuns`,
+`Rerun { id, which }`, `Suspend` and `Resume` answer
+`AdminResponse::JobRuns(JobRunsView)`; viewers may read runs, and
+submitters may act on their own account's jobs.
+
+### Attempts and retries
+
+`place` calls `attempt_started`, which appends an `AttemptRecord` (the
+newest `MAX_ATTEMPT_RECORDS`, 50, are kept; older ones count in
+`dropped`) and sets `PUMASI_RETRY` in the assignment's environment for
+jobs with a retry policy. `on_primary_report` calls `on_run_ended`
+first: it records the end (`EndKind::of(outcome)`, the run's wall time
+and the usage that arrived in the report's tail, held in
+`RunState::report_use` until then) and, when the job has retries left
+and `retries_on(end)`, marks the attempt retried, bumps `retries` and
+`spent`, and either pushes the run back to the queue at once or, after
+`delay_before(n)` (`retry_delay` doubled per retry, at most an hour),
+puts it in `RunState::delayed` (and `retry_at_ms`, so a restart keeps
+it); `tick_retries` releases due ones and `need_for` skips a task whose
+retry is not due (`run_held_back`). The task then stays `Pending` with
+its last output, and the job does not end. `requeue` counts `spent` as
+free attempts, so retries never use up `max_attempts`; it also ends the
+attempt as `Lost` or, when the run was moved (preemption, drain,
+suspension), `Moved` (`on_run_requeued`). `Need::avoid` lists the nodes
+of the task's last failed attempts, and `best_node` sorts them last
+before any other key, so a retry goes elsewhere when another node fits.
+Gangs refuse retries in validation.
+
+### Reruns and suspension
+
+`rerun_job` takes the failed and cancelled tasks, or the named finished
+ones, of a job whose `after` jobs are done: each goes back to `Pending`
+without its output, stored output or checkpoint, its `retries` reset,
+its earlier placements counted in `spent` and `rerun_next` set so the
+next attempt is marked as a rerun; the job is no longer cancelled, and
+when its store work had ended (`ext.finished`), its mounts are tagged
+again through `after_submit`. `suspend_job` sets
+`JobMeta::run.suspended`, drops the job's queue items and `evict`s its
+running runs (a checkpoint first where the job keeps them, as for a
+drain; these moves are free attempts); `need_for` then holds its tasks
+back, `waiting_reason` reports the suspension and queue timeouts skip
+it. `resume_job` clears it, restarts the queue timeout and queues the
+pending tasks. `JobState` has no suspended state, so older clients still
+decode the job.
+
+### Periodic checkpoints
+
+`checkpoint_every` needs checkpoints (and turns them on in the job
+file), is 10 s to 24 h, and is refused for microVM jobs (an image job
+with it is narrowed to Docker). The agent builds a `PeriodicCheckpoint`
+(period, the job's grace period to answer, a scratch directory and a
+channel) and `PeriodicState` steps it: after each period it puts
+`/checkpoint/.pumasi-checkpoint` in place (Docker: a one-file tar through
+`docker cp`; WASM: a file in the host directory preopened as
+`/checkpoint`), polls every 500 ms until the task deletes it, then copies
+`/checkpoint` out (without the request file) and hands the copy over;
+a task that does not answer within the grace period is skipped until the
+next period. A task in `start_task` pushes each copy to the file store
+and sends `FromAgent::Checkpointed`; the server checks that the store
+holds it and that it is within the checkpoint size limit, and
+`on_checkpointed` keeps it with `save_checkpoint(..., announce = false)`
+when the run is still that attempt. The next run of the task, wherever
+and however it starts (a move, a lost node, a retry), gets the latest
+checkpoint as in 1.9.
+
+### What runs use
+
+`usage::Sampler::docker` starts after `docker start`: it finds the
+container's main process (`docker inspect`), then reads its cgroup every
+500 ms, v2 (`cpu.stat` `usage_usec`, `memory.peak` or else
+`memory.current`, `io.stat`) or v1 (`memory.max_usage_in_bytes`,
+`cpuacct.usage`, `blkio.throttle.io_service_bytes`), and
+`/proc/PID/net/dev` (every interface but loopback); figures only grow
+(memory is the peak). Where it cannot see the cgroup (Docker Desktop,
+the WSL distro) it runs `docker stats --no-stream` every 2 s and
+integrates CPU percent over time. `Sampler::process(pid)` reads the
+microVM's VMM process with sysinfo every 500 ms (CPU time, the highest
+resident memory, disk bytes); the gateway's `NetCount` gives the
+network. WASM runs read the CPU time of their blocking thread
+(`CLOCK_THREAD_CPUTIME_ID`, `GetThreadTimes` on Windows) around the run
+and the engine's peak linear memory. The agent sends the `RunUse` in the
+report's tail; `note_use` keeps it while the run is still the node's.
+`JobRunsView` sums every attempt's usage and gives each task's
+`overasked` hints from its last measured attempt
+(`attempt::overasked`: peak memory under a quarter of a limit of at
+least 256 MiB; average CPUs under a quarter of at least one CPU asked
+for, over at least 10 s).
+
+### Compatibility
+
+A 1.20 control plane refuses `SubmitRun`, `SetScheduleMore`,
+`ApplySched` and the new ops; the CLI's `pumasi job` then shows what it
+showed before, and `job rerun|suspend|resume` say a control plane before
+1.21 has none of them. Jobs without retries, `checkpoint_every` or the
+schedule extras use the old ops, so a 1.21 CLI still submits them to
+1.20. A 1.20 agent reports no usage and gets no runs with
+`checkpoint_every`.
+
 ## Not yet
 
 - Remote API: ACME has no DNS-01 (no wildcard certificates) and no
@@ -4127,15 +4253,16 @@ from upgraded agents do not raise `perf.drop` against version 1 ones.
   otherwise share memory on trust, and are Docker-only; vGPU is not
   handled.
 - MicroVM network: no ICMP; allow lists and caps are microVM-only (not
-  Docker) and not in schedules; IPv6 only where the host has it; egress is
+  Docker); IPv6 only where the host has it; egress is
   the node's signed figure; Firecracker without QEMU has a network only
   when the agent runs as root.
 - Cluster management: WASM tasks are stopped without warning when they
-  move, keeping what they saved so far; a
-  checkpoint is saved when a run moves, not periodically, so a machine
-  that dies without notice loses the progress since the last move;
-  affinity sees only running tasks of the same account; CPU quotas count
-  whole CPUs a run asks for, not what it uses.
+  move, keeping what they saved so far; microVM tasks checkpoint only
+  when they move (no `checkpoint_every`), so a machine that dies without
+  notice loses their progress since the last move; gangs have no
+  retries; affinity sees only running tasks of the same account; CPU
+  quotas count whole CPUs a run asks for, not what it uses (which runs
+  now report); Docker usage off Linux is sampled every 2 s.
 - Monitoring: live microVM output covers what the result keeps (4 MiB a
   stream), through the output disk on Firecracker and QEMU and as fast as
   the console carries it on vz; Windows GPUs report a

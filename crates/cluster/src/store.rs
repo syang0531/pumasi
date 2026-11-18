@@ -160,6 +160,12 @@ const SCIM_GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("scim_gro
 const EVENT_TEXTS: TableDefinition<u64, &[u8]> = TableDefinition::new("event_texts");
 /// Key: job id. A microVM network's allow list and cap (1.18).
 const JOB_NET: TableDefinition<u128, &[u8]> = TableDefinition::new("job_net");
+/// Key: job id. Retries, periodic checkpoints and suspension (1.21).
+const JOB_RUN: TableDefinition<u128, &[u8]> = TableDefinition::new("job_run");
+/// Key: (job id, task index). A task's attempts and retries (1.21).
+const TASK_RUNS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_runs");
+/// Key: schedule name. What its job has beyond `schedule_ext` (1.21).
+const SCHEDULE_MORE: TableDefinition<&str, &[u8]> = TableDefinition::new("schedule_more");
 /// Meta key of the SCIM tokens (their hashes).
 const SCIM_TOKENS_META: &str = "scim_tokens";
 
@@ -238,7 +244,10 @@ macro_rules! tables {
             SCIM_USERS,
             SCIM_GROUPS,
             EVENT_TEXTS,
-            JOB_NET
+            JOB_NET,
+            JOB_RUN,
+            TASK_RUNS,
+            SCHEDULE_MORE
         )
     };
 }
@@ -673,6 +682,9 @@ impl Store {
         tx.open_table(SCIM_GROUPS)?;
         tx.open_table(EVENT_TEXTS)?;
         tx.open_table(JOB_NET)?;
+        tx.open_table(JOB_RUN)?;
+        tx.open_table(TASK_RUNS)?;
+        tx.open_table(SCHEDULE_MORE)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1166,11 +1178,20 @@ impl Store {
             let (k, v) = row?;
             exts.insert(k.value().to_string(), dec(v.value())?);
         }
+        let mut mores: std::collections::HashMap<String, pumasi_proto::sched::ScheduleMore> =
+            std::collections::HashMap::new();
+        for row in tx.open_table(SCHEDULE_MORE)?.iter()? {
+            let (k, v) = row?;
+            mores.insert(k.value().to_string(), dec(v.value())?);
+        }
         for row in tx.open_table(SCHEDULES)?.iter()? {
             let (_, v) = row?;
             let mut r: ScheduleRecord = dec(v.value())?;
             if let Some(e) = exts.remove(&r.spec.name) {
                 r.spec.set_ext(e);
+            }
+            if let Some(m) = mores.remove(&r.spec.name) {
+                r.spec.set_more(m);
             }
             snap.schedules.push(r);
         }
@@ -1313,6 +1334,9 @@ impl Store {
         if !meta.net.is_empty() {
             b.put(JOB_NET, meta.id.0, enc(&meta.net).as_slice());
         }
+        if !meta.run.is_empty() {
+            b.put(JOB_RUN, meta.id.0, enc(&meta.run).as_slice());
+        }
         for (i, task) in tasks.iter().enumerate() {
             b.put(TASKS, (meta.id.0, i as u32), enc(task).as_slice());
             if !task.ext.is_empty() {
@@ -1339,7 +1363,9 @@ impl Store {
             b.del(JOB_PLACE, job);
             b.del(JOB_GPU_EXT, job);
             b.del(JOB_NET, job);
+            b.del(JOB_RUN, job);
             for i in 0..tasks {
+                b.del(TASK_RUNS, (job, i));
                 b.del(CHECKPOINTS, (job, i));
                 b.del(TASKS, (job, i));
                 b.del(TASK_EXT, (job, i));
@@ -1448,10 +1474,17 @@ impl Store {
                 } else {
                     b.put(SCHEDULE_EXT, name, enc(&ext).as_slice());
                 }
+                let more = r.spec.more();
+                if more.is_empty() {
+                    b.del(SCHEDULE_MORE, name);
+                } else {
+                    b.put(SCHEDULE_MORE, name, enc(&more).as_slice());
+                }
             }
             None => {
                 b.del(SCHEDULES, name);
                 b.del(SCHEDULE_EXT, name);
+                b.del(SCHEDULE_MORE, name);
             }
         }
         self.commit(b)
@@ -1463,6 +1496,55 @@ impl Store {
         q: Option<&pumasi_proto::sched::ResourceQuota>,
     ) -> Result<()> {
         self.put_str_row(ACCOUNT_RESOURCES, account, q.map(enc))
+    }
+
+    // -- runs (1.21) ---------------------------------------------------------
+
+    /// A job's retries, periodic checkpoints and suspension.
+    pub fn put_job_run(&self, job: u128, r: &crate::runs::JobRunRecord) -> Result<()> {
+        let mut b = Batch::default();
+        if r.is_empty() {
+            b.del(JOB_RUN, job);
+        } else {
+            b.put(JOB_RUN, job, enc(r).as_slice());
+        }
+        self.commit(b)
+    }
+
+    pub fn job_runs(&self) -> Result<Vec<(u128, crate::runs::JobRunRecord)>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(JOB_RUN)?.iter()? {
+            let (k, v) = row?;
+            out.push((k.value(), dec(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Writes (or with `None` deletes) tasks' attempts.
+    pub fn put_task_runs(
+        &self,
+        job: u128,
+        rows: &[(u32, Option<&crate::runs::TaskRunsRecord>)],
+    ) -> Result<()> {
+        let mut b = Batch::default();
+        for (i, r) in rows {
+            match r {
+                Some(r) => b.put(TASK_RUNS, (job, *i), enc(*r).as_slice()),
+                None => b.del(TASK_RUNS, (job, *i)),
+            }
+        }
+        self.commit(b)
+    }
+
+    pub fn task_runs(&self) -> Result<Vec<((u128, u32), crate::runs::TaskRunsRecord)>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(TASK_RUNS)?.iter()? {
+            let (k, v) = row?;
+            out.push((k.value(), dec(v.value())?));
+        }
+        Ok(out)
     }
 
     /// Writes (or with `None` deletes) a task's checkpoint record.
@@ -2478,6 +2560,7 @@ pub(crate) mod legacy {
                 place: Default::default(),
                 gpu_ext: Default::default(),
                 net: Default::default(),
+                run: Default::default(),
             }
         }
     }
@@ -2594,6 +2677,7 @@ pub(crate) mod legacy {
                         after: j.after,
                         queue_timeout_ms: None,
                         gpu_capabilities: Vec::new(),
+                        run: Default::default(),
                     },
                     overlap: r.spec.overlap,
                 },
@@ -2706,6 +2790,7 @@ mod tests {
                     after: vec![],
                     queue_timeout_ms: None,
                     gpu_capabilities: vec![],
+                    run: Default::default(),
                 },
                 overlap: true,
             },

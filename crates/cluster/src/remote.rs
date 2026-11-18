@@ -226,9 +226,14 @@ impl State {
             .ready_since
             .retain(|id, _| active.iter().any(|(a, _)| a == id));
         for (id, timeout_ms) in active {
-            if self.mgmt.waiting.contains(&id) {
-                // Its dependencies have not finished: the clock starts
-                // when it could run.
+            if self.mgmt.waiting.contains(&id)
+                || self
+                    .jobs
+                    .get(&id)
+                    .is_some_and(|j| j.meta.run.suspended.is_some())
+            {
+                // Its dependencies have not finished, or it is suspended:
+                // the clock starts when it could run.
                 self.mgmt.ready_since.remove(&id);
                 continue;
             }
@@ -411,6 +416,7 @@ impl State {
             trusted_only: sub.tier == Tier::Trusted,
             // Sealed once the job exists; the nodes must have a TEE.
             confidential: None,
+            avoid: Default::default(),
         };
         let labels = self.online_labels();
         let mut ready_nodes = Vec::new();
@@ -583,6 +589,7 @@ impl State {
             gpu_graphics: graphics,
             trusted_only: false,
             confidential: None,
+            avoid: Default::default(),
         };
         let usage = self.usage();
         let at_quota = !self.within_quota(&need_for(Executor::Wasm, None, false), &usage);

@@ -245,6 +245,7 @@ async fn metrics_live_logs_events_and_prometheus() {
             after: vec![],
             queue_timeout_ms: None,
             gpu_capabilities: vec![],
+            run: Default::default(),
         };
         let AdminResponse::Submitted { id } =
             client.call(AdminOp::Submit(Box::new(sub))).await.unwrap()

@@ -1271,6 +1271,9 @@ async fn describe_inner(client: &AdminClient, kind: DescribeKind, name: &str) ->
             };
             let ran = crate::task_executors(client, &v).await;
             print_job(&v, &crate::task_details(client, id).await, &ran, false);
+            if let Some(runs) = crate::job_runs(client, id).await {
+                crate::print_runs(&v, &runs);
+            }
         }
         DescribeKind::Account => {
             let list = quotas(client).await?;

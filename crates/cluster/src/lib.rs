@@ -27,6 +27,7 @@ pub mod remote;
 pub mod replicas;
 pub mod retention;
 pub mod rollout;
+pub mod runs;
 pub mod sched;
 pub mod scim;
 pub mod server;

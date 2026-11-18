@@ -134,6 +134,13 @@ fn op_name(op: &AdminOp) -> &'static str {
         Verify => "read honeypots and scores",
         SetVerifyPolicy(_) | HoneypotRemove { .. } | HoneypotRelease { .. } => "change honeypots",
         HoneypotAdd { .. } => "add honeypots",
+        SubmitRun { .. } => "submit jobs",
+        CheckJobRun { .. } => "check jobs",
+        JobRuns { .. } => "read jobs",
+        Rerun { .. } => "rerun jobs",
+        Suspend { .. } | Resume { .. } => "suspend jobs",
+        SetScheduleMore { .. } => "change schedules",
+        ApplySched { .. } => "apply cluster files",
     }
 }
 
@@ -196,6 +203,7 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | LogsWait { .. }
             | JobCaps
             | Verify
+            | JobRuns { .. }
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -270,6 +278,10 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | JobWait { id, .. }
         | LogsWait { job: id, .. }
         | HoneypotAdd { job: id, .. }
+        | JobRuns { id }
+        | Rerun { id, .. }
+        | Suspend { id }
+        | Resume { id }
         | Logs { job: id, .. } => own_job(st, account, id)?,
         RemoveSchedule { name } | RunSchedule { name } => {
             if let Some(other) = st.schedule_account(name) {
@@ -309,6 +321,10 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | JobWait { .. }
         | LogsWait { .. }
         | HoneypotAdd { .. }
+        | JobRuns { .. }
+        | Rerun { .. }
+        | Suspend { .. }
+        | Resume { .. }
         | Logs { .. }) => op,
         op @ (Metrics { .. }
         | Events { .. }

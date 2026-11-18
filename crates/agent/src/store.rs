@@ -258,6 +258,11 @@ impl NodeStore {
     }
 
     /// A scratch directory on the store's disk, removed on drop.
+    /// Where [`Self::scratch`] makes its directories.
+    pub fn scratch_root(&self) -> std::path::PathBuf {
+        self.dir.join("tmp")
+    }
+
     pub fn scratch(&self, tag: &str) -> Result<TempDir> {
         TempDir::new_in(&self.dir.join("tmp"), tag)
     }

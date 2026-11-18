@@ -467,6 +467,10 @@ pub struct JobSubmission {
     /// carries them).
     #[serde(skip)]
     pub net: crate::vmnet::NetSpec,
+    // 1.21 from here, never on the wire inside a submission either.
+    /// Retries and periodic checkpoints ([`JobExt`] carries them).
+    #[serde(skip)]
+    pub run: crate::attempt::JobRun,
 }
 
 /// What postcard leaves out of a [`JobSubmission`], sent beside it in
@@ -483,6 +487,10 @@ pub struct JobExt {
     /// [`crate::msg::AdminOp::SubmitNet`], which older control planes
     /// refuse.
     pub net: crate::vmnet::NetSpec,
+    /// 1.21: retries and periodic checkpoints. Sent in
+    /// [`crate::msg::AdminOp::SubmitRun`], which older control planes
+    /// refuse.
+    pub run: crate::attempt::JobRun,
 }
 
 impl JobSubmission {
@@ -492,6 +500,7 @@ impl JobSubmission {
             placement: std::mem::take(&mut self.placement),
             gpu: std::mem::take(&mut self.gpu_ext),
             net: std::mem::take(&mut self.net),
+            run: std::mem::take(&mut self.run),
         }
     }
 
@@ -500,6 +509,7 @@ impl JobSubmission {
         self.placement = ext.placement;
         self.gpu_ext = ext.gpu;
         self.net = ext.net;
+        self.run = ext.run;
     }
 
     /// Whether its tasks need a node whose Docker GPUs can draw.
@@ -518,7 +528,11 @@ impl JobSubmission {
         if self.tier == Tier::Confidential || !self.net.is_empty() {
             // Allow lists and caps are the microVM gateway's (1.18).
             self.executor = Executor::Microvm;
-        } else if !self.gpu_capabilities.is_empty() || self.gpu_ext.share > 0 {
+        } else if !self.gpu_capabilities.is_empty()
+            || self.gpu_ext.share > 0
+            || self.run.checkpoint_every_ms.is_some()
+        {
+            // Periodic checkpoints are Docker's and WASM's (1.21).
             // A microVM takes its GPU whole. (Checkpoints work in both
             // since 1.14; the control plane sends a checkpointing run to a
             // microVM only on agents that keep its checkpoint.)
@@ -686,6 +700,14 @@ impl JobSubmission {
             "memory limit must be at least 64 KiB"
         );
         self.placement.validate(self)?;
+        self.run
+            .validate(self.placement.checkpoint.is_some(), self.placement.gang)?;
+        if self.run.checkpoint_every_ms.is_some() {
+            ensure!(
+                !matches!(self.executor, Executor::Microvm),
+                "checkpoint_every is for docker and wasm jobs yet (a microVM saves its checkpoint when it stops)"
+            );
+        }
         Ok(())
     }
 }
@@ -805,6 +827,19 @@ pub struct JobFile {
     /// and the grace period, and its `/checkpoint` comes back when it runs
     /// again.
     pub checkpoint: Option<crate::sched::CheckpointFile>,
+    // 1.21 from here.
+    /// Try a failed task again this many times (`retry_on` says when,
+    /// `retry_delay` how long to wait first; it doubles each time).
+    pub retries: Option<u32>,
+    /// `["exit", "exit:75", "oom", "timeout", "error"]`; all of them when
+    /// left out.
+    #[serde(default)]
+    pub retry_on: Vec<String>,
+    /// `"10s"` by default.
+    pub retry_delay: Option<String>,
+    /// Ask each task for a checkpoint this often while it runs (`"15m"`):
+    /// a machine that dies loses at most this much. Turns on `checkpoint`.
+    pub checkpoint_every: Option<String>,
 }
 
 /// `network = true`, `network = ["pypi.org:443"]` or
@@ -1384,11 +1419,22 @@ impl JobFile {
             .transpose()
             .context("queue_timeout")?;
         let wants_gpu = gpu.is_some();
+        let run = crate::attempt::JobRun::from_file(
+            self.retries,
+            &self.retry_on,
+            self.retry_delay.as_deref(),
+            self.checkpoint_every.as_deref(),
+        )?;
+        // Periodic checkpoints are checkpoints.
+        let checkpoint = match (&self.checkpoint, run.checkpoint_every_ms) {
+            (None, Some(_)) => Some(crate::sched::CheckpointFile::On(true)),
+            (c, _) => c.clone(),
+        };
         let placement = crate::sched::placement_of(
             self.gang,
             self.spread.as_ref(),
             self.affinity.as_ref(),
-            self.checkpoint.as_ref(),
+            checkpoint.as_ref(),
         )?;
         let checkpoints = placement.checkpoint.is_some();
         let output_dataset = match &self.output {
@@ -1402,6 +1448,7 @@ impl JobFile {
             None => None,
         };
         let sub = JobSubmission {
+            run,
             net,
             placement,
             gpu_ext: crate::gpu::GpuExt {

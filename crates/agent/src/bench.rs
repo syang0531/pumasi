@@ -756,13 +756,9 @@ pub fn disk_challenge(dir: &Path, c: &DiskChallenge) -> Result<[u8; 32]> {
                 reads <= pumasi_proto::verify::MAX_DISK_CHALLENGE_READS,
                 "disk challenge of {reads} reads is too large"
             );
-            struct Remove<'a>(&'a Path);
-            impl Drop for Remove<'_> {
-                fn drop(&mut self) {
-                    let _ = std::fs::remove_file(self.0);
-                }
-            }
-            let _remove = Remove(&path);
+            // The caller removes the file once the answer is sent
+            // ([`remove_disk_challenge`]): deleting it is no part of the
+            // timing (a virus scanner can make it slow).
             let file = open_direct_read(&path)?;
             let blocks = file.metadata()?.len() / DISK_BLOCK as u64;
             let mut page = Aligned::new(DISK_BLOCK);
@@ -773,6 +769,11 @@ pub fn disk_challenge(dir: &Path, c: &DiskChallenge) -> Result<[u8; 32]> {
             Ok(answer)
         }
     }
+}
+
+/// Removes what a disk challenge wrote, after its last step.
+pub fn remove_disk_challenge(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(CHALLENGE_FILE));
 }
 
 /// Answers a memory challenge: the kernel's result in the first eight

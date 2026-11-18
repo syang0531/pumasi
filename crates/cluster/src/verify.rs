@@ -1490,8 +1490,20 @@ impl State {
         v.disk = Some(check.clone());
         v.disk_error = None;
         self.save_verify_nodes();
+        // The walk's reads come one after another, so the cluster times
+        // their mean, which a slow tail (a virtual disk, a busy host) pulls
+        // well past the median the profile claims; the claimed 99th
+        // percentile bounds it too.
+        let p99 = self
+            .members
+            .get(id)
+            .and_then(|n| n.perf.as_ref())
+            .and_then(|p| p.profile.disk.as_ref())
+            .filter(|d| claim_of(d) == claim)
+            .map_or(0, |d| d.rand_read_p99_us);
+        let slowest_us = (claim.p50_us as u64 * INFLATED + 100).max(p99 as u64 * INFLATED);
         let inflated = claim.seq_read_mb_s as u64 > best_read as u64 * INFLATED + 50
-            || (best_us as u64) > claim.p50_us as u64 * INFLATED + 100;
+            || best_us as u64 > slowest_us;
         if !correct {
             self.strike(id, "wrong answer to the disk check");
         } else if inflated && attempts < STRIKE_AFTER {

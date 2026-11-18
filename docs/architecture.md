@@ -4070,7 +4070,9 @@ seed to `.pumasi-challenge.tmp` with O_DIRECT, at most `challenge_bytes`
 chunk's last block fold), `Sequential` (reads the chunks in
 `chunk_order(seed, nonce)` and folds every 4 KiB block) and `Random {
 reads }` (follows `random_walk`, where each read's offset comes from the
-previous block's fold, sized for `DISK_MS` at the claimed latency). The
+previous block's fold, sized for `DISK_MS` at the claimed latency; the
+agent removes the file only after it has sent this answer). Timed
+speeds stop at `MAX_TIMED_DISK_MB_S` (20,000 MB/s). The
 answers are checked off the state lock (`disk_folds` recomputes the
 data). The memory challenge runs `memory_kernel(seed, bytes, passes)`
 (three streams over `bytes`, `passes` sized for `MEMORY_MS` at the
@@ -4078,7 +4080,9 @@ claimed bandwidth). The agent's own benchmark folds its disk reads and
 runs the same memory kernel (`BENCH_VERSION` 2), so honest figures match.
 `apply_disk_check` and `apply_memory_check` keep the best timing of the
 same claim; a claim over `INFLATED` (2) times the best timing (plus a
-small allowance) is timed again and on the second timing a strike with a
+small allowance; for latency, the walk's mean per read against twice the
+claimed median or twice the claimed 99th percentile, whichever is
+larger, since a slow tail pulls the mean past the median) is timed again and on the second timing a strike with a
 `perf.inflated` event, and a wrong answer a strike at once. A retiming
 that falls by the monitor's `perf_drop_percent` raises `perf.drop`. On
 providers `disk_label` is the lower of the timed and the claimed class,

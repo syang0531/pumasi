@@ -405,16 +405,20 @@ pub fn disk_chunk(seed: u64, index: u64, out: &mut [u8]) {
 /// A cheap digest of one 4 KiB block that needs every byte of it.
 pub fn block_fold(block: &[u8]) -> u64 {
     let mut a = 0xCBF2_9CE4_8422_2325u64;
-    for w in block.chunks_exact(8) {
-        let w = u64::from_le_bytes(w.try_into().expect("8 bytes"));
-        a = (a ^ w).wrapping_mul(0x0000_0100_0000_01B3);
+    for w in block.as_chunks::<8>().0 {
+        a = (a ^ u64::from_le_bytes(*w)).wrapping_mul(0x0000_0100_0000_01B3);
     }
     a
 }
 
 /// The folds of every block of one chunk.
 pub fn chunk_folds(chunk: &[u8]) -> Vec<u64> {
-    chunk.chunks_exact(DISK_BLOCK).map(block_fold).collect()
+    chunk
+        .as_chunks::<DISK_BLOCK>()
+        .0
+        .iter()
+        .map(|b| block_fold(b))
+        .collect()
 }
 
 /// Every block's fold of a challenge file of `bytes`: what the control
@@ -623,8 +627,8 @@ pub fn builtin_wasm(seed: u64) -> BuiltinWasm {
     // The same computation natively.
     let mut x = a;
     let mut y = b;
-    for w in data.chunks_exact(8) {
-        x = (x ^ u64::from_le_bytes(w.try_into().expect("8 bytes"))).wrapping_mul(m);
+    for w in data.as_chunks::<8>().0 {
+        x = (x ^ u64::from_le_bytes(*w)).wrapping_mul(m);
     }
     for _ in 0..iters {
         x = x.wrapping_mul(m).wrapping_add(c);

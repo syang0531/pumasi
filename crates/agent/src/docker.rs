@@ -573,6 +573,7 @@ impl DockerExecutor {
             .ok();
         // What the container uses (1.21).
         let sampler = crate::usage::Sampler::docker(self.bin.clone(), name.clone());
+        sampler.feed(&io.cpu_feed);
         // Checkpoints asked for while it runs (1.21).
         let mut periodic = io
             .checkpoint

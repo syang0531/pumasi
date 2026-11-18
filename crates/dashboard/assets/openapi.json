@@ -506,6 +506,56 @@
         }
       }
     },
+    "/api/v1/energy": {
+      "get": {
+        "summary": "Each node's electricity and CU by day, and its energy settings (1.22)",
+        "description": "`days` (newest first: `day` in the control plane's local time, `node`, `name`, `account`, `mwh` measured CPU package and GPU energy in milliwatt-hours, `measured_secs`, `cost_mwon` at the node's price now in milli-won or `null` without a price, `worth_ucu` what its runs were worth at the cluster's rates in micro-CU, `earned_mcu` what other accounts paid it in milli-CU, `runs`), `nodes` (`id`, `name`, `account`, `settings` as in `PUT /api/v1/nodes/{node}/energy`, `hot_since_unix` when paused for its temperature, `temp_c`, `watts`) and `utc_offset`.",
+        "tags": [
+          "monitoring"
+        ],
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 400,
+              "default": 7
+            },
+            "description": "Days back, today included"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/v1/jobs": {
       "post": {
         "summary": "Submit a job",
@@ -2200,6 +2250,97 @@
                 ]
               }
             }
+          }
+        }
+      }
+    },
+    "/api/v1/nodes/{node}/energy": {
+      "put": {
+        "summary": "Set a node's electricity price, cheap hours and temperature limit (1.22, admin)",
+        "description": "Kept by the control plane; the agent does not restart. The body replaces all three: a field left out or `null` is removed. `cheap` needs `price`. A node over `max_temp_c` for a minute takes no new tasks (and with the agent's `--on-pause requeue` its running ones move). Answers the node's settings and today as in `GET /api/v1/energy`.",
+        "tags": [
+          "nodes"
+        ],
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Node name or id"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "price": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "description": "Won per kWh (0 to 100000)"
+                  },
+                  "cheap": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "description": "Cheaper hours, local time: from 23, to 7 means 23:00 to 07:00",
+                    "properties": {
+                      "from": {
+                        "type": "integer"
+                      },
+                      "to": {
+                        "type": "integer"
+                      },
+                      "price": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "max_temp_c": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "description": "40 to 120 °C"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }

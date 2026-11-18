@@ -42,6 +42,7 @@ pub fn routes(uploads: axum::extract::DefaultBodyLimit) -> Router<St> {
         .route("/nodes/{node}", get(nodes::detail))
         .route("/nodes/{node}/charts", get(nodes::chart_stream))
         .route("/nodes/{node}/settings", post(nodes::settings))
+        .route("/nodes/{node}/energy", post(nodes::energy))
         .route("/nodes/{node}/{action}", post(nodes::action))
         .route("/jobs", get(jobs::list).post(jobs::submit).layer(uploads))
         .route("/jobs/new", get(jobs::new))
@@ -439,9 +440,13 @@ pub async fn events(
 
 /// The firing alerts, their messages in the page's language (1.15).
 pub async fn alerts(ctx: &Ctx) -> pumasi_proto::monitor::AlertsView {
-    let mut alerts = match ctx.call(AdminOp::Alerts).await {
+    // The true webhook formats from 1.22, else the older view.
+    let mut alerts = match ctx.call(AdminOp::AlertsFull).await {
         Ok(AdminResponse::Alerts(a)) => *a,
-        _ => Default::default(),
+        _ => match ctx.call(AdminOp::Alerts).await {
+            Ok(AdminResponse::Alerts(a)) => *a,
+            _ => Default::default(),
+        },
     };
     if ctx.l == Lang::Ko
         && !alerts.firing.is_empty()

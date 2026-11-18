@@ -621,6 +621,7 @@ fn attempts_section(
                     td class="net" { @if u.net_rx_bytes.is_some() || u.net_tx_bytes.is_some() {
                         (format_size(u.net_rx_bytes.unwrap_or(0))) " / " (format_size(u.net_tx_bytes.unwrap_or(0)))
                     } }
+                    td class="energy" { @if let Some(e) = r.energy_of(t.index, a.attempt) { (e.describe()) } }
                 }
             }
         })
@@ -634,6 +635,7 @@ fn attempts_section(
     html! {
         h2 { (l.t("Attempts and usage", "시도와 사용량")) }
         @if !r.total.is_empty() { p class="dim" #job-usage { (l.t("Used in all:", "전체 사용량:")) " " (r.total.describe()) } }
+        @if !r.total_energy.is_empty() { p class="dim" #job-energy { (l.t("Energy in all:", "전체 전력량:")) " " (r.total_energy.describe()) } }
         @for t in &hints {
             @for h in &t.overasked {
                 div class="flash info" data-overasked=(t.index) { "#" (t.index) ": " (h) }
@@ -645,7 +647,7 @@ fn attempts_section(
             }
         }
         (table(&[l.t("Task", "태스크"), l.t("Attempt", "시도"), l.t("Node", "노드"), l.t("Ended", "종료"), l.t("Run", "실행"),
-                 "CPU", l.t("Peak memory", "최대 메모리"), l.t("Disk read / written", "디스크 읽기 / 쓰기"), l.t("Net in / out", "네트워크 수신 / 송신")],
+                 "CPU", l.t("Peak memory", "최대 메모리"), l.t("Disk read / written", "디스크 읽기 / 쓰기"), l.t("Net in / out", "네트워크 수신 / 송신"), l.t("Energy", "전력량")],
             rows, ""))
         @if r.dropped > 0 { p class="dim" { (r.dropped) " " (l.t("older attempts not kept", "개의 이전 시도는 보관하지 않음")) } }
     }

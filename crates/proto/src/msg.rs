@@ -511,6 +511,10 @@ pub struct ReportTail {
     /// What the run used: CPU time, peak memory, disk and network bytes
     /// (1.21). Shown, not billed.
     pub usage: Option<crate::attempt::RunUse>,
+    /// What the run drew (1.22). Shown, not billed. A tail from an older
+    /// agent ends before it.
+    #[serde(default, deserialize_with = "crate::wire::trailing")]
+    pub energy: Option<crate::energy::RunEnergy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1403,6 +1407,23 @@ pub enum AdminOp {
         more: Box<crate::manage::ApplyMore>,
         sched: Vec<(String, crate::sched::ScheduleMore)>,
     },
+    // 1.22 from here.
+    /// Each node's electricity price, cheap hours and temperature limit,
+    /// and its energy against the CU its runs were worth over the last
+    /// `days` local days, today included ([`AdminResponse::Energy`]).
+    Energy {
+        days: u32,
+    },
+    /// Changes a node's electricity and temperature settings (the node: a
+    /// name or an id prefix). Answers like [`AdminOp::Energy`] for today.
+    SetNodeEnergy {
+        node: String,
+        settings: crate::energy::NodeEnergy,
+    },
+    /// [`AdminOp::Alerts`] with every webhook's own format. `Alerts`
+    /// shows the formats 1.22 added (Telegram, ntfy, email) as JSON, which
+    /// older clients can read.
+    AlertsFull,
 }
 
 /// The longest [`AdminOp::JobWait`] and [`AdminOp::LogsWait`] (1.19):
@@ -1848,6 +1869,8 @@ pub enum AdminResponse {
     Verify(Box<crate::verify::VerifyView>),
     // 1.21 from here.
     JobRuns(Box<crate::attempt::JobRunsView>),
+    // 1.22 from here.
+    Energy(Box<crate::energy::EnergyView>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

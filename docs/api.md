@@ -720,6 +720,36 @@ curl -fsS -X POST -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/
 curl -fsS -X POST -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/resume"
 ```
 
+### Electricity, earnings and temperature (1.22)
+
+Since 1.22 `.../runs` also has each attempt's energy (`energy`: task,
+attempt and `{cpu_mwh, gpu_mwh}` in milliwatt-hours, where the node
+reads that power) and the job's `total_energy`.
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/jobs/$JOB/runs" | jq -e 'has("energy") and has("total_energy")' -->
+
+Give a node its electricity price (won per kWh), the cheaper hours of a
+time-of-use plan and a temperature limit (admin). The body sets all
+three, so a field left out is removed; the node takes no new tasks while
+a sensor stays over `max_temp_c` for a minute:
+
+```sh
+curl -fsS -X PUT -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' \
+  -d '{"price": 120, "cheap": {"from": 23, "to": 7, "price": 80}, "max_temp_c": 85}' \
+  "$PUMASI_URL/api/v1/nodes/node-a/energy"
+```
+<!-- ci: curl -fsS -X PUT -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{"price": 120, "cheap": {"from": 23, "to": 7, "price": 80}, "max_temp_c": 85}' "$PUMASI_URL/api/v1/nodes/node-a/energy" | jq -e '(.nodes | length) == 1 and .nodes[0].settings.price == 120 and .nodes[0].settings.max_temp_c == 85' -->
+<!-- ci: test "$(curl -sS -X PUT -H "Authorization: Bearer $PUMASI_ADMIN_TICKET" -H 'Content-Type: application/json' -d '{"cheap": {"from": 23, "to": 7, "price": 80}}' -o /dev/null -w '%{http_code}' "$PUMASI_URL/api/v1/nodes/node-a/energy")" = 400 -->
+
+Each node's days (the control plane's local dates, newest first): the
+energy measured, its cost at the node's price, what its runs were worth
+in CU at the cluster's rates, what other accounts paid it, and each
+node's settings and temperature state:
+
+```sh
+curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/energy?days=30"
+```
+<!-- ci: curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/energy?days=30" | jq -e '(.days | type) == "array" and (.nodes[] | select(.name == "node-a") | .settings.cheap.from == 23 and .hot_since_unix == null) and (.utc_offset | test("^[+-]"))' -->
+
 Every route, with its parameters, is in `$PUMASI_URL/api/openapi.json`
 (OpenAPI 3.1), which code generators and tools such as Postman read.
 

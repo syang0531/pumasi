@@ -63,7 +63,7 @@ machines.
 | 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | done |
 | 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | done |
 | 37 | 1.21 | Cluster management: retries, reruns, suspended jobs, periodic checkpoints, what tasks really use | done |
-| 38 | 1.22 | Monitoring: energy per task, electricity against earnings, pausing when hot, more alert channels | planned |
+| 38 | 1.22 | Monitoring: energy per task, electricity against earnings, pausing when hot, more alert channels | done |
 | 39 | 1.23 | Dashboard: what is still CLI-only, and alerts pushed to the phone | planned |
 | 40 | 1.24 | MicroVMs and old Intel Macs: warm guests with networks, snapshots, memory given back, fans | planned |
 | 41 | 1.25 | GPUs: built-in GPU honeypots, what each task uses, GPU health | planned |
@@ -906,6 +906,34 @@ schedule with an allow list. By hand: a long job on the home cluster
 survives pulling a PC's power plug.
 
 ## 38. Monitoring: energy per task, electricity against earnings, pausing when hot, more alert channels (1.22)
+
+Done in 1.22.0 ([release notes](releases/v1.22.0.md),
+[details](architecture.md#phase-38-monitoring-122)).
+What differs from the plan: watt-hours appear with each attempt in
+`pumasi job`, the dashboard and the API's runs, not in receipts: signed
+receipts stay as they were, so older clients and `verify-receipts` read
+them unchanged. GPU power is shared equally among the runs holding the
+GPU, and a WASM run, whose CPU time the agent does not sample while it
+runs, counts as one busy core. The daily view prices each node's hours
+at its price as it is now (a price set today also prices last week), and
+counts the CU its runs were worth at the cluster's rates even for the
+owner's own runs, which move no CU, next to what other accounts paid.
+The electricity price, cheap hours and temperature limit are kept by the
+control plane (`node set` changes them without restarting the agent),
+and `pumasi energy` is the new command for the daily view. Cheap hours
+are whole hours of the control plane's time zone (`23-07@80`). The
+temperature pause is not stored: a control plane that restarts lets the
+node work until it is over its limit for another minute. `bench
+--estimate` takes CU rates from the cluster when a ticket is at hand
+(else the defaults) and power from the CPU package while the benchmark
+runs, which leaves out the GPUs and the rest of the machine, so
+`--watts` takes a power meter's figure. On Linux, `service install` of a
+system agent (which runs as root and reads RAPL anyway) writes the udev
+rule for other users; `service rapl --add-user USER` does it for an
+agent run as a user. ntfy servers other than ntfy.sh and `ntfy.*` hosts
+take `--format ntfy`; email goes through `smtp://` (STARTTLS required
+except to a server on the same machine) or `smtps://`. `--keep-metrics`
+is off by default.
 
 Why: since 1.15 the cluster reads CPU package and GPU power on most
 machines but only charts it. The research asked to show providers what

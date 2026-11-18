@@ -455,6 +455,23 @@ pub struct JobRunsView {
     /// What the job's runs used in all.
     pub total: RunUse,
     pub cost: MilliCu,
+    /// What each attempt drew, where its node measured it: (task, attempt,
+    /// energy) (1.22). Last, so a 1.21 client reads the rest.
+    #[serde(default, deserialize_with = "crate::wire::trailing")]
+    pub energy: Vec<(u32, u32, crate::energy::RunEnergy)>,
+    /// The job's runs together.
+    #[serde(default, deserialize_with = "crate::wire::trailing")]
+    pub total_energy: crate::energy::RunEnergy,
+}
+
+impl JobRunsView {
+    /// What one attempt drew.
+    pub fn energy_of(&self, task: u32, attempt: u32) -> Option<&crate::energy::RunEnergy> {
+        self.energy
+            .iter()
+            .find(|(t, a, _)| *t == task && *a == attempt)
+            .map(|(_, _, e)| e)
+    }
 }
 
 /// Which tasks `pumasi job rerun` runs again.

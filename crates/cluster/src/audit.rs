@@ -735,6 +735,8 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | JobCaps
         | Verify
         | JobRuns { .. }
+        | Energy { .. }
+        | AlertsFull
         | ScimView => return None,
         // Unwrapped before anything looks at it.
         FollowerRead(inner) => return describe(inner),
@@ -748,6 +750,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         ScimTokenRevoke { id } => ("scim.token.revoke", id.clone(), none()),
         SetResources { account, quota } => ("resources.set", account.clone(), quota.describe()),
         SetJobCaps { account, caps } => ("job_caps.set", account.clone(), caps.describe()),
+        SetNodeEnergy { node, settings } => ("node.energy", node.clone(), settings.describe()),
         SetVerifyPolicy(p) => ("honeypot.policy", none(), format!("{p:?}")),
         HoneypotAdd { job, task } => (
             "honeypot.add",

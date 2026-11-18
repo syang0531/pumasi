@@ -476,6 +476,18 @@ pub enum WebhookFormat {
     /// The whole alert as JSON, for your own receiver.
     #[default]
     Json,
+    // 1.22 from here.
+    /// A Telegram bot's `sendMessage`:
+    /// `https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT>`.
+    Telegram,
+    /// An ntfy topic (`https://ntfy.sh/<topic>` or your own server): the
+    /// text as the body, the title, priority and tags as headers. Put
+    /// `user:password@` in the URL for a protected topic.
+    Ntfy,
+    /// Email over SMTP: `smtp://user:password@host:587?from=a@b&to=c@d`
+    /// (STARTTLS, required except to a loopback address) or `smtps://`
+    /// (TLS from the start, port 465).
+    Email,
 }
 
 impl WebhookFormat {
@@ -483,7 +495,15 @@ impl WebhookFormat {
     pub fn detect(url: &str) -> Self {
         let host = url_host(url).to_ascii_lowercase();
         let path = url.to_ascii_lowercase();
-        if host.ends_with("discord.com") || host.ends_with("discordapp.com") {
+        if path.starts_with("smtp://") || path.starts_with("smtps://") {
+            WebhookFormat::Email
+        } else if host == "api.telegram.org"
+            || path.contains("/sendmessage") && path.contains("/bot")
+        {
+            WebhookFormat::Telegram
+        } else if host == "ntfy.sh" || host.starts_with("ntfy.") {
+            WebhookFormat::Ntfy
+        } else if host.ends_with("discord.com") || host.ends_with("discordapp.com") {
             if path.trim_end_matches('/').ends_with("/slack") {
                 WebhookFormat::Slack
             } else {
@@ -503,7 +523,20 @@ impl fmt::Display for WebhookFormat {
             WebhookFormat::Slack => "slack",
             WebhookFormat::Discord => "discord",
             WebhookFormat::Json => "json",
+            WebhookFormat::Telegram => "telegram",
+            WebhookFormat::Ntfy => "ntfy",
+            WebhookFormat::Email => "email",
         })
+    }
+}
+
+impl WebhookFormat {
+    /// Whether a client older than 1.22 knows it.
+    pub fn is_new(self) -> bool {
+        matches!(
+            self,
+            WebhookFormat::Telegram | WebhookFormat::Ntfy | WebhookFormat::Email
+        )
     }
 }
 
@@ -514,7 +547,12 @@ impl FromStr for WebhookFormat {
             "slack" | "mattermost" => WebhookFormat::Slack,
             "discord" => WebhookFormat::Discord,
             "json" => WebhookFormat::Json,
-            other => bail!("unknown webhook format {other:?} (slack, discord or json)"),
+            "telegram" => WebhookFormat::Telegram,
+            "ntfy" => WebhookFormat::Ntfy,
+            "email" | "smtp" => WebhookFormat::Email,
+            other => bail!(
+                "unknown webhook format {other:?} (slack, discord, json, telegram, ntfy or email)"
+            ),
         })
     }
 }
@@ -532,13 +570,145 @@ impl WebhookSpec {
         crate::manage::validate_schedule_name(&self.name)
             .map_err(|e| anyhow::anyhow!("{e:#}").context("webhook name"))?;
         let lower = self.url.to_ascii_lowercase();
-        ensure!(
-            lower.starts_with("https://") || lower.starts_with("http://"),
-            "webhook URL must start with https:// or http://"
-        );
+        if self.format == WebhookFormat::Email {
+            MailTarget::parse(&self.url)?;
+        } else {
+            ensure!(
+                lower.starts_with("https://") || lower.starts_with("http://"),
+                "webhook URL must start with https:// or http://"
+            );
+        }
+        if self.format == WebhookFormat::Telegram {
+            ensure!(
+                query_param(&self.url, "chat_id").is_some(),
+                "a Telegram URL names the chat: .../bot<TOKEN>/sendMessage?chat_id=<CHAT>"
+            );
+        }
         ensure!(!url_host(&self.url).is_empty(), "webhook URL has no host");
         ensure!(self.url.len() <= 2048, "webhook URL is too long");
         Ok(())
+    }
+}
+
+/// A query parameter of a URL, percent-decoded.
+pub fn query_param(url: &str, key: &str) -> Option<String> {
+    let q = url.split_once('?')?.1.split('#').next()?;
+    q.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        (k == key).then(|| percent_decode(v))
+    })
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// How an email webhook's connection is protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailTls {
+    /// `smtp://`: STARTTLS, which the server must offer unless it is
+    /// this machine ([`MailTarget::loopback`]).
+    StartTls,
+    /// `smtps://`: TLS from the first byte.
+    Implicit,
+}
+
+/// Where an email webhook sends: `smtp://user:pass@host:587?from=..&to=..`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailTarget {
+    pub host: String,
+    pub port: u16,
+    pub tls: MailTls,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub from: String,
+    pub to: Vec<String>,
+}
+
+impl MailTarget {
+    pub fn parse(url: &str) -> Result<Self> {
+        let (scheme, rest) = url
+            .split_once("://")
+            .context("an email webhook is smtp://... or smtps://...")?;
+        let tls = match scheme.to_ascii_lowercase().as_str() {
+            "smtp" => MailTls::StartTls,
+            "smtps" => MailTls::Implicit,
+            other => bail!("an email webhook is smtp:// or smtps://, not {other}://"),
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let (cred, hostport) = match authority.rsplit_once('@') {
+            Some((c, h)) => (Some(c), h),
+            None => (None, authority),
+        };
+        let (user, password) = match cred {
+            Some(c) => {
+                let (u, p) = c.split_once(':').unwrap_or((c, ""));
+                (Some(percent_decode(u)), Some(percent_decode(p)))
+            }
+            None => (None, None),
+        };
+        let host = url_host(url).to_string();
+        ensure!(!host.is_empty(), "the email webhook has no host");
+        let port = match hostport.rsplit_once(':') {
+            Some((_, p)) if !hostport.ends_with(']') => {
+                p.parse().with_context(|| format!("invalid port {p:?}"))?
+            }
+            _ => match tls {
+                MailTls::Implicit => 465,
+                _ => 587,
+            },
+        };
+        let from = query_param(url, "from").context("an email webhook needs ?from=ADDRESS")?;
+        let to: Vec<String> = query_param(url, "to")
+            .context("an email webhook needs &to=ADDRESS[,ADDRESS...]")?
+            .split(',')
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        for a in std::iter::once(&from).chain(&to) {
+            ensure!(
+                a.contains('@') && !a.contains(['\r', '\n', '<', '>']),
+                "invalid email address {a:?}"
+            );
+        }
+        ensure!(
+            !to.is_empty() && to.len() <= 20,
+            "an email webhook has 1 to 20 recipients"
+        );
+        Ok(Self {
+            host,
+            port,
+            tls,
+            user,
+            password,
+            from,
+            to,
+        })
+    }
+
+    /// The server is this machine: `localhost` or a loopback address.
+    pub fn loopback(&self) -> bool {
+        self.host == "localhost"
+            || self
+                .host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
     }
 }
 
@@ -1194,6 +1364,67 @@ mod tests {
             "Mattermost"
         );
         assert_eq!(WebhookFormat::detect("http://127.0.0.1:9000/alert"), Json);
+        // 1.22.
+        assert_eq!(
+            WebhookFormat::detect("https://api.telegram.org/bot1:abc/sendMessage?chat_id=5"),
+            Telegram
+        );
+        assert_eq!(
+            WebhookFormat::detect("http://127.0.0.1:9/bot1:abc/sendMessage?chat_id=5"),
+            Telegram
+        );
+        assert_eq!(WebhookFormat::detect("https://ntfy.sh/pumasi-home"), Ntfy);
+        assert_eq!(
+            WebhookFormat::detect("smtp://u:p@mail.example.com?from=a@b.c&to=d@e.f"),
+            Email
+        );
+        for f in [Telegram, Ntfy, Email] {
+            assert!(f.is_new());
+            assert_eq!(f.to_string().parse::<WebhookFormat>().unwrap(), f);
+        }
+        let spec = |url: &str, format| WebhookSpec {
+            name: "w".into(),
+            url: url.into(),
+            format,
+        };
+        assert!(
+            spec("https://api.telegram.org/bot1:abc/sendMessage", Telegram)
+                .validate()
+                .is_err()
+        );
+        spec(
+            "https://api.telegram.org/bot1:abc/sendMessage?chat_id=-100",
+            Telegram,
+        )
+        .validate()
+        .unwrap();
+        spec("smtp://127.0.0.1:2525?from=a@b.c&to=d@e.f", Email)
+            .validate()
+            .unwrap();
+        assert!(
+            spec("https://x.org/?from=a@b.c&to=d@e.f", Email)
+                .validate()
+                .is_err()
+        );
+        assert!(spec("smtp://h?from=a@b.c", Email).validate().is_err());
+        let m = MailTarget::parse(
+            "smtp://me%40x.org:p%26ss@mail.example.com?from=pumasi@x.org&to=a@x.org,%20b@x.org",
+        )
+        .unwrap();
+        assert_eq!(m.host, "mail.example.com");
+        assert_eq!(m.port, 587);
+        assert_eq!(m.tls, MailTls::StartTls);
+        assert_eq!(m.user.as_deref(), Some("me@x.org"));
+        assert_eq!(m.password.as_deref(), Some("p&ss"));
+        assert_eq!(m.to, ["a@x.org", "b@x.org"]);
+        assert!(!m.loopback());
+        let m = MailTarget::parse("smtps://[::1]?from=a@b&to=c@d").unwrap();
+        assert_eq!((m.port, m.tls), (465, MailTls::Implicit));
+        assert!(m.loopback());
+        assert_eq!(
+            redact_url("smtp://me:secret@mail.example.com:587?from=a@b&to=c@d"),
+            "smtp://mail.example.com/…"
+        );
         assert_eq!(
             redact_url("https://user:pw@hooks.slack.com:443/services/secret"),
             "https://hooks.slack.com/…"

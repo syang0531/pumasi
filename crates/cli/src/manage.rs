@@ -1031,6 +1031,7 @@ pub async fn apply(
     spec.dry_run = dry_run;
     spec.prune = prune;
     let caps = std::mem::take(&mut spec.job_caps);
+    let energy = std::mem::take(&mut spec.energy);
     let client = connect_admin(home, admin).await?;
     let applied = async {
         let AdminResponse::Applied(mut changes) = client.call(AdminOp::apply(spec)).await? else {
@@ -1069,6 +1070,45 @@ pub async fn apply(
                 return Err(e.context(
                     "the file sets caps per job, which this control plane does not have (they came in 1.19)",
                 ));
+            }
+        }
+        // Electricity prices and temperature limits (1.22) go on their
+        // own too: a node whose table names any of them gets exactly
+        // those, one that names none keeps what it has.
+        if !energy.is_empty() {
+            let cur = match client.call(AdminOp::Energy { days: 1 }).await {
+                Ok(AdminResponse::Energy(v)) => v,
+                Ok(_) => bail!("unexpected response"),
+                Err(e) => {
+                    return Err(e.context(
+                        "the file sets electricity prices or temperature limits, which this control plane does not have (they came in 1.22)",
+                    ));
+                }
+            };
+            for (node, e) in energy {
+                let now = cur
+                    .nodes
+                    .iter()
+                    .find(|n| n.name == node || n.id == node)
+                    .map(|n| n.settings.clone())
+                    .unwrap_or_default();
+                if now == e {
+                    continue;
+                }
+                changes.push(format!(
+                    "node {node}: energy {} -> {}",
+                    now.describe(),
+                    e.describe()
+                ));
+                if !dry_run {
+                    client
+                        .call(AdminOp::SetNodeEnergy {
+                            node: node.clone(),
+                            settings: e,
+                        })
+                        .await
+                        .with_context(|| format!("node {node}"))?;
+                }
             }
         }
         anyhow::Ok(changes)

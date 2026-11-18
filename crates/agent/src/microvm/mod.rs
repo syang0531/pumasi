@@ -1110,6 +1110,9 @@ impl MicrovmExecutor {
         };
         // What the VMM process uses stands for what the guest used (1.21).
         let sampler = running.child.id().map(crate::usage::Sampler::process);
+        if let Some(s) = &sampler {
+            s.feed(&io.cpu_feed);
+        }
         let end = self
             .wait_vm(
                 &vmm,

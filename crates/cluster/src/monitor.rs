@@ -42,6 +42,20 @@ const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 /// 10 s for an hour, 1 min for a day, 10 min for the rest. Every tier is
 /// written out (the 10 s one since 1.6, so a restart keeps the last hour).
 const TIERS: [(u64, u64); 3] = [(10, 3600), (60, 86_400), (600, u64::MAX)];
+/// Hourly averages kept past the retention (`--keep-metrics`, 1.22): the
+/// fourth tier, stored as tier 3.
+const HOURLY_STEP: u64 = 3600;
+const HOURLY_TIER: u8 = 3;
+
+/// The tier a series over `since_secs` comes from.
+fn tier_for(since_secs: u64, retention: u64, hourly: u64) -> usize {
+    match since_secs {
+        s if s <= TIERS[0].1 => 0,
+        s if s <= TIERS[1].1 => 1,
+        s if s > retention && hourly > 0 => HOURLY_TIER as usize,
+        _ => 2,
+    }
+}
 /// A sample older than this does not count as the node's current state.
 const FRESH_SECS: u64 = 60;
 /// Webhook notices kept for `recent_notices` (tests, debugging).
@@ -156,20 +170,27 @@ impl Acc {
 }
 
 impl NodeSeries {
-    fn new(retention: u64) -> Self {
+    fn new(retention: u64, hourly: u64) -> Self {
+        let mut tiers: Vec<Tier> = TIERS
+            .iter()
+            .map(|&(step, window)| Tier {
+                step,
+                keep: (window.min(retention) / step).max(1) as usize,
+                points: VecDeque::new(),
+                acc: None,
+            })
+            .collect();
+        tiers.push(Tier {
+            step: HOURLY_STEP,
+            keep: (hourly / HOURLY_STEP).max(1) as usize,
+            points: VecDeque::new(),
+            acc: None,
+        });
         Self {
             latest: None,
             extra: None,
             rates: (0, 0),
-            tiers: TIERS
-                .iter()
-                .map(|&(step, window)| Tier {
-                    step,
-                    keep: (window.min(retention) / step).max(1) as usize,
-                    points: VecDeque::new(),
-                    acc: None,
-                })
-                .collect(),
+            tiers,
         }
     }
 
@@ -228,12 +249,14 @@ impl NodeSeries {
 
     /// Points of the tier that fits `since_secs`, from `now - since_secs`,
     /// the unfinished step last.
-    fn series(&self, now: u64, since_secs: u64) -> (u32, Vec<MetricPoint>) {
-        let i = match since_secs {
-            s if s <= TIERS[0].1 => 0,
-            s if s <= TIERS[1].1 => 1,
-            _ => 2,
-        };
+    fn series(
+        &self,
+        now: u64,
+        since_secs: u64,
+        retention: u64,
+        hourly: u64,
+    ) -> (u32, Vec<MetricPoint>) {
+        let i = tier_for(since_secs, retention, hourly);
         let tier = &self.tiers[i];
         let from = now.saturating_sub(since_secs);
         let open = tier.acc.as_ref().map(Acc::point);
@@ -245,6 +268,10 @@ impl NodeSeries {
             .collect();
         out.extend(open);
         (tier.step as u32, out)
+    }
+
+    pub(crate) fn latest_fresh(&self, now: u64) -> Option<&NodeMetrics> {
+        self.fresh(now)
     }
 
     fn fresh(&self, now: u64) -> Option<&NodeMetrics> {
@@ -314,21 +341,86 @@ impl Notice {
         }
     }
 
-    /// The request body in a webhook's format.
-    pub fn body(&self, format: WebhookFormat) -> String {
+    /// A short title: ntfy's and the email's subject (1.22).
+    pub fn title(&self) -> String {
+        let what = if self.repeat {
+            "still firing"
+        } else {
+            self.status.as_str()
+        };
+        format!("[{}] {what}: {}", self.cluster, self.rule)
+    }
+
+    /// The request body in a webhook's format. `url` is the webhook's:
+    /// Telegram's names the chat, ntfy's the topic.
+    pub fn body(&self, format: WebhookFormat, url: &str) -> String {
         match format {
             WebhookFormat::Slack => serde_json::json!({ "text": self.text() }).to_string(),
             WebhookFormat::Discord => serde_json::json!({ "content": self.text() }).to_string(),
             WebhookFormat::Json => serde_json::to_string(self).expect("notice encodes"),
+            WebhookFormat::Telegram => serde_json::json!({
+                "chat_id": pumasi_proto::monitor::query_param(url, "chat_id").unwrap_or_default(),
+                "text": self.text(),
+                "disable_web_page_preview": true,
+            })
+            .to_string(),
+            WebhookFormat::Ntfy => {
+                let (priority, tag) = if self.status == "resolved" {
+                    (3, "white_check_mark")
+                } else if self.level == "critical" {
+                    (5, "rotating_light")
+                } else if self.level == "warning" {
+                    (4, "warning")
+                } else {
+                    (3, "information_source")
+                };
+                serde_json::json!({
+                    "topic": ntfy_target(url).1,
+                    "title": self.title(),
+                    "message": self.message,
+                    "priority": priority,
+                    "tags": [tag, "pumasi"],
+                })
+                .to_string()
+            }
+            WebhookFormat::Email => format!(
+                "{}\n\nrule: {}\nsubject: {}\nlevel: {}\nsince: {}\n",
+                self.text(),
+                self.rule,
+                self.subject,
+                self.level,
+                pumasi_proto::audit::rfc3339(self.since_unix)
+            ),
         }
     }
 }
 
-/// One POST for the webhook worker.
+/// Where an ntfy notice is posted (the server's root, which takes JSON)
+/// and its topic: the URL's last path segment.
+pub fn ntfy_target(url: &str) -> (String, String) {
+    let base = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    match base.rsplit_once('/') {
+        Some((root, topic))
+            if root.contains("://") && !root.ends_with(':') && !root.ends_with('/') =>
+        {
+            (format!("{root}/"), topic.to_string())
+        }
+        _ => (format!("{base}/"), String::new()),
+    }
+}
+
+/// One notice for the webhook worker.
 pub struct Delivery {
     pub webhook: String,
     pub url: String,
+    pub format: WebhookFormat,
     pub body: String,
+    /// The email's subject.
+    pub subject: String,
     /// `pumasi webhook test` waits for the answer.
     pub reply: Option<oneshot::Sender<Result<(), String>>>,
 }
@@ -346,6 +438,8 @@ pub(crate) struct Counters {
 /// Monitoring state.
 pub(crate) struct Monitor {
     pub retention_secs: u64,
+    /// `--keep-metrics` (1.22): hourly averages kept this long.
+    pub hourly_secs: u64,
     pub started_unix: u64,
     pub series: HashMap<String, NodeSeries>,
     pending_points: Vec<(String, u8, MetricPoint)>,
@@ -393,6 +487,7 @@ impl Default for Monitor {
     fn default() -> Self {
         Self {
             retention_secs: 7 * 86_400,
+            hourly_secs: 0,
             started_unix: now_unix(),
             series: HashMap::new(),
             pending_points: Vec::new(),
@@ -433,16 +528,25 @@ pub(crate) fn stored_series(
     nodes: &mut [pumasi_proto::monitor::NodeMetricsView],
     since_secs: u64,
 ) -> Result<()> {
-    let i = match since_secs {
-        s if s <= TIERS[0].1 => 0,
-        s if s <= TIERS[1].1 => 1,
-        _ => 2,
-    };
-    let mut since = vec![u64::MAX; TIERS.len()];
+    // A follower does not know the leader's retention: past the default
+    // week, hourly points where there are any.
+    let i = tier_for(since_secs, 7 * 86_400, 1);
+    let mut since = vec![u64::MAX; TIERS.len() + 1];
     since[i] = now_unix().saturating_sub(since_secs);
-    let points = store.load_points(&since)?;
+    let mut points = store.load_points(&since)?;
+    let mut step = if i == HOURLY_TIER as usize {
+        HOURLY_STEP
+    } else {
+        TIERS[i].0
+    };
+    if i == HOURLY_TIER as usize && points.is_empty() {
+        since = vec![u64::MAX; TIERS.len() + 1];
+        since[2] = now_unix().saturating_sub(since_secs);
+        points = store.load_points(&since)?;
+        step = TIERS[2].0;
+    }
     for n in nodes.iter_mut() {
-        n.step_secs = TIERS[i].0 as u32;
+        n.step_secs = step as u32;
         n.series = points
             .iter()
             .filter(|(id, _, _)| *id == n.id)
@@ -453,11 +557,13 @@ pub(crate) fn stored_series(
     Ok(())
 }
 
-fn tier_since(now: u64, retention: u64) -> Vec<u64> {
-    TIERS
+fn tier_since(now: u64, retention: u64, hourly: u64) -> Vec<u64> {
+    let mut v: Vec<u64> = TIERS
         .iter()
         .map(|&(_, window)| now.saturating_sub(window.min(retention)))
-        .collect()
+        .collect();
+    v.push(now.saturating_sub(hourly));
+    v
 }
 
 impl State {
@@ -499,14 +605,16 @@ impl State {
         }
         m.events = events.into();
         let now = now_unix();
-        let mut points = self.store.load_points(&tier_since(now, m.retention_secs))?;
+        let mut points =
+            self.store
+                .load_points(&tier_since(now, m.retention_secs, m.hourly_secs))?;
         points.sort_by_key(|(_, _, p)| p.unix);
         for (node, tier, p) in points {
-            let retention = m.retention_secs;
+            let (retention, hourly) = (m.retention_secs, m.hourly_secs);
             let s = m
                 .series
                 .entry(node)
-                .or_insert_with(|| NodeSeries::new(retention));
+                .or_insert_with(|| NodeSeries::new(retention, hourly));
             if let Some(t) = s.tiers.get_mut(tier as usize) {
                 t.points.push_back(p);
                 while t.points.len() > t.keep {
@@ -531,6 +639,46 @@ impl State {
         for s in self.monitor.series.values_mut() {
             for (t, &(step, window)) in s.tiers.iter_mut().zip(TIERS.iter()) {
                 t.keep = (window.min(r) / step).max(1) as usize;
+                while t.points.len() > t.keep {
+                    t.points.pop_front();
+                }
+            }
+        }
+    }
+
+    /// How long hourly averages are kept past the retention
+    /// (`--keep-metrics`, 1.22); zero keeps none.
+    pub fn set_keep_metrics(&mut self, d: Duration) {
+        let h = d.as_secs();
+        let before = self.monitor.hourly_secs;
+        self.monitor.hourly_secs = h;
+        // The stored hourly points, which loading at start left out.
+        let mut stored = Vec::new();
+        if h > before {
+            let mut since = vec![u64::MAX; TIERS.len() + 1];
+            since[HOURLY_TIER as usize] = now_unix().saturating_sub(h);
+            match self.store.load_points(&since) {
+                Ok(p) => stored = p,
+                Err(e) => warn!("load hourly metrics: {e:#}"),
+            }
+            stored.sort_by_key(|(_, _, p)| p.unix);
+        }
+        let retention = self.monitor.retention_secs;
+        for (node, _, p) in stored {
+            let s = self
+                .monitor
+                .series
+                .entry(node)
+                .or_insert_with(|| NodeSeries::new(retention, h));
+            if let Some(t) = s.tiers.get_mut(HOURLY_TIER as usize)
+                && t.points.back().is_none_or(|b| b.unix < p.unix)
+            {
+                t.points.push_back(p);
+            }
+        }
+        for s in self.monitor.series.values_mut() {
+            if let Some(t) = s.tiers.get_mut(HOURLY_TIER as usize) {
+                t.keep = (h / HOURLY_STEP).max(1) as usize;
                 while t.points.len() > t.keep {
                     t.points.pop_front();
                 }
@@ -669,7 +817,7 @@ impl State {
         {
             return;
         }
-        let retention = self.monitor.retention_secs;
+        let (retention, hourly) = (self.monitor.retention_secs, self.monitor.hourly_secs);
         // An older agent sends nothing more; a 1.15 one sends its extra
         // right after.
         let old_agent = self.node_minor(id) < pumasi_proto::METRICS_EXTRA_MINOR;
@@ -677,15 +825,28 @@ impl State {
             .monitor
             .series
             .entry(id.to_string())
-            .or_insert_with(|| NodeSeries::new(retention));
-        let done = series.add(now_unix(), m);
+            .or_insert_with(|| NodeSeries::new(retention, hourly));
+        let now = now_unix();
+        let done = series.add(now, m);
         if old_agent {
             series.extra = None;
             self.monitor.samples.send_modify(|n| *n += 1);
         }
-        self.monitor
-            .pending_points
-            .extend(done.into_iter().map(|(t, p)| (id.to_string(), t, p)));
+        self.monitor.pending_points.extend(
+            done.into_iter()
+                .filter(|(t, _)| *t != HOURLY_TIER || hourly > 0)
+                .map(|(t, p)| (id.to_string(), t, p)),
+        );
+        // Energy and the temperature limit (1.22).
+        if let Some(m) = self
+            .monitor
+            .series
+            .get(id)
+            .and_then(|s| s.latest.as_ref())
+            .map(|(_, m)| m.clone())
+        {
+            self.energy_sample(id, now, &m);
+        }
     }
 
     /// What came with a node's latest sample beyond it (1.15).
@@ -755,7 +916,8 @@ impl State {
     pub fn metrics_view(&self, node: Option<&str>, since_secs: u64) -> Result<MetricsView> {
         let only = node.map(|n| self.resolve_node(n)).transpose()?;
         let now = now_unix();
-        let since = since_secs.min(self.monitor.retention_secs);
+        let (retention, hourly) = (self.monitor.retention_secs, self.monitor.hourly_secs);
+        let since = since_secs.min(retention.max(hourly));
         let mut nodes: Vec<NodeMetricsView> = self
             .members
             .values()
@@ -764,7 +926,7 @@ impl State {
                 let rt = self.nodes.get(&m.id);
                 let s = self.monitor.series.get(&m.id);
                 let (step_secs, series) = match s {
-                    Some(s) if since > 0 => s.series(now, since),
+                    Some(s) if since > 0 => s.series(now, since, retention, hourly),
                     _ => (0, Vec::new()),
                 };
                 NodeMetricsView {
@@ -1070,7 +1232,11 @@ impl State {
     }
 
     /// A test notice for one webhook, to send now.
-    pub fn test_delivery(&self, name: &str) -> Result<(String, String)> {
+    pub fn test_delivery(
+        &self,
+        name: &str,
+        reply: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<Delivery> {
         let w = self
             .monitor
             .webhooks
@@ -1088,7 +1254,14 @@ impl State {
             since_unix: now,
             repeat: false,
         };
-        Ok((w.spec.url.clone(), n.body(w.spec.format)))
+        Ok(Delivery {
+            webhook: name.to_string(),
+            url: w.spec.url.clone(),
+            format: w.spec.format,
+            body: n.body(w.spec.format, &w.spec.url),
+            subject: n.title(),
+            reply,
+        })
     }
 
     /// How a delivery went (from the webhook worker).
@@ -1121,7 +1294,9 @@ impl State {
                 let _ = tx.send(Delivery {
                     webhook: w.spec.name.clone(),
                     url: w.spec.url.clone(),
-                    body: n.body(w.spec.format),
+                    format: w.spec.format,
+                    body: n.body(w.spec.format, &w.spec.url),
+                    subject: n.title(),
                     reply: None,
                 });
             }
@@ -1687,13 +1862,13 @@ impl State {
         }
         if self.monitor.last_prune.elapsed() >= PRUNE_EVERY {
             self.monitor.last_prune = Instant::now();
-            let retention = self.monitor.retention_secs;
+            let (retention, hourly) = (self.monitor.retention_secs, self.monitor.hourly_secs);
             let nodes: HashSet<String> = self.members.keys().cloned().collect();
             self.monitor.series.retain(|id, _| nodes.contains(id));
             match self.store.prune_monitor(
                 now.saturating_sub(retention),
                 MAX_STORED_EVENTS,
-                &tier_since(now, retention),
+                &tier_since(now, retention, hourly),
                 &nodes,
             ) {
                 Ok((e, p)) if e + p > 0 => {
@@ -1779,6 +1954,7 @@ impl State {
             warn!("persist metrics: {e:#}");
         }
         self.save_links(false);
+        self.flush_energy();
     }
 
     // -- Prometheus -----------------------------------------------------------
@@ -2260,7 +2436,7 @@ mod tests {
 
     #[test]
     fn series_downsample_and_rates() {
-        let mut s = NodeSeries::new(7 * 86_400);
+        let mut s = NodeSeries::new(7 * 86_400, 90 * 86_400);
         let t0 = 1_000_000_020; // a multiple of 60
         let mut done = Vec::new();
         for i in 0..30u64 {
@@ -2279,16 +2455,22 @@ mod tests {
         assert!(minutes[0].cpu_percent < minutes[1].cpu_percent);
         assert_eq!(minutes[0].gpu_percent, Some(50.0));
         assert_eq!(minutes[0].temp_c, Some(70.0));
-        let (step, points) = s.series(t0 + 150, 3600);
+        let (step, points) = s.series(t0 + 150, 3600, 7 * 86_400, 90 * 86_400);
         assert_eq!(step, 10);
         assert_eq!(
             points.len(),
             14 + 1,
             "14 finished steps and the current one"
         );
-        let (step, _) = s.series(t0 + 150, 86_400);
+        let (step, _) = s.series(t0 + 150, 86_400, 7 * 86_400, 90 * 86_400);
         assert_eq!(step, 60);
-        let (step, _) = s.series(t0 + 150, 7 * 86_400);
+        let (step, _) = s.series(t0 + 150, 7 * 86_400, 7 * 86_400, 90 * 86_400);
+        assert_eq!(step, 600);
+        // Past the retention, the hourly tier (1.22); without
+        // `--keep-metrics` still the 10-minute one.
+        let (step, _) = s.series(t0 + 150, 30 * 86_400, 7 * 86_400, 90 * 86_400);
+        assert_eq!(step, 3600);
+        let (step, _) = s.series(t0 + 150, 30 * 86_400, 7 * 86_400, 0);
         assert_eq!(step, 600);
         // A counter that went backwards (a reboot) is not a huge rate.
         s.add(t0 + 155, sample(1.0, 10));
@@ -2297,10 +2479,34 @@ mod tests {
 
     #[test]
     fn tiers_keep_no_more_than_retention() {
-        let s = NodeSeries::new(3600);
+        let s = NodeSeries::new(3600, 0);
         assert_eq!(s.tiers[0].keep, 360);
         assert_eq!(s.tiers[1].keep, 60);
         assert_eq!(s.tiers[2].keep, 6);
+        let s = NodeSeries::new(7 * 86_400, 90 * 86_400);
+        assert_eq!(s.tiers[2].keep, 7 * 144);
+        assert_eq!(s.tiers[3].keep, 90 * 24);
+        assert_eq!(s.tiers[3].step, 3600);
+    }
+
+    #[test]
+    fn hourly_points_finish_on_the_hour() {
+        let mut s = NodeSeries::new(3600, 90 * 86_400);
+        let t0 = 999_999_800; // 1000 s before an hour's end
+        let mut done = Vec::new();
+        for i in 0..250u64 {
+            done.extend(s.add(t0 + i * 5, sample(10.0, 0)));
+        }
+        let hours: Vec<&MetricPoint> = done
+            .iter()
+            .filter(|(t, _)| *t == HOURLY_TIER)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(hours.len(), 1);
+        assert_eq!(hours[0].unix % 3600, 0);
+        assert_eq!(hours[0].cpu_percent, 10.0);
+        assert_eq!(tier_since(10_000_000, 3600, 0)[3], 10_000_000);
+        assert_eq!(tier_since(10_000_000, 3600, 86_400)[3], 10_000_000 - 86_400);
     }
 
     #[test]
@@ -2316,7 +2522,8 @@ mod tests {
             since_unix: 5,
             repeat: false,
         };
-        let slack: serde_json::Value = serde_json::from_str(&n.body(WebhookFormat::Slack)).unwrap();
+        let slack: serde_json::Value =
+            serde_json::from_str(&n.body(WebhookFormat::Slack, "")).unwrap();
         assert!(
             slack["text"]
                 .as_str()
@@ -2324,12 +2531,39 @@ mod tests {
                 .contains("[homelab] node desktop offline")
         );
         let discord: serde_json::Value =
-            serde_json::from_str(&n.body(WebhookFormat::Discord)).unwrap();
+            serde_json::from_str(&n.body(WebhookFormat::Discord, "")).unwrap();
         assert!(discord["content"].as_str().unwrap().contains("🚨"));
-        let json: serde_json::Value = serde_json::from_str(&n.body(WebhookFormat::Json)).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&n.body(WebhookFormat::Json, "")).unwrap();
         assert_eq!(json["rule"], "node_offline");
         assert_eq!(json["status"], "firing");
         assert_eq!(json["subject"], "desktop");
+        // 1.22.
+        let tg: serde_json::Value = serde_json::from_str(&n.body(
+            WebhookFormat::Telegram,
+            "https://api.telegram.org/bot1:x/sendMessage?chat_id=-1001",
+        ))
+        .unwrap();
+        assert_eq!(tg["chat_id"], "-1001");
+        assert!(tg["text"].as_str().unwrap().contains("🚨 [homelab]"));
+        let url = "https://u:p@ntfy.example.org/pumasi-home";
+        let nt: serde_json::Value =
+            serde_json::from_str(&n.body(WebhookFormat::Ntfy, url)).unwrap();
+        assert_eq!(nt["topic"], "pumasi-home");
+        assert_eq!(nt["priority"], 5);
+        assert_eq!(nt["title"], "[homelab] firing: node_offline");
+        assert_eq!(nt["message"], "node desktop offline for 2m");
+        assert_eq!(
+            ntfy_target(url),
+            ("https://u:p@ntfy.example.org/".into(), "pumasi-home".into())
+        );
+        assert_eq!(ntfy_target("https://ntfy.sh/t/").1, "t");
+        let mail = n.body(WebhookFormat::Email, "smtp://h?from=a@b&to=c@d");
+        assert!(
+            mail.starts_with("🚨 [homelab] node desktop offline"),
+            "{mail}"
+        );
+        assert!(mail.contains("subject: desktop"));
     }
 
     #[test]

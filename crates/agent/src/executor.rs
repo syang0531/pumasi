@@ -107,6 +107,10 @@ pub struct TaskIo {
     /// What the task's network carried, which the executor writes when the
     /// run ends (1.18).
     pub net_usage: NetCount,
+    /// Where the run's CPU time can be read while it runs, for its share
+    /// of the CPU's energy (1.22): the container's or VMM's usage sampler
+    /// attaches to it.
+    pub cpu_feed: crate::energy::CpuFeed,
 }
 
 /// What a microVM task's network carried, written by the executor.

@@ -96,6 +96,9 @@ pub struct ClusterConfig {
     pub metrics_token: Option<String>,
     /// How long node metrics and events are kept.
     pub metrics_retention: Duration,
+    /// Hourly averages kept past the retention (`--keep-metrics`, 1.22);
+    /// zero keeps none.
+    pub keep_metrics: Duration,
     /// How often a follower copies the leader's file store.
     pub mirror_every: Duration,
     /// How long finished jobs are kept (zero: forever).
@@ -151,6 +154,7 @@ impl ClusterConfig {
             metrics_addr: None,
             metrics_token: None,
             metrics_retention: Duration::from_secs(7 * 86_400),
+            keep_metrics: Duration::ZERO,
             keep_jobs: crate::retention::DEFAULT_KEEP_JOBS,
             keep_audit: Duration::ZERO,
             sign_in_per_min: crate::limits::PEER_PER_MIN,
@@ -360,6 +364,7 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
         true,
     );
     state.set_metrics_retention(config.metrics_retention);
+    state.set_keep_metrics(config.keep_metrics);
     state.power.wake_after = config.wake_after;
     state.set_probe_every(config.probe_every);
     state.set_replica_timing(config.replica_repair_after, config.scrub_every);
@@ -1413,6 +1418,9 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                         if let Some(u) = t.usage {
                             st.note_use(&node_id, generation, report.task, u);
                         }
+                        if let Some(e) = t.energy {
+                            st.note_energy(&node_id, generation, report.task, e);
+                        }
                     }
                     // A stored output must be complete in the store and be
                     // what the report says before the result counts.
@@ -1637,6 +1645,17 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
     // waits for sessions really releases the database.
     let _ = fetcher.await;
     result
+}
+
+/// Alerts for a client that may be older than 1.22: webhooks in the
+/// formats 1.22 added show as JSON.
+fn old_formats(mut v: pumasi_proto::monitor::AlertsView) -> pumasi_proto::monitor::AlertsView {
+    for w in &mut v.webhooks {
+        if w.format.is_new() {
+            w.format = pumasi_proto::monitor::WebhookFormat::Json;
+        }
+    }
+    v
 }
 
 /// Takes the tail off a message read with `read_msg_tail`, so the agent loop
@@ -3290,14 +3309,8 @@ async fn handle_store_admin(
         }
         AdminOp::TestWebhook { name } => {
             async {
-                let (url, body) = inner.state().test_delivery(&name)?;
                 let (tx, rx) = oneshot::channel();
-                let sent = crate::monitor::Delivery {
-                    webhook: name.clone(),
-                    url,
-                    body,
-                    reply: Some(tx),
-                };
+                let sent = inner.state().test_delivery(&name, Some(tx))?;
                 crate::prometheus::deliver(inner.clone(), sent);
                 match rx.await {
                     Ok(Ok(())) => Ok(AdminResponse::Ok),
@@ -3739,11 +3752,30 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             stdout_from,
             stderr_from,
         )?))),
-        AdminOp::Alerts => Ok(AdminResponse::Alerts(Box::new(inner.state().alerts_view()))),
+        // A 1.21 client cannot decode the formats 1.22 added: they show
+        // as JSON here, and as themselves in `AlertsFull`.
+        AdminOp::Alerts => Ok(AdminResponse::Alerts(Box::new(old_formats(
+            inner.state().alerts_view(),
+        )))),
+        AdminOp::AlertsFull => Ok(AdminResponse::Alerts(Box::new(inner.state().alerts_view()))),
+        AdminOp::Energy { days } => Ok(AdminResponse::Energy(Box::new(
+            inner.state().energy_view(days),
+        ))),
+        AdminOp::SetNodeEnergy { node, settings } => {
+            let mut st = inner.state();
+            // The node's settings and today, alone.
+            let id = st.set_node_energy(&node, settings)?;
+            let mut v = st.energy_view(1);
+            v.nodes.retain(|n| n.id == id);
+            v.days.retain(|d| d.node == id);
+            Ok(AdminResponse::Energy(Box::new(v)))
+        }
         AdminOp::SetAlertPolicy(p) => {
             let mut st = inner.state();
             st.set_alert_policy(*p)?;
-            Ok(AdminResponse::Alerts(Box::new(st.alerts_view())))
+            Ok(AdminResponse::Alerts(Box::new(old_formats(
+                st.alerts_view(),
+            ))))
         }
         AdminOp::SetWebhook(w) => {
             inner.state().set_webhook(*w)?;

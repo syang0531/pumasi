@@ -141,6 +141,9 @@ fn op_name(op: &AdminOp) -> &'static str {
         Suspend { .. } | Resume { .. } => "suspend jobs",
         SetScheduleMore { .. } => "change schedules",
         ApplySched { .. } => "apply cluster files",
+        Energy { .. } => "read energy",
+        SetNodeEnergy { .. } => "change electricity prices",
+        AlertsFull => "read alerts",
     }
 }
 
@@ -204,6 +207,8 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | JobCaps
             | Verify
             | JobRuns { .. }
+            | Energy { .. }
+            | AlertsFull
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -329,6 +334,8 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         op @ (Metrics { .. }
         | Events { .. }
         | Alerts
+        | AlertsFull
+        | Energy { .. }
         | AlertTuning
         | Net
         | MetricsWait { .. }

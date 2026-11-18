@@ -166,6 +166,11 @@ const JOB_RUN: TableDefinition<u128, &[u8]> = TableDefinition::new("job_run");
 const TASK_RUNS: TableDefinition<(u128, u32), &[u8]> = TableDefinition::new("task_runs");
 /// Key: schedule name. What its job has beyond `schedule_ext` (1.21).
 const SCHEDULE_MORE: TableDefinition<&str, &[u8]> = TableDefinition::new("schedule_more");
+/// Key: node id. Its electricity price and temperature limit (1.22).
+const NODE_ENERGY: TableDefinition<&str, &[u8]> = TableDefinition::new("node_energy");
+/// Key: (node id, local day number). Its energy by hour and the CU its
+/// runs were worth that day (1.22).
+const ENERGY_DAYS: TableDefinition<(&str, i32), &[u8]> = TableDefinition::new("energy_days");
 /// Meta key of the SCIM tokens (their hashes).
 const SCIM_TOKENS_META: &str = "scim_tokens";
 
@@ -247,7 +252,9 @@ macro_rules! tables {
             JOB_NET,
             JOB_RUN,
             TASK_RUNS,
-            SCHEDULE_MORE
+            SCHEDULE_MORE,
+            NODE_ENERGY,
+            ENERGY_DAYS
         )
     };
 }
@@ -685,6 +692,8 @@ impl Store {
         tx.open_table(JOB_RUN)?;
         tx.open_table(TASK_RUNS)?;
         tx.open_table(SCHEDULE_MORE)?;
+        tx.open_table(NODE_ENERGY)?;
+        tx.open_table(ENERGY_DAYS)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -1558,6 +1567,71 @@ impl Store {
         match r {
             Some(r) => b.put(CHECKPOINTS, (job, index), enc(r).as_slice()),
             None => b.del(CHECKPOINTS, (job, index)),
+        }
+        self.commit(b)
+    }
+
+    /// Every node's electricity and temperature settings (1.22).
+    pub fn node_energy(&self) -> Result<Vec<(String, pumasi_proto::energy::NodeEnergy)>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(NODE_ENERGY)?.iter()? {
+            let (k, v) = row?;
+            out.push((k.value().to_string(), dec(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Writes (or with `None` deletes) a node's electricity settings.
+    pub fn put_node_energy(
+        &self,
+        node: &str,
+        e: Option<&pumasi_proto::energy::NodeEnergy>,
+    ) -> Result<()> {
+        let mut b = Batch::default();
+        match e {
+            Some(e) => b.put(NODE_ENERGY, node, enc(e).as_slice()),
+            None => b.del(NODE_ENERGY, node),
+        }
+        self.commit(b)
+    }
+
+    /// Nodes' days of energy from local day `since` on (1.22).
+    pub fn energy_days(
+        &self,
+        since: i32,
+    ) -> Result<Vec<((String, i32), crate::energy::DayRecord)>> {
+        let tx = self.read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(ENERGY_DAYS)?.iter()? {
+            let (k, v) = row?;
+            let (node, day) = k.value();
+            if day >= since {
+                out.push(((node.to_string(), day), dec(v.value())?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Writes nodes' days, and deletes the days before `prune_before`.
+    pub fn put_energy_days(
+        &self,
+        rows: &[((String, i32), crate::energy::DayRecord)],
+        prune_before: Option<i32>,
+    ) -> Result<()> {
+        let mut b = Batch::default();
+        for ((node, day), r) in rows {
+            b.put(ENERGY_DAYS, (node.as_str(), *day), enc(r).as_slice());
+        }
+        if let Some(before) = prune_before {
+            let tx = self.read()?;
+            for row in tx.open_table(ENERGY_DAYS)?.iter()? {
+                let (k, _) = row?;
+                let (node, day) = k.value();
+                if day < before {
+                    b.del(ENERGY_DAYS, (node, day));
+                }
+            }
         }
         self.commit(b)
     }

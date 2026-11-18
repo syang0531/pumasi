@@ -117,11 +117,17 @@ pub struct AlertRules {
 #[derive(Subcommand)]
 pub enum WebhookCmd {
     /// Send alerts to a URL: a Slack or Mattermost incoming webhook, a
-    /// Discord webhook, or your own receiver (JSON).
+    /// Discord webhook, Telegram, ntfy, email or your own receiver (JSON).
+    ///
+    /// Telegram: https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>.
+    /// ntfy: https://ntfy.sh/<topic> (user:password@ for a server that asks).
+    /// Email: smtp://user:password@host:587?from=a@x.org&to=b@x.org,c@x.org
+    /// (STARTTLS) or smtps://…:465 (TLS from the start).
     Add {
         name: String,
         url: String,
-        /// `slack`, `discord` or `json` (default: guessed from the URL).
+        /// `slack`, `discord`, `telegram`, `ntfy`, `email` or `json`
+        /// (default: guessed from the URL; a self-hosted ntfy needs `ntfy`).
         #[arg(long)]
         format: Option<WebhookFormat>,
         /// Do not send a test alert after adding it.
@@ -695,7 +701,12 @@ fn print_webhooks(v: &AlertsView) {
     }
 }
 
+/// The alert policy with the true webhook formats (1.22), else the older
+/// view, where Telegram, ntfy and email show as json.
 async fn alerts(client: &AdminClient) -> Result<AlertsView> {
+    if let Ok(AdminResponse::Alerts(a)) = client.call(AdminOp::AlertsFull).await {
+        return Ok(*a);
+    }
     match client.call(AdminOp::Alerts).await? {
         AdminResponse::Alerts(a) => Ok(*a),
         _ => bail!("unexpected response"),
@@ -1078,7 +1089,16 @@ pub async fn webhook(home: &Path, cmd: WebhookCmd) -> Result<i32> {
             };
             spec.validate()?;
             let client = connect_admin(home, &admin).await?;
-            client.call(AdminOp::SetWebhook(Box::new(spec))).await?;
+            let set = client.call(AdminOp::SetWebhook(Box::new(spec))).await;
+            if let Err(e) = set {
+                client.close().await;
+                if format.is_new() {
+                    return Err(e.context(format!(
+                        "this control plane cannot send {format} alerts (they came in 1.22)"
+                    )));
+                }
+                return Err(e);
+            }
             println!("webhook {name} added ({format})");
             if !no_test {
                 match client

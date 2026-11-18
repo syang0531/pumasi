@@ -5,6 +5,7 @@ pub mod agent;
 pub mod availability;
 pub mod bench;
 pub mod docker;
+pub mod energy;
 pub mod executor;
 pub mod gpu;
 pub mod metrics;

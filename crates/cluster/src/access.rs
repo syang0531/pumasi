@@ -87,7 +87,10 @@ fn op_name(op: &AdminOp) -> &'static str {
         LatestRelease { check: false } => "read the release check",
         LatestRelease { check: true } => "check for releases",
         UpgradeToLatest { .. } => "roll out upgrades",
-        TaskDetails { .. } | TaskExecutors { .. } => "read jobs",
+        TaskDetails { .. } | TaskExecutors { .. } | JobWait { .. } => "read jobs",
+        LogsWait { .. } => "read task output",
+        JobCaps => "read quotas",
+        SetJobCaps { .. } => "set job policies",
         NodePower => "read the status",
         WakeNode { .. } => "wake nodes",
         AlertTuning => "read alerts",
@@ -186,6 +189,9 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | MetricsWait { .. }
             | EventsKeyed { .. }
             | AlertTexts
+            | JobWait { .. }
+            | LogsWait { .. }
+            | JobCaps
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -257,6 +263,8 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | TaskDetails { id }
         | TaskExecutors { id }
         | Placement { id }
+        | JobWait { id, .. }
+        | LogsWait { job: id, .. }
         | Logs { job: id, .. } => own_job(st, account, id)?,
         RemoveSchedule { name } | RunSchedule { name } => {
             if let Some(other) = st.schedule_account(name) {
@@ -293,6 +301,8 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | TaskDetails { .. }
         | TaskExecutors { .. }
         | Placement { .. }
+        | JobWait { .. }
+        | LogsWait { .. }
         | Logs { .. }) => op,
         op @ (Metrics { .. }
         | Events { .. }
@@ -303,6 +313,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | EventsKeyed { .. }
         | AlertTexts) => op,
         op @ (Status
+        | JobCaps
         | NodePower
         | Accounts
         | GetPolicy
@@ -450,6 +461,10 @@ pub fn scope(caller: &Caller, resp: AdminResponse) -> AdminResponse {
         AdminResponse::Resources(mut v) => {
             v.retain(|r| r.account == *account);
             AdminResponse::Resources(v)
+        }
+        AdminResponse::JobCaps(mut v) => {
+            v.retain(|(a, _)| a == account);
+            AdminResponse::JobCaps(v)
         }
         AdminResponse::Schedules(mut v) => {
             v.retain(|s| s.account == *account);

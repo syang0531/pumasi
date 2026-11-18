@@ -418,9 +418,22 @@ are copied to every replica, so a failover loses neither.
 Since 1.12 followers answer the dashboard's reads (status, events and
 node metrics) for admins and viewers from a copy the leader sends every
 2 seconds, so a busy dashboard does not load the leader; anything older
-than 6 seconds, any write, and any other caller go to the leader as
-before. Rate limits shared between dashboards live in the leader's
-memory, so a failover starts them afresh.
+than 6 seconds and any write go to the leader as before. Since 1.19 the
+API and the CLI read from followers too (`pumasi status`, `job`, `top`,
+`events`, metrics history), submitters included, for their own jobs:
+jobs that are queued or running, and those that ended in the last ten
+minutes, come from the copy; older jobs and task output from the leader.
+
+Rate limits shared between dashboards, and failed sign-in blocks, are
+written to the replicated state every 2 seconds when they changed (one
+compacted record, not an entry per request), so a new leader carries on
+from them; at most the last 2 seconds before a crash are lost.
+
+A replica that comes back on another address (a new IP from DHCP, another
+port) needs no new invite since 1.19: it signs its new address with its
+key and the leader puts it in the membership, within a few seconds of
+the start. Make new join and admin tickets afterwards if clients reach
+the cluster by that replica's address.
 
 ## 6. Watch it
 

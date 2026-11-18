@@ -157,7 +157,7 @@ async fn call(home: &Path, admin: &AdminArgs, op: AdminOp) -> Result<AdminRespon
 
 async fn metrics(client: &AdminClient, node: Option<String>, since: u64) -> Result<MetricsView> {
     match client
-        .call(AdminOp::Metrics {
+        .read(AdminOp::Metrics {
             node,
             since_secs: since,
         })
@@ -431,17 +431,22 @@ pub async fn logs(
     let mut first = true;
     let mut said_not_live = false;
     let mut said_waiting = false;
+    // 1.19: the control plane answers when there is more (`LogsWait`)
+    // instead of being asked five times a second.
+    let mut pushed = true;
+    let mut idle = false;
     loop {
-        let chunk: LogChunk = match client
-            .call(AdminOp::Logs {
-                job,
-                index,
-                attempt,
-                stdout_from: out_at,
-                stderr_from: err_at,
-            })
-            .await?
-        {
+        let wait = if follow && idle {
+            Duration::from_secs(30)
+        } else {
+            Duration::ZERO
+        };
+        let asked = client.wait_logs((job, index, attempt), (out_at, err_at), wait, &mut pushed);
+        let answer = tokio::select! {
+            r = asked => r?,
+            _ = tokio::signal::ctrl_c() => break,
+        };
+        let chunk: LogChunk = match answer {
             AdminResponse::Logs(c) => *c,
             _ => bail!("unexpected response"),
         };
@@ -484,7 +489,8 @@ pub async fn logs(
                 said_not_live = true;
             }
         }
-        if !more {
+        idle = !more;
+        if !more && !pushed {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
                 _ = tokio::signal::ctrl_c() => break,
@@ -549,7 +555,7 @@ pub async fn events(
         let client = &client;
         async move {
             match client
-                .call(AdminOp::Events {
+                .read(AdminOp::Events {
                     after,
                     since_unix,
                     limit,

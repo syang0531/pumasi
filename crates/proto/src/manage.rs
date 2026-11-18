@@ -776,6 +776,112 @@ pub fn parse_executor(s: &str) -> Result<Executor> {
     }
 }
 
+/// Caps on each job of an account (1.19): what one job's runs may hold at
+/// once and what one job may spend. They sit beside the account's job
+/// policy (`pumasi quota NAME --max-job-cpus`, `max_job_cpus` in
+/// `cluster.toml`) but travel and are stored on their own, so 1.18 control
+/// planes and records stay as they were. Unlike the policy they hold every
+/// job of the account, whoever submits it, as quotas do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCaps {
+    /// CPUs one job's runs hold at once (each run counts the CPUs it asks
+    /// for, a WASM run one).
+    pub cpus: Option<u32>,
+    /// Memory one job's runs hold at once, in bytes.
+    pub memory_bytes: Option<u64>,
+    /// Milli-CU one job may spend; once it has, its tasks that have not run
+    /// yet fail.
+    pub cu: Option<MilliCu>,
+}
+
+impl JobCaps {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let Some(c) = self.cpus {
+            ensure!(c > 0, "max_job_cpus must be positive");
+        }
+        if let Some(m) = self.memory_bytes {
+            ensure!(m > 0, "max_job_memory must be positive");
+        }
+        if let Some(c) = self.cu {
+            ensure!(c > 0, "max_job_cu must be positive");
+        }
+        Ok(())
+    }
+
+    /// `cpus 8, memory 16.0 GiB, 500 CU`, or `none`.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(c) = self.cpus {
+            parts.push(format!("cpus {c}"));
+        }
+        if let Some(m) = self.memory_bytes {
+            parts.push(format!("memory {}", crate::store::format_size(m)));
+        }
+        if let Some(c) = self.cu {
+            parts.push(crate::economy::format_cu(c));
+        }
+        if parts.is_empty() {
+            "none".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// Why a task asking for `cpus` and `memory_bytes` can never run under
+    /// these caps, if it cannot.
+    pub fn refuse_task(&self, cpus: u32, memory_bytes: u64) -> Option<String> {
+        if let Some(max) = self.cpus
+            && cpus > max
+        {
+            return Some(format!(
+                "a task asks for {cpus} CPUs and the account's jobs may hold {max} at once"
+            ));
+        }
+        if let Some(max) = self.memory_bytes
+            && memory_bytes > max
+        {
+            return Some(format!(
+                "a task asks for {} of memory and the account's jobs may hold {} at once",
+                crate::store::format_size(memory_bytes),
+                crate::store::format_size(max)
+            ));
+        }
+        None
+    }
+}
+
+/// A change to [`JobCaps`]: each field `Some(None)` lifts that cap,
+/// `Some(Some(v))` sets it, `None` leaves it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobCapsPatch {
+    pub cpus: Option<Option<u32>>,
+    pub memory_bytes: Option<Option<u64>>,
+    pub cu: Option<Option<MilliCu>>,
+}
+
+impl JobCapsPatch {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn apply(&self, c: &mut JobCaps) -> Result<()> {
+        if let Some(v) = self.cpus {
+            c.cpus = v;
+        }
+        if let Some(v) = self.memory_bytes {
+            c.memory_bytes = v;
+        }
+        if let Some(v) = self.cu {
+            c.cu = v;
+        }
+        c.validate()
+    }
+}
+
 /// A change to an account's job policy that leaves what it does not name
 /// as it is (1.4): `PATCH /api/v1/accounts/NAME/policy`, `pumasi quota
 /// NAME --add-images ...` and the dashboard's Accounts page.
@@ -1283,6 +1389,11 @@ pub struct ApplySpec {
     /// The CPU and memory quota of every account in `accounts`.
     #[serde(skip)]
     pub resources: Vec<(String, crate::sched::ResourceQuota)>,
+    /// 1.19, never on the wire inside the spec: `pumasi apply` sends each
+    /// account's caps per job with [`AdminOp::SetJobCaps`](crate::msg::AdminOp)
+    /// once the rest is applied.
+    #[serde(skip)]
+    pub job_caps: Vec<(String, JobCaps)>,
     // 1.15 from here, never on the wire inside the spec either:
     // [`AdminOp::ApplyMore`](crate::msg::AdminOp) carries them.
     /// Repeat and resolved notices and per-node thresholds, when the file's
@@ -1827,6 +1938,10 @@ pub struct AccountFile {
     pub memory: Option<String>,
     #[serde(default)]
     pub label_quotas: Vec<crate::sched::LabelQuotaFile>,
+    // 1.19: caps on each job.
+    pub max_job_cpus: Option<u32>,
+    pub max_job_memory: Option<String>,
+    pub max_job_cu: Option<NumberOrText>,
 }
 
 /// `allow` or `deny` (`--network`, `network =` in cluster.toml): whether
@@ -1853,6 +1968,27 @@ impl AccountFile {
         };
         q.validate()?;
         Ok(q)
+    }
+
+    /// The `[accounts.NAME]` caps on each job (1.19).
+    pub fn job_caps(&self) -> Result<JobCaps> {
+        let c = JobCaps {
+            cpus: self.max_job_cpus,
+            memory_bytes: self
+                .max_job_memory
+                .as_deref()
+                .map(parse_size)
+                .transpose()
+                .context("max_job_memory")?,
+            cu: self
+                .max_job_cu
+                .as_ref()
+                .map(|n| parse_cu(&n.text()))
+                .transpose()
+                .context("max_job_cu")?,
+        };
+        c.validate()?;
+        Ok(c)
     }
 
     /// The `[accounts.NAME]` policy fields.
@@ -1965,6 +2101,9 @@ impl ClusterFile {
             let resources = a
                 .resources()
                 .with_context(|| format!("account {account}: cpus and memory"))?;
+            let caps = a
+                .job_caps()
+                .with_context(|| format!("account {account}: caps per job"))?;
             let q = AccountQuota {
                 slots: a.slots,
                 gpus: a.gpus,
@@ -1983,6 +2122,7 @@ impl ClusterFile {
             };
             spec.policies.push((account.clone(), policy));
             spec.resources.push((account.clone(), resources));
+            spec.job_caps.push((account.clone(), caps));
             spec.accounts.push((account, q));
         }
         for (name, s) in self.schedules {

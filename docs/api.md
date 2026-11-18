@@ -175,6 +175,24 @@ pumasi ui --api-only --listen 0.0.0.0:8443 \
   --tls-key  /etc/letsencrypt/live/pumasi.example.com/privkey.pem
 ```
 
+Or let the dashboard get and renew the certificate itself from Let's
+Encrypt (1.19). The name has to point at the machine, and the CA has to
+reach port 443 there (TLS-ALPN-01, on the dashboard's own port) or port
+80 (`--acme-challenge http-01`, a small listener that also sends
+browsers to HTTPS):
+
+```bash
+pumasi ui --api-only --listen 0.0.0.0:443 \
+  --acme pumasi.example.com --acme-email ops@example.com
+```
+
+The account key and the certificate are kept in the home (`acme/`), so a
+restart does not order again; the certificate is renewed 30 days before
+it expires, without a restart. `--acme-directory letsencrypt-staging`
+tries Let's Encrypt's staging server first, and `--acme-directory URL`
+(with `--acme-ca FILE` for its CA) uses another ACME server such as
+step-ca.
+
 `--api-only` refuses an address other than loopback over plain HTTP
 (tickets would cross the network readable); `--insecure-http` overrides
 that for a TLS proxy elsewhere on a private network.
@@ -273,7 +291,10 @@ instead of letting it wait forever.
 ### Wait for it
 
 `?wait=` answers as soon as the job finishes, or when the wait runs out
-(at most 90 seconds); then ask again:
+(at most 90 seconds); then ask again. Since 1.19 the control plane tells
+the dashboard the moment the job ends (within 100 ms in CI) instead of
+being asked every few hundred milliseconds, and `GET .../logs?wait=30s`
+does the same for new output:
 
 ```sh
 while :; do
@@ -447,6 +468,7 @@ curl -fsS -H "Authorization: Bearer $PUMASI_TICKET" "$PUMASI_URL/api/v1/accounts
 | `"network": "deny"`, `"require_digest": true`, `"selector": "gpu=nvidia"` | sets the value |
 | `"max_timeout_ms": null`, `"max_gpus_per_task": null` | lifts the limit |
 | `"quota": {"slots": 4, "gpus": null}` | sets or lifts the quotas it names (`slots`, `gpus`, `cu_per_day`, `max_priority`, `storage_bytes`) |
+| `"max_job_cpus": 8`, `"max_job_memory_bytes": 34359738368`, `"max_job_cu": 20000` | caps on each job of the account (1.19; CU in thousandths), `null` lifts one; a control plane older than 1.19 answers `400` |
 
 What `GET` answers can be sent back as it is, and an unknown field is a
 `400`. The schema is in `/api/openapi.json` (`AccountPolicyPatch`).

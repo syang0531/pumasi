@@ -15,6 +15,7 @@
 //! in front works too.
 
 mod accounts;
+pub mod acme;
 mod api;
 mod auth;
 mod backend;

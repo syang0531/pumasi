@@ -1202,9 +1202,9 @@ pub enum AdminOp {
     /// The SCIM tokens and the provisioned people and groups.
     ScimView,
     /// A read that a follower may answer from what the leader handed it a
-    /// moment ago ([`crate::ha::ReadCache`]): [`AdminOp::Status`],
-    /// [`AdminOp::Events`] and [`AdminOp::Metrics`] with `since_secs` 0.
-    /// The leader answers it like the call inside.
+    /// moment ago ([`crate::ha::ReadCache`]): see
+    /// [`AdminOp::follower_may_answer`]. The leader answers it like the
+    /// call inside.
     FollowerRead(Box<AdminOp>),
     // 1.13 from here.
     /// Each control plane replica's version and where it is with the
@@ -1267,7 +1267,40 @@ pub enum AdminOp {
     ReceiptsFull {
         id: JobId,
     },
+    // 1.19 from here.
+    /// [`AdminOp::Job`] without output, answered once the job has ended or
+    /// after `wait_ms` (at most [`MAX_WAIT_MS`]) with how it is then: the
+    /// control plane answers when the job ends instead of being asked
+    /// again and again (`?wait=`, `pumasi wait`).
+    JobWait {
+        id: JobId,
+        wait_ms: u64,
+    },
+    /// [`AdminOp::Logs`] answered once the task has output beyond the
+    /// offsets, its run ended or moved on, or `wait_ms` passed (at most
+    /// [`MAX_WAIT_MS`]): `pumasi logs -f` without asking every second.
+    LogsWait {
+        job: JobId,
+        index: u32,
+        attempt: u32,
+        stdout_from: u64,
+        stderr_from: u64,
+        wait_ms: u64,
+    },
+    /// Every account's caps per job ([`AdminResponse::JobCaps`]).
+    JobCaps,
+    /// Sets (replaces) an account's caps per job; answers like
+    /// [`AdminOp::JobCaps`].
+    SetJobCaps {
+        account: String,
+        caps: crate::manage::JobCaps,
+    },
 }
+
+/// The longest [`AdminOp::JobWait`] and [`AdminOp::LogsWait`] (1.19):
+/// under the 100 seconds Cloudflare gives a response to start, like the
+/// API's `?wait=`.
+pub const MAX_WAIT_MS: u64 = 90_000;
 
 impl AdminOp {
     /// The call that submits `sub`: [`AdminOp::SubmitPlaced`] when it has a
@@ -1434,10 +1467,22 @@ impl AdminOp {
     }
 
     /// Whether a follower may answer this call ([`AdminOp::FollowerRead`]).
+    /// 1.19 added metrics history, jobs without their output, task details
+    /// and executors, and the nodes' power states; a 1.18 follower sends
+    /// those to the leader.
     pub fn follower_may_answer(&self) -> bool {
         matches!(
             self,
-            AdminOp::Status | AdminOp::Events { .. } | AdminOp::Metrics { since_secs: 0, .. }
+            AdminOp::Status
+                | AdminOp::Events { .. }
+                | AdminOp::Metrics { .. }
+                | AdminOp::Job {
+                    with_output: false,
+                    ..
+                }
+                | AdminOp::TaskDetails { .. }
+                | AdminOp::TaskExecutors { .. }
+                | AdminOp::NodePower
         )
     }
 
@@ -1629,6 +1674,9 @@ pub enum AdminResponse {
     // 1.18 from here.
     /// Receipts in [`Receipt::encode`]'s encoding, egress parts included.
     ReceiptsFull(Vec<Vec<u8>>),
+    // 1.19 from here.
+    /// Accounts with caps per job, by name.
+    JobCaps(Vec<(String, crate::manage::JobCaps)>),
 }
 
 /// One task of a job: the node it ran on by name, and how long each part

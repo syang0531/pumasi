@@ -83,6 +83,8 @@ impl Room {
 pub(crate) struct Usage {
     pub accounts: HashMap<String, ResourceUse>,
     pub nodes: HashMap<(String, String), ResourceUse>,
+    /// What each job's runs hold (1.19: caps per job).
+    pub jobs: HashMap<JobId, ResourceUse>,
 }
 
 impl Usage {
@@ -90,9 +92,16 @@ impl Usage {
         self.accounts.get(account).copied().unwrap_or_default()
     }
 
+    pub fn job(&self, job: JobId) -> ResourceUse {
+        self.jobs.get(&job).copied().unwrap_or_default()
+    }
+
     /// A run of `need` placed on `node` with `gpus` GPUs.
     pub fn add(&mut self, need: &Need, node: &str, gpus: u32) {
         let u = use_of(need, gpus);
+        if !need.item.check {
+            self.jobs.entry(need.item.job).or_default().add(&u);
+        }
         self.accounts
             .entry(need.consumer.clone())
             .or_default()
@@ -257,6 +266,9 @@ impl State {
                     .entry(j.meta.account.clone())
                     .or_default()
                     .add(&r);
+                if !t.check {
+                    u.jobs.entry(t.job).or_default().add(&r);
+                }
                 u.nodes
                     .entry((id.clone(), j.meta.account.clone()))
                     .or_default()

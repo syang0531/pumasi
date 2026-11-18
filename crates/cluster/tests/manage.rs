@@ -902,3 +902,136 @@ async fn sessions_survive_a_restart_and_end_with_their_ticket() {
     client.close().await;
     cluster.shutdown().await.unwrap();
 }
+
+/// 1.19: caps per job bind every job of the account, whoever submits it:
+/// a task asking for more memory than the cap is refused at submission,
+/// and a job that has spent its CU cap stops before its other tasks run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn caps_per_job() {
+    use pumasi_proto::manage::JobCaps;
+    init_tracing();
+    let cluster = start_cluster(tempdir("caps")).await.unwrap();
+    let ticket = cluster
+        .create_join_ticket(Duration::from_secs(60), None)
+        .unwrap();
+    let a = spawn_agent("a", 4, ticket).await;
+    wait_online(&cluster, 1).await;
+    let client = admin(&cluster).await;
+    // Runs cost something.
+    client
+        .call(AdminOp::SetPolicy(pumasi_proto::economy::Policy {
+            rates: pumasi_proto::economy::CuRates {
+                memory_gib_hour: 100_000_000_000_000_000,
+                ..Default::default()
+            },
+            hold_secs: 1,
+            verify_permille: 0,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    client
+        .call(AdminOp::Deposit {
+            account: "carol".into(),
+            amount: 1_000_000_000_000,
+            memo: "test".into(),
+        })
+        .await
+        .unwrap();
+    // One run at a time, so the cap is seen after the first.
+    client
+        .call(AdminOp::SetQuota {
+            account: "carol".into(),
+            quota: AccountQuota {
+                slots: Some(1),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let caps = JobCaps {
+        cpus: Some(1),
+        memory_bytes: Some(64 << 20),
+        cu: Some(1),
+    };
+    let AdminResponse::JobCaps(all) = client
+        .call(AdminOp::SetJobCaps {
+            account: "carol".into(),
+            caps,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(all, vec![("carol".to_string(), caps)]);
+    assert!(
+        client
+            .call(AdminOp::SetJobCaps {
+                account: "carol".into(),
+                caps: JobCaps {
+                    cpus: Some(0),
+                    ..Default::default()
+                },
+            })
+            .await
+            .is_err()
+    );
+
+    // The admin submitting for carol is bound too.
+    let mut big = submission(vec![vec!["x"]]);
+    big.account = Some("carol".into());
+    let err = client
+        .call(AdminOp::Submit(Box::new(big)))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("memory"), "{err:#}");
+
+    // Within the memory cap; the first run spends the CU cap.
+    let mut small = submission(vec![vec!["t", "slow"]; 3]);
+    small.account = Some("carol".into());
+    small.limits.memory_bytes = 32 << 20;
+    let id = submit(&client, small).await;
+    let v = wait_job(&client, id, 60).await;
+    assert_eq!(v.summary.state, JobState::Failed, "{v:#?}");
+    let ran = v
+        .tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Succeeded)
+        .count();
+    assert_eq!(ran, 1, "{v:#?}");
+    let AdminResponse::Events(events) = client
+        .call(AdminOp::Events {
+            after: 0,
+            since_unix: 0,
+            limit: 200,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(events.iter().any(|e| e.kind == "job.cu_cap"), "{events:#?}");
+
+    // Others' jobs are not bound; lifting the caps frees carol's.
+    let owners = submit(&client, submission(vec![vec!["o"]])).await;
+    assert_eq!(
+        wait_job(&client, owners, 60).await.summary.state,
+        JobState::Succeeded
+    );
+    client
+        .call(AdminOp::SetJobCaps {
+            account: "carol".into(),
+            caps: JobCaps::default(),
+        })
+        .await
+        .unwrap();
+    let AdminResponse::JobCaps(all) = client.call(AdminOp::JobCaps).await.unwrap() else {
+        panic!()
+    };
+    assert!(all.is_empty());
+
+    client.close().await;
+    a.handle.abort();
+    cluster.shutdown().await.unwrap();
+}

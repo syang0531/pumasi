@@ -127,6 +127,8 @@ pub(crate) struct Mgmt {
     pub schedules: BTreeMap<String, ScheduleRecord>,
     /// What each account's jobs may be (phase 15).
     pub policies: HashMap<String, pumasi_proto::manage::AccountPolicy>,
+    /// Caps on each job of an account (1.19).
+    pub job_caps: HashMap<String, pumasi_proto::manage::JobCaps>,
     /// When jobs with a queue timeout could first run (phase 15).
     pub ready_since: HashMap<JobId, std::time::Instant>,
     /// What a node said its run's parts took, until the run's report is
@@ -184,11 +186,130 @@ enum Deps {
     Failed(String),
 }
 
+/// The meta key of every account's caps per job (1.19).
+const JOB_CAPS_META: &str = "job_caps";
+
 impl State {
+    /// Every account's caps per job, by name.
+    pub fn job_caps_view(&self) -> Vec<(String, pumasi_proto::manage::JobCaps)> {
+        let mut v: Vec<_> = self
+            .mgmt
+            .job_caps
+            .iter()
+            .map(|(a, c)| (a.clone(), *c))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    pub fn job_caps(&self, account: &str) -> pumasi_proto::manage::JobCaps {
+        self.mgmt.job_caps.get(account).copied().unwrap_or_default()
+    }
+
+    /// Sets (replaces) an account's caps per job.
+    pub fn set_job_caps(
+        &mut self,
+        account: &str,
+        caps: pumasi_proto::manage::JobCaps,
+    ) -> Result<()> {
+        pumasi_proto::economy::validate_account(account)?;
+        caps.validate()?;
+        let mut all = self.mgmt.job_caps.clone();
+        if caps.is_empty() {
+            all.remove(account);
+        } else {
+            all.insert(account.to_string(), caps);
+        }
+        let mut rows: Vec<_> = all.iter().map(|(a, c)| (a.clone(), *c)).collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        self.store.put_meta_record(JOB_CAPS_META, &rows)?;
+        self.mgmt.job_caps = all;
+        info!(%account, caps = %caps.describe(), "caps per job set");
+        Ok(())
+    }
+
+    /// Why a job of `account` whose tasks each ask for `cpus` and
+    /// `memory_bytes` can never run under the account's caps per job.
+    pub(crate) fn check_job_caps(&self, account: &str, cpus: u32, memory_bytes: u64) -> Result<()> {
+        if let Some(why) = self.job_caps(account).refuse_task(cpus, memory_bytes) {
+            anyhow::bail!("{why} (`pumasi quota {account} --max-job-cpus/--max-job-memory`)");
+        }
+        Ok(())
+    }
+
+    /// The account's CU cap per job, once job `id` has spent it (1.19).
+    pub(crate) fn job_over_cu(&self, id: JobId) -> Option<pumasi_proto::economy::MilliCu> {
+        let j = self.jobs.get(&id)?;
+        let cap = self.mgmt.job_caps.get(&j.meta.account)?.cu?;
+        let spent: pumasi_proto::economy::MilliCu = j.tasks.iter().map(|t| t.cost).sum();
+        (spent >= cap).then_some(cap)
+    }
+
+    /// Fails the tasks of job `id` that have not run yet, once it has spent
+    /// its account's CU cap per job; runs under way finish (1.19).
+    pub(crate) fn stop_at_cu_cap(&mut self, id: JobId) {
+        let Some(cap) = self.job_over_cu(id) else {
+            return;
+        };
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return;
+        };
+        if job.meta.cancelled {
+            return;
+        }
+        let spent: pumasi_proto::economy::MilliCu = job.tasks.iter().map(|t| t.cost).sum();
+        let msg = format!(
+            "the job spent {} of the {} its account's jobs may each spend",
+            pumasi_proto::economy::format_cu(spent),
+            pumasi_proto::economy::format_cu(cap)
+        );
+        let stopped: Vec<u32> = (0..job.tasks.len() as u32)
+            .filter(|&i| job.tasks[i as usize].state == TaskState::Pending)
+            .collect();
+        if stopped.is_empty() {
+            return;
+        }
+        for &i in &stopped {
+            job.tasks[i as usize].state =
+                TaskState::Failed(pumasi_proto::msg::Outcome::Error(msg.clone()));
+        }
+        let refs: Vec<(u32, &crate::state::TaskRecord)> = stopped
+            .iter()
+            .map(|&i| (i, &job.tasks[i as usize]))
+            .collect();
+        if let Err(e) = self.store.put_tasks(id.0, &refs) {
+            warn!("persist tasks: {e:#}");
+        }
+        self.queue
+            .retain(|q| !(q.job == id && !q.check && stopped.contains(&q.index)));
+        warn!(job = %id, tasks = stopped.len(), "{msg}");
+        self.event(
+            pumasi_proto::monitor::EventLevel::Warning,
+            "job.cu_cap",
+            None,
+            Some(id),
+            pumasi_proto::text::Text::new(
+                "job.cu_cap",
+                [
+                    id.to_string(),
+                    pumasi_proto::economy::format_cu(spent),
+                    pumasi_proto::economy::format_cu(cap),
+                    stopped.len().to_string(),
+                ],
+            ),
+        );
+    }
+
     pub(crate) fn load_mgmt(&mut self, snap: MgmtSnapshot) -> Result<()> {
         self.mgmt.node_config = snap.node_config.into_iter().collect();
         self.mgmt.quotas = snap.account_quotas.into_iter().collect();
         self.mgmt.policies = snap.account_policies.into_iter().collect();
+        self.mgmt.job_caps = self
+            .store
+            .meta_record::<Vec<(String, pumasi_proto::manage::JobCaps)>>(JOB_CAPS_META)?
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         self.mgmt.preempted = snap
             .preempted
             .into_iter()
@@ -636,6 +757,19 @@ impl State {
             && r.over(&used, &crate::sched::use_of(need, 0)).is_some()
         {
             return false;
+        }
+        // What one job may hold at once (1.19).
+        if !need.item.check
+            && let Some(caps) = self.mgmt.job_caps.get(&need.consumer)
+        {
+            let held = usage.job(need.item.job);
+            if caps.cpus.is_some_and(|max| held.cpus + need.cpus > max)
+                || caps
+                    .memory_bytes
+                    .is_some_and(|max| held.memory_bytes + need.memory > max)
+            {
+                return false;
+            }
         }
         true
     }

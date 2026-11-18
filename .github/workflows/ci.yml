@@ -60,6 +60,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
           echo "PUMASI_TEST_WEBGPU=require" >> "$GITHUB_ENV"
+      - name: Pebble, a local ACME server, for the `--acme` test
+        if: runner.os == 'Linux'
+        run: |
+          GOBIN="$RUNNER_TEMP/pebble" go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.7.0
+          GOBIN="$RUNNER_TEMP/pebble" go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.7.0
+          echo "PEBBLE=$RUNNER_TEMP/pebble/pebble" >> "$GITHUB_ENV"
+          echo "PEBBLE_CHALLTESTSRV=$RUNNER_TEMP/pebble/pebble-challtestsrv" >> "$GITHUB_ENV"
       - name: Unit and end-to-end tests
         run: cargo test --workspace
       - name: Build sample module

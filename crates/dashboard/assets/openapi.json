@@ -672,7 +672,7 @@
             "description": "Long poll: wait up to this long for the job to finish (`30s`, `2m`; a bare number is seconds; at most 90s)"
           }
         ],
-        "description": "With `?wait=`, answers as soon as the job finishes (succeeded, failed or cancelled) or when the wait runs out, whichever comes first; check `summary.state`. Waits of more than 90s are cut to 90s, under the 100s a Cloudflare Tunnel allows. Each task carries `node_name` next to `node`, and how long it waited (`queued_ms`), fetched its inputs (`fetch_ms`), pulled its image (`pull_ms`), ran (`run_ms`) and stored its output (`upload_ms`). `wall_ms` and the receipt cover `run_ms` only."
+        "description": "With `?wait=`, answers as soon as the job finishes (the control plane says when, from 1.19; within about 100 ms) (succeeded, failed or cancelled) or when the wait runs out, whichever comes first; check `summary.state`. Waits of more than 90s are cut to 90s, under the 100s a Cloudflare Tunnel allows. Each task carries `node_name` next to `node`, and how long it waited (`queued_ms`), fetched its inputs (`fetch_ms`), pulled its image (`pull_ms`), ran (`run_ms`) and stored its output (`upload_ms`). `wall_ms` and the receipt cover `run_ms` only."
       }
     },
     "/api/v1/jobs/{id}/cancel": {
@@ -849,7 +849,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "Poll with `stdout_next` and `stderr_next` as the next offsets; when `attempt` changes the task started over and offsets restart at 0. `live` is false for microVM tasks, whose output comes when they end.",
+        "description": "Ask again with `stdout_next` and `stderr_next` as the next offsets; when `attempt` changes the task started over and offsets restart at 0. With `?wait=` (1.19) the answer comes as soon as there is output beyond the offsets, the run ends or starts over, or the wait runs out (at most 90s), so following a task needs no polling. `live` is false for microVM tasks on agents older than 1.6, whose output comes when they end.",
         "parameters": [
           {
             "name": "id",
@@ -891,6 +891,15 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Long poll: wait up to this long for more output (`30s`; a bare number is seconds; at most 90s)"
           }
         ]
       }
@@ -2392,6 +2401,27 @@
               },
               "usage": {
                 "$ref": "#/components/schemas/AccountUsage"
+              },
+              "max_job_cpus": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Whole CPUs one task of a job may ask for (1.19); applies to every job of the account, whoever submits it"
+              },
+              "max_job_memory_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Memory one task of a job may ask for, in bytes (1.19)"
+              },
+              "max_job_cu": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "What one job may spend, in thousandths of a CU (1.19): once it has, its tasks that have not run fail and those running finish"
               }
             },
             "required": [
@@ -2493,6 +2523,27 @@
           "usage": {
             "type": "object",
             "description": "Ignored, so that what GET answers can be sent back"
+          },
+          "max_job_cpus": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Whole CPUs one task of a job may ask for (1.19); applies to every job of the account, whoever submits it"
+          },
+          "max_job_memory_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Memory one task of a job may ask for, in bytes (1.19)"
+          },
+          "max_job_cu": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "What one job may spend, in thousandths of a CU (1.19): once it has, its tasks that have not run fail and those running finish"
           }
         }
       },

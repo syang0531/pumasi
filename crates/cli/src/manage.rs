@@ -13,9 +13,9 @@ use pumasi_proto::{
     economy::{format_cu, parse_cu, validate_account},
     job::{JobFile, JobId, parse_duration_ms},
     manage::{
-        AccessRole, AccessView, AccountPolicy, AccountQuota, ClusterFile, ListPatch, NodeEdit,
-        PolicyPatch, QuotaView, ScheduleSpec, ScheduleView, Selector, Taint, Toleration,
-        parse_executor, parse_network_rule,
+        AccessRole, AccessView, AccountPolicy, AccountQuota, ClusterFile, JobCaps, JobCapsPatch,
+        ListPatch, NodeEdit, PolicyPatch, QuotaView, ScheduleSpec, ScheduleView, Selector, Taint,
+        Toleration, parse_executor, parse_network_rule,
     },
     msg::{AccountView, AdminOp, AdminResponse, ClusterStatus, NodeView},
     store::{format_size, parse_size},
@@ -223,7 +223,7 @@ async fn call(home: &Path, admin: &AdminArgs, op: AdminOp) -> Result<AdminRespon
 }
 
 async fn status(client: &AdminClient) -> Result<ClusterStatus> {
-    match client.call(AdminOp::Status).await? {
+    match client.read(AdminOp::Status).await? {
         AdminResponse::Status(s) => Ok(s),
         _ => bail!("unexpected response"),
     }
@@ -399,6 +399,17 @@ pub struct PolicyArgs {
     /// Most GPUs per task; `none` lifts it.
     #[arg(long)]
     max_gpus_per_task: Option<String>,
+    /// CPUs one job's runs may hold at once (1.19), for every job of the
+    /// account; `none` lifts it.
+    #[arg(long)]
+    max_job_cpus: Option<String>,
+    /// Memory one job's runs may hold at once, e.g. 16G; `none` lifts it.
+    #[arg(long)]
+    max_job_memory: Option<String>,
+    /// CU one job may spend; once it has, its tasks that have not run
+    /// fail. `none` lifts it.
+    #[arg(long)]
+    max_job_cu: Option<String>,
     /// Adds image patterns to the ones allowed and keeps the rest.
     #[arg(long, value_delimiter = ',', conflicts_with = "images")]
     add_images: Vec<String>,
@@ -430,6 +441,18 @@ impl PolicyArgs {
             || self.max_timeout.is_some()
             || self.max_gpus_per_task.is_some()
             || !self.edits().is_empty()
+    }
+
+    /// `--max-job-cpus`, `--max-job-memory` and `--max-job-cu` (1.19).
+    fn caps(&self) -> Result<JobCapsPatch> {
+        Ok(JobCapsPatch {
+            cpus: limit(&self.max_job_cpus, |s| {
+                s.parse::<u32>().context("expected a number or `none`")
+            })
+            .context("--max-job-cpus")?,
+            memory_bytes: limit(&self.max_job_memory, parse_size).context("--max-job-memory")?,
+            cu: limit(&self.max_job_cu, parse_cu).context("--max-job-cu")?,
+        })
     }
 
     /// `--add-...` and `--remove-...`: changes to the lists that keep the
@@ -531,13 +554,21 @@ pub async fn quota(
             Ok(_) => resources(&client).await,
             Err(_) => None,
         };
+        let caps = match &list {
+            Ok(_) => job_caps(&client).await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
         client.close().await;
         print_quotas(&list?);
         if let Some(cpu) = cpu {
             print_resources(&cpu)?;
         }
+        for (a, c) in caps {
+            println!("caps per job of {a}: {}", c.describe());
+        }
         return Ok(0);
     };
+    let caps_patch = policy.caps()?;
     validate_account(&account)?;
     let num = |s: &str| s.parse::<u32>().context("expected a number or `none`");
     let slots = limit(&slots, num)?;
@@ -623,11 +654,36 @@ pub async fn quota(
                 .await?;
             r = Some(rq);
         }
-        anyhow::Ok((q, p, r))
+        let mut c = None;
+        if clear || !caps_patch.is_empty() {
+            let cur = job_caps(&client)
+                .await
+                .context("this control plane has no caps per job (they came in 1.19)")?;
+            let mut caps = if clear {
+                JobCaps::default()
+            } else {
+                cur.into_iter()
+                    .find(|(a, _)| *a == account)
+                    .map(|(_, c)| c)
+                    .unwrap_or_default()
+            };
+            caps_patch.apply(&mut caps)?;
+            client
+                .call(AdminOp::SetJobCaps {
+                    account: account.clone(),
+                    caps,
+                })
+                .await?;
+            c = Some(caps);
+        }
+        anyhow::Ok((q, p, r, c))
     };
     let r = set.await;
     client.close().await;
-    let (q, p, r) = r?;
+    let (q, p, r, c) = r?;
+    if let Some(c) = c {
+        eprintln!("caps per job of {account}: {}", c.describe());
+    }
     eprintln!("quota of {account}: {}", q.describe());
     if let Some(r) = r {
         // Written to the terminal, not logged (an account name is no secret).
@@ -636,6 +692,15 @@ pub async fn quota(
     }
     eprintln!("job policy of {account}: {}", p.describe());
     Ok(0)
+}
+
+/// Every account's caps per job (1.19); an error from an older control
+/// plane.
+async fn job_caps(client: &AdminClient) -> Result<Vec<(String, JobCaps)>> {
+    match client.call(AdminOp::JobCaps).await? {
+        AdminResponse::JobCaps(v) => Ok(v),
+        _ => bail!("unexpected response"),
+    }
 }
 
 /// CPU and memory quotas, for accounts that have one or hold something.
@@ -958,9 +1023,52 @@ pub async fn apply(
     let mut spec = ClusterFile::load(file, INLINE_INPUT_BYTES)?;
     spec.dry_run = dry_run;
     spec.prune = prune;
-    let AdminResponse::Applied(changes) = call(home, admin, AdminOp::apply(spec)).await? else {
-        bail!("unexpected response");
-    };
+    let caps = std::mem::take(&mut spec.job_caps);
+    let client = connect_admin(home, admin).await?;
+    let applied = async {
+        let AdminResponse::Applied(mut changes) = client.call(AdminOp::apply(spec)).await? else {
+            bail!("unexpected response");
+        };
+        // Caps per job (1.19) go on their own, for each account the file
+        // lists.
+        match job_caps(&client).await {
+            Ok(cur) => {
+                for (account, c) in caps {
+                    let now = cur
+                        .iter()
+                        .find(|(a, _)| *a == account)
+                        .map(|(_, c)| *c)
+                        .unwrap_or_default();
+                    if now == c {
+                        continue;
+                    }
+                    changes.push(format!(
+                        "account {account}: caps per job {} -> {}",
+                        now.describe(),
+                        c.describe()
+                    ));
+                    if !dry_run {
+                        client
+                            .call(AdminOp::SetJobCaps {
+                                account: account.clone(),
+                                caps: c,
+                            })
+                            .await?;
+                    }
+                }
+            }
+            Err(_) if caps.iter().all(|(_, c)| c.is_empty()) => {}
+            Err(e) => {
+                return Err(e.context(
+                    "the file sets caps per job, which this control plane does not have (they came in 1.19)",
+                ));
+            }
+        }
+        anyhow::Ok(changes)
+    }
+    .await;
+    client.close().await;
+    let changes = applied?;
     if changes.is_empty() {
         eprintln!("{}: nothing to change", file.display());
     }

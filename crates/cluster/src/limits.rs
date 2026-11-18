@@ -9,16 +9,45 @@
 //!   address itself, with the counts kept below.
 //! - The counts every `pumasi ui` process shares ([`LimitOp`]): token
 //!   buckets per ticket and per address starting a sign-in, and failed
-//!   sign-ins per address. They live in memory on the leader; a failover
-//!   starts them afresh, as a restart of one dashboard did before.
+//!   sign-ins per address. They live in memory on the leader, which
+//!   writes a copy into the replicated state every couple of seconds when
+//!   they changed (1.19), so a new leader, or the same one restarted,
+//!   takes them up: one write per interval, not one per request.
 
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::IpAddr,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use pumasi_proto::{
-    limit::{Bucket, Buckets, Failures, LimitOp, LimitReply},
+    limit::{Bucket, BucketCopy, Buckets, FailureCopy, Failures, LimitOp, LimitReply},
     msg::AdminOp,
 };
+use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+/// The meta key of the limits' copy in the state (1.19).
+pub(crate) const LIMITS_META: &str = "limits";
+
+/// What [`Limits`] hold, written into the state ([`LIMITS_META`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct LimitsCopy {
+    /// When the copy was made (UNIX milliseconds).
+    pub at_unix_ms: u64,
+    pub peers: Vec<BucketCopy>,
+    pub polls: Vec<BucketCopy>,
+    pub all: Vec<BucketCopy>,
+    pub tickets: Vec<BucketCopy>,
+    pub sign_ins: Vec<BucketCopy>,
+    pub failures: Vec<FailureCopy>,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
 
 /// Sign-in calls one peer may make in a burst, and per minute after it
 /// (`ClusterConfig::sign_in_per_min`).
@@ -40,6 +69,8 @@ pub(crate) struct Limits {
     tickets: Buckets<String>,
     sign_ins: Buckets<String>,
     failures: Failures<IpAddr>,
+    /// Something changed since the last [`Limits::copy`].
+    dirty: AtomicBool,
 }
 
 impl Default for Limits {
@@ -63,7 +94,49 @@ impl Limits {
             tickets: Buckets::for_bucket(Bucket::Ticket),
             sign_ins: Buckets::for_bucket(Bucket::SignIn),
             failures: Failures::default(),
+            dirty: AtomicBool::new(false),
         }
+    }
+
+    /// A copy to write into the state, when something changed since the
+    /// last one.
+    pub fn copy_if_changed(&self) -> Option<LimitsCopy> {
+        self.dirty
+            .swap(false, Ordering::Relaxed)
+            .then(|| self.copy())
+    }
+
+    pub fn copy(&self) -> LimitsCopy {
+        let now = Instant::now();
+        let s = |k: &String| k.clone();
+        LimitsCopy {
+            at_unix_ms: unix_ms(),
+            peers: self.peers.copy(now, s),
+            polls: self.polls.copy(now, s),
+            all: self.all.copy(now, |_| String::new()),
+            tickets: self.tickets.copy(now, s),
+            sign_ins: self.sign_ins.copy(now, s),
+            failures: self.failures.copy(now, |ip| ip.to_string()),
+        }
+    }
+
+    /// Takes up a copy the leader before wrote: what was spent and who is
+    /// blocked stays spent and blocked.
+    pub fn restore(&self, c: &LimitsCopy) {
+        let now = Instant::now();
+        let elapsed = Duration::from_millis(unix_ms().saturating_sub(c.at_unix_ms));
+        let s = |k: &str| Some(k.to_string());
+        self.peers.restore(&c.peers, elapsed, now, s);
+        self.polls.restore(&c.polls, elapsed, now, s);
+        self.all.restore(&c.all, elapsed, now, |_| Some(()));
+        self.tickets.restore(&c.tickets, elapsed, now, s);
+        self.sign_ins.restore(&c.sign_ins, elapsed, now, s);
+        self.failures
+            .restore(&c.failures, elapsed, now, |k| k.parse::<IpAddr>().ok());
+    }
+
+    fn touched(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Whether peer `peer` may make sign-in call `op` without a ticket
@@ -75,6 +148,7 @@ impl Limits {
             AdminOp::SsoDevicePoll { .. } => &self.polls,
             _ => &self.peers,
         };
+        self.touched();
         bucket.take(&peer.to_string())?;
         self.all.take(&())
     }
@@ -82,11 +156,15 @@ impl Limits {
     /// A call that carried a wrong credential of its own (a SCIM token):
     /// it costs the peer like a sign-in.
     pub fn wrong_credential(&self, peer: &str) -> Result<(), Duration> {
+        self.touched();
         self.peers.take(&peer.to_string())?;
         self.all.take(&())
     }
 
     pub fn call(&self, op: LimitOp) -> anyhow::Result<LimitReply> {
+        if !matches!(op, LimitOp::Blocked) {
+            self.touched();
+        }
         Ok(match op {
             LimitOp::Take { bucket, key, want } => {
                 anyhow::ensure!(key.len() <= 128, "limit key too long");
@@ -155,6 +233,54 @@ mod tests {
             }
         }
         assert!(refused, "no limit on all peers together");
+    }
+
+    #[test]
+    fn a_copy_keeps_blocks_and_spent_tokens() {
+        let l = Limits::default();
+        assert!(l.copy_if_changed().is_none());
+        for _ in 0..pumasi_proto::limit::MAX_FAILURES {
+            l.call(LimitOp::Failed {
+                ip: "198.51.100.7".into(),
+            })
+            .unwrap();
+        }
+        for _ in 0..3 {
+            l.call(LimitOp::Failed {
+                ip: "198.51.100.8".into(),
+            })
+            .unwrap();
+        }
+        for _ in 0..PEER_PER_MIN as u32 {
+            l.sign_in("p", &AdminOp::SsoDeviceStart).unwrap();
+        }
+        let c = l.copy_if_changed().expect("changed");
+        assert!(l.copy_if_changed().is_none());
+        let bytes = postcard::to_stdvec(&c).unwrap();
+        let back: LimitsCopy = postcard::from_bytes(&bytes).unwrap();
+        let next = Limits::default();
+        next.restore(&back);
+        let LimitReply::Blocked(b) = next.call(LimitOp::Blocked).unwrap() else {
+            panic!()
+        };
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert!(next.sign_in("p", &AdminOp::SsoDeviceStart).is_err());
+        // The open window came along: seven more block the other address.
+        for _ in 0..pumasi_proto::limit::MAX_FAILURES - 4 {
+            next.call(LimitOp::Failed {
+                ip: "198.51.100.8".into(),
+            })
+            .unwrap();
+        }
+        let LimitReply::Blocked(b) = next
+            .call(LimitOp::Failed {
+                ip: "198.51.100.8".into(),
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(b.len(), 2, "{b:?}");
     }
 
     #[test]

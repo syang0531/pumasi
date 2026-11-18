@@ -188,6 +188,11 @@ pub const TEXTS: &[(&str, &str, &str)] = &[
         "작업 {0}: 태스크 1개를 대기 시간 제한 {1} 안에 받은 노드 없음: {2}",
     ),
     (
+        "job.cu_cap",
+        "job {0} spent {1}, its account's cap per job ({2}): {3} tasks that had not run fail",
+        "작업 {0}이(가) {1}을(를) 써서 계정의 작업당 상한({2})에 닿음: 아직 안 돈 태스크 {3}개 실패",
+    ),
+    (
         "task.failed",
         "task {0}/{1} failed: {2}",
         "태스크 {0}/{1} 실패: {2}",

@@ -12,7 +12,7 @@ use maud::html;
 use pumasi_proto::{
     economy::{format_cu, parse_cu, validate_account},
     job::{Executor, format_duration_ms, parse_duration_ms},
-    manage::{ListPatch, PolicyPatch, QuotaView, parse_network_rule},
+    manage::{JobCaps, ListPatch, PolicyPatch, QuotaView, parse_network_rule},
     store::{format_size, parse_size},
 };
 use serde::Deserialize;
@@ -25,6 +25,19 @@ use crate::accounts::{self, QuotaPatch};
 
 /// The account's CPU and memory quota and use (1.9); `None` from an older
 /// control plane.
+/// The account's caps per job (1.19); `None` from an older control plane.
+async fn job_caps(ctx: &Ctx, name: &str) -> Option<JobCaps> {
+    match ctx.call(AdminOp::JobCaps).await {
+        Ok(AdminResponse::JobCaps(v)) => Some(
+            v.into_iter()
+                .find(|(a, _)| a == name)
+                .map(|(_, c)| c)
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    }
+}
+
 async fn resources(ctx: &Ctx, name: &str) -> Option<ResourceView> {
     match ctx.call(AdminOp::Resources).await {
         Ok(AdminResponse::Resources(v)) => Some(
@@ -146,6 +159,7 @@ async fn render(ctx: &Ctx, name: &str) -> anyhow::Result<Response> {
         None => anyhow::bail!("no such account: {name}"),
     };
     let res = resources(ctx, name).await;
+    let caps = job_caps(ctx, name).await;
     let q = &v.quota;
     let p = &v.policy;
     let has = |e: Executor| p.executors.contains(&e);
@@ -306,6 +320,29 @@ async fn render(ctx: &Ctx, name: &str) -> anyhow::Result<Response> {
                     }
                 }
             }
+            @if let Some(c) = &caps {
+                fieldset disabled[!admin] {
+                    legend { (l.t("Each job", "작업마다")) }
+                    p class="dim" { (l.t(
+                        "What one job of this account may hold at once and spend, whoever sends it. A job that has spent its CU fails its tasks that have not run. Empty: no limit.",
+                        "이 계정의 작업 하나가 한꺼번에 차지하고 쓸 수 있는 양입니다(누가 보냈든). CU를 다 쓴 작업은 아직 안 돈 태스크가 실패합니다. 비우면 한도가 없습니다."
+                    )) }
+                    div class="row" {
+                        div {
+                            label for="max_job_cpus" { "CPU" }
+                            input #max_job_cpus name="max_job_cpus" type="number" min="1" value=(num(c.cpus.map(|c| c.to_string())));
+                        }
+                        div {
+                            label for="max_job_memory" { (l.t("Memory", "메모리")) }
+                            input #max_job_memory name="max_job_memory" size="8" placeholder="16G" value=(num(c.memory_bytes.map(format_size)));
+                        }
+                        div {
+                            label for="max_job_cu" { "CU" }
+                            input #max_job_cu name="max_job_cu" size="8" value=(num(c.cu.map(format_cu)));
+                        }
+                    }
+                }
+            }
             @if admin {
                 div class="row" { button type="submit" { (l.t("Save", "저장")) } }
             } @else {
@@ -344,6 +381,9 @@ pub struct AccountForm {
     cpus: Option<String>,
     memory: Option<String>,
     label_quotas: Option<String>,
+    max_job_cpus: Option<String>,
+    max_job_memory: Option<String>,
+    max_job_cu: Option<String>,
 }
 
 fn opt(s: &Option<String>) -> Option<&str> {
@@ -418,6 +458,26 @@ impl AccountForm {
         Ok((policy, quota))
     }
 
+    /// The caps per job (1.19), when the form had those fields.
+    fn job_caps(&self) -> anyhow::Result<Option<JobCaps>> {
+        if self.max_job_cpus.is_none() && self.max_job_memory.is_none() && self.max_job_cu.is_none()
+        {
+            return Ok(None);
+        }
+        let c = JobCaps {
+            cpus: opt(&self.max_job_cpus)
+                .map(|v| {
+                    v.parse::<u32>()
+                        .map_err(|_| anyhow::anyhow!("CPUs per job: a whole number, or empty"))
+                })
+                .transpose()?,
+            memory_bytes: opt(&self.max_job_memory).map(parse_size).transpose()?,
+            cu: opt(&self.max_job_cu).map(parse_cu).transpose()?,
+        };
+        c.validate()?;
+        Ok(Some(c))
+    }
+
     /// The CPU and memory quota (1.9), when the form had those fields.
     fn resources(&self) -> anyhow::Result<Option<ResourceQuota>> {
         if self.cpus.is_none() && self.memory.is_none() && self.label_quotas.is_none() {
@@ -457,12 +517,20 @@ pub async fn save(
         validate_account(&name)?;
         let (policy, quota) = f.patches()?;
         let res = f.resources()?;
+        let caps = f.job_caps()?;
         let v =
             accounts::patch(&ctx.st, ctx.me.secret, &ctx.me.role, &name, &policy, &quota).await?;
         if let Some(q) = res {
             ctx.call(AdminOp::SetResources {
                 account: name.clone(),
                 quota: Box::new(q),
+            })
+            .await?;
+        }
+        if let Some(caps) = caps {
+            ctx.call(AdminOp::SetJobCaps {
+                account: name.clone(),
+                caps,
             })
             .await?;
         }

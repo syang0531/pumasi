@@ -474,6 +474,9 @@ const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 pub struct Store {
     db: Arc<Database>,
     sink: Sink,
+    /// Bumped whenever tasks are written (1.19): what `?wait=` and
+    /// `logs -f` wait on instead of asking again and again.
+    changes: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 /// Everything loaded at startup.
@@ -550,7 +553,19 @@ impl Store {
         Self {
             db: self.db.clone(),
             sink,
+            changes: self.changes.clone(),
         }
+    }
+
+    /// A receiver that sees every later write of tasks, and every
+    /// [`Self::touch`].
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Wakes whoever waits on [`Self::changes`] (live output came in).
+    pub fn touch(&self) {
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// The database, shared with the Raft state machine.
@@ -683,6 +698,7 @@ impl Store {
         let store = Self {
             db,
             sink: Sink::Direct,
+            changes: Arc::new(tokio::sync::watch::channel(0).0),
         };
         if schema < 2 {
             store.migrate_v1()?;
@@ -1351,6 +1367,7 @@ impl Store {
     }
 
     pub fn put_tasks(&self, job: u128, tasks: &[(u32, &TaskRecord)]) -> Result<()> {
+        self.touch();
         let mut b = Batch::default();
         for (i, task) in tasks {
             b.put(TASKS, (job, *i), enc(*task).as_slice());

@@ -143,10 +143,93 @@ impl<K: std::hash::Hash + Eq + Clone> Buckets<K> {
         *at = now;
         let got = (tokens.floor() as u32).min(want);
         *tokens -= f64::from(got);
-        if got > 0 {
+        if got > 0 || want == 0 {
             (got, Duration::ZERO)
         } else {
-            (0, Duration::from_secs_f64((1.0 - *tokens) / self.per_sec))
+            (0, Duration::from_secs_f64((1.0 - *tokens).max(0.0) / self.per_sec))
+        }
+    }
+}
+
+/// A copy of what a [`Buckets`] or [`Failures`] holds, as ages rather than
+/// instants, so it can be written down and taken up by another process
+/// (1.19: the leader replicates its limits, so a failover keeps them).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BucketCopy {
+    pub key: String,
+    pub tokens: f64,
+    /// How long before the copy was made the bucket was last filled up.
+    pub age_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureCopy {
+    pub key: String,
+    /// Failures in the current window and how old the window is.
+    pub failures: u32,
+    pub window_age_ms: Option<u64>,
+    /// How long the block still lasts.
+    pub blocked_ms: Option<u64>,
+}
+
+/// Entries a copy keeps at most per kind (the emptiest buckets first).
+pub const MAX_COPIED: usize = 2_000;
+
+fn ms(d: Duration) -> u64 {
+    d.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+impl<K: std::hash::Hash + Eq + Clone> Buckets<K> {
+    /// The buckets that are not full (a full bucket is the same as none),
+    /// emptiest first, at most [`MAX_COPIED`]; `name` turns a key into
+    /// text.
+    pub fn copy(&self, now: Instant, name: impl Fn(&K) -> String) -> Vec<BucketCopy> {
+        let map = self.map.lock().unwrap();
+        let mut out: Vec<BucketCopy> = map
+            .iter()
+            .filter_map(|(k, (t, at))| {
+                let age = now.saturating_duration_since(*at);
+                let level = (*t + age.as_secs_f64() * self.per_sec).min(self.burst);
+                (level < self.burst).then(|| BucketCopy {
+                    key: name(k),
+                    tokens: *t,
+                    age_ms: ms(age),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.tokens.total_cmp(&b.tokens));
+        out.truncate(MAX_COPIED);
+        out
+    }
+
+    /// Takes up a copy made `elapsed` ago: each bucket becomes the copy's
+    /// level, or stays lower when it already is.
+    pub fn restore(
+        &self,
+        copy: &[BucketCopy],
+        elapsed: Duration,
+        now: Instant,
+        key: impl Fn(&str) -> Option<K>,
+    ) {
+        let mut map = self.map.lock().unwrap();
+        for c in copy {
+            let Some(k) = key(&c.key) else { continue };
+            if map.len() >= MAX_TRACKED && !map.contains_key(&k) {
+                break;
+            }
+            let at = now
+                .checked_sub(Duration::from_millis(c.age_ms) + elapsed)
+                .unwrap_or(now);
+            let tokens = c.tokens.clamp(0.0, self.burst);
+            let level = |t: f64, at: Instant| {
+                t + now.saturating_duration_since(at).as_secs_f64() * self.per_sec
+            };
+            match map.get(&k) {
+                Some(&(t, a)) if level(t, a) <= level(tokens, at) => {}
+                _ => {
+                    map.insert(k, (tokens, at));
+                }
+            }
         }
     }
 }
@@ -202,6 +285,66 @@ impl<K: std::hash::Hash + Eq + Clone> Failures<K> {
         let e = map.entry(key).or_default();
         if e.blocked_until.is_none_or(|u| u < until) {
             e.blocked_until = Some(until);
+        }
+    }
+
+    /// Keys with failures in an open window or a block, at most
+    /// [`MAX_COPIED`] (blocks first).
+    pub fn copy(&self, now: Instant, name: impl Fn(&K) -> String) -> Vec<FailureCopy> {
+        let window = Duration::from_secs(WINDOW_SECS);
+        let map = self.map.lock().unwrap();
+        let mut out: Vec<FailureCopy> = map
+            .iter()
+            .filter_map(|(k, e)| {
+                let blocked = e.blocked_until.filter(|u| *u > now).map(|u| ms(u - now));
+                let window = e
+                    .window_start
+                    .map(|s| now.saturating_duration_since(s))
+                    .filter(|age| *age < window && e.failures > 0);
+                (blocked.is_some() || window.is_some()).then(|| FailureCopy {
+                    key: name(k),
+                    failures: if window.is_some() { e.failures } else { 0 },
+                    window_age_ms: window.map(ms),
+                    blocked_ms: blocked,
+                })
+            })
+            .collect();
+        out.sort_by_key(|c| (c.blocked_ms.is_none(), std::cmp::Reverse(c.failures)));
+        out.truncate(MAX_COPIED);
+        out
+    }
+
+    /// Takes up a copy made `elapsed` ago, keeping whatever is worse of the
+    /// copy and what is here already.
+    pub fn restore(
+        &self,
+        copy: &[FailureCopy],
+        elapsed: Duration,
+        now: Instant,
+        key: impl Fn(&str) -> Option<K>,
+    ) {
+        let mut map = self.map.lock().unwrap();
+        for c in copy {
+            let Some(k) = key(&c.key) else { continue };
+            if map.len() >= MAX_TRACKED && !map.contains_key(&k) {
+                break;
+            }
+            let e = map.entry(k).or_default();
+            if let Some(left) = c.blocked_ms.map(Duration::from_millis)
+                && let Some(left) = left.checked_sub(elapsed)
+            {
+                let until = now + left;
+                if e.blocked_until.is_none_or(|u| u < until) {
+                    e.blocked_until = Some(until);
+                }
+            }
+            if let Some(age) = c.window_age_ms.map(Duration::from_millis)
+                && c.failures > e.failures
+                && let Some(start) = now.checked_sub(age + elapsed)
+            {
+                e.window_start = Some(start);
+                e.failures = c.failures;
+            }
         }
     }
 
@@ -273,6 +416,39 @@ mod tests {
         assert!(f.blocked(&"b").is_none());
         f.block_until("b", Instant::now() + Duration::from_secs(30));
         assert_eq!(f.all_blocked().len(), 2);
+    }
+
+    #[test]
+    fn copies_carry_levels_failures_and_blocks() {
+        let now = Instant::now();
+        let b: Buckets<String> = Buckets::new(10.0, 1.0);
+        assert_eq!(b.take_up_to_at(&"a".to_string(), 8, now).0, 8);
+        b.take_up_to_at(&"full".to_string(), 0, now);
+        let copy = b.copy(now, |k| k.clone());
+        assert_eq!(copy.len(), 1, "full buckets are left out: {copy:?}");
+        let other: Buckets<String> = Buckets::new(10.0, 1.0);
+        other.restore(&copy, Duration::ZERO, now, |k| Some(k.to_string()));
+        assert_eq!(other.take_up_to_at(&"a".to_string(), 8, now).0, 2);
+
+        let f: Failures<String> = Failures::default();
+        for _ in 0..4 {
+            f.failed("x".into());
+        }
+        for _ in 0..MAX_FAILURES {
+            f.failed("y".into());
+        }
+        let copy = f.copy(Instant::now(), |k| k.clone());
+        assert_eq!(copy.len(), 2);
+        let g: Failures<String> = Failures::default();
+        g.restore(&copy, Duration::from_secs(1), Instant::now(), |k| {
+            Some(k.to_string())
+        });
+        assert!(g.blocked(&"y".to_string()).is_some());
+        // Four failures came along: six more block.
+        for _ in 0..MAX_FAILURES - 5 {
+            assert!(!g.failed("x".into()));
+        }
+        assert!(g.failed("x".into()));
     }
 
     #[test]

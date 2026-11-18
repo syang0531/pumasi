@@ -4160,7 +4160,8 @@ from upgraded agents do not raise `perf.drop` against version 1 ones.
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 36 are done ([roadmap.md](roadmap.md));
+- Roadmap: phases 20 to 36 are done and 37 to 45 (1.21 to 1.29) are
+  planned ([roadmap.md](roadmap.md));
   phases 18 and 19 (the hub and buying CU) are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it
   (people still appear when they first sign in), filters support only

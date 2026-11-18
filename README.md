@@ -1996,7 +1996,7 @@ paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane, phase 30 (1.14) old Intel Macs, phase 31 (1.15) what monitoring and the dashboard had left, phase 32 (1.16) GPUs, phase 33 (1.17) Windows, phase 34 (1.18) the file store and microVM networks, phase 35 (1.19) high availability and the remote API and phase 36 (1.20) result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane, phase 30 (1.14) old Intel Macs, phase 31 (1.15) what monitoring and the dashboard had left, phase 32 (1.16) GPUs, phase 33 (1.17) Windows, phase 34 (1.18) the file store and microVM networks, phase 35 (1.19) high availability and the remote API and phase 36 (1.20) result checks for work that is not deterministic. Phases 37 to 45 (1.21 to 1.29) are planned: retries, reruns and periodic checkpoints, energy and electricity against earnings, the dashboard's CLI-only leftovers and push alerts, faster microVMs for old Macs, GPU honeypots and health, the store as a folder, Docker allow lists on Windows, signed releases and leadership transfer, and what outside providers need; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -2035,6 +2035,15 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 34 | File store and microVM networks: node cache quotas, private images through the store, UDP, IPv6, per-job allow lists, bandwidth caps, billed egress, Firecracker networks on TAP devices | done (1.18) |
 | 35 | High availability and the remote API: the API and CLI reading from followers, limits replicated across failovers, replicas that move, pushed `?wait=`, per-job CPU, memory and CU caps, ACME | done (1.19) |
 | 36 | Result checks: honeypot tasks with known answers, disk and memory challenges, periodic re-benchmarks, a score per provider | done (1.20) |
+| 37 | Cluster management: retries on failure, reruns of failed tasks, suspended jobs, periodic checkpoints, each task's CPU, memory, disk and network use, schedules with allow lists | planned (1.21) |
+| 38 | Monitoring: energy per task, electricity cost against CU earned (and an estimate before joining), pausing above a temperature, CPU power without root on Linux, Telegram, ntfy and email alerts, longer history | planned (1.22) |
+| 39 | Dashboard: honeypots, holds and score history in the browser, retries, reruns and suspend, `cluster.toml` job files and prune, your own binaries for canaries, Web Push alerts on the phone | planned (1.23) |
+| 40 | MicroVMs and old Intel Macs: warm guests for network tasks, snapshots for first tasks, memory given back by a balloon, ICMP, fan speeds and a stopped-fan alert | planned (1.24) |
+| 41 | GPUs: built-in GPU honeypots, GPU time and memory per task, Xid, ECC and throttling events with GPUs cordoned on repeated errors, more WebGPU features | planned (1.25) |
+| 42 | File store: datasets mounted as folders over WebDAV, retention by versions and age, sharing between accounts, cache quotas per dataset | planned (1.26) |
+| 43 | Windows and Docker networks: allow lists, caps and billed egress for Docker (root Linux agents and the WSL distro), a Windows agent without administrator, rotated service logs; HCS and signing when real-PC numbers and SignPath arrive | planned (1.27) |
+| 44 | Operations and supply chain: openraft 0.10 leadership transfer, upgrades across protocol changes, signed releases with expiry and key rotation, tickets that follow the cluster, jiff, SCIM creating accounts, ACME DNS-01 | planned (1.28) |
+| 45 | Providers: honeypots without a pattern and with more images, deposits held from earnings, the confidential tier's scratch disk, network, TCB minimum and leases | planned (1.29) |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | on hold |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | on hold |
 
@@ -2076,11 +2085,11 @@ silence` stay off it (the Events page lists them all).
 The control plane upgrades itself only within one agent protocol (a
 protocol change still goes to it by hand first), and replicas from before
 1.13 are upgraded by hand once. The remote API has
-no built-in tunnel or certificate renewal (Cloudflare Tunnel, a reverse
-proxy or certbot do that), limits shared between dashboards live in the
-leader's memory (a failover resets them), uploads
-through Cloudflare stop at its plan's body limit, and `?wait=` follows a
-job by polling the control plane. Drawing in Docker is checked on real
+no built-in tunnel (Cloudflare Tunnel or a reverse proxy does that), and
+its own certificates (ACME, 1.19) use HTTP-01 or TLS-ALPN-01, so no
+wildcards; limits shared between dashboards are written down every 2
+seconds, so a leader that crashes can lose the last 2 seconds of counts;
+and uploads through Cloudflare stop at its plan's body limit. Drawing in Docker is checked on real
 GPUs by hand; EEVEE on a Linux host runs under Xvfb and so on the CPU
 unless the image brings its own GPU display (Cycles is not affected). Confidential VMs are checked in CI with a
 test stand-in for the TEE (an ordinary microVM that cannot attest for

@@ -365,10 +365,15 @@ async fn a_provider_that_fails_honeypots_is_held_and_placed_last() {
         .any(|t| t.node.as_deref() == Some(cheat.as_str()));
     tokio::time::sleep(Duration::from_secs(3)).await;
     let alice = account(&client, "alice").await;
-    assert!(alice.earned > 0 && alice.held == 0, "{alice:?}");
+    assert!(
+        alice.earned > 0 && alice.held == 0,
+        "earned {} held {}",
+        alice.earned,
+        alice.held
+    );
     let mallory = account(&client, "mallory").await;
     if cheat_ran {
-        assert!(mallory.held > 0, "{mallory:?}");
+        assert!(mallory.held > 0, "nothing held");
     }
     // The owner lets them go: they wait out the usual hold.
     let v = verify(
@@ -387,7 +392,7 @@ async fn a_provider_that_fails_honeypots_is_held_and_placed_last() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(released, "{:?}", account(&client, "mallory").await);
+    assert!(released, "still held");
 
     // With both idle, single tasks go to the node with the higher score.
     for _ in 0..3 {

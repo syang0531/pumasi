@@ -1241,8 +1241,13 @@ impl State {
                 let Some(d) = profile.disk.as_ref().filter(|d| d.direct) else {
                     continue;
                 };
-                // A quarter of its free space at most.
-                let room = (d.free_bytes / 4) / DISK_CHUNK as u64 * DISK_CHUNK as u64;
+                // A quarter of its free space at most (when the agent knew
+                // it).
+                let room = if d.free_bytes == 0 {
+                    disk_bytes
+                } else {
+                    (d.free_bytes / 4) / DISK_CHUNK as u64 * DISK_CHUNK as u64
+                };
                 let bytes = disk_bytes.min(room);
                 if bytes < MIN_DISK_BYTES.min(disk_bytes) {
                     debug!(node = %id, "too little free disk for a disk challenge");

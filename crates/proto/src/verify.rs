@@ -757,7 +757,7 @@ mod tests {
 
     #[test]
     fn disk_answers_agree_from_data_and_folds() {
-        let (seed, nonce) = (7, 99);
+        let (seed, nonce): (u64, u64) = (rand::random(), rand::random());
         let bytes = 4 * DISK_CHUNK as u64;
         let folds = disk_folds(seed, bytes);
         assert_eq!(folds.len(), 4 * BLOCKS_PER_CHUNK);

@@ -523,6 +523,12 @@ struct DriveInfo {
 
 fn drive_info(dir: &Path) -> DriveInfo {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    // Windows canonicalizes to `\\?\D:\...`, which no mount point (`D:\`)
+    // is a prefix of.
+    let dir = match dir.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) if !plain.starts_with("UNC\\") => PathBuf::from(plain),
+        _ => dir,
+    };
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let best = disks
         .list()

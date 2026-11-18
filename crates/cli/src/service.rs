@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand};
 
 /// Exit code of an agent that must restart (after an upgrade or a
@@ -189,6 +189,23 @@ pub enum ServiceCmd {
         #[command(flatten)]
         scope: ScopeArgs,
     },
+    /// Linux: let agents that do not run as root read the CPU package's
+    /// power (RAPL), which kernels since 5.10 show to root alone (1.22).
+    /// Writes a udev rule that gives the counters to a group, creates the
+    /// group and adds USER to it. Needs root; `service install` of a
+    /// system service does it by itself.
+    Rapl {
+        /// The group that may read them.
+        #[arg(long, default_value = RAPL_GROUP)]
+        group: String,
+        /// Add this user to the group (they log in again, or restart their
+        /// user service, to get it).
+        #[arg(long, value_name = "USER")]
+        add_user: Option<String>,
+        /// Print the rule instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// What an installed service runs: the role's command with the
     /// options in its options file (or, for services installed before
     /// 1.4 on Windows, the ones after `--`).
@@ -199,6 +216,96 @@ pub enum ServiceCmd {
         #[arg(last = true)]
         args: Vec<String>,
     },
+}
+
+/// Where `service rapl` writes its udev rule.
+pub const RAPL_RULE_FILE: &str = "/etc/udev/rules.d/60-pumasi-rapl.rules";
+
+/// The group that reads the RAPL counters by default.
+pub const RAPL_GROUP: &str = "pumasi";
+
+/// The udev rule that lets `group` read every RAPL domain's energy
+/// counter (Intel, and AMD Zen through the same driver), applied as each
+/// powercap zone appears.
+pub fn rapl_rule(group: &str) -> String {
+    format!(
+        "# Written by `pumasi service rapl`: lets the {group} group read the CPU's\n\
+         # energy counters (RAPL), which the kernel shows to root alone.\n\
+         ACTION==\"add|change\", SUBSYSTEM==\"powercap\", KERNEL==\"intel-rapl:*\", \
+         RUN+=\"/bin/chgrp {group} /sys%p/energy_uj\", RUN+=\"/bin/chmod g+r /sys%p/energy_uj\"\n"
+    )
+}
+
+/// A group name `groupadd` takes (and safe inside the rule).
+pub fn valid_group(g: &str) -> bool {
+    !g.is_empty()
+        && g.len() <= 32
+        && g.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && g.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// Whether this user can read a RAPL counter now; `None` where the
+/// machine has none (not Linux, a VM, a container).
+pub fn rapl_readable() -> Option<bool> {
+    let dir = std::fs::read_dir("/sys/class/powercap").ok()?;
+    let mut any = None;
+    for e in dir.flatten() {
+        if !e.file_name().to_string_lossy().starts_with("intel-rapl:") {
+            continue;
+        }
+        let f = e.path().join("energy_uj");
+        if !f.exists() {
+            continue;
+        }
+        if std::fs::read_to_string(&f).is_ok() {
+            return Some(true);
+        }
+        any = Some(false);
+    }
+    any
+}
+
+/// `service rapl`: the rule, the group and the user (Linux, as root).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn install_rapl(group: &str, add_user: Option<&str>, dry_run: bool) -> Result<i32> {
+    ensure!(valid_group(group), "{group:?} is not a group name");
+    if let Some(u) = add_user {
+        ensure!(
+            !u.is_empty() && !u.starts_with('-') && !u.contains(char::is_whitespace),
+            "{u:?} is not a user name"
+        );
+    }
+    if dry_run {
+        println!("# {RAPL_RULE_FILE}");
+        print!("{}", rapl_rule(group));
+        return Ok(0);
+    }
+    ensure!(
+        cfg!(target_os = "linux"),
+        "only Linux keeps the CPU's power from other users"
+    );
+    ensure!(is_root(), "writing a udev rule needs root: use sudo");
+    if !run_cmd("getent", &["group", group]).is_ok_and(|o| o.status.success()) {
+        check_cmd("groupadd", &["--system", group])?;
+        println!("created the group {group}");
+    }
+    std::fs::write(RAPL_RULE_FILE, rapl_rule(group))
+        .with_context(|| format!("write {RAPL_RULE_FILE}"))?;
+    println!("wrote {RAPL_RULE_FILE}");
+    check_cmd("udevadm", &["control", "--reload-rules"])?;
+    check_cmd(
+        "udevadm",
+        &["trigger", "--subsystem-match=powercap", "--action=add"],
+    )?;
+    if let Some(u) = add_user {
+        check_cmd("usermod", &["-aG", group, u])?;
+        println!(
+            "added {u} to {group}: it takes effect at their next login (or `systemctl --user restart pumasi-agent`)"
+        );
+    }
+    println!("the {group} group can read the CPU's power now");
+    Ok(0)
 }
 
 #[derive(Args, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1871,6 +1978,31 @@ pub mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule `service install --dry-run` prints for a system agent
+    /// (and `service rapl` writes): one udev rule for every RAPL zone that
+    /// hands its energy counter to the group.
+    #[test]
+    fn the_rapl_rule_gives_the_counters_to_the_group() {
+        let rule = rapl_rule(RAPL_GROUP);
+        let lines: Vec<&str> = rule.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(lines.len(), 1, "{rule}");
+        let r = lines[0];
+        assert!(r.starts_with(
+            "ACTION==\"add|change\", SUBSYSTEM==\"powercap\", KERNEL==\"intel-rapl:*\""
+        ));
+        assert!(r.contains("RUN+=\"/bin/chgrp pumasi /sys%p/energy_uj\""));
+        assert!(r.contains("RUN+=\"/bin/chmod g+r /sys%p/energy_uj\""));
+        assert!(rule.ends_with('\n'));
+        assert_eq!(RAPL_RULE_FILE, "/etc/udev/rules.d/60-pumasi-rapl.rules");
+        assert!(rapl_rule("power").contains("chgrp power "));
+        assert!(valid_group("pumasi") && valid_group("_rapl-1"));
+        assert!(!valid_group("") && !valid_group("Pumasi") && !valid_group("a b"));
+        assert!(!valid_group("x\"; RUN+=\"/bin/sh"));
+        // A dry run prints and changes nothing, as anyone.
+        assert_eq!(install_rapl(RAPL_GROUP, None, true).unwrap(), 0);
+        assert!(install_rapl("bad group", None, true).is_err());
+    }
 
     /// A service as releases before 1.4 installed it: options inline.
     fn spec() -> Spec {

@@ -149,7 +149,7 @@ pub async fn page(ctx: Ctx, Query(q): Query<EventsQuery>) -> Response {
                 ul class="plain" {
                     @for w in &alerts.webhooks {
                         li {
-                            strong { (w.name) } " · " code { (w.target) } " · " (format!("{:?}", w.format).to_lowercase())
+                            strong { (w.name) } " · " code { (w.target) } " · " (w.format.to_string())
                             br; span class="dim" { (w.sent) " " (l.t("sent", "전송")) ", " (w.failed) " " (l.t("failed", "실패"))
                                 @if let Some(e) = &w.last_error { " — " (e) } }
                             @if admin {
@@ -169,8 +169,15 @@ pub async fn page(ctx: Ctx, Query(q): Query<EventsQuery>) -> Response {
                                 option value="" { (l.t("guess from the URL", "URL로 추측")) }
                                 option value="slack" { "Slack / Mattermost" }
                                 option value="discord" { "Discord" }
+                                option value="telegram" { "Telegram" }
+                                option value="ntfy" { "ntfy" }
+                                option value="email" { (l.t("Email (SMTP)", "이메일(SMTP)")) }
                                 option value="json" { "JSON" }
                             }
+                        }
+                        p class="dim" {
+                            (l.t("Telegram: https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID> · ntfy: https://ntfy.sh/<topic> · email: smtp://user:password@host:587?from=a@x.org&to=b@x.org",
+                                 "Telegram: https://api.telegram.org/bot<토큰>/sendMessage?chat_id=<ID> · ntfy: https://ntfy.sh/<토픽> · 이메일: smtp://사용자:비밀번호@호스트:587?from=a@x.org&to=b@x.org"))
                         }
                         button { (l.t("Add webhook", "웹훅 추가")) }
                     }

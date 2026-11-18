@@ -11,6 +11,8 @@ use tokio::{
 };
 use tracing::debug;
 
+use pumasi_proto::monitor::{MailTarget, WebhookFormat};
+
 use crate::{monitor::Delivery, server::Inner};
 
 /// Largest request head read.
@@ -124,7 +126,7 @@ pub(crate) async fn webhook_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedRec
 /// how it went.
 pub(crate) fn deliver(inner: Arc<Inner>, d: Delivery) {
     tokio::spawn(async move {
-        let result = post(&d.url, &d.body).await;
+        let result = send(&d).await;
         inner.state().on_delivery(&d.webhook, result.clone());
         if let Some(reply) = d.reply {
             let _ = reply.send(result);
@@ -132,20 +134,70 @@ pub(crate) fn deliver(inner: Arc<Inner>, d: Delivery) {
     });
 }
 
-async fn post(url: &str, body: &str) -> Result<(), String> {
+/// Sends a notice the way its webhook's format wants (1.22: Telegram,
+/// ntfy and email besides the POSTs of 1.6).
+pub(crate) async fn send(d: &Delivery) -> Result<(), String> {
+    match d.format {
+        WebhookFormat::Email => {
+            let target = MailTarget::parse(&d.url).map_err(|e| format!("{e:#}"))?;
+            let tls = crate::smtp::client_tls().map_err(|e| format!("{e:#}"))?;
+            let mut last = String::new();
+            for attempt in 0..=RETRY_WAITS.len() {
+                if attempt > 0 {
+                    tokio::time::sleep(RETRY_WAITS[attempt - 1]).await;
+                }
+                match crate::smtp::send(&target, &d.subject, &d.body, tls.clone()).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = format!("{e:#}"),
+                }
+            }
+            Err(last)
+        }
+        WebhookFormat::Ntfy => {
+            // Credentials in the URL become basic authentication.
+            let (root, _) = crate::monitor::ntfy_target(&d.url);
+            let (root, auth) = split_userinfo(&root);
+            post(&root, &d.body, auth).await
+        }
+        _ => post(&d.url, &d.body, None).await,
+    }
+}
+
+/// A URL without `user:password@`, and those.
+fn split_userinfo(url: &str) -> (String, Option<(String, String)>) {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return (url.to_string(), None);
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    match authority.rsplit_once('@') {
+        Some((cred, host)) => {
+            let (u, p) = cred.split_once(':').unwrap_or((cred, ""));
+            (
+                format!("{scheme}://{host}{path}"),
+                Some((u.to_string(), p.to_string())),
+            )
+        }
+        None => (url.to_string(), None),
+    }
+}
+
+async fn post(url: &str, body: &str, auth: Option<(String, String)>) -> Result<(), String> {
     let client = pumasi_proto::registry::http_client().map_err(|e| format!("{e:#}"))?;
     let mut last = String::new();
     for attempt in 0..=RETRY_WAITS.len() {
         if attempt > 0 {
             tokio::time::sleep(RETRY_WAITS[attempt - 1]).await;
         }
-        let res = client
+        let mut req = client
             .post(url)
             .header("content-type", "application/json")
             .body(body.to_string())
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await;
+            .timeout(Duration::from_secs(10));
+        if let Some((u, p)) = &auth {
+            req = req.basic_auth(u, Some(p));
+        }
+        let res = req.send().await;
         match res {
             Ok(r) if r.status().is_success() => return Ok(()),
             Ok(r) => {

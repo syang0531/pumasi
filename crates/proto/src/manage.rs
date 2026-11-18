@@ -1414,6 +1414,12 @@ pub struct ApplySpec {
     /// Schedules listed without a `job`: they keep the job they have.
     #[serde(skip)]
     pub keep_jobs: Vec<String>,
+    /// 1.22, never on the wire inside the spec: `pumasi apply` sends each
+    /// node's electricity and temperature settings with
+    /// [`AdminOp::SetNodeEnergy`](crate::msg::AdminOp) once the rest is
+    /// applied.
+    #[serde(skip)]
+    pub energy: Vec<(String, crate::energy::NodeEnergy)>,
 }
 
 /// What an `apply` has beyond [`ApplySpec`]'s wire layout and
@@ -1604,6 +1610,11 @@ impl ApplySpec {
 ///
 /// [alerts.labels."os=windows"]    # any node selector
 /// node_offline = "30m"
+///
+/// [nodes.gpu-pc]                  # 1.22: electricity and heat
+/// electricity_price = 120         # won per kWh
+/// cheap_hours = "23-07@80"        # cheaper hours and their price
+/// max_temperature = 85            # no new tasks while hotter
 ///
 /// [silences.imac-move]
 /// rule = "node_offline"           # left out: every rule
@@ -1935,6 +1946,56 @@ pub struct NodeFile {
     #[serde(default)]
     pub taints: Vec<String>,
     pub cordoned: Option<bool>,
+    // 1.22: electricity and temperature. When any is given, the file
+    // states all three (left-out ones are removed).
+    /// Won per kWh.
+    pub electricity_price: Option<NumberOrText>,
+    /// Cheaper hours and their price: `"23-07@80"`.
+    pub cheap_hours: Option<String>,
+    /// Pause while a sensor stays over this many °C.
+    pub max_temperature: Option<NumberOrText>,
+}
+
+impl NodeFile {
+    /// The node's electricity and temperature settings, when the file
+    /// gives any.
+    pub fn energy(&self) -> Result<Option<crate::energy::NodeEnergy>> {
+        if self.electricity_price.is_none()
+            && self.cheap_hours.is_none()
+            && self.max_temperature.is_none()
+        {
+            return Ok(None);
+        }
+        let mut e = crate::energy::NodeEnergy::default();
+        crate::energy::NodeEnergyPatch {
+            price: Some(
+                self.electricity_price
+                    .as_ref()
+                    .map(|p| crate::energy::parse_price(&p.text()))
+                    .transpose()
+                    .context("electricity_price")?
+                    .flatten(),
+            ),
+            cheap: Some(
+                self.cheap_hours
+                    .as_deref()
+                    .map(crate::energy::parse_cheap)
+                    .transpose()
+                    .context("cheap_hours")?
+                    .flatten(),
+            ),
+            max_temp_c: Some(
+                self.max_temperature
+                    .as_ref()
+                    .map(|t| crate::energy::parse_temp(&t.text()))
+                    .transpose()
+                    .context("max_temperature")?
+                    .flatten(),
+            ),
+        }
+        .apply(&mut e)?;
+        Ok(Some(e))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2114,6 +2175,9 @@ impl ClusterFile {
                 .collect::<Result<Vec<_>>>()
                 .with_context(|| format!("node {node}"))?;
             taints.sort();
+            if let Some(e) = n.energy().with_context(|| format!("node {node}"))? {
+                spec.energy.push((node.clone(), e));
+            }
             spec.nodes.push(NodeSpec {
                 node,
                 labels: n.labels,
@@ -2819,6 +2883,26 @@ mod tests {
         std::fs::write(dir.join("cluster.toml"), text).unwrap();
         let spec = ClusterFile::load(&dir.join("cluster.toml"), 1 << 20).unwrap();
         assert_eq!(spec.nodes[0].node, "gpu-box");
+        assert!(spec.energy.is_empty());
+        // 1.22: electricity and heat.
+        let f = ClusterFile::parse(
+            "[nodes.gpu-pc]\nelectricity_price = 120\ncheap_hours = \"23-07@80\"\nmax_temperature = \"85\"\n[nodes.imac]\nmax_temperature = 90\n",
+        )
+        .unwrap();
+        let e = f.resolve(&dir, 1 << 20).unwrap().energy;
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0].0, "gpu-pc");
+        assert_eq!(
+            e[0].1.describe(),
+            "120 won/kWh, 23:00-07:00 at 80 won/kWh, pause over 85 °C"
+        );
+        assert_eq!((e[1].1.price, e[1].1.max_temp_c), (None, Some(90)));
+        assert!(
+            ClusterFile::parse("[nodes.x]\ncheap_hours = \"23-07@80\"\n")
+                .unwrap()
+                .resolve(&dir, 1 << 20)
+                .is_err()
+        );
         assert_eq!(spec.nodes[0].taints[0].to_string(), "a=b", "sorted");
         assert_eq!(spec.nodes[0].cordoned, Some(true));
         let (a, q) = &spec.accounts[0];

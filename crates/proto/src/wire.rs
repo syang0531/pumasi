@@ -102,9 +102,74 @@ where
     Ok(Some(buf))
 }
 
+/// Deserializes a field added at the end of a struct that is the last
+/// thing in its frame or record (1.22): bytes from an older peer simply
+/// end before it, which postcard reports as an error, so the field takes
+/// its default instead. Use with `#[serde(default, deserialize_with =
+/// "crate::wire::trailing")]`; `default` covers JSON, where the key is
+/// missing. Only for trailing fields: a field after it would read from
+/// wherever the failed one left off.
+pub fn trailing<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(T::deserialize(d).unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trailing_fields_default_when_the_bytes_end() {
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct Old {
+            a: u32,
+            b: Option<String>,
+        }
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct New {
+            a: u32,
+            b: Option<String>,
+            #[serde(default, deserialize_with = "trailing")]
+            c: Option<u64>,
+            #[serde(default, deserialize_with = "trailing")]
+            d: Vec<u8>,
+        }
+        let old = postcard::to_stdvec(&Old {
+            a: 7,
+            b: Some("x".into()),
+        })
+        .unwrap();
+        let new: New = postcard::from_bytes(&old).unwrap();
+        assert_eq!(
+            new,
+            New {
+                a: 7,
+                b: Some("x".into()),
+                c: None,
+                d: vec![]
+            }
+        );
+        // An older reader ignores what follows.
+        let bytes = postcard::to_stdvec(&New {
+            a: 1,
+            b: None,
+            c: Some(9),
+            d: vec![1, 2],
+        })
+        .unwrap();
+        let back: New = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!((back.c, back.d), (Some(9), vec![1, 2]));
+        assert_eq!(
+            postcard::from_bytes::<Old>(&bytes).unwrap(),
+            Old { a: 1, b: None }
+        );
+        // JSON without the keys.
+        let j: New = serde_json::from_str(r#"{"a":3,"b":null}"#).unwrap();
+        assert_eq!((j.c, j.d.len()), (None, 0));
+    }
 
     #[tokio::test]
     async fn roundtrip() {

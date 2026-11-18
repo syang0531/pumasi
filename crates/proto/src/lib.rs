@@ -9,6 +9,7 @@ pub mod audit;
 pub mod blobs;
 pub mod confidential;
 pub mod economy;
+pub mod energy;
 pub mod gpu;
 pub mod ha;
 pub mod job;

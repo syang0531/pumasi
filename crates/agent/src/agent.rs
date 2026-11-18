@@ -239,6 +239,8 @@ pub struct Agent {
     /// What goes after each run's report in its frame (1.4): the writer
     /// takes it when it writes the report.
     report_tails: ReportTails,
+    /// What runs draw (1.22).
+    energy: crate::energy::Meter,
     /// The machine's sleep and wake (1.5).
     power: Arc<crate::power::Power>,
     /// Where new settings from the dashboard go (1.7); `None` for an
@@ -650,6 +652,7 @@ impl Agent {
             key_waiters: Default::default(),
             stops: Default::default(),
             report_tails: Default::default(),
+            energy: Default::default(),
             settings_hook: None,
             restarting: watch::channel(None).0,
             _router: router,
@@ -1084,6 +1087,10 @@ impl Agent {
             let out_tx = out_tx.clone();
             let running = running.clone();
             let sampler = self.sampler.clone();
+            let meter = self.energy.clone();
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1) as f64;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(METRICS_EVERY_SECS));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1097,6 +1104,19 @@ impl Agent {
                     else {
                         continue;
                     };
+                    // Each run's share of what the machine drew (1.22).
+                    meter.sample(
+                        Instant::now(),
+                        crate::energy::PowerSample {
+                            cpu_w: extra.cpu_power_w.map(f64::from),
+                            gpu_w: m
+                                .gpus
+                                .iter()
+                                .filter_map(|g| Some((g.index, f64::from(g.power_w?))))
+                                .collect(),
+                            busy_cores: Some(f64::from(m.cpu_percent) / 100.0 * cpus),
+                        },
+                    );
                     if out_tx.send(FromAgent::Metrics(Box::new(m))).is_err() {
                         break;
                     }
@@ -1798,6 +1818,7 @@ impl Agent {
             waiters: self.key_waiters.clone(),
         };
         let tails = self.report_tails.clone();
+        let meter = self.energy.clone();
         debug!(task = %a.task, executor = %a.executor, "starting task");
         tokio::spawn(async move {
             let _awake = awake;
@@ -1933,9 +1954,18 @@ impl Agent {
                 }
                 _ => None,
             };
+            // Its share of the machine's power from here (1.22). A WASM
+            // run's CPU time is read only when it ends: it counts as one
+            // busy core meanwhile.
+            meter.start(
+                task,
+                io.gpus.iter().map(|g| g.index).collect(),
+                (a.executor != Executor::Wasm).then(|| io.cpu_feed.clone()),
+            );
             let result: Result<RunResult> = match a.executor {
                 Executor::Wasm => {
                     let Some(hash) = a.module_hash else {
+                        meter.forget(task);
                         let _ = out_tx.send(FromAgent::Done(Box::new(error_report(
                             task,
                             "no module".into(),
@@ -1973,6 +2003,7 @@ impl Agent {
                 )),
             };
             drop(streamer);
+            let energy = meter.finish(task);
             periodic_done.store(true, std::sync::atomic::Ordering::Relaxed);
             // What the run used (1.21), for the job's runs and the hint.
             let mut run_use = result.as_ref().map(|r| r.usage).unwrap_or_default();
@@ -2080,6 +2111,7 @@ impl Agent {
                     timing,
                     net,
                     usage: (!run_use.is_empty()).then_some(run_use),
+                    energy,
                 },
             );
             let sent = out_tx.send(FromAgent::Report {

@@ -4235,6 +4235,129 @@ schedule extras use the old ops, so a 1.21 CLI still submits them to
 1.20. A 1.20 agent reports no usage and gets no runs with
 `checkpoint_every`.
 
+## Phase 38: Monitoring (1.22)
+
+Release 1.22 turns the power the nodes read since 1.15 into watt-hours
+per run and per day, prices a node's days at its electricity price
+against the CU its runs were worth, pauses a node that runs hot,
+estimates a machine's earnings before it joins, lets Linux agents not
+run as root read RAPL, sends alerts to Telegram, ntfy and email, and
+keeps hourly metrics for months. The code is `pumasi_proto::energy`
+(`RunEnergy`, `NodeEnergy`, the views, `Estimate`), `pumasi_agent::energy`
+(the meter), `pumasi_cluster::energy` (days and the temperature pause)
+and `pumasi_cluster::smtp`. The agent protocol stays 14, minor 12; the
+stored layout (7) is unchanged.
+
+### Wire and storage
+
+Fields appended to a struct that is the last thing in its frame or
+record use `wire::trailing`, a deserializer that gives the default when
+the bytes end (an older writer) and is otherwise the field's own; an
+older reader ignores what follows, as postcard does. That carries
+`ReportTail::energy`, `TaskRunsRecord::energy` (per attempt) and
+`JobRunsView::energy`/`total_energy`. New admin ops come last:
+`Energy { days }`, `SetNodeEnergy { node, settings }` (both answer
+`AdminResponse::Energy`) and `AlertsFull`. `WebhookFormat` gains
+`Telegram`, `Ntfy` and `Email` at the end; the old `Alerts` op (and
+`SetAlertPolicy`'s answer) shows them as `Json`, so a 1.21 client still
+decodes the view, and 1.22 clients ask `AlertsFull` first. Two tables are
+appended: `node_energy` (`NodeEnergy` by node id) and `energy_days`
+(`DayRecord` by node id and local day: milliwatt-hours per local hour,
+seconds measured, worth in micro-CU, earned milli-CU, runs), replicated
+like the others. `cluster.toml` takes `electricity_price`,
+`cheap_hours` and `max_temperature` under `[nodes.NAME]`;
+`ApplySpec::energy` is `#[serde(skip)]` and the CLI sends each node's
+settings with `SetNodeEnergy` after the apply, as it does caps per job.
+Viewers and submitters may read `Energy`; changing settings is admin
+only and audited as `node.energy`.
+
+### Energy per run
+
+The agent's metrics loop gives each 5 s sample to a `Meter`: CPU package
+power (`NodeMetricsExtra::cpu_power_w`), each GPU's power, and the
+machine's busy cores (CPU percent times its threads). A reading stands
+for the time since the previous sample; gaps over 30 s are skipped. The
+CPU's power is shared by CPU time: each run's CPU-time delta (read from
+the same cgroup or process sampler that measures its usage, through a
+`CpuFeed` the executor attaches) over the larger of the runs' sum and
+the machine's busy cores, so other programs keep their share; a run
+without a feed (WASM) counts as one busy core. A GPU's power is shared
+equally among the runs holding it. `start` is called before the
+executor runs and `finish` after the output streamer ends, so a run
+shorter than a sample gets the latest reading for its length. The
+result travels in `ReportTail::energy`; `note_energy` holds it until the
+attempt ends and `attempt_ended` stores it with the attempt.
+
+### Days, prices and earnings
+
+`State::energy_sample` (from `on_metrics`) integrates the node's CPU and
+GPU power the same way (gaps over a minute skipped, fractions of a
+milliwatt-hour carried) into the hour of the control plane's local time,
+and billing calls `energy_note_run` with what the run was worth (the
+metered charge plus egress, also for runs on the consumer's own node,
+which move no CU) and what the node's account earned. `flush_energy`
+writes changed days with the monitor's flush and drops days older than
+400 once a day. `energy_view` prices each day at the node's settings now
+(`NodeEnergy::cost_mwon`: each hour at the cheap price when its hour is
+inside the cheap range, else the normal price), with the node's latest
+temperature and power.
+
+### The temperature pause
+
+`hot_sample` compares the hottest sensor of each sample with the node's
+`max_temp_c`: over it for `HOT_HOLD_SECS` (60) pauses the node
+(`hot_reason`, used by the refusal check after the node's own pause and
+by `NodeView::paused`), logs `node.paused` and, when the agent's
+`--on-pause` is `requeue`, moves its runs as for its other rules; under
+it for as long, or the limit removed, resumes it (`node.resumed`). The
+pause lives in memory: a control plane that restarts re-pauses after
+another minute over the limit.
+
+### Alert channels
+
+`Notice::body` writes Telegram's `sendMessage` JSON (`chat_id` from the
+URL, `text`), ntfy's JSON publish (`topic`, `title`, `message`, priority
+5 for firing critical alerts, 4 for warnings, 3 for resolved, and tags)
+posted to the server's root with basic auth from the URL's user, and a
+plain-text email. `smtp::send` speaks SMTP itself: `smtp://` requires
+STARTTLS unless the server is a loopback address, `smtps://` is TLS from
+the start, credentials go only over TLS (or to loopback) with `AUTH
+PLAIN` where offered, else `AUTH LOGIN`, and the message has a base64
+body and an RFC 2047 subject, so it needs no 8BITMIME. TLS trusts the
+same roots as registries.
+
+### Hourly metrics
+
+`--keep-metrics` adds a fourth tier (index 3, one point an hour) to each
+node's series, kept for that long and stored like the others;
+`metrics_view` serves it for a `--since` past `--metrics-retention`.
+Off by default.
+
+### Estimates and RAPL
+
+`pumasi bench --estimate` runs the benchmark while a thread samples the
+CPU package's power every second (the highest reading stands for full
+load), asks the cluster's rates (`GetPolicy`, when a ticket is at hand,
+else `CuRates::default()`) and detects the GPUs, then prints
+`Estimate`: CU per hour for every vCPU at its billed score, the memory
+less 2 GiB and the GPUs, and with `--price` the cost per hour and per
+CU. `service rapl` writes `/etc/udev/rules.d/60-pumasi-rapl.rules`,
+which on each `powercap` `intel-rapl:*` zone runs `chgrp GROUP` and
+`chmod g+r` on its `energy_uj`, creates the group (`groupadd --system`),
+reloads and triggers udev, and adds a user with `usermod -aG`; a system
+`service install agent` (root) writes it too, and `--dry-run` prints it.
+
+### Compatibility
+
+A 1.21 agent reports no energy; a 1.21 control plane ignores the tail's
+new field and refuses the new ops: `pumasi energy`, `node set
+--electricity-price` and the like say the control plane is older than
+1.22, `apply` refuses a file with those keys, `webhook add` of a new
+format says so, and `pumasi job` shows what it did. 1.21 clients see
+Telegram, ntfy and email webhooks as `json`. Replicas of 1.21 do not
+know the two new tables, so a cluster with replicas upgrades them
+together, as before.
+
 ## Not yet
 
 - Remote API: ACME has no DNS-01 (no wildcard certificates) and no
@@ -4267,7 +4390,9 @@ schedule extras use the old ops, so a 1.21 CLI still submits them to
   stream), through the output disk on Firecracker and QEMU and as fast as
   the console carries it on vz; Windows GPUs report a
   temperature but no power, and Linux CPU package power needs an agent
-  that can read RAPL; DRM fdinfo sees only processes the agent may read;
+  that can read RAPL (root, or `service rapl`); energy per run shares a
+  GPU equally among its runs and counts a WASM run as one busy core;
+  DRM fdinfo sees only processes the agent may read;
   Windows desktops without a hardware monitor (LibreHardwareMonitor, Open
   Hardware Monitor, HWiNFO) often have no temperature (few boards fill in
   ACPI thermal zones), and the monitors start with a sign-in.
@@ -4287,7 +4412,7 @@ schedule extras use the old ops, so a 1.21 CLI still submits them to
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 36 are done and 37 to 45 (1.21 to 1.29) are
+- Roadmap: phases 20 to 38 are done and 39 to 45 (1.23 to 1.29) are
   planned ([roadmap.md](roadmap.md));
   phases 18 and 19 (the hub and buying CU) are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it

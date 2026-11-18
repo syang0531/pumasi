@@ -48,6 +48,7 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
         .route("/alerts/silences/{id}", delete(unsilence))
         .route("/webhooks/{name}/test", post(test_webhook))
         .route("/net", get(net))
+        .route("/energy", get(energy))
         .route("/jobs", post(submit).layer(uploads))
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -64,6 +65,7 @@ pub fn routes(uploads: DefaultBodyLimit) -> Router<St> {
             "/nodes/{node}/settings",
             get(node_settings).put(set_node_settings),
         )
+        .route("/nodes/{node}/energy", put(set_node_energy))
         .route("/nodes/{node}/{action}", post(node_action))
         .route("/upgrade", get(upgrade_status).post(upgrade_latest))
         .route("/upgrade/canary", get(canary))
@@ -252,7 +254,13 @@ async fn events(axum::extract::State(st): S, a: Api, Query(q): Query<EventsQuery
 /// The alerts view, with the 1.6 tuning merged in when the control
 /// plane has it.
 async fn alerts(axum::extract::State(st): S, a: Api) -> Response {
-    let mut v = match call(&st, &a, AdminOp::Alerts).await {
+    // The true webhook formats from 1.22 (older control planes answer
+    // only `Alerts`).
+    let r = match call(&st, &a, AdminOp::AlertsFull).await {
+        Ok(r @ AdminResponse::Alerts(_)) => Ok(r),
+        _ => call(&st, &a, AdminOp::Alerts).await,
+    };
+    let mut v = match r {
         Ok(AdminResponse::Alerts(v)) => match serde_json::to_value(&*v) {
             Ok(v) => v,
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -805,6 +813,37 @@ async fn set_node_settings(
         },
     )
     .await
+}
+
+#[derive(Deserialize)]
+struct EnergyQuery {
+    days: Option<u32>,
+}
+
+/// Each node's days of electricity and CU, and its settings (1.22).
+async fn energy(axum::extract::State(st): S, a: Api, Query(q): Query<EnergyQuery>) -> Response {
+    simple_read(
+        st,
+        a,
+        AdminOp::Energy {
+            days: q.days.unwrap_or(7),
+        },
+    )
+    .await
+}
+
+/// A node's electricity price, cheap hours and temperature limit, all
+/// at once (1.22): what the body leaves out is removed.
+async fn set_node_energy(
+    axum::extract::State(st): S,
+    a: Api,
+    Path(node): Path<String>,
+    Json(settings): Json<pumasi_proto::energy::NodeEnergy>,
+) -> Response {
+    if let Err(e) = settings.validate() {
+        return error(StatusCode::BAD_REQUEST, &format!("{e:#}"));
+    }
+    simple(st, a, AdminOp::SetNodeEnergy { node, settings }).await
 }
 
 #[derive(Deserialize)]

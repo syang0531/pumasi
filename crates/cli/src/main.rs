@@ -1,6 +1,7 @@
 //! `pumasi`: one binary for the control plane, the node agent and the
 //! admin CLI.
 
+mod energy_cmd;
 mod follow;
 mod gpu_cmd;
 mod ha_cmd;
@@ -21,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use pumasi_agent::{
     Agent, AgentConfig, AgentExit, BenchConfig, MicrovmConfig, MicrovmExecutor, UpgradeConfig,
@@ -31,8 +32,8 @@ use pumasi_agent::{
 use pumasi_cluster::{ADMIN_TICKET_FILE, AdminClient, Cluster, ClusterConfig};
 use pumasi_proto::{
     economy::{
-        LedgerMode, Policy, format_cu, format_rate, parse_cu, parse_rate, parse_rate_permille,
-        validate_account,
+        CuRates, LedgerMode, Policy, format_cu, format_rate, parse_cu, parse_rate,
+        parse_rate_permille, validate_account,
     },
     job::{
         Executor, JobFile, JobId, Limits, MAX_INPUT_FILES_BYTES, TaskInput, parse_duration_ms,
@@ -147,6 +148,39 @@ enum Cmd {
         /// Measure only this many CPUs (default: all).
         #[arg(long)]
         cpus: Option<u32>,
+        /// Also estimate what the machine would earn at full load (CU per
+        /// hour at the cluster's rates, or the defaults when no cluster is
+        /// reachable) and what its electricity would cost (1.22).
+        #[arg(long)]
+        estimate: bool,
+        /// Won per kWh for --estimate (e.g. 120).
+        #[arg(long, value_name = "WON", requires = "estimate")]
+        price: Option<String>,
+        /// Watts at full load for --estimate, instead of what the CPU
+        /// package read during the benchmark (give the whole machine's
+        /// from a power meter to count the GPUs, board and PSU).
+        #[arg(long, value_name = "WATTS", requires = "estimate")]
+        watts: Option<f64>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Each node's electricity by day (1.22): energy measured, its cost at
+    /// the node's price (`pumasi node set --electricity-price`), the CU
+    /// its runs were worth and earned, and won per CU.
+    Energy {
+        /// Days back, today included.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Only this node (its name or an id prefix).
+        #[arg(long)]
+        node: Option<String>,
+        /// Sum the nodes of each account.
+        #[arg(long)]
+        by_account: bool,
+        #[arg(short = 'o', long, value_enum, default_value = "table")]
+        output: manage::Output,
+        #[command(flatten)]
+        admin: AdminArgs,
     },
     /// This machine's GPUs: list them, or check what jobs could do with
     /// them (Docker, microVM passthrough, the cluster's GPU check).
@@ -994,6 +1028,20 @@ enum NodeCmd {
         /// Take tasks at any time of day.
         #[arg(long)]
         any_time: bool,
+        /// What electricity costs this node, in won per kWh, for `pumasi
+        /// energy` (1.22; kept by the control plane, no agent restart);
+        /// `off` removes it.
+        #[arg(long, value_name = "WON|off")]
+        electricity_price: Option<String>,
+        /// Cheaper hours of a time-of-use plan and their price, e.g.
+        /// `23-07@80` (control plane's local time); `off` removes them.
+        #[arg(long, value_name = "HH-HH@WON|off")]
+        cheap_hours: Option<String>,
+        /// Take no new tasks while a CPU or GPU sensor stays over this
+        /// many °C for a minute (1.22; with the agent's `--on-pause
+        /// requeue` its running tasks move too); `off` removes it.
+        #[arg(long, value_name = "CELSIUS|off")]
+        max_temperature: Option<String>,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -1076,6 +1124,12 @@ struct MetricsArgs {
     /// Default 0: keep them forever.
     #[arg(long, default_value = "0")]
     keep_audit: String,
+    /// Also keep each node's metrics at one point an hour for this long,
+    /// e.g. 365d, for `pumasi metrics --since` over months (1.22): 8,760
+    /// points per node a year. Default 0: off, metrics go after
+    /// --metrics-retention.
+    #[arg(long, default_value = "0")]
+    keep_metrics: String,
     /// Wake a sleeping node (one started with --wake-on-lan) for work
     /// that has waited this long for a busy node, e.g. 10m; `never` wakes
     /// nodes only for work that no online node can run at all.
@@ -1730,7 +1784,25 @@ async fn run(cli: Cli) -> Result<i32> {
             quick,
             json,
             cpus,
-        } => bench(&home, dir, quick, json, cpus).await,
+            estimate,
+            price,
+            watts,
+            admin,
+        } => {
+            let estimate = estimate.then_some(EstimateArgs {
+                price,
+                watts,
+                admin,
+            });
+            bench(&home, dir, quick, json, cpus, estimate).await
+        }
+        Cmd::Energy {
+            days,
+            node,
+            by_account,
+            output,
+            admin,
+        } => energy_cmd::energy(&home, days, node, by_account, output, &admin).await,
         Cmd::Gpu(cmd) => gpu_cmd::run(&home, cmd).await,
         Cmd::Honeypot(cmd) => verify_cmd::honeypot(&home, cmd).await,
         Cmd::Score { output, admin } => verify_cmd::score(&home, output, &admin).await,
@@ -1796,12 +1868,37 @@ async fn run(cli: Cli) -> Result<i32> {
                     no_idle,
                     hours,
                     any_time,
+                    electricity_price,
+                    cheap_hours,
+                    max_temperature,
                     admin,
                 }),
             ..
         } => {
+            use pumasi_proto::energy::{NodeEnergyPatch, parse_cheap, parse_price, parse_temp};
+            let patch = NodeEnergyPatch {
+                price: electricity_price.as_deref().map(parse_price).transpose()?,
+                cheap: cheap_hours.as_deref().map(parse_cheap).transpose()?,
+                max_temp_c: max_temperature.as_deref().map(parse_temp).transpose()?,
+            };
+            let agent_change = slots.is_some()
+                || default_slots
+                || max_cpu_percent.is_some()
+                || all_cpus
+                || only_on_ac
+                || any_power
+                || idle_minutes.is_some()
+                || no_idle
+                || hours.is_some()
+                || any_time;
             let client = connect_admin(&home, &admin).await?;
             let res = async {
+                if !patch.is_empty() {
+                    set_node_energy(&client, &node, &patch).await?;
+                    if !agent_change {
+                        return Ok(());
+                    }
+                }
                 let AdminResponse::NodeSettings(view) = client
                     .call(AdminOp::NodeSettings { node: node.clone() })
                     .await?
@@ -1809,6 +1906,14 @@ async fn run(cli: Cli) -> Result<i32> {
                     bail!("unexpected response");
                 };
                 let Some(report) = view.report.clone() else {
+                    if !agent_change {
+                        println!(
+                            "{}: has not reported its settings (offline, or an agent older than 1.7)",
+                            view.name
+                        );
+                        show_node_energy(&client, &node).await;
+                        return Ok(());
+                    }
                     bail!(
                         "{} has not reported its settings: it is offline, or its agent is older than 1.7",
                         view.name
@@ -1855,6 +1960,7 @@ async fn run(cli: Cli) -> Result<i32> {
                     if report.restarting {
                         println!("restarts with them once its running tasks end");
                     }
+                    show_node_energy(&client, &node).await;
                     return Ok(());
                 }
                 let AdminResponse::NodeSettings(after) = client
@@ -2228,6 +2334,8 @@ async fn cluster_start(
     config.keep_jobs = Duration::from_millis(parse_duration_ms(&metrics.keep_jobs)?);
     config.keep_audit =
         Duration::from_millis(parse_duration_ms(&metrics.keep_audit).context("--keep-audit")?);
+    config.keep_metrics =
+        Duration::from_millis(parse_duration_ms(&metrics.keep_metrics).context("--keep-metrics")?);
     config.wake_after = match metrics.wake_after.trim() {
         "never" => None,
         d => Some(Duration::from_millis(
@@ -3079,7 +3187,7 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
                 }
             }
             let exe = own_exe().context("cannot find this binary's path")?;
-            install_service(
+            let code = install_service(
                 service::Spec {
                     role: Role::Agent,
                     exe,
@@ -3091,8 +3199,31 @@ fn service_cmd(home: &Path, cmd: service::ServiceCmd) -> Result<i32> {
                 inline_options,
                 scope,
                 dry_run,
-            )
+            )?;
+            // The CPU's power for agents not run as root (1.22): a system
+            // install, made as root, writes the udev rule too.
+            if cfg!(target_os = "linux") {
+                if service::is_system(scope) {
+                    if dry_run {
+                        println!();
+                        service::install_rapl(service::RAPL_GROUP, None, true)?;
+                    } else if let Err(e) = service::install_rapl(service::RAPL_GROUP, None, false) {
+                        eprintln!("note: could not make the CPU's power readable: {e:#}");
+                    }
+                } else if !dry_run && service::rapl_readable() == Some(false) {
+                    eprintln!(
+                        "note: this user cannot read the CPU's power (RAPL): `sudo pumasi service rapl --add-user {}` lets the agent measure each task's energy",
+                        std::env::var("USER").unwrap_or_else(|_| "USER".into())
+                    );
+                }
+            }
+            Ok(code)
         }
+        ServiceCmd::Rapl {
+            group,
+            add_user,
+            dry_run,
+        } => service::install_rapl(&group, add_user.as_deref(), dry_run),
         ServiceCmd::Uninstall { role, scope } => service::uninstall(role, scope),
         ServiceCmd::Status { role, scope } => service::status(role, scope),
         ServiceCmd::Run { role, .. } => {
@@ -3470,6 +3601,74 @@ async fn job_cmd(home: &Path, cmd: JobCmd) -> Result<i32> {
     Ok(0)
 }
 
+/// A node's energy settings from `view` (by name, else id prefix).
+fn find_node_energy<'a>(
+    view: &'a pumasi_proto::energy::EnergyView,
+    node: &str,
+) -> Option<&'a pumasi_proto::energy::NodeEnergyView> {
+    let node = node.trim();
+    view.nodes
+        .iter()
+        .find(|n| n.name == node || n.id == node)
+        .or_else(|| {
+            let mut m = view.nodes.iter().filter(|n| n.id.starts_with(node));
+            let first = m.next()?;
+            m.next().is_none().then_some(first)
+        })
+}
+
+/// Changes a node's electricity price, cheap hours or temperature limit
+/// (1.22), kept by the control plane.
+async fn set_node_energy(
+    client: &AdminClient,
+    node: &str,
+    patch: &pumasi_proto::energy::NodeEnergyPatch,
+) -> Result<()> {
+    const OLD: &str =
+        "this control plane has no electricity prices or temperature limits (they came in 1.22)";
+    let AdminResponse::Energy(now) = client
+        .call(AdminOp::Energy { days: 1 })
+        .await
+        .context(OLD)?
+    else {
+        bail!("unexpected response");
+    };
+    let mut settings = find_node_energy(&now, node)
+        .map(|n| n.settings.clone())
+        .unwrap_or_default();
+    patch.apply(&mut settings)?;
+    let AdminResponse::Energy(after) = client
+        .call(AdminOp::SetNodeEnergy {
+            node: node.to_string(),
+            settings: settings.clone(),
+        })
+        .await?
+    else {
+        bail!("unexpected response");
+    };
+    let name = after.nodes.first().map(|n| n.name.as_str()).unwrap_or(node);
+    println!("{name}: energy {}", settings.describe());
+    Ok(())
+}
+
+/// A node's energy settings and temperature state, when the control
+/// plane has them (1.22).
+async fn show_node_energy(client: &AdminClient, node: &str) {
+    let Ok(AdminResponse::Energy(v)) = client.read(AdminOp::Energy { days: 1 }).await else {
+        return;
+    };
+    let Some(n) = find_node_energy(&v, node) else {
+        return;
+    };
+    println!("energy: {}", n.settings.describe());
+    if let Some(since) = n.hot_since_unix {
+        println!(
+            "PAUSED for its temperature since {}",
+            pumasi_proto::audit::rfc3339(since)
+        );
+    }
+}
+
 /// A job's attempts and usage (1.21). `None` when the control plane is
 /// older and does not answer.
 pub(crate) async fn job_runs(
@@ -3504,7 +3703,10 @@ pub(crate) fn print_runs(v: &JobView, r: &pumasi_proto::attempt::JobRunsView) {
     if !r.total.is_empty() {
         println!("  used: {}", r.total.describe());
     }
-    let line = |a: &AttemptView| {
+    if !r.total_energy.is_empty() {
+        println!("  energy: {}", r.total_energy.describe());
+    }
+    let line = |task: u32, a: &AttemptView| {
         let node = a
             .node_name
             .clone()
@@ -3518,6 +3720,10 @@ pub(crate) fn print_runs(v: &JobView, r: &pumasi_proto::attempt::JobRunsView) {
         if let Some(u) = a.usage.filter(|u| !u.is_empty()) {
             l.push_str("  ");
             l.push_str(&u.describe());
+        }
+        if let Some(e) = r.energy_of(task, a.attempt).filter(|e| !e.is_empty()) {
+            l.push_str("  ");
+            l.push_str(&e.describe());
         }
         // Why, where the end alone does not say it (an error, a trap, a
         // lost node).
@@ -3540,10 +3746,14 @@ pub(crate) fn print_runs(v: &JobView, r: &pumasi_proto::attempt::JobRunsView) {
     for t in &r.tasks {
         let several = t.attempts.len() > 1;
         let few = r.tasks.len() <= MAX_TASK_LINES;
-        if several || (few && t.attempts.iter().any(|a| a.usage.is_some())) {
+        let measured = t
+            .attempts
+            .iter()
+            .any(|a| a.usage.is_some() || r.energy_of(t.index, a.attempt).is_some());
+        if several || (few && measured) {
             println!("  [{}] attempts:", t.index);
             for a in &t.attempts {
-                println!("      {}", line(a));
+                println!("      {}", line(t.index, a));
             }
         }
         if let Some(at) = t.retry_unix {
@@ -5189,13 +5399,82 @@ fn sensors(home: &Path, raw: bool) -> Result<()> {
     Ok(())
 }
 
+/// `pumasi bench --estimate`.
+struct EstimateArgs {
+    price: Option<String>,
+    watts: Option<f64>,
+    admin: AdminArgs,
+}
+
+/// Reads the CPU package's power every second while the benchmark runs;
+/// the highest reading stands for full load.
+struct PowerWatch {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<Option<f32>>,
+}
+
+impl PowerWatch {
+    fn start(dir: PathBuf) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut sampler = pumasi_agent::metrics::Sampler::new(&dir, Vec::new());
+            let mut peak: Option<f32> = None;
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(1));
+                if let Some(w) = sampler.sample(0).1.cpu_power_w.filter(|w| w.is_finite()) {
+                    peak = Some(peak.map_or(w, |p| p.max(w)));
+                }
+            }
+            peak
+        });
+        Self { stop, thread }
+    }
+
+    fn finish(self) -> Option<f32> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.join().ok().flatten()
+    }
+}
+
+/// The cluster's CU rates, or the defaults when no cluster answers soon.
+async fn rates_for_estimate(home: &Path, admin: &AdminArgs) -> (CuRates, bool) {
+    let ask = async {
+        let client = connect_admin(home, admin).await?;
+        let r = client.read(AdminOp::GetPolicy).await;
+        client.close().await;
+        match r? {
+            AdminResponse::Policy(p) => Ok(p.rates),
+            _ => bail!("unexpected response"),
+        }
+    };
+    if load_ticket_with_source(home, admin).is_err() {
+        return (CuRates::default(), false);
+    }
+    match tokio::time::timeout(Duration::from_secs(15), ask).await {
+        Ok(Ok(r)) => (r, true),
+        _ => (CuRates::default(), false),
+    }
+}
+
 async fn bench(
     home: &Path,
     dir: Option<PathBuf>,
     quick: bool,
     json: bool,
     cpus: Option<u32>,
+    estimate: Option<EstimateArgs>,
 ) -> Result<i32> {
+    let price = match estimate.as_ref().and_then(|e| e.price.as_deref()) {
+        Some(p) => pumasi_proto::energy::parse_price(p)?,
+        None => None,
+    };
+    if let Some(w) = estimate.as_ref().and_then(|e| e.watts) {
+        ensure!(
+            w.is_finite() && w > 0.0 && w < 100_000.0,
+            "--watts takes a power like 250"
+        );
+    }
     let dir = dir.unwrap_or_else(|| home.join("agent"));
     let config = if quick {
         BenchConfig::quick(dir)
@@ -5210,17 +5489,107 @@ async fn bench(
     if !json {
         eprintln!("benchmarking (about {} s)...", if quick { 2 } else { 12 });
     }
+    let watch = estimate
+        .as_ref()
+        .filter(|e| e.watts.is_none())
+        .map(|_| PowerWatch::start(config.dir.clone()));
     let p = tokio::task::spawn_blocking(move || -> Result<PerfProfile> {
         let kernel = pumasi_agent::bench::CpuKernel::new()?;
         pumasi_agent::bench::measure(&config, &kernel, &iroh::SecretKey::generate(), cpus)
     })
     .await??;
+    let measured = watch.and_then(PowerWatch::finish);
+    let Some(args) = estimate else {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&p)?);
+        } else {
+            print_profile(&p);
+        }
+        return Ok(0);
+    };
+    let (rates, from_cluster) = rates_for_estimate(home, &args.admin).await;
+    let mut notes = Vec::new();
+    let gpus: Vec<(u64, u64)> =
+        pumasi_agent::gpu::detect(&pumasi_agent::gpu::GpuEnv::default(), &mut notes)
+            .iter()
+            .map(|g| (g.fp32_gflops as u64, g.vram_mib))
+            .collect();
+    let mut e = pumasi_proto::energy::Estimate::new(
+        &rates,
+        p.cpu.threads,
+        p.cpu.per_vcpu(),
+        p.memory.total_bytes,
+        &gpus,
+    );
+    e.watts = args.watts.or(measured.map(f64::from));
+    e.price = price;
     if json {
-        println!("{}", serde_json::to_string_pretty(&p)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "profile": p, "estimate": e }))?
+        );
     } else {
         print_profile(&p);
+        print_estimate(&e, from_cluster, args.watts.is_some(), !gpus.is_empty());
     }
     Ok(0)
+}
+
+fn print_estimate(
+    e: &pumasi_proto::energy::Estimate,
+    from_cluster: bool,
+    watts_given: bool,
+    has_gpus: bool,
+) {
+    use pumasi_proto::economy::format_rate;
+    println!();
+    println!(
+        "estimate at full load ({} rates):",
+        if from_cluster {
+            "the cluster's"
+        } else {
+            "default"
+        }
+    );
+    println!(
+        "         CPU    {} CU/h ({} vCPUs at score {} each)",
+        format_rate(e.cpu_ucu),
+        e.vcpus,
+        e.score_per_vcpu
+    );
+    println!(
+        "         memory {} CU/h ({:.1} GiB, 2 GiB left to the system)",
+        format_rate(e.memory_ucu),
+        e.memory_gib
+    );
+    if e.gpu_ucu > 0 {
+        println!("         GPU    {} CU/h", format_rate(e.gpu_ucu));
+    }
+    println!("         total  {} CU/h", format_rate(e.cu_per_hour()));
+    match e.watts {
+        Some(w) if watts_given => println!("         power  {w:.0} W (given)"),
+        Some(w) => println!(
+            "         power  {w:.0} W (CPU package at full load{})",
+            if has_gpus {
+                "; GPUs not counted, give --watts"
+            } else {
+                ""
+            }
+        ),
+        None => println!(
+            "         power  not readable here (Linux: `sudo pumasi service rapl`; or give --watts)"
+        ),
+    }
+    match (e.won_per_hour(), e.won_per_cu()) {
+        (Some(h), Some(c)) => {
+            println!("         cost   {h:.1} won/h, {c:.2} won per CU earned");
+        }
+        (Some(h), None) => println!("         cost   {h:.1} won/h"),
+        _ if e.price.is_none() => {
+            println!("         cost   give --price (won per kWh) to see won per CU")
+        }
+        _ => {}
+    }
 }
 
 fn print_profile(p: &PerfProfile) {

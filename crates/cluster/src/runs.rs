@@ -17,6 +17,7 @@ use pumasi_proto::attempt::{
     AttemptView, EndKind, JobRun, JobRunsView, MAX_ATTEMPT_RECORDS, RerunWhich, RunUse, Suspension,
     TaskRunsView,
 };
+use pumasi_proto::energy::RunEnergy;
 use pumasi_proto::job::JobId;
 use pumasi_proto::monitor::EventLevel;
 use pumasi_proto::msg::{Outcome, TaskRef, TaskState};
@@ -74,6 +75,11 @@ pub struct TaskRunsRecord {
     pub retry_at_ms: Option<u64>,
     /// The next attempt is the first after a rerun.
     pub rerun_next: bool,
+    /// What attempts drew, by attempt number (1.22), for the attempts
+    /// still kept. Last, so a 1.21 replica still reads the record, and a
+    /// 1.21 record reads with none.
+    #[serde(default, deserialize_with = "pumasi_proto::wire::trailing")]
+    pub energy: Vec<(u32, RunEnergy)>,
 }
 
 /// Runtime state of retries and runs.
@@ -84,6 +90,8 @@ pub(crate) struct RunState {
     pub delayed: BTreeSet<(u64, JobId, u32)>,
     /// What runs used, from their reports' tails, until the report counts.
     pub report_use: HashMap<TaskRef, RunUse>,
+    /// What runs drew, likewise (1.22).
+    pub report_energy: HashMap<TaskRef, RunEnergy>,
 }
 
 fn now_ms() -> u64 {
@@ -235,6 +243,8 @@ impl State {
             let n = rec.attempts.len() - MAX_ATTEMPT_RECORDS;
             rec.attempts.drain(..n);
             rec.dropped += n as u32;
+            let first = rec.attempts.first().map_or(0, |a| a.attempt);
+            rec.energy.retain(|(a, _)| *a >= first);
         }
         self.persist_runs(r.job, r.index);
     }
@@ -245,6 +255,7 @@ impl State {
             return;
         }
         let usage = self.runs.report_use.remove(&r);
+        let energy = self.runs.report_energy.remove(&r);
         let Some(rec) = self.runs.tasks.get_mut(&(r.job, r.index)) else {
             return;
         };
@@ -261,6 +272,10 @@ impl State {
         a.why = why;
         a.wall_ms = wall_ms;
         a.usage = usage.filter(|u| !u.is_empty());
+        if let Some(e) = energy.filter(|e| !e.is_empty()) {
+            rec.energy.retain(|(n, _)| *n != r.attempt);
+            rec.energy.push((r.attempt, e));
+        }
         self.persist_runs(r.job, r.index);
     }
 
@@ -362,6 +377,18 @@ impl State {
             .is_some_and(|n| n.generation == generation && n.running.contains_key(&task));
         if running {
             self.runs.report_use.insert(task, u);
+        }
+    }
+
+    /// What the node measured a run drew (1.22), kept until its report
+    /// counts.
+    pub fn note_energy(&mut self, node_id: &str, generation: u64, task: TaskRef, e: RunEnergy) {
+        let running = self
+            .nodes
+            .get(node_id)
+            .is_some_and(|n| n.generation == generation && n.running.contains_key(&task));
+        if running {
+            self.runs.report_energy.insert(task, e);
         }
     }
 
@@ -668,6 +695,10 @@ impl State {
                 if let Some(u) = &a.usage {
                     add_use(&mut v.total, u);
                 }
+            }
+            for (attempt, e) in &r.energy {
+                v.total_energy.add(e);
+                v.energy.push((i as u32, *attempt, *e));
             }
             let overasked = r
                 .attempts

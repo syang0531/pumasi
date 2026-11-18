@@ -881,3 +881,243 @@ async fn apply_thresholds_silences_keyed_events_and_pushed_metrics() {
     client.close().await;
     cluster.shutdown().await.unwrap();
 }
+
+/// A webhook receiver that passes on each request's head and body.
+async fn receiver_full() -> (SocketAddr, mpsc::UnboundedReceiver<(String, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = s.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= len {
+                            let _ = tx.send((head.to_string(), body[..len].to_string()));
+                            let _ = s
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (addr, rx)
+}
+
+/// A mail server on this machine without TLS, as a local relay is: it
+/// takes one message per connection and passes on the envelope and the
+/// data.
+async fn smtp_server() -> (SocketAddr, mpsc::UnboundedReceiver<(Vec<String>, String)>) {
+    use tokio::io::AsyncBufReadExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = listener.accept().await else {
+                return;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = s.into_split();
+                let mut r = tokio::io::BufReader::new(r);
+                w.write_all(b"220 stand-in ESMTP\r\n").await.unwrap();
+                let mut envelope = Vec::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let cmd = line.trim_end().to_string();
+                    let upper = cmd.to_ascii_uppercase();
+                    if upper.starts_with("EHLO") {
+                        w.write_all(b"250-stand-in\r\n250 8BITMIME\r\n")
+                            .await
+                            .unwrap();
+                    } else if upper.starts_with("MAIL FROM") || upper.starts_with("RCPT TO") {
+                        envelope.push(cmd);
+                        w.write_all(b"250 ok\r\n").await.unwrap();
+                    } else if upper == "DATA" {
+                        w.write_all(b"354 go on\r\n").await.unwrap();
+                        let mut data = String::new();
+                        loop {
+                            line.clear();
+                            r.read_line(&mut line).await.unwrap();
+                            if line == ".\r\n" {
+                                break;
+                            }
+                            data.push_str(&line);
+                        }
+                        w.write_all(b"250 queued\r\n").await.unwrap();
+                        let _ = tx.send((std::mem::take(&mut envelope), data));
+                    } else if upper == "QUIT" {
+                        let _ = w.write_all(b"221 bye\r\n").await;
+                        return;
+                    } else {
+                        w.write_all(b"502 no\r\n").await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    (addr, rx)
+}
+
+/// 1.22: `webhook test` reaches a Telegram bot API, an ntfy server and a
+/// mail server (stand-ins on this machine), each in its own form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn telegram_ntfy_and_email_test_alerts_reach_their_servers() {
+    init_tracing();
+    let (http, mut requests) = receiver_full().await;
+    let (smtp, mut mails) = smtp_server().await;
+    let cluster = start_cluster(tempdir("cp-channels"), None).await.unwrap();
+    let client = admin(&cluster).await;
+    let hooks = [
+        (
+            "tg",
+            format!("http://{http}/bot123:secret/sendMessage?chat_id=-1001"),
+            WebhookFormat::Telegram,
+        ),
+        (
+            "phone",
+            format!("http://me:pw@{http}/pumasi-home"),
+            WebhookFormat::Ntfy,
+        ),
+        (
+            "mail",
+            format!("smtp://{smtp}?from=pumasi@home.test&to=stan@home.test,ops@home.test"),
+            WebhookFormat::Email,
+        ),
+    ];
+    for (name, url, format) in &hooks {
+        // A self-hosted ntfy on a plain address is named with --format.
+        if *format != WebhookFormat::Ntfy {
+            assert_eq!(WebhookFormat::detect(url), *format, "{url}");
+        }
+        client
+            .call(AdminOp::SetWebhook(Box::new(WebhookSpec {
+                name: (*name).into(),
+                url: url.clone(),
+                format: *format,
+            })))
+            .await
+            .unwrap();
+    }
+
+    client
+        .call(AdminOp::TestWebhook { name: "tg".into() })
+        .await
+        .unwrap();
+    let (head, body) = requests.recv().await.unwrap();
+    assert!(
+        head.starts_with("POST /bot123:secret/sendMessage?chat_id=-1001 "),
+        "{head}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["chat_id"], "-1001");
+    assert!(v["text"].as_str().unwrap().contains("test alert"), "{v}");
+
+    client
+        .call(AdminOp::TestWebhook {
+            name: "phone".into(),
+        })
+        .await
+        .unwrap();
+    let (head, body) = requests.recv().await.unwrap();
+    assert!(
+        head.starts_with("POST / "),
+        "ntfy takes JSON at its root: {head}"
+    );
+    // me:pw
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("authorization: basic bwu6chc="),
+        "{head}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["topic"], "pumasi-home");
+    assert_eq!(v["title"], "[test-cluster] firing: test");
+    assert!(v["message"].as_str().unwrap().contains("test alert"));
+
+    client
+        .call(AdminOp::TestWebhook {
+            name: "mail".into(),
+        })
+        .await
+        .unwrap();
+    let (envelope, data) = mails.recv().await.unwrap();
+    assert_eq!(
+        envelope,
+        [
+            "MAIL FROM:<pumasi@home.test>",
+            "RCPT TO:<stan@home.test>",
+            "RCPT TO:<ops@home.test>"
+        ]
+    );
+    assert!(
+        data.contains("Subject: [test-cluster] firing: test\r\n"),
+        "{data}"
+    );
+    assert!(data.contains("To: stan@home.test, ops@home.test\r\n"));
+    let body = data.split("\r\n\r\n").nth(1).unwrap().replace("\r\n", "");
+    let text = String::from_utf8(data_encoding::BASE64.decode(body.as_bytes()).unwrap()).unwrap();
+    assert!(
+        text.contains("test alert from pumasi cluster test-cluster"),
+        "{text}"
+    );
+
+    // Each counts as sent; a 1.21 client sees the new formats as JSON.
+    let AdminResponse::Alerts(full) = client.call(AdminOp::AlertsFull).await.unwrap() else {
+        panic!()
+    };
+    let mut formats: Vec<(String, WebhookFormat, u64)> = full
+        .webhooks
+        .iter()
+        .map(|w| (w.name.clone(), w.format, w.sent))
+        .collect();
+    formats.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        formats,
+        [
+            ("mail".into(), WebhookFormat::Email, 1),
+            ("phone".into(), WebhookFormat::Ntfy, 1),
+            ("tg".into(), WebhookFormat::Telegram, 1),
+        ]
+    );
+    assert!(
+        full.webhooks
+            .iter()
+            .all(|w| !w.target.contains("secret") && !w.target.contains("pw"))
+    );
+    let AdminResponse::Alerts(old) = client.call(AdminOp::Alerts).await.unwrap() else {
+        panic!()
+    };
+    assert!(old.webhooks.iter().all(|w| w.format == WebhookFormat::Json));
+
+    client.close().await;
+    cluster.shutdown().await.unwrap();
+}

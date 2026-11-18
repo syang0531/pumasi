@@ -9,6 +9,8 @@ use axum::{
 };
 use maud::{Markup, html};
 use pumasi_proto::{
+    economy::{MICRO_PER_CU, format_cu},
+    energy::{EnergyView, format_wh, format_won},
     manage::NodeEdit,
     monitor::{
         MetricsView, NetView, NodeMetricsExtra, NodeMetricsView, STORE_LINK, human_bps, human_rtt,
@@ -105,12 +107,16 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
         Ok(AdminResponse::Net(v)) => net_matrix(l, &v),
         _ => html! {},
     };
+    let energy = match ctx.call(AdminOp::Energy { days: 7 }).await {
+        Ok(AdminResponse::Energy(v)) => energy_days(l, &v),
+        _ => html! {},
+    };
     Ok(ctx.page(
         l.t("Nodes", "노드"),
         Nav::Nodes,
         html! { div class="page-head" { h1 { (l.t("Nodes", "노드")) } } },
         Some(("5s", live)),
-        html! { (super::upgrade::placeholder(ctx)) (net) (conf) },
+        html! { (super::upgrade::placeholder(ctx)) (energy) (net) (conf) },
     ))
 }
 
@@ -387,6 +393,15 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
         Ok(AdminResponse::NodeSettings(v)) => Some(*v),
         _ => None,
     };
+    // 1.22: the node's electricity and temperature limit, and its days.
+    let energy = match ctx.call(AdminOp::Energy { days: 7 }).await {
+        Ok(AdminResponse::Energy(mut v)) => {
+            v.nodes.retain(|x| x.id == n.id);
+            v.days.retain(|d| d.node == n.id);
+            Some(*v)
+        }
+        _ => None,
+    };
     let bottom = html! {
         div #charts data-sse=(stream) {
             (charts_block(l, mv.as_ref(), None, since, "page"))
@@ -397,6 +412,7 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
         }
         @if let Some(sc) = &score { (score_block(l, sc)) }
         (availability(ctx, &n, settings.as_ref()))
+        @if let Some(v) = &energy { (energy_settings(ctx, &n, v)) }
     };
     Ok(ctx.page(
         &n.info.name,
@@ -405,6 +421,136 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
         Some(("10s", live)),
         bottom,
     ))
+}
+
+/// Each node's last days: energy, its cost at the node's price, the CU
+/// its runs were worth and earned, and won per CU (1.22).
+fn energy_days(l: Lang, v: &EnergyView) -> Markup {
+    if v.days.is_empty() && v.nodes.iter().all(|n| n.settings.is_empty()) {
+        return html! {};
+    }
+    let rows: Vec<Markup> = v
+        .days
+        .iter()
+        .map(|d| {
+            html! {
+                tr data-energy-day={(d.node) "-" (d.day)} {
+                    td { (d.day) }
+                    td { a href={"/nodes/" (d.node)} { (d.name) } }
+                    td class="num" { (format_wh(d.mwh)) }
+                    td class="num" { (format!("{:.1}", d.measured_secs as f64 / 3600.0)) }
+                    td class="num cost" { (d.cost_mwon.map(format_won).unwrap_or_else(|| "-".into())) }
+                    td class="num" { (format!("{:.2}", d.worth_ucu as f64 / MICRO_PER_CU as f64)) }
+                    td class="num" { (format_cu(d.earned_mcu)) }
+                    td class="num" { (d.won_per_cu().map(|w| format!("{w:.1}")).unwrap_or_else(|| "-".into())) }
+                    td class="num" { (d.runs) }
+                }
+            }
+        })
+        .collect();
+    html! {
+        section #energy {
+            h2 { (l.t("Electricity and earnings", "전기와 수익")) }
+            p class="dim" { (l.t(
+                "Measured CPU package and GPU power by day (control plane's local time), its cost at each node's price, what its runs were worth in CU at the cluster's rates and what other accounts paid. Set a price on the node's page or with pumasi node set NODE --electricity-price 120.",
+                "날짜별(컨트롤 플레인 현지 시각) CPU 패키지·GPU 전력 측정값과 노드별 전기요금으로 계산한 비용, 클러스터 단가로 본 실행의 CU 가치와 다른 계정이 낸 CU입니다. 요금은 노드 화면이나 pumasi node set NODE --electricity-price 120으로 정합니다.")) " (" (v.utc_offset) ")" }
+            (table(&[l.t("Day", "날짜"), l.t("Node", "노드"), l.t("Energy", "전력량"), l.t("Hours", "측정 시간"),
+                     l.t("Cost", "비용"), l.t("Worth (CU)", "가치(CU)"), l.t("Earned (CU)", "수입(CU)"), l.t("Won/CU", "원/CU"), l.t("Runs", "실행")],
+                rows,
+                l.t("No measured power yet: nodes report it from 1.22, and Linux CPUs need RAPL access (sudo pumasi service rapl).",
+                    "아직 측정된 전력이 없습니다. 노드는 1.22부터 보고하며, 리눅스 CPU는 RAPL 접근이 필요합니다(sudo pumasi service rapl).")))
+        }
+    }
+}
+
+/// A node's electricity price, cheap hours and temperature limit (1.22).
+fn energy_settings(ctx: &Ctx, n: &NodeView, v: &EnergyView) -> Markup {
+    let l = ctx.l;
+    let e = v
+        .nodes
+        .first()
+        .map(|x| x.settings.clone())
+        .unwrap_or_default();
+    let hot = v.nodes.first().and_then(|x| x.hot_since_unix);
+    let cheap = e
+        .cheap
+        .map(|c| format!("{:02}-{:02}@{}", c.from, c.to, c.price))
+        .unwrap_or_default();
+    html! {
+        section #node-energy {
+            h2 { (l.t("Electricity and temperature", "전기요금과 온도")) }
+            p { strong data-energy=(e.describe()) { (e.describe()) } }
+            @if let Some(since) = hot {
+                p class="flash warn" data-hot="true" { (l.t("Paused for its temperature since", "온도 때문에 멈춤:")) " " (fmt::time(since)) }
+            }
+            @if ctx.me.is_admin() {
+                form #energy-form class="stack settings" hx-post={"/nodes/" (n.id) "/energy"} hx-target="#flash" {
+                    div class="grid2" {
+                    label { (l.t("Price (won/kWh)", "요금(원/kWh)")) " "
+                        input name="price" inputmode="decimal" placeholder=(l.t("none", "없음")) value=[e.price]; }
+                    label { (l.t("Cheap hours @ price", "저렴한 시간대 @ 요금")) " "
+                        input name="cheap" placeholder="23-07@80" value=(cheap); }
+                    label { (l.t("Pause over (°C)", "멈춤 온도(°C)")) " "
+                        input type="number" name="max_temperature" min="40" max="120" placeholder=(l.t("off", "끔")) value=[e.max_temp_c]; }
+                    }
+                    button type="submit" { (l.t("Save", "저장")) }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct EnergyForm {
+    price: Option<String>,
+    cheap: Option<String>,
+    max_temperature: Option<String>,
+}
+
+impl EnergyForm {
+    pub fn settings(&self) -> anyhow::Result<pumasi_proto::energy::NodeEnergy> {
+        use pumasi_proto::energy::{CheapHours, NodeEnergy, parse_cheap, parse_price, parse_temp};
+        let text = |v: &Option<String>| {
+            let t = v.as_deref().unwrap_or("").trim().to_string();
+            if t.is_empty() { "off".to_string() } else { t }
+        };
+        let e = NodeEnergy {
+            price: parse_price(&text(&self.price))?,
+            cheap: parse_cheap(&text(&self.cheap))?.map(|(from, to, price)| CheapHours {
+                from,
+                to,
+                price,
+            }),
+            max_temp_c: parse_temp(&text(&self.max_temperature))?,
+        };
+        e.validate()?;
+        Ok(e)
+    }
+}
+
+/// Saves a node's electricity price and temperature limit (1.22).
+pub async fn energy(
+    ctx: Ctx,
+    headers: HeaderMap,
+    Path(node): Path<String>,
+    Form(f): Form<EnergyForm>,
+) -> Response {
+    let res = async {
+        let settings = f.settings()?;
+        let desc = settings.describe();
+        ctx.call(AdminOp::SetNodeEnergy { node, settings }).await?;
+        anyhow::Ok(desc)
+    }
+    .await;
+    match res {
+        Ok(desc) => {
+            let mut r = ctx.done(format!("{} {desc}", ctx.t("Saved:", "저장했습니다:")));
+            r.headers_mut()
+                .insert("hx-refresh", axum::http::HeaderValue::from_static("true"));
+            r
+        }
+        Err(e) => ctx.fail(e, hx(&headers)),
+    }
 }
 
 /// `stays awake while tasks run · says goodbye before sleeping`.

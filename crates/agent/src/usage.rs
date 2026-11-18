@@ -111,6 +111,12 @@ impl Sampler {
     pub fn process(pid: u32) -> Self {
         Self::spawn(|shared, stop| tokio::spawn(process_loop(pid, shared, stop)))
     }
+
+    /// Lets the energy meter read the CPU time while the run goes on
+    /// (1.22).
+    pub fn feed(&self, f: &crate::energy::CpuFeed) {
+        f.attach(self.shared.clone());
+    }
 }
 
 /// Sleeps `d` in short steps, returning early once `stop` is set.

@@ -555,6 +555,8 @@ pub struct State {
     pub(crate) verify: crate::verify::VerifyState,
     /// Attempts, retries waiting out their delay (1.21).
     pub(crate) runs: crate::runs::RunState,
+    /// Electricity prices, energy by day, nodes paused for heat (1.22).
+    pub(crate) energy: crate::energy::EnergyState,
 }
 
 /// What a run holding part of a GPU (1.10) finds in its environment:
@@ -664,6 +666,7 @@ impl State {
             sched: Default::default(),
             verify: Default::default(),
             runs: Default::default(),
+            energy: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -785,6 +788,7 @@ impl State {
         state.load_scim()?;
         state.load_verify()?;
         state.load_runs()?;
+        state.load_energy()?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(
@@ -1175,6 +1179,7 @@ impl State {
         }
         let lost: Vec<TaskRef> = node.running.drain().map(|(t, _)| t).collect();
         node.stopping.clear();
+        self.energy_offline(id);
         self.verify_offline(id);
         self.note_lost(id, lost.len() as u64);
         self.forget_replicas_sent(id);
@@ -1842,7 +1847,20 @@ impl State {
                 }
             });
         let exact_ucu = exact_ucu.saturating_add(egress.as_ref().map_or(0, |e| e.exact_ucu));
+        // What the run was worth at the cluster's prices, billed or not
+        // (1.22): a node's own account's runs are free but still worth it.
+        let worth = if provider == consumer {
+            self.policy
+                .rates
+                .charge(&metered)
+                .saturating_add(egress.as_ref().map_or(0, |e| {
+                    pumasi_proto::store::egress_charge(e.billed_bytes, self.policy.rates.egress_gib)
+                }))
+        } else {
+            exact_ucu
+        };
         let amount = self.carry_forward(&consumer, &provider, exact_ucu);
+        self.energy_note_run(node_id, worth, amount);
         if signed.usage.executor == Executor::Wasm {
             self.note_run_speed(node_id, signed.usage.fuel_used, billed_wall_ms);
         }
@@ -2323,6 +2341,12 @@ impl State {
             return Some(R::Upgrading);
         }
         if let Some(why) = &n.paused
+            && !awake
+        {
+            return Some(R::Paused(why));
+        }
+        // Over its temperature limit (1.22).
+        if let Some(why) = self.hot_reason(id)
             && !awake
         {
             return Some(R::Paused(why));
@@ -2846,7 +2870,11 @@ impl State {
                     running: rt.map(|n| n.running.len() as u32).unwrap_or(0),
                     completed: rt.map(|n| n.completed).unwrap_or(0),
                     last_seen_unix: rt.map(|n| n.last_seen_unix).unwrap_or(0),
-                    paused: online.and_then(|n| n.paused.clone()),
+                    paused: online.and_then(|n| {
+                        n.paused
+                            .clone()
+                            .or_else(|| self.hot_reason(&m.id).map(String::from))
+                    }),
                     perf: m.perf.as_ref().map(|p| p.profile.clone()),
                     cpu_score,
                     perf_note,
@@ -6442,5 +6470,162 @@ mod tests {
         let id = st.run_schedule("nightly", true).unwrap();
         assert_eq!(st.jobs[&id].meta.net, net);
         assert_eq!(st.jobs[&id].meta.run.run.retry.as_ref().unwrap().retries, 2);
+    }
+
+    // -- 1.22: electricity and heat ------------------------------------------
+
+    fn temp(t: f32) -> pumasi_proto::monitor::NodeMetrics {
+        pumasi_proto::monitor::NodeMetrics {
+            temp_c: Some(t),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_node_over_its_temperature_limit_gets_no_tasks() {
+        use pumasi_proto::energy::NodeEnergy;
+        let mut st = state();
+        let (a, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        st.set_node_energy(
+            "a",
+            NodeEnergy {
+                max_temp_c: Some(85),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        st.energy_sample(&a, 1000, &temp(91.0));
+        st.energy_sample(&a, 1030, &temp(92.0));
+        assert!(st.hot_reason(&a).is_none(), "not a minute yet");
+        // A dip resets the minute.
+        st.energy_sample(&a, 1035, &temp(80.0));
+        st.energy_sample(&a, 1040, &temp(95.0));
+        st.energy_sample(&a, 1090, &temp(95.0));
+        assert!(st.hot_reason(&a).is_none());
+        st.energy_sample(&a, 1100, &temp(90.0));
+        let why = st.hot_reason(&a).unwrap().to_string();
+        assert!(why.contains("over 85 °C"), "{why}");
+        let id = st.submit(job(Executor::Wasm, 1)).unwrap();
+        assert!(assigned(&mut a_rx).is_empty(), "kept off while hot");
+        assert_eq!(st.status().nodes[0].paused.as_deref(), Some(why.as_str()));
+        assert!(
+            st.events(0, 0, 100)
+                .iter()
+                .any(|e| e.kind == "node.paused" && e.message.contains("85"))
+        );
+        // A minute under the limit lets it take tasks again.
+        st.energy_sample(&a, 1110, &temp(80.0));
+        st.energy_sample(&a, 1150, &temp(84.0));
+        assert!(st.hot_reason(&a).is_some());
+        st.energy_sample(&a, 1170, &temp(70.0));
+        assert!(st.hot_reason(&a).is_none());
+        let got = assigned(&mut a_rx);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].task.job, id);
+        // Removing the limit lets a hot node go at once.
+        for t in [1200, 1300] {
+            st.energy_sample(&a, t, &temp(99.0));
+        }
+        assert!(st.hot_reason(&a).is_some());
+        st.set_node_energy("a", NodeEnergy::default()).unwrap();
+        assert!(st.hot_reason(&a).is_none());
+    }
+
+    #[test]
+    fn a_hot_node_with_on_pause_requeue_moves_its_runs() {
+        use pumasi_proto::energy::NodeEnergy;
+        use pumasi_proto::power::{OnPause, PowerReport};
+        let mut st = state();
+        let (a, mut a_rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let generation = st.nodes[&a].generation;
+        st.on_minor(&a, generation, pumasi_proto::PROTOCOL_MINOR);
+        st.on_power(
+            &a,
+            generation,
+            PowerReport {
+                on_pause: OnPause::Requeue,
+                ..Default::default()
+            },
+        );
+        st.set_node_energy(
+            &a,
+            NodeEnergy {
+                max_temp_c: Some(80),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sub = job(Executor::Wasm, 1);
+        sub.max_attempts = 1;
+        let id = st.submit(sub).unwrap();
+        assert_eq!(assigned(&mut a_rx).len(), 1);
+        st.energy_sample(&a, 10, &temp(88.0));
+        st.energy_sample(&a, 70, &temp(88.0));
+        let (_, cancelled) = cancels(&mut a_rx);
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(st.jobs[&id].tasks[0].state, TaskState::Pending);
+    }
+
+    #[test]
+    fn energy_is_kept_by_local_hour_and_priced() {
+        use pumasi_proto::energy::{CheapHours, NodeEnergy};
+        use pumasi_proto::monitor::{GpuMetrics, NodeMetrics};
+        let mut st = state();
+        let (a, _rx) = join(&mut st, "a", vec![Executor::Wasm], None);
+        let watts = |w: f32| NodeMetrics {
+            gpus: vec![GpuMetrics {
+                index: 0,
+                power_w: Some(w),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let t0 = now_unix() - 120;
+        // 360 W for 10 s is 1 Wh; a gap of two minutes is not counted.
+        st.energy_sample(&a, t0, &watts(360.0));
+        st.energy_sample(&a, t0 + 5, &watts(360.0));
+        st.energy_sample(&a, t0 + 10, &watts(360.0));
+        st.energy_sample(&a, t0 + 130, &watts(360.0));
+        st.energy_note_run(&a, 2_000_000, 0);
+        st.set_node_energy(
+            "a",
+            NodeEnergy {
+                price: Some(200),
+                cheap: None,
+                max_temp_c: None,
+            },
+        )
+        .unwrap();
+        let v = st.energy_view(1);
+        assert_eq!(v.days.len(), 1);
+        let d = &v.days[0];
+        assert_eq!(d.mwh, 1000);
+        assert_eq!(d.measured_secs, 10);
+        // 1 Wh at 200 won/kWh: 0.2 won.
+        assert_eq!(d.cost_mwon, Some(200));
+        assert_eq!((d.worth_ucu, d.runs), (2_000_000, 1));
+        assert_eq!(v.nodes[0].settings.price, Some(200));
+        // All hours cheap: the cheap price.
+        let (_, hour) = crate::energy::local_day_hour(t0 + 10);
+        st.set_node_energy(
+            "a",
+            NodeEnergy {
+                price: Some(200),
+                cheap: Some(CheapHours {
+                    from: hour,
+                    to: (hour + 1) % 24,
+                    price: 100,
+                }),
+                max_temp_c: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(st.energy_view(1).days[0].cost_mwon, Some(100));
+        // Flushed and loaded again.
+        st.flush_energy();
+        let rows = st.store.energy_days(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.mwh(), 1000);
+        assert_eq!(st.store.node_energy().unwrap().len(), 1);
     }
 }

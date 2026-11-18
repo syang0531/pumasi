@@ -559,6 +559,10 @@ impl State {
         job: Option<JobId>,
         message: impl Into<EventMsg>,
     ) {
+        // Honeypots are nobody's business but the cluster's (1.20).
+        if job.is_some_and(|j| self.is_honeypot_job(j)) {
+            return;
+        }
         let (message, text) = match message.into() {
             EventMsg::Plain(s) => (s, None),
             EventMsg::Text(t) => (t.en(), Some(t)),
@@ -1143,7 +1147,13 @@ impl State {
     }
 
     /// An alert about something that happened once (no "resolved").
-    fn alert_once(&mut self, rule: &str, subject: &str, level: EventLevel, message: &str) {
+    pub(crate) fn alert_once(
+        &mut self,
+        rule: &str,
+        subject: &str,
+        level: EventLevel,
+        message: &str,
+    ) {
         if self.silenced(rule, subject, now_unix()) {
             return;
         }
@@ -1819,6 +1829,12 @@ impl State {
                 "gauge",
                 "CPU score runs are billed at (1000 = the reference vCPU).",
                 Box::new(|m| Some(crate::perf::cpu_score(m).0 as f64)),
+            ),
+            (
+                "pumasi_node_score",
+                "gauge",
+                "The node's score, 0 to 1000 (uptime, checks and honeypots, finished runs); placement prefers higher.",
+                Box::new(|m| self.provider_score(&m.id).map(|s| s.score as f64)),
             ),
             (
                 "pumasi_node_last_seen_timestamp_seconds",

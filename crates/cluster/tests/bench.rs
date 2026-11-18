@@ -10,7 +10,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use pumasi_agent::{Agent, AgentConfig, AgentExit};
-use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
+use pumasi_cluster::{AdminClient, Cluster, ClusterConfig, verify::MAX_TIMED_DISK_MB_S};
 use pumasi_proto::{
     msg::{AdminOp, Invite},
     net::NetMode,
@@ -46,6 +46,9 @@ async fn start_cluster(dir: PathBuf) -> Result<Cluster> {
     config.bind = Some("127.0.0.1:0".parse().unwrap());
     config.heartbeat = Duration::from_millis(200);
     config.node_timeout = Duration::from_secs(2);
+    // Disk and memory challenges (1.20) about the size of the quick
+    // benchmark's own measurements.
+    config.challenge_bytes = (16 << 20, 16 << 20);
     Cluster::start(config).await
 }
 
@@ -135,10 +138,11 @@ async fn wait_for(what: &str, cond: impl Fn() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-async fn benched(name: &str, dir: PathBuf, inflate: u32) -> Agent {
+async fn benched(name: &str, dir: PathBuf, inflate: u32, inflate_disk: u32) -> Agent {
     let mut config = agent_config(name, 1, dir.clone());
     let mut bench = pumasi_agent::BenchConfig::quick(dir);
     bench.inflate = inflate;
+    bench.inflate_disk = inflate_disk;
     config.bench = Some(bench);
     Agent::new(config).await.unwrap()
 }
@@ -160,15 +164,29 @@ async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
     let ticket = cluster
         .create_join_ticket(Duration::from_secs(60), None)
         .unwrap();
-    let own = benched("own", tempdir("o"), 1).await;
-    let honest = benched("honest", tempdir("h"), 1).await;
+    let own = benched("own", tempdir("o"), 1, 1).await;
+    let honest = benched("honest", tempdir("h"), 1, 1).await;
     // Claims a CPU eight times faster than it is.
-    let liar = benched("liar", tempdir("l"), 8).await;
+    let liar = benched("liar", tempdir("l"), 8, 1).await;
     let claimed = liar.perf().unwrap().profile.cpu.single;
+    // Claims a disk sixteen times faster than it is (1.20).
+    let disky = benched("disky", tempdir("d"), 1, 16).await;
+    let disk_takes = disky
+        .perf()
+        .unwrap()
+        .profile
+        .disk
+        .as_ref()
+        .is_some_and(|d| d.direct);
+    // macOS takes the bypass (F_NOCACHE) but can still serve data just
+    // written from its cache, so there the timing cannot tell the disks
+    // apart; the answers are still checked.
+    let disk_direct = disk_takes && !cfg!(target_os = "macos");
     let o = spawn_join(own, ticket);
     let h = spawn_join(honest, invite(&cluster, "alice"));
     let l = spawn_join(liar, invite(&cluster, "mallory"));
-    wait_online(&cluster, 3).await;
+    let d = spawn_join(disky, invite(&cluster, "dave"));
+    wait_online(&cluster, 4).await;
 
     // Every node sends its signed profile; the cluster times the
     // providers' CPU benchmark itself.
@@ -198,6 +216,55 @@ async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
         pumasi_proto::economy::billing_score(p.cpu.per_vcpu())
     );
     assert!(own.rtt_us.is_some(), "the cluster measures latency");
+
+    // The cluster times the disk and memory of providers too (1.20): the
+    // disk that claims sixteen times its speed is struck, and its `disk`
+    // label follows the timing, not the claim. Where the disk cannot be
+    // read past the page cache (tmpfs), no disk challenge is sent.
+    let score = |name: &str| {
+        let id = node_named(&cluster, name).id;
+        cluster
+            .verify_view()
+            .scores
+            .into_iter()
+            .find(|s| s.node == id)
+            .unwrap()
+    };
+    if disk_direct {
+        wait_for("the inflated disk caught", || {
+            node_named(&cluster, "disky").strikes > 0
+        })
+        .await;
+        let s = score("disky");
+        let disk = s.disk.as_ref().expect("disk timed");
+        assert!(disk.correct && disk.attempts >= 2, "{disk:?}");
+        // Caught on speed or on latency: a page cache that ignores the
+        // bypass (macOS) can make the sequential read look fast.
+        assert!(
+            disk.claimed_seq_read_mb_s > disk.seq_read_mb_s * 2
+                || disk.read_us > disk.claimed_p50_us * 2,
+            "{disk:?}"
+        );
+        assert!(disk.seq_read_mb_s <= MAX_TIMED_DISK_MB_S, "{disk:?}");
+        assert_eq!(s.disk_label, Some(disk.class));
+        wait_for("the honest disk timed", || score("honest").disk.is_some()).await;
+    } else if disk_takes {
+        wait_for("the disks timed", || {
+            score("disky").disk.is_some() && score("honest").disk.is_some()
+        })
+        .await;
+        assert!(score("disky").disk.unwrap().correct);
+        assert!(score("honest").disk.unwrap().correct);
+    }
+    wait_for("the honest memory timed", || {
+        score("honest").memory.is_some()
+    })
+    .await;
+    let s = score("honest");
+    assert!(s.memory.as_ref().unwrap().correct, "{s:?}");
+    assert_eq!(s.strikes, 0, "{s:?}");
+    // The owner's machine is not checked.
+    assert!(score("own").disk.is_none() && score("own").memory.is_none());
 
     let honest = node_named(&cluster, "honest");
     assert_eq!(honest.strikes, 0, "{:?}", honest.perf_note);
@@ -235,5 +302,6 @@ async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
     o.kill().await;
     h.kill().await;
     l.kill().await;
+    d.kill().await;
     cluster.shutdown().await.unwrap();
 }

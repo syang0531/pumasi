@@ -15,6 +15,7 @@ use pumasi_proto::{
     },
     msg::{AdminOp, AdminResponse, NodeView},
     power::{NodePowerView, format_mac},
+    verify::ProviderScore,
 };
 use serde::Deserialize;
 
@@ -41,6 +42,14 @@ async fn power(ctx: &Ctx) -> Vec<NodePowerView> {
     }
 }
 
+/// Each node's score and the disk and memory the cluster timed (1.20).
+async fn scores(ctx: &Ctx) -> Vec<ProviderScore> {
+    match ctx.call(AdminOp::Verify).await {
+        Ok(AdminResponse::Verify(v)) => v.scores,
+        _ => Vec::new(),
+    }
+}
+
 pub async fn list(ctx: Ctx) -> Response {
     match render_list(&ctx).await {
         Ok(r) => r,
@@ -53,6 +62,7 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
     let s = status(ctx).await?;
     let m = metrics(ctx, None, 0).await;
     let power = power(ctx).await;
+    let scores = scores(ctx).await;
     let mut nodes = s.nodes.clone();
     nodes.sort_by(|a, b| b.online.cmp(&a.online).then(a.info.name.cmp(&b.info.name)));
     let rows = nodes
@@ -62,7 +72,7 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
             let asleep = power
                 .iter()
                 .any(|p| p.id == n.id && p.asleep_since_unix.is_some());
-            row(l, n, mv, asleep)
+            row(l, n, mv, asleep, scores.iter().find(|s| s.node == n.id))
         })
         .collect();
     let live = table(
@@ -78,6 +88,7 @@ async fn render_list(ctx: &Ctx) -> anyhow::Result<Response> {
             l.t("Temp", "온도"),
             "GPU",
             l.t("CPU score", "CPU 점수"),
+            l.t("Score", "신뢰 점수"),
             l.t("Labels", "라벨"),
         ],
         rows,
@@ -236,7 +247,13 @@ fn confidential(ctx: &Ctx, v: &pumasi_proto::confidential::ConfidentialView) -> 
     }
 }
 
-fn row(l: Lang, n: &NodeView, mv: Option<&NodeMetricsView>, asleep: bool) -> Markup {
+fn row(
+    l: Lang,
+    n: &NodeView,
+    mv: Option<&NodeMetricsView>,
+    asleep: bool,
+    score: Option<&ProviderScore>,
+) -> Markup {
     let latest = mv.and_then(|m| m.latest.as_ref());
     html! {
         tr data-node=(n.info.name) {
@@ -262,6 +279,9 @@ fn row(l: Lang, n: &NodeView, mv: Option<&NodeMetricsView>, asleep: bool) -> Mar
                 }
             }
             td { (n.cpu_score) }
+            td data-score=[score.map(|s| s.score)] {
+                @if let Some(s) = score { (s.score) br; span class="dim" { (s.level.to_string()) } } @else { "—" }
+            }
             td class="labels" {
                 @for (k, v) in &n.config.labels { span class="chip" { (k) "=" (v) } " " }
                 @for t in &n.config.taints { span class="chip taint" { (t.to_string()) } " " }
@@ -303,6 +323,7 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
     let m = metrics(ctx, Some(n.id.clone()), since).await;
     let mv = m.nodes.iter().find(|x| x.id == n.id).cloned();
     let pw = power(ctx).await.into_iter().find(|p| p.id == n.id);
+    let score = scores(ctx).await.into_iter().find(|s| s.node == n.id);
     let asleep = pw.as_ref().is_some_and(|p| p.asleep_since_unix.is_some());
     // Offered for any offline node that opted in: a machine that lost
     // power or slept without saying so wakes the same way.
@@ -374,6 +395,7 @@ async fn render_detail(ctx: &Ctx, id: &str, range: &str) -> anyhow::Result<Respo
             (perf(l, &n))
             (labels(ctx, &n))
         }
+        @if let Some(sc) = &score { (score_block(l, sc)) }
         (availability(ctx, &n, settings.as_ref()))
     };
     Ok(ctx.page(
@@ -833,6 +855,56 @@ fn perf(l: Lang, n: &NodeView) -> Markup {
                             @if let Some(t) = &w.busy { " · " span class="badge info" { (l.t("busy", "사용 중")) } " " a href={"/jobs/" (t.job)} { code { (t.job) } } }
                             @if let Some(note) = &w.note { br; span class="dim" { (note) } }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The node's score and what the cluster timed itself (1.20).
+fn score_block(l: Lang, s: &ProviderScore) -> Markup {
+    let pct = |p: u32| format!("{}%", p / 10);
+    html! {
+        section data-score=(s.score) {
+            h2 { (l.t("Score", "신뢰 점수")) }
+            dl class="facts" {
+                dt { (l.t("Score", "점수")) } dd {
+                    strong { (s.score) } " / 1000 · " (s.level.to_string())
+                    br; span class="dim" { (l.t("Placement prefers nodes with higher scores.", "배치는 점수가 높은 노드를 먼저 고릅니다.")) }
+                }
+                dt { (l.t("Uptime", "가동률")) } dd { (pct(s.uptime_permille)) }
+                dt { (l.t("Checks", "검증")) } dd {
+                    (pct(s.checks_permille)) " · "
+                    (l.t("passed", "통과")) " " (s.checks_passed) " · "
+                    (l.t("strikes", "스트라이크")) " " (s.strikes)
+                }
+                dt { (l.t("Honeypots", "함정 작업")) } dd {
+                    (l.t("passed", "통과")) " " (s.honeypots_passed) " · "
+                    (l.t("failed", "실패")) " " (s.honeypots_failed)
+                }
+                dt { (l.t("Runs", "실행")) } dd {
+                    (pct(s.completion_permille)) " · "
+                    (l.t("done", "완료")) " " (s.runs_done) " · "
+                    (l.t("lost", "유실")) " " (s.runs_lost)
+                }
+                @if let Some(d) = &s.disk {
+                    dt { (l.t("Disk (timed)", "디스크(실측)")) } dd {
+                        (d.class.to_string()) " · " (d.seq_read_mb_s) " MB/s "
+                        (l.t("read", "읽기")) " · " (d.read_us) " µs"
+                        @if !d.correct { " · " span class="badge bad" { (l.t("wrong answer", "틀린 답")) } }
+                    }
+                }
+                @if let Some(m) = &s.memory {
+                    dt { (l.t("Memory (timed)", "메모리(실측)")) } dd {
+                        (m.measured_mb_s) " MB/s · " (l.t("claims", "주장")) " " (m.claimed_mb_s) " MB/s"
+                        @if !m.correct { " · " span class="badge bad" { (l.t("wrong answer", "틀린 답")) } }
+                    }
+                }
+                @if let Some(until) = s.held_until {
+                    dt { (l.t("Earnings", "수익")) } dd {
+                        span class="badge bad" { (l.t("held", "보류")) } " "
+                        (l.t("after a failed honeypot, until ", "함정 작업 실패로 다음까지: ")) (fmt::time(until))
                     }
                 }
             }

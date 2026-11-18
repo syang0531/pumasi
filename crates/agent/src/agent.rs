@@ -1506,6 +1506,59 @@ impl Agent {
                         }
                     });
                 }
+                Ok(Some(ToAgent::DiskChallenge(ch))) => {
+                    // As fast as possible: the cluster times each step.
+                    let dir = self
+                        .config
+                        .bench
+                        .as_ref()
+                        .map(|b| b.dir.clone())
+                        .unwrap_or_else(|| self.config.data_dir.clone());
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let at = dir.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            crate::bench::disk_challenge(&at, &ch)
+                        })
+                        .await;
+                        let last = matches!(ch.step, pumasi_proto::verify::DiskStep::Random { .. });
+                        let failed = !matches!(res, Ok(Ok(_)));
+                        let result = match res {
+                            Ok(Ok(a)) => Ok(a),
+                            Ok(Err(e)) => Err(format!("{e:#}")),
+                            Err(e) => Err(format!("disk check panicked: {e}")),
+                        };
+                        let _ = out_tx.send(FromAgent::ChallengeResult {
+                            nonce: ch.nonce,
+                            result,
+                        });
+                        // After the answer, so the cluster does not time it.
+                        if last || failed {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                crate::bench::remove_disk_challenge(&dir)
+                            })
+                            .await;
+                        }
+                    });
+                }
+                Ok(Some(ToAgent::MemoryChallenge(ch))) => {
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let res = tokio::task::spawn_blocking(move || {
+                            crate::bench::memory_challenge(&ch)
+                        })
+                        .await;
+                        let result = match res {
+                            Ok(Ok(a)) => Ok(a),
+                            Ok(Err(e)) => Err(format!("{e:#}")),
+                            Err(e) => Err(format!("memory check panicked: {e}")),
+                        };
+                        let _ = out_tx.send(FromAgent::ChallengeResult {
+                            nonce: ch.nonce,
+                            result,
+                        });
+                    });
+                }
                 Ok(Some(ToAgent::GpuChallenge(ch))) => {
                     let gpu = self
                         .devices

@@ -423,6 +423,8 @@ pub(crate) enum Refusal<'a> {
     Away(&'a str),
     /// The account holds all its quota on nodes this selector matches.
     LabelQuota(&'a pumasi_proto::manage::Selector),
+    /// The run is kept for another node (a honeypot, 1.20).
+    Kept,
 }
 
 impl std::fmt::Display for Refusal<'_> {
@@ -472,6 +474,7 @@ impl std::fmt::Display for Refusal<'_> {
             Refusal::NotNear(j) => write!(f, "no task of job {j} runs here (affinity near)"),
             Refusal::Away(j) => write!(f, "a task of job {j} runs here (affinity away)"),
             Refusal::LabelQuota(s) => write!(f, "the account's quota on {s} nodes is used up"),
+            Refusal::Kept => f.write_str("kept for another node"),
         }
     }
 }
@@ -542,6 +545,8 @@ pub struct State {
     pub(crate) reps: crate::replicas::RepState,
     /// CPU and memory quotas, checkpoints, gangs waiting (1.9).
     pub(crate) sched: crate::sched::SchedState,
+    /// Honeypots, disk and memory challenges, scores (1.20).
+    pub(crate) verify: crate::verify::VerifyState,
 }
 
 /// What a run holding part of a GPU (1.10) finds in its environment:
@@ -649,6 +654,7 @@ impl State {
             settings: Default::default(),
             reps: Default::default(),
             sched: Default::default(),
+            verify: Default::default(),
         };
         let mut job_sched: HashMap<u128, JobSched> = snap.job_sched.into_iter().collect();
         let mut job_gpu: HashMap<u128, GpuRequest> = snap.job_gpu.into_iter().collect();
@@ -768,6 +774,7 @@ impl State {
         state.load_audit()?;
         state.load_sso()?;
         state.load_scim()?;
+        state.load_verify()?;
         let now = now_unix();
         state.tokens.retain(|t| t.expires_unix > now);
         info!(
@@ -981,6 +988,7 @@ impl State {
         self.conf.tees.remove(id);
         self.mgmt.node_config.remove(id);
         self.forget_power(id);
+        self.forget_verify(id);
         self.store.remove_member(id)?;
         self.forget_node_name(id)?;
         if let Some(n) = self.nodes.get_mut(id)
@@ -1157,6 +1165,8 @@ impl State {
         }
         let lost: Vec<TaskRef> = node.running.drain().map(|(t, _)| t).collect();
         node.stopping.clear();
+        self.verify_offline(id);
+        self.note_lost(id, lost.len() as u64);
         self.forget_replicas_sent(id);
         self.forget_cache_sent(id);
         if !lost.is_empty() {
@@ -1272,6 +1282,7 @@ impl State {
         }
         for (id, t) in hung {
             warn!(node = %id, task = %t, "task exceeded its lease; rescheduling");
+            self.note_lost(&id, 1);
             if let Some(n) = self.nodes.get_mut(&id) {
                 n.running.remove(&t);
                 n.gpu.release(&t);
@@ -1298,8 +1309,10 @@ impl State {
             // A re-timing asked for within the gap between two challenges
             // waits for a tick, not for the next job.
             self.drive_challenges();
+            self.drive_verify_challenges();
             self.drive_gpu_challenges();
         }
+        self.tick_verify();
         self.tick_monitor();
     }
 
@@ -1600,6 +1613,7 @@ impl State {
         let receipt_check = self.check_receipt(node_id, &job.meta, &report, &digest);
         if let Err(e) = receipt_check {
             warn!(node = %node_id, task = %r, "rejected report: {e:#}");
+            self.note_lost(node_id, 1);
             self.strike(node_id, &format!("invalid receipt: {e:#}"));
             self.requeue_run(r, "invalid receipt");
             self.schedule();
@@ -1608,6 +1622,11 @@ impl State {
         if let Some(signed) = report.usage.clone() {
             self.settle_run(node_id, signed, observed_ms, &gpus, share, net);
             self.sample_gpus(node_id, &gpus);
+        }
+        if matches!(report.outcome, Outcome::Error(_)) {
+            self.note_lost(node_id, 1);
+        } else {
+            self.note_done(node_id);
         }
         self.conf.leases.remove(&r);
         let (report, stored, digest) = match opened {
@@ -1628,6 +1647,24 @@ impl State {
                 self.add_check_stored(r.job, r.index, r.attempt, s);
             }
             self.on_check_report(node_id, report, digest);
+        } else if self.verify.runs.contains_key(&r.job) {
+            // A honeypot (1.20): kept like any task, then compared.
+            self.set_stored(r.job, r.index, stored);
+            let outcome = report.outcome.clone();
+            if let Some(task) = self
+                .jobs
+                .get_mut(&r.job)
+                .and_then(|j| j.tasks.get_mut(r.index as usize))
+            {
+                task.fuel_used = report.fuel_used;
+                task.wall_ms = report.wall_ms;
+                task.stdout = report.stdout;
+                task.stderr = report.stderr;
+                task.output_files = report.files;
+                task.state = final_state(&outcome);
+            }
+            self.persist_task(r);
+            self.on_honeypot_report(node_id, r, &outcome, digest);
         } else {
             self.set_stored(r.job, r.index, stored);
             self.note_run(node_id, r, &report.outcome);
@@ -1821,6 +1858,7 @@ impl State {
     fn on_primary_report(&mut self, node_id: &str, report: TaskReport, digest: [u8; 32]) {
         let r = report.task;
         let (trusted, account, version, passes, strikes) = self.node_record(node_id);
+        let provider = account.clone();
         let rate = self.policy.sample_permille(passes, strikes);
         let Some(job) = self.jobs.get_mut(&r.job) else {
             return;
@@ -1869,6 +1907,11 @@ impl State {
         }
         if queue_check {
             self.push_run(r.job, r.index, true, false);
+        }
+        // Work for another account may be followed by a honeypot (1.20).
+        let consumer = self.jobs.get(&r.job).map(|j| j.meta.account.clone());
+        if !trusted && consumer.is_some_and(|c| c != provider) {
+            self.maybe_honeypot(node_id, r);
         }
     }
 
@@ -2046,11 +2089,14 @@ impl State {
         let executor = job.meta.executor;
         let consumer = job.meta.account.clone();
         let floor = self.policy.ledger.floor();
+        // A honeypot is the cluster's cost of checking (1.20): it runs
+        // whatever the paying account has left.
         let can_pay = self
             .accounts
             .get(&consumer)
             .is_some_and(|a| a.balance > floor)
-            && !self.over_daily(&consumer);
+            && !self.over_daily(&consumer)
+            || job.meta.origin.submitted_by == crate::verify::HONEYPOT_BY;
         let extra_memory = match &confidential {
             Some(crate::confidential::ConfNeed::Ready(s)) => s.extra_mib << 20,
             _ => 0,
@@ -2221,8 +2267,15 @@ impl State {
         {
             return Some(R::Paused(why));
         }
-        if n.perf.wanted || n.perf.challenge.is_some() {
+        if n.perf.wanted || n.perf.challenge.is_some() || self.verify_busy(id) {
             return Some(R::Benchmarking);
+        }
+        // A honeypot goes only to the node it was made for (1.20).
+        if self
+            .honeypot_node(need.item.job)
+            .is_some_and(|kept| kept != id)
+        {
+            return Some(R::Kept);
         }
         if config.is_some_and(|c| c.cordoned) {
             return Some(R::Cordoned);
@@ -2323,6 +2376,7 @@ impl State {
         // idle nodes due for a benchmark check get that.
         self.drive_rollout();
         self.drive_challenges();
+        self.drive_verify_challenges();
         self.drive_gpu_challenges();
         self.release_waiting();
         self.sweep_leases();
@@ -2742,6 +2796,7 @@ impl State {
         let mut jobs: Vec<(u64, JobSummary)> = self
             .jobs
             .values()
+            .filter(|j| j.meta.origin.submitted_by != crate::verify::HONEYPOT_BY)
             .map(|j| (j.meta.seq, Self::summary(j)))
             .collect();
         jobs.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));

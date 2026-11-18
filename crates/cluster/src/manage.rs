@@ -617,8 +617,9 @@ impl State {
         {
             put("webgpu", w.profile.adapters.len().to_string());
         }
-        if let Some(d) = m.perf.as_ref().and_then(|p| p.profile.disk.as_ref()) {
-            put("disk", d.class.to_string());
+        // From the cluster's timing on providers' machines (1.20).
+        if let Some(class) = self.disk_label(id) {
+            put("disk", class.to_string());
         }
         if let Some(c) = self.mgmt.node_config.get(id) {
             for (k, v) in &c.labels {

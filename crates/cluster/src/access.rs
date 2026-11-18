@@ -131,6 +131,9 @@ fn op_name(op: &AdminOp) -> &'static str {
         ApplyMore { .. } => "apply cluster files",
         MetricsWait { .. } => "read metrics",
         EventsKeyed { .. } | AlertTexts => "read events",
+        Verify => "read honeypots and scores",
+        SetVerifyPolicy(_) | HoneypotRemove { .. } | HoneypotRelease { .. } => "change honeypots",
+        HoneypotAdd { .. } => "add honeypots",
     }
 }
 
@@ -192,6 +195,7 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | JobWait { .. }
             | LogsWait { .. }
             | JobCaps
+            | Verify
             | HaStatus => Ok(op),
             other => Err(denied(caller, &other)),
         },
@@ -265,6 +269,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | Placement { id }
         | JobWait { id, .. }
         | LogsWait { job: id, .. }
+        | HoneypotAdd { job: id, .. }
         | Logs { job: id, .. } => own_job(st, account, id)?,
         RemoveSchedule { name } | RunSchedule { name } => {
             if let Some(other) = st.schedule_account(name) {
@@ -303,6 +308,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | Placement { .. }
         | JobWait { .. }
         | LogsWait { .. }
+        | HoneypotAdd { .. }
         | Logs { .. }) => op,
         op @ (Metrics { .. }
         | Events { .. }
@@ -313,6 +319,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         | EventsKeyed { .. }
         | AlertTexts) => op,
         op @ (Status
+        | Verify
         | JobCaps
         | NodePower
         | Accounts
@@ -465,6 +472,18 @@ pub fn scope(caller: &Caller, resp: AdminResponse) -> AdminResponse {
         AdminResponse::JobCaps(mut v) => {
             v.retain(|(a, _)| a == account);
             AdminResponse::JobCaps(v)
+        }
+        // Its own honeypots; which nodes got honeypots is the cluster's.
+        AdminResponse::Verify(mut v) => {
+            v.honeypots.retain(|h| h.account == *account);
+            v.runs.clear();
+            v.held.retain(|(a, _)| a == account);
+            for s in &mut v.scores {
+                if s.account != *account {
+                    s.held_until = None;
+                }
+            }
+            AdminResponse::Verify(v)
         }
         AdminResponse::Schedules(mut v) => {
             v.retain(|s| s.account == *account);

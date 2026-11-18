@@ -224,7 +224,11 @@ impl State {
         let due: Vec<TaskRef> = self
             .holds
             .values()
-            .filter(|h| h.release_after_unix <= now && !self.check_pending(h.task))
+            .filter(|h| {
+                h.release_after_unix <= now
+                    && !self.check_pending(h.task)
+                    && !self.held_by_honeypot(&h.provider, now)
+            })
             .map(|h| h.task)
             .collect();
         if due.is_empty() {

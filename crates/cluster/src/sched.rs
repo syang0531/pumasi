@@ -391,7 +391,8 @@ impl State {
                     n.account == need.consumer
                 };
                 let free = (n.free_slots() + room.freed_slots).saturating_sub(room.taken_slots);
-                (Reverse(spread), pref, free)
+                // The higher score among equals (1.20).
+                (Reverse(spread), pref, self.placement_score(id), free)
             })
             .map(|(id, _)| id.clone())
     }

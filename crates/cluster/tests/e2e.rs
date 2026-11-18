@@ -87,7 +87,14 @@ async fn start_cluster(dir: PathBuf) -> Result<Cluster> {
     // The default node timeout (10 s): a node that is killed closes its
     // connection, which the control plane sees at once, and with 2 s a
     // slow CI runner lost healthy nodes ("node missed heartbeats").
-    Cluster::start(config).await
+    let cluster = Cluster::start(config).await?;
+    // No honeypots (1.20): they would bill and strike in tests that count
+    // both. `verify.rs` tests them.
+    cluster.set_verify_policy(&pumasi_proto::verify::VerifyPolicyPatch {
+        honeypots: Some(false),
+        ..Default::default()
+    })?;
+    Ok(cluster)
 }
 
 struct RunningAgent {

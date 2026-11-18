@@ -247,6 +247,13 @@ pub const TEXTS: &[(&str, &str, &str)] = &[
         "benchmark of {0} dropped: {1}",
         "{0} 벤치마크 하락: {1}",
     ),
+    // Result checks (1.20).
+    ("perf.inflated", "{0}: {1}", "{0}: 부풀린 벤치마크 ({1})"),
+    (
+        "honeypot.failed",
+        "{0} gave a wrong answer to a honeypot task; account {1}'s earnings are held for {2}",
+        "{0}이(가) 함정 작업에 틀린 답을 냈습니다. 계정 {1}의 수익을 {2} 동안 보류합니다",
+    ),
     // Confidential computing.
     (
         "confidential.keys",

@@ -40,7 +40,9 @@ pub const MAX_SCORE: u32 = 5000;
 
 /// Bumped when the benchmarks change in a way that makes old profiles
 /// incomparable; agents re-measure then.
-pub const BENCH_VERSION: u32 = 1;
+/// Version 2 (1.20) measures memory with the memory challenge's kernel and
+/// folds every disk block it reads, as the disk challenge does.
+pub const BENCH_VERSION: u32 = 2;
 
 /// The CPU benchmark kernel. `bench(seed, iters)` fills a 4 KiB table from
 /// the seed, then runs `iters` rounds of dependent 64-bit multiply, rotate,

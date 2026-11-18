@@ -11,6 +11,7 @@ mod security;
 mod service;
 mod ui;
 mod upgrade;
+mod verify_cmd;
 
 use std::{
     io::Write,
@@ -151,6 +152,18 @@ enum Cmd {
     /// them (Docker, microVM passthrough, the cluster's GPU check).
     #[command(subcommand)]
     Gpu(gpu_cmd::GpuCmd),
+    /// Honeypot tasks: known-answer tasks slipped into providers' queues
+    /// to catch wrong results (list, add, remove, release, set).
+    #[command(subcommand)]
+    Honeypot(verify_cmd::HoneypotCmd),
+    /// Each node's score (uptime, checks and honeypots, finished runs) and
+    /// the disk the cluster timed.
+    Score {
+        #[arg(short = 'o', long, value_enum, default_value = "table")]
+        output: manage::Output,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
     /// Show what this machine's temperature and power sensors read, as the
     /// agent reports them (Macs: the SMC on Intel, IOReport and the HID
     /// sensors on Apple Silicon; Windows: ACPI thermal zones and the
@@ -1682,6 +1695,8 @@ async fn run(cli: Cli) -> Result<i32> {
             cpus,
         } => bench(&home, dir, quick, json, cpus).await,
         Cmd::Gpu(cmd) => gpu_cmd::run(&home, cmd).await,
+        Cmd::Honeypot(cmd) => verify_cmd::honeypot(&home, cmd).await,
+        Cmd::Score { output, admin } => verify_cmd::score(&home, output, &admin).await,
         Cmd::Sensors { raw } => {
             let home = home.clone();
             tokio::task::spawn_blocking(move || sensors(&home, raw)).await??;
@@ -1861,8 +1876,12 @@ async fn run(cli: Cli) -> Result<i32> {
                 );
             }
             let power = node_power(&client).await;
+            let score = verify_cmd::node_score(&client, &n.id).await;
             client.close().await;
             print_node(n, power.iter().find(|p| p.id == n.id));
+            if let Some(s) = &score {
+                verify_cmd::print_node_score(s);
+            }
             Ok(0)
         }
         Cmd::Receipts { id, export, admin } => {

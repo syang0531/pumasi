@@ -96,6 +96,9 @@ pub(crate) struct PerfRuntime {
     pub last_challenge: Option<Instant>,
     /// Single-thread scores implied by recent WASM runs.
     pub implied: VecDeque<u32>,
+    /// The next timing is the periodic one: a drop from the best raises
+    /// the benchmark alert (1.20).
+    pub retime: bool,
 }
 
 /// The CPU score a member's runs are billed at, and why it is not simply
@@ -186,10 +189,15 @@ impl State {
         let trusted = m.trusted();
         let scores = |p: &pumasi_proto::perf::PerfProfile| (p.cpu.per_vcpu(), p.memory.copy_mb_s);
         let new_scores = scores(p);
+        // A profile of another benchmark version measured differently
+        // (1.20 measures memory with the challenge's kernel): no drop.
         let old_scores = m
             .perf
             .as_ref()
-            .filter(|old| old.profile.measured_unix != p.measured_unix)
+            .filter(|old| {
+                old.profile.measured_unix != p.measured_unix
+                    && old.profile.bench_version == p.bench_version
+            })
             .map(|old| scores(&old.profile));
         let changed = m.perf.as_ref() != Some(&signed);
         if changed {
@@ -203,6 +211,10 @@ impl State {
             && let Some(n) = self.nodes.get_mut(id)
         {
             n.perf.wanted = true;
+        }
+        // Disk and memory too, from 1.20 agents.
+        if !trusted {
+            self.want_verify_challenges(id);
         }
         self.schedule();
         Ok(())
@@ -310,6 +322,21 @@ impl State {
         correct: bool,
     ) {
         let timed = score_for(c.bench.iters, took.as_nanos().max(1_000_000));
+        let retime = self
+            .nodes
+            .get_mut(id)
+            .is_some_and(|n| std::mem::take(&mut n.perf.retime));
+        if retime
+            && correct
+            && let Some(p) = self
+                .members
+                .get(id)
+                .and_then(|m| m.perf_check.as_ref())
+                .filter(|p| p.claimed_single == c.claimed_single && p.correct)
+        {
+            let best = p.measured_single;
+            self.note_timed_drop(id, &[("CPU", best, timed)]);
+        }
         let Some(m) = self.members.get_mut(id) else {
             return;
         };

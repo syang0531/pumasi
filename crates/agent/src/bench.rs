@@ -26,9 +26,16 @@ use std::{
 
 use anyhow::Result;
 use iroh::SecretKey;
-use pumasi_proto::perf::{
-    BENCH_VERSION, CpuPerf, DiskClass, DiskPerf, KERNEL_WAT, MemoryPerf, PerfProfile, SignedPerf,
-    SmartInfo, classify_disk, score_for,
+use pumasi_proto::{
+    perf::{
+        BENCH_VERSION, CpuPerf, DiskClass, DiskPerf, KERNEL_WAT, MemoryPerf, PerfProfile,
+        SignedPerf, SmartInfo, classify_disk, score_for,
+    },
+    verify::{
+        DISK_BLOCK, DISK_CHUNK, DiskChallenge, DiskStep, MemoryChallenge, SequentialAnswer,
+        block_fold, chunk_folds, chunk_order, disk_chunk, memory_buffers, memory_kernel,
+        memory_pass, memory_step, prepare_answer, random_walk,
+    },
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -60,6 +67,10 @@ pub struct BenchConfig {
     /// like a provider inflating its benchmark. 1 is honest.
     #[doc(hidden)]
     pub inflate: u32,
+    /// Test hook: report the disk this many times faster (and claim NVMe
+    /// beyond 1). 1 is honest.
+    #[doc(hidden)]
+    pub inflate_disk: u32,
 }
 
 impl BenchConfig {
@@ -74,6 +85,7 @@ impl BenchConfig {
             smart: true,
             interval: Duration::from_secs(24 * 3600),
             inflate: 1,
+            inflate_disk: 1,
         }
     }
 
@@ -88,6 +100,7 @@ impl BenchConfig {
             smart: false,
             interval: Duration::from_secs(24 * 3600),
             inflate: 1,
+            inflate_disk: 1,
         }
     }
 }
@@ -204,24 +217,33 @@ fn cpu(kernel: &CpuKernel, threads: u32, window: Duration) -> Result<CpuPerf> {
 // Memory
 // ---------------------------------------------------------------------------
 
+/// Streaming bandwidth with the memory challenge's kernel (1.20), so the
+/// cluster's timing of it measures the same thing: bytes read and written
+/// over two buffers much larger than the caches.
 fn memory(want: u64, window: Duration) -> MemoryPerf {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let total = sys.total_memory();
     // At most an eighth of the machine's memory, split in two buffers.
-    let size = (want.min(total / 8).max(4 * MIB) / 2) as usize;
-    let src = vec![1u8; size];
-    let mut dst = vec![0u8; size];
-    dst.copy_from_slice(&src);
+    let bytes = want.min(total / 8).max(4 * MIB);
+    let (mut a, mut b) = memory_buffers(1, bytes);
+    let n = a.len();
+    // Warm up: the first pass faults the second buffer's pages in.
+    memory_pass(&a, &mut b, 1, 1);
     let start = Instant::now();
-    let mut copies = 0u64;
-    while start.elapsed() < window || copies < 2 {
-        dst.copy_from_slice(std::hint::black_box(&src));
-        std::hint::black_box(&mut dst);
-        copies += 1;
+    let mut passes = 0u32;
+    while start.elapsed() < window || passes < 2 {
+        let (k, off) = memory_step(1, passes, n);
+        if passes.is_multiple_of(2) {
+            memory_pass(&a, &mut b, k, off);
+        } else {
+            memory_pass(&b, &mut a, k, off);
+        }
+        passes += 1;
     }
+    std::hint::black_box((&a, &b));
     let secs = start.elapsed().as_secs_f64();
-    let mb = (2 * size as u64 * copies) as f64 / 1e6;
+    let mb = (3 * n as u64 * 8 * passes as u64) as f64 / 1e6;
     MemoryPerf {
         total_bytes: total,
         copy_mb_s: (mb / secs).min(u32::MAX as f64) as u32,
@@ -424,6 +446,8 @@ fn measure_disk(dir: &Path, bytes: u64, window: Duration) -> Result<DiskNumbers>
         if n == 0 {
             break;
         }
+        // Folded as the disk challenge folds what it reads (1.20).
+        std::hint::black_box(chunk_folds(&block.as_ref()[..n]));
         read += n as u64;
     }
     let secs = start.elapsed().as_secs_f64();
@@ -438,6 +462,7 @@ fn measure_disk(dir: &Path, bytes: u64, window: Duration) -> Result<DiskNumbers>
         let off = rng.next() % pages * PAGE as u64;
         let t = Instant::now();
         read_at(&file, page.as_mut(), off)?;
+        std::hint::black_box(block_fold(page.as_ref()));
         lat.push(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
     }
     lat.sort_unstable();
@@ -498,6 +523,12 @@ struct DriveInfo {
 
 fn drive_info(dir: &Path) -> DriveInfo {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    // Windows canonicalizes to `\\?\D:\...`, which no mount point (`D:\`)
+    // is a prefix of.
+    let dir = match dir.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) if !plain.starts_with("UNC\\") => PathBuf::from(plain),
+        _ => dir,
+    };
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let best = disks
         .list()
@@ -641,17 +672,157 @@ fn smart(device: Option<&str>) -> std::result::Result<SmartInfo, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Challenges (1.20)
+// ---------------------------------------------------------------------------
+
+/// The file disk challenges write and read, in the work directory.
+const CHALLENGE_FILE: &str = ".pumasi-challenge.tmp";
+
+/// Opens an existing file for unbuffered reads.
+fn open_direct_read(path: &Path) -> io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_DIRECT);
+        o.open(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let f = o.open(path)?;
+        // SAFETY: valid descriptor; F_NOCACHE takes an int.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(f)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        o.custom_flags(FILE_FLAG_NO_BUFFERING);
+        o.open(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = (o, path);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no direct I/O"))
+    }
+}
+
+/// Answers one step of a disk challenge in `dir`, as fast as it can.
+/// Blocking.
+pub fn disk_challenge(dir: &Path, c: &DiskChallenge) -> Result<[u8; 32]> {
+    let path = dir.join(CHALLENGE_FILE);
+    match c.step {
+        DiskStep::Prepare { bytes } => {
+            std::fs::create_dir_all(dir)?;
+            let _ = std::fs::remove_file(&path);
+            anyhow::ensure!(
+                bytes <= pumasi_proto::verify::MAX_DISK_CHALLENGE_BYTES,
+                "disk challenge of {bytes} bytes is too large"
+            );
+            let chunks = bytes / DISK_CHUNK as u64;
+            anyhow::ensure!(chunks > 0, "empty disk challenge");
+            let file = open_direct(&path)
+                .map_err(|e| anyhow::anyhow!("no direct I/O in {}: {e}", dir.display()))?;
+            let mut block = Aligned::new(DISK_CHUNK);
+            let mut last = Vec::with_capacity(chunks as usize);
+            for i in 0..chunks {
+                disk_chunk(c.seed, i, block.as_mut());
+                let n = write_at(&file, block.as_ref(), i * DISK_CHUNK as u64)?;
+                anyhow::ensure!(n == DISK_CHUNK, "short write");
+                last.push(block_fold(&block.as_ref()[DISK_CHUNK - DISK_BLOCK..]));
+            }
+            file.sync_all()?;
+            Ok(prepare_answer(c.nonce, last))
+        }
+        DiskStep::Sequential => {
+            let file = open_direct_read(&path)?;
+            let chunks = (file.metadata()?.len() / DISK_CHUNK as u64) as u32;
+            let mut block = Aligned::new(DISK_CHUNK);
+            let mut answer = SequentialAnswer::new(c.nonce);
+            for i in chunk_order(c.seed, c.nonce, chunks) {
+                let n = read_at(&file, block.as_mut(), i as u64 * DISK_CHUNK as u64)?;
+                anyhow::ensure!(n == DISK_CHUNK, "short read");
+                answer.chunk(&chunk_folds(block.as_ref()));
+            }
+            Ok(answer.finish())
+        }
+        DiskStep::Random { reads } => {
+            anyhow::ensure!(
+                reads <= pumasi_proto::verify::MAX_DISK_CHALLENGE_READS,
+                "disk challenge of {reads} reads is too large"
+            );
+            // The caller removes the file once the answer is sent
+            // ([`remove_disk_challenge`]): deleting it is no part of the
+            // timing (a virus scanner can make it slow).
+            let file = open_direct_read(&path)?;
+            let blocks = file.metadata()?.len() / DISK_BLOCK as u64;
+            let mut page = Aligned::new(DISK_BLOCK);
+            let answer = random_walk(c.nonce, reads, blocks, |i| -> io::Result<u64> {
+                read_at(&file, page.as_mut(), i * DISK_BLOCK as u64)?;
+                Ok(block_fold(page.as_ref()))
+            })?;
+            Ok(answer)
+        }
+    }
+}
+
+/// Removes what a disk challenge wrote, after its last step.
+pub fn remove_disk_challenge(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(CHALLENGE_FILE));
+}
+
+/// Answers a memory challenge: the kernel's result in the first eight
+/// bytes. Blocking.
+pub fn memory_challenge(c: &MemoryChallenge) -> Result<[u8; 32]> {
+    anyhow::ensure!(
+        c.bytes <= pumasi_proto::verify::MAX_MEMORY_CHALLENGE_BYTES
+            && c.passes <= pumasi_proto::verify::MAX_MEMORY_CHALLENGE_PASSES,
+        "memory challenge of {} bytes and {} passes is too large",
+        c.bytes,
+        c.passes
+    );
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&memory_kernel(c.seed, c.bytes, c.passes).to_le_bytes());
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // The whole profile
 // ---------------------------------------------------------------------------
 
 /// The CPU scores `inflate` times too high (for testing the checks that
-/// catch it).
+/// catch it), and at least `inflate` times the reference: a busy CI
+/// machine has measured its quick benchmark at a fifth of what the
+/// cluster timed a minute later, which made eight times that no lie.
 fn inflated(mut cpu: CpuPerf, inflate: u32) -> CpuPerf {
     if inflate > 1 {
-        cpu.single = cpu.single.saturating_mul(inflate);
-        cpu.multi = cpu.multi.saturating_mul(inflate);
+        let floor = |per_thread: u32, threads: u32| {
+            per_thread
+                .saturating_mul(inflate)
+                .max(1000u32.saturating_mul(inflate).saturating_mul(threads))
+        };
+        cpu.single = floor(cpu.single, 1);
+        cpu.multi = floor(cpu.multi, cpu.threads.max(1));
     }
     cpu
+}
+
+/// The disk `inflate` times faster than measured, and NVMe-fast (for
+/// testing the disk challenge).
+fn inflated_disk(mut n: DiskNumbers, inflate: u32) -> DiskNumbers {
+    if inflate > 1 {
+        n.seq_read_mb_s = n.seq_read_mb_s.saturating_mul(inflate).max(3000);
+        n.seq_write_mb_s = n.seq_write_mb_s.saturating_mul(inflate);
+        n.p50_us = (n.p50_us / inflate).clamp(1, 60);
+        n.p99_us = (n.p99_us / inflate).max(1);
+        n.iops = n.iops.saturating_mul(inflate);
+    }
+    n
 }
 
 /// Measures this machine. Blocking; takes about `cpu * 2.4 + disk * 4` plus
@@ -696,6 +867,7 @@ pub fn measure(
                 } else {
                     None
                 };
+                let n = inflated_disk(n, config.inflate_disk);
                 Some(DiskPerf {
                     class: classify_disk(n.direct, n.seq_read_mb_s, n.p50_us),
                     os_class: drive.os_class,
@@ -878,7 +1050,10 @@ mod tests {
         let x10 = inflated(p.cpu.clone(), 10);
         assert_eq!(
             (x10.single, x10.multi),
-            (p.cpu.single * 10, p.cpu.multi * 10)
+            (
+                (p.cpu.single * 10).max(10_000),
+                (p.cpu.multi * 10).max(10_000 * p.cpu.threads.max(1))
+            )
         );
         assert_eq!(inflated(p.cpu.clone(), 1), p.cpu);
     }

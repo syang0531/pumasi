@@ -130,6 +130,9 @@ pub struct ClusterConfig {
     /// The longest a write waits for its copies before it is acknowledged
     /// anyway (1.8).
     pub replica_ack_timeout: Duration,
+    /// How much the disk and memory challenges write and touch at most
+    /// (1.20; tests use less).
+    pub challenge_bytes: (u64, u64),
 }
 
 impl ClusterConfig {
@@ -160,6 +163,10 @@ impl ClusterConfig {
             scrub_every: crate::replicas::DEFAULT_SCRUB_EVERY,
             repair_every: Duration::from_secs(60),
             replica_ack_timeout: Duration::from_secs(300),
+            challenge_bytes: (
+                crate::verify::DISK_CHALLENGE_BYTES,
+                crate::verify::MEMORY_CHALLENGE_BYTES,
+            ),
         }
     }
 }
@@ -356,6 +363,14 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
     state.power.wake_after = config.wake_after;
     state.set_probe_every(config.probe_every);
     state.set_replica_timing(config.replica_repair_after, config.scrub_every);
+    state.verify.disk_bytes = config
+        .challenge_bytes
+        .0
+        .min(pumasi_proto::verify::MAX_DISK_CHALLENGE_BYTES);
+    state.verify.memory_bytes = config
+        .challenge_bytes
+        .1
+        .min(pumasi_proto::verify::MAX_MEMORY_CHALLENGE_BYTES);
     if config.insecure_test_tee {
         warn!(
             "--insecure-test-tee: confidential tasks may run without a TEE; nothing they hold is protected"
@@ -804,6 +819,16 @@ impl Cluster {
     /// The Prometheus text `/metrics` serves.
     pub fn prometheus_text(&self) -> String {
         self.inner().state().prometheus()
+    }
+
+    /// The honeypots, scores and timings `pumasi honeypot` shows (1.20).
+    pub fn verify_view(&self) -> pumasi_proto::verify::VerifyView {
+        self.inner().state().verify_view()
+    }
+
+    /// Changes the honeypot policy, as `pumasi honeypot set` does.
+    pub fn set_verify_policy(&self, patch: &pumasi_proto::verify::VerifyPolicyPatch) -> Result<()> {
+        self.inner().state().set_verify_policy(patch)
     }
 
     /// Alerts sent to webhooks lately (for tests).
@@ -1324,6 +1349,36 @@ async fn agent_session(shared: Arc<Shared>, conn: Connection) -> Result<()> {
                                 );
                             }
                         });
+                    }
+                }
+                Ok(Some(FromAgent::ChallengeResult { nonce, result })) => {
+                    let answered = {
+                        let mut st = inner.state();
+                        st.on_heartbeat(&node_id, generation);
+                        st.on_challenge_result(&node_id, generation, nonce, result)
+                    };
+                    // Checked off the state lock: the control plane makes
+                    // the data again (1.20).
+                    match answered {
+                        crate::verify::Answered::Nothing => {}
+                        crate::verify::Answered::Disk(d) => {
+                            let inner = inner.clone();
+                            tokio::spawn(async move {
+                                let d2 = d.clone();
+                                if let Ok(ok) = tokio::task::spawn_blocking(move || d2.check()).await {
+                                    inner.state().apply_disk_check(&d, ok);
+                                }
+                            });
+                        }
+                        crate::verify::Answered::Memory(m) => {
+                            let inner = inner.clone();
+                            tokio::spawn(async move {
+                                let m2 = m.clone();
+                                if let Ok(ok) = tokio::task::spawn_blocking(move || m2.check()).await {
+                                    inner.state().apply_memory_check(&m, ok);
+                                }
+                            });
+                        }
                     }
                 }
                 Ok(Some(FromAgent::Done(report))) => {
@@ -3399,6 +3454,27 @@ fn handle_admin(inner: &Inner, caller: &Caller, op: AdminOp) -> AdminResponse {
             let mut st = inner.state();
             st.set_job_caps(&account, caps)?;
             Ok(AdminResponse::JobCaps(st.job_caps_view()))
+        }
+        AdminOp::Verify => Ok(AdminResponse::Verify(Box::new(inner.state().verify_view()))),
+        AdminOp::SetVerifyPolicy(patch) => {
+            let mut st = inner.state();
+            st.set_verify_policy(&patch)?;
+            Ok(AdminResponse::Verify(Box::new(st.verify_view())))
+        }
+        AdminOp::HoneypotAdd { job, task } => {
+            let mut st = inner.state();
+            st.add_honeypots(job, task)?;
+            Ok(AdminResponse::Verify(Box::new(st.verify_view())))
+        }
+        AdminOp::HoneypotRemove { id } => {
+            let mut st = inner.state();
+            st.remove_honeypot(id)?;
+            Ok(AdminResponse::Verify(Box::new(st.verify_view())))
+        }
+        AdminOp::HoneypotRelease { account } => {
+            let mut st = inner.state();
+            st.release_held(&account)?;
+            Ok(AdminResponse::Verify(Box::new(st.verify_view())))
         }
         AdminOp::WakeNode { node } => Ok(AdminResponse::Applied(inner.state().wake_node(&node)?)),
         AdminOp::CheckJob { sub, upload_bytes } => {

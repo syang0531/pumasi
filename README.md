@@ -646,6 +646,28 @@ pumasi run examples/montecarlo/job.toml
   provider whose result disagrees loses that earning (you are refunded), gets
   a strike, and after 3 strikes gets no more tasks. If a check run's result
   wins, it replaces the provider's.
+- Work that is not deterministic (Docker, microVMs, GPUs) cannot be
+  checked that way, so the control plane also slips **honeypot tasks**
+  with known answers into providers' queues (1.20): after a task, with a
+  chance set per trust level (10% for new providers, 2% for others, 25%
+  after a strike, none on machines you trust). Built-in ones are small
+  seeded computations in the executor the provider just ran; `pumasi
+  honeypot add <JOB>` makes copies of a finished job's tasks, which look
+  exactly like your real work once one of your own machines has run them
+  again with the same answer. A wrong answer is a strike, the run's
+  earning is forfeited and every earning of that account is **held** for
+  a day (`pumasi honeypot release <ACCOUNT>` lets them go).
+- Each provider has a **score** from 0 to 1000 (uptime, checks and
+  honeypots passed or failed, runs finished or lost), shown by `pumasi
+  score`, `pumasi node <NODE>` and the dashboard; placement prefers the
+  higher score.
+
+```sh
+pumasi honeypot list               # policy, honeypots, latest runs, held accounts
+pumasi honeypot add 7c1e04b2d9a8f310 --task 3
+pumasi honeypot set --provider 50 --image python:3.12-slim
+pumasi score
+```
 
 ```
 $ pumasi job 7c1e04b2d9a8f310
@@ -710,6 +732,17 @@ kernel when it is idle, times the answer and recomputes it. The provider
 is billed at no more than 1.25 times what the cluster timed, and a claim
 over twice that (or a wrong answer) is a strike. Claiming shorter runs to
 look fast does not pay either: the bill is time x score.
+
+Since 1.20 the control plane times providers' **disk and memory** the same
+way, and all three again every day (`pumasi honeypot set --retime 24h`):
+it has the agent write seeded data with the page cache bypassed, read it
+back in an order it picks and follow a chain of dependent 4 KiB reads,
+and run the memory kernel with a fresh seed, timing each step itself. A
+claim over twice the timing (two timings in a row) or a wrong answer is a
+strike, a timing well below the last one raises the benchmark-drop alert,
+and on providers the automatic `disk` label is the class the cluster
+timed, never more than the profile claims, so `disk=nvme` selectors can
+trust it.
 
 ```
 $ pumasi bench
@@ -1650,7 +1683,9 @@ defends against, including the API exposed to the internet.
 | `pumasi secret set NAME [VALUE]` / `ls` / `rm NAME` | Cluster secrets; `registry/<host>` logs in to a private registry. |
 | `pumasi run job.toml [--account A] [--priority N] [--after JOB] [--output] [--out DIR] [--detach]` | Submit a job and wait for it. Output files are saved to `DIR` (default `pumasi-out/<job id>`). Exit code 0 on success, 2 if any task failed. `--account` picks who pays for provider runs (default `owner`). |
 | `pumasi status` | Nodes (role, online, executors, slots, running, checks, billed CPU score, disk class, latency, GPUs) and recent jobs with their cost in CU. |
-| `pumasi node <NODE> [--rebenchmark]` | One node's benchmark profile, billed score, GPUs, latency and checks; `--rebenchmark` asks it to measure again. |
+| `pumasi node <NODE> [--rebenchmark]` | One node's benchmark profile, billed score, GPUs, latency and checks, and (1.20) its score and the disk and memory the cluster timed; `--rebenchmark` asks it to measure again. |
+| `pumasi score [-o json]` | Each node's score (0 to 1000: uptime, checks and honeypots, runs finished and lost), trust level and the disk the cluster timed (1.20). |
+| `pumasi honeypot list [--output json]` / `add <JOB> [--task N]` / `remove <ID>` / `release <ACCOUNT>` / `set [--on\|--off] [--new P] [--provider P] [--trusted P] [--struck P] [--image I] [--hold 24h] [--retime 24h]` | Honeypot tasks (1.20): the policy (chances in thousandths per trust level), the account's honeypots copied from finished jobs and their latest runs; `release` lets earnings held after a failed honeypot go after their usual hold. |
 | `pumasi node set <NODE> [--slots N\|--default-slots] [--max-cpu-percent P\|--all-cpus] [--hours 22:00-07:00\|--any-time] [--idle-minutes M\|--no-idle] [--only-on-ac\|--any-power]` | Change when a node takes tasks: its agent (a 1.7 service) writes them to `agent.toml` and restarts with them once idle. Without options, shows them. The dashboard's node page and `PUT /api/v1/nodes/NODE/settings` do the same. |
 | `pumasi node wake <NODE>` | Send the Wake-on-LAN magic packet of an offline node that runs with `--wake-on-lan`, from the machines of the cluster on its LAN. The dashboard's Wake button and `POST /api/v1/nodes/NODE/wake` do the same. |
 | `pumasi node rename <NODE> <NAME>` / `--reset` | Give a node a display name (status, dashboard, events, the `name` label, any NODE argument); it replaces the agent's `--name` until `--reset`. The dashboard's node page and `POST /api/v1/nodes/NODE/rename` do the same. |
@@ -1956,12 +1991,12 @@ scope in [docs/security-review.md](docs/security-review.md) is done
 1.0 was tagged after a green run of the long checks (5-hour soaks on
 Linux and macOS, 20 minutes per fuzz target) on the tagged commit
 ([release notes](docs/releases/v1.0.0.md); 1.0.1 fixes GPU drawing in Docker on
-Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md). 1.12.0 adds SCIM provisioning, audit log pruning behind a signed checkpoint, limits shared by every dashboard, the CLI behind an HTTPS proxy and followers answering the dashboard's reads: [notes](docs/releases/v1.12.0.md). 1.13.0 upgrades the control plane itself after the agents, replicas one at a time, with a rollback when the new binary does not come back healthy, and fixes the three checks that failed now and then in CI: [notes](docs/releases/v1.13.0.md). 1.14.0 keeps microVMs warm for the next task of an image, lets microVM tasks checkpoint, and reads Mac temperatures and GPU power from the SMC and IOReport: [notes](docs/releases/v1.14.0.md). 1.15.0 puts per-node alert thresholds and silences in `cluster.toml`, edits schedules and secrets in the browser, pushes the dashboard's charts, streams microVM output past 1 MiB, reads Intel and AMD GPU temperatures, measures the network to the file store and shows events in Korean: [notes](docs/releases/v1.15.0.md). 1.16.0 gives parts of NVIDIA GPUs a memory limit with MPS, benchmarks MIG slices, draws over WebGPU with textures and render passes, gives wasm tasks several GPUs and runs WASI preview 2 components: [notes](docs/releases/v1.16.0.md). 1.17.0 removes the WSL Docker in one go and repairs it when changed by hand, and reads Windows CPU temperatures from Open Hardware Monitor and HWiNFO: [notes](docs/releases/v1.17.0.md). 1.18.0 gives microVM jobs UDP, IPv6, allow lists, bandwidth caps and billed egress, Firecracker a network without QEMU, pulls private images once into the store, and adds node cache quotas: [notes](docs/releases/v1.18.0.md). 1.19.0 reads from followers for the API and the CLI, keeps sign-in limits across a failover, lets a replica that moved rejoin by itself, pushes `?wait=` and `logs -f`, caps CPUs, memory and CU per job, and gets the dashboard's certificate with ACME: [notes](docs/releases/v1.19.0.md)). There has been no
+Windows and the Blender example: [notes](docs/releases/v1.0.1.md); 1.1.0 adds your own relay servers and clearer ticket errors: [notes](docs/releases/v1.1.0.md); 1.2.0 installs the control plane and the dashboard as services, lists and revokes join tickets, and fixes microVMs on macOS: [notes](docs/releases/v1.2.0.md); 1.2.1 explains Smart App Control blocks on Windows: [notes](docs/releases/v1.2.1.md); 1.2.2 keeps rollouts from downgrading: [notes](docs/releases/v1.2.2.md); 1.2.3 serves the dashboard behind a tunnel: [notes](docs/releases/v1.2.3.md); 1.3.0 renames nodes, upgrades the cluster to the newest release from the dashboard, API or CLI, and gives vz microVMs on macOS 11+ (old Intel Macs on Big Sur too) a network: [notes](docs/releases/v1.3.0.md). 1.3.2 makes microVMs boot on Intel Macs: [notes](docs/releases/v1.3.2.md). 1.4.0 changes a service's options without reinstalling it, edits account policies from the dashboard and the API, lets a submitter check a job before sending it, and splits each task's time into waiting, fetching, pulling, running and storing: [notes](docs/releases/v1.4.0.md). 1.4.1 fixes a control plane that froze when a node could not start a task, and Windows services that `Restart-Service` could not restart: [notes](docs/releases/v1.4.1.md). 1.5.0 handles machines that sleep (stay awake while working, say goodbye, Wake-on-LAN) and adds `executor = "image"`: [notes](docs/releases/v1.5.0.md). 1.5.1 adds `--trusted-proxy`, so a reverse proxy on another machine no longer makes every client share one failed sign-in limit: [notes](docs/releases/v1.5.1.md). 1.6.0 streams microVM output while tasks run, reports every GPU and Windows temperatures, measures the network between nodes and adds alert silences, repeat notices and per-node thresholds: [notes](docs/releases/v1.6.0.md). 1.7.0 keeps dashboard sign-ins across restarts, edits alert rules, webhooks, prices, schedules, `cluster.toml` and each node's availability in the browser, and adds canary rollouts, streaming charts and a phone layout: [notes](docs/releases/v1.7.0.md). 1.8.0 keeps the file store on several machines and adds an S3 gateway: [notes](docs/releases/v1.8.0.md). 1.9.0 adds gang scheduling, spreading and affinity, CPU and memory quotas, checkpoints and schedule time zones: [notes](docs/releases/v1.9.0.md). 1.10.0 stops runaway WebGPU shaders at the job's timeout, times WebGPU adapters and AMD GPUs with the GPU check, and lets tasks share a GPU (`gpus = 0.5`, MIG slices): [notes](docs/releases/v1.10.0.md). 1.11.0 runs Docker on Windows without Docker Desktop, from boot (`pumasi docker setup`), and microVMs on Windows on Arm: [notes](docs/releases/v1.11.0.md). 1.12.0 adds SCIM provisioning, audit log pruning behind a signed checkpoint, limits shared by every dashboard, the CLI behind an HTTPS proxy and followers answering the dashboard's reads: [notes](docs/releases/v1.12.0.md). 1.13.0 upgrades the control plane itself after the agents, replicas one at a time, with a rollback when the new binary does not come back healthy, and fixes the three checks that failed now and then in CI: [notes](docs/releases/v1.13.0.md). 1.14.0 keeps microVMs warm for the next task of an image, lets microVM tasks checkpoint, and reads Mac temperatures and GPU power from the SMC and IOReport: [notes](docs/releases/v1.14.0.md). 1.15.0 puts per-node alert thresholds and silences in `cluster.toml`, edits schedules and secrets in the browser, pushes the dashboard's charts, streams microVM output past 1 MiB, reads Intel and AMD GPU temperatures, measures the network to the file store and shows events in Korean: [notes](docs/releases/v1.15.0.md). 1.16.0 gives parts of NVIDIA GPUs a memory limit with MPS, benchmarks MIG slices, draws over WebGPU with textures and render passes, gives wasm tasks several GPUs and runs WASI preview 2 components: [notes](docs/releases/v1.16.0.md). 1.17.0 removes the WSL Docker in one go and repairs it when changed by hand, and reads Windows CPU temperatures from Open Hardware Monitor and HWiNFO: [notes](docs/releases/v1.17.0.md). 1.18.0 gives microVM jobs UDP, IPv6, allow lists, bandwidth caps and billed egress, Firecracker a network without QEMU, pulls private images once into the store, and adds node cache quotas: [notes](docs/releases/v1.18.0.md). 1.19.0 reads from followers for the API and the CLI, keeps sign-in limits across a failover, lets a replica that moved rejoin by itself, pushes `?wait=` and `logs -f`, caps CPUs, memory and CU per job, and gets the dashboard's certificate with ACME: [notes](docs/releases/v1.19.0.md). 1.20.0 slips honeypot tasks with known answers into providers' queues, times their disk and memory and all their figures again every day, and gives each provider a score that placement prefers: [notes](docs/releases/v1.20.0.md)). There has been no
 paid third-party audit yet ([SECURITY.md](SECURITY.md)). Phases 20 to 28
 fill in what is still missing for GPUs, Windows, old Macs, the file store,
 cluster management, the dashboard and monitoring. Phase 20 (1.4) closed
 the open issues from real use, phase 21 (1.5) handles machines that sleep
-phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane, phase 30 (1.14) old Intel Macs, phase 31 (1.15) what monitoring and the dashboard had left, phase 32 (1.16) GPUs, phase 33 (1.17) Windows, phase 34 (1.18) the file store and microVM networks and phase 35 (1.19) high availability and the remote API. Phase 36 (1.20) is planned: result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
+phase 22 (1.6) fills in monitoring, phase 23 (1.7) the dashboard, phase 24 (1.8) the file store, phase 25 (1.9) scheduling, phase 26 (1.10) GPUs, phase 27 (1.11) Windows, phase 28 (1.12) operations, phase 29 (1.13) upgrades that reach the control plane, phase 30 (1.14) old Intel Macs, phase 31 (1.15) what monitoring and the dashboard had left, phase 32 (1.16) GPUs, phase 33 (1.17) Windows, phase 34 (1.18) the file store and microVM networks, phase 35 (1.19) high availability and the remote API and phase 36 (1.20) result checks for work that is not deterministic; each phase's scope and gate are in [docs/roadmap.md](docs/roadmap.md).
 Phases 18 and 19 are only for trading with other clusters and are on hold.
 
 | Phase | Scope | Status |
@@ -1999,7 +2034,7 @@ Phases 18 and 19 are only for trading with other clusters and are on hold.
 | 33 | Windows: a one-step `docker remove` and a `docker setup` that repairs, CPU temperatures from Open Hardware Monitor and HWiNFO; HCS and signing wait for real-PC numbers and SignPath | done (1.17) |
 | 34 | File store and microVM networks: node cache quotas, private images through the store, UDP, IPv6, per-job allow lists, bandwidth caps, billed egress, Firecracker networks on TAP devices | done (1.18) |
 | 35 | High availability and the remote API: the API and CLI reading from followers, limits replicated across failovers, replicas that move, pushed `?wait=`, per-job CPU, memory and CU caps, ACME | done (1.19) |
-| 36 | Result checks: honeypot tasks with known answers, disk and memory challenges, periodic re-benchmarks, a score per provider | planned (1.20) |
+| 36 | Result checks: honeypot tasks with known answers, disk and memory challenges, periodic re-benchmarks, a score per provider | done (1.20) |
 | 18 | Hub, called Madang (마당, "the yard"; separate private repository `madang`): provider discovery, latency probes, trust scores, cross-group CU ledger with a hub fee | on hold |
 | 19 | Buying CU with won through the hub (Toss Payments); no cash-out, no transfers between users | on hold |
 
@@ -2058,7 +2093,12 @@ VM's memory (no encrypted scratch disk yet), and are run again if the
 control plane restarts or fails over while they run. The SEV-SNP check
 does not yet enforce a minimum firmware (TCB) version beyond what AMD
 still certifies, and TDX measurements cover MRTD, RTMR1 and RTMR2 (the
-firmware's own RTMR0 is not pinned).
+firmware's own RTMR0 is not pinned). Honeypots catch a provider that
+answers wrongly often, not one that cheats on a few tasks only; built-in
+Docker and microVM honeypots use one image (`pumasi honeypot set
+--image`), built-in ones use no GPU, and account honeypots cannot use the
+file store. The disk challenge proves the work, not where the data sat:
+an agent modified to keep it in memory passes it.
 
 ## Development
 

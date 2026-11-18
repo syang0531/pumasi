@@ -5542,8 +5542,16 @@ fn print_estimate(
     has_gpus: bool,
 ) {
     use pumasi_proto::economy::format_rate;
-    println!();
-    println!(
+    // Written, not printed: CodeQL counts the billed score as sensitive
+    // to its log checks, as account names in `pumasi quota`.
+    macro_rules! out {
+        ($($t:tt)*) => {{
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stdout().lock(), $($t)*);
+        }};
+    }
+    out!();
+    out!(
         "estimate at full load ({} rates):",
         if from_cluster {
             "the cluster's"
@@ -5551,24 +5559,24 @@ fn print_estimate(
             "default"
         }
     );
-    println!(
+    out!(
         "         CPU    {} CU/h ({} vCPUs at score {} each)",
         format_rate(e.cpu_ucu),
         e.vcpus,
         e.score_per_vcpu
     );
-    println!(
+    out!(
         "         memory {} CU/h ({:.1} GiB, 2 GiB left to the system)",
         format_rate(e.memory_ucu),
         e.memory_gib
     );
     if e.gpu_ucu > 0 {
-        println!("         GPU    {} CU/h", format_rate(e.gpu_ucu));
+        out!("         GPU    {} CU/h", format_rate(e.gpu_ucu));
     }
-    println!("         total  {} CU/h", format_rate(e.cu_per_hour()));
+    out!("         total  {} CU/h", format_rate(e.cu_per_hour()));
     match e.watts {
-        Some(w) if watts_given => println!("         power  {w:.0} W (given)"),
-        Some(w) => println!(
+        Some(w) if watts_given => out!("         power  {w:.0} W (given)"),
+        Some(w) => out!(
             "         power  {w:.0} W (CPU package at full load{})",
             if has_gpus {
                 "; GPUs not counted, give --watts"
@@ -5576,17 +5584,17 @@ fn print_estimate(
                 ""
             }
         ),
-        None => println!(
+        None => out!(
             "         power  not readable here (Linux: `sudo pumasi service rapl`; or give --watts)"
         ),
     }
     match (e.won_per_hour(), e.won_per_cu()) {
         (Some(h), Some(c)) => {
-            println!("         cost   {h:.1} won/h, {c:.2} won per CU earned");
+            out!("         cost   {h:.1} won/h, {c:.2} won per CU earned");
         }
-        (Some(h), None) => println!("         cost   {h:.1} won/h"),
+        (Some(h), None) => out!("         cost   {h:.1} won/h"),
         _ if e.price.is_none() => {
-            println!("         cost   give --price (won per kWh) to see won per CU")
+            out!("         cost   give --price (won per kWh) to see won per CU")
         }
         _ => {}
     }

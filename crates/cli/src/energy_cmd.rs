@@ -148,11 +148,11 @@ mod tests {
             runs: 7,
         };
         let r = row(&d, false);
-        assert!(r.contains("2.35 kWh"), "{r}");
-        assert!(r.contains("282 won"), "{r}");
-        assert!(r.contains("48.00"), "{r}");
-        assert!(r.contains("12.5"), "{r}");
-        assert!(r.contains("5.9"), "{r}");
+        assert!(r.contains("2.35 kWh"));
+        assert!(r.contains("282 won"));
+        assert!(r.contains("48.00"));
+        assert!(r.contains("12.5"));
+        assert!(r.contains("5.9"));
         assert!(row(&d, true).contains("stan"));
     }
 }

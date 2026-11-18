@@ -23,6 +23,11 @@ const CLUSTER_DOMAIN: &[u8] = b"pumasi/receipt/cluster/v2\0";
 /// part. Receipts without GPUs keep the v2 message, so they verify the
 /// same in older versions.
 const CLUSTER_GPU_DOMAIN: &[u8] = b"pumasi/receipt/cluster/v3\0";
+/// Receipts of runs whose microVM network carried traffic (1.18): the
+/// cluster signature also covers the egress part.
+const CLUSTER_NET_DOMAIN: &[u8] = b"pumasi/receipt/cluster/v4\0";
+/// What a node signs about a run's network (1.18).
+const NET_DOMAIN: &[u8] = b"pumasi/receipt/net/v1\0";
 const BLOB_PREFIX: &str = "pumasicureceipt";
 /// Receipts from before compute units (pumasi 0.6 and older).
 const OLD_BLOB_PREFIX: &str = "pumasireceipt";
@@ -115,6 +120,63 @@ pub struct GpuBilling {
     pub exact_ucu: MicroCu,
 }
 
+/// What a run's microVM network carried, signed by the node that ran it
+/// (1.18). It goes beside the [`SignedUsage`] (in the report's tail), so
+/// the usage message and receipts without a network stay as they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedNet {
+    pub usage: crate::vmnet::NetUsage,
+    pub node_sig: Signature,
+}
+
+fn net_message(
+    cluster: &[u8; 32],
+    node: &[u8; 32],
+    task: &TaskRef,
+    usage: &crate::vmnet::NetUsage,
+) -> Vec<u8> {
+    let mut m = NET_DOMAIN.to_vec();
+    m.extend(postcard::to_stdvec(&(cluster, node, task, usage)).expect("net usage encodes"));
+    m
+}
+
+impl SignedNet {
+    pub fn sign(
+        cluster: &[u8; 32],
+        task: &TaskRef,
+        usage: crate::vmnet::NetUsage,
+        key: &SecretKey,
+    ) -> Self {
+        let node = *key.public().as_bytes();
+        Self {
+            usage,
+            node_sig: key.sign(&net_message(cluster, &node, task, &usage)),
+        }
+    }
+
+    /// Checks the node's signature for this run.
+    pub fn verify(&self, cluster: &[u8; 32], node: &[u8; 32], task: &TaskRef) -> Result<()> {
+        let key = PublicKey::from_bytes(node).context("bad node key")?;
+        key.verify(
+            &net_message(cluster, node, task, &self.usage),
+            &self.node_sig,
+        )
+        .map_err(|_| anyhow::anyhow!("node signature over the network usage does not match"))
+    }
+}
+
+/// The traffic a run's microVM network carried and what it cost (1.18):
+/// bytes both ways at the price list's egress rate. [`Billing::exact_ucu`]
+/// includes `exact_ucu`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressBilling {
+    pub net: SignedNet,
+    /// The bytes billed: the node's figure, capped by what the job's
+    /// bandwidth cap allows in the billed time.
+    pub billed_bytes: u64,
+    pub exact_ucu: MicroCu,
+}
+
 /// A countersigned usage receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
@@ -125,6 +187,23 @@ pub struct Receipt {
     /// Present for runs with GPUs. Last, so receipts from before phase 9
     /// decode with [`Receipt::decode`].
     pub gpu: Option<GpuBilling>,
+    /// Present for runs whose network carried traffic (1.18). Left out of
+    /// serde's encoding, which stays what it was (receipts travel in
+    /// [`crate::msg::AdminResponse::Receipts`] to clients of any version);
+    /// [`Self::encode`] and [`Self::decode`] carry it.
+    #[serde(skip)]
+    pub egress: Option<EgressBilling>,
+}
+
+/// The encoding of a receipt with an egress part (1.18).
+#[derive(Serialize, Deserialize)]
+struct ReceiptV4 {
+    usage: Usage,
+    node_sig: Signature,
+    billing: Billing,
+    cluster_sig: Signature,
+    gpu: Option<GpuBilling>,
+    egress: EgressBilling,
 }
 
 /// A receipt from before phase 9.
@@ -141,7 +220,15 @@ fn cluster_message(
     node_sig: &Signature,
     billing: &Billing,
     gpu: Option<&GpuBilling>,
+    egress: Option<&EgressBilling>,
 ) -> Vec<u8> {
+    if let Some(e) = egress {
+        let mut m = CLUSTER_NET_DOMAIN.to_vec();
+        m.extend(
+            postcard::to_stdvec(&(usage, node_sig, billing, gpu, e)).expect("receipt encodes"),
+        );
+        return m;
+    }
     match gpu {
         None => {
             let mut m = CLUSTER_DOMAIN.to_vec();
@@ -169,11 +256,24 @@ impl Receipt {
         gpu: Option<GpuBilling>,
         key: &SecretKey,
     ) -> Self {
+        Self::countersign_full(signed, billing, gpu, None, key)
+    }
+
+    /// [`Self::countersign`] for a run that may have had GPUs and a
+    /// network that carried traffic.
+    pub fn countersign_full(
+        signed: SignedUsage,
+        billing: Billing,
+        gpu: Option<GpuBilling>,
+        egress: Option<EgressBilling>,
+        key: &SecretKey,
+    ) -> Self {
         let cluster_sig = key.sign(&cluster_message(
             &signed.usage,
             &signed.node_sig,
             &billing,
             gpu.as_ref(),
+            egress.as_ref(),
         ));
         Self {
             usage: signed.usage,
@@ -181,11 +281,24 @@ impl Receipt {
             billing,
             cluster_sig,
             gpu,
+            egress,
         }
     }
 
-    /// Decodes a receipt of this layout or of the one before phase 9.
+    /// Decodes a receipt of this layout or of an older one (before phase
+    /// 9, or before 1.18).
     pub fn decode(bytes: &[u8]) -> postcard::Result<Self> {
+        // The longest layout first: a shorter one would ignore the rest.
+        if let Ok(v4) = postcard::from_bytes::<ReceiptV4>(bytes) {
+            return Ok(Self {
+                usage: v4.usage,
+                node_sig: v4.node_sig,
+                billing: v4.billing,
+                cluster_sig: v4.cluster_sig,
+                gpu: v4.gpu,
+                egress: Some(v4.egress),
+            });
+        }
         postcard::from_bytes::<Self>(bytes).or_else(|e| {
             let old: ReceiptV2 = postcard::from_bytes(bytes).map_err(|_| e)?;
             Ok(Self {
@@ -194,8 +307,26 @@ impl Receipt {
                 billing: old.billing,
                 cluster_sig: old.cluster_sig,
                 gpu: None,
+                egress: None,
             })
         })
+    }
+
+    /// The encoding [`Self::decode`] reads: receipts without traffic keep
+    /// the layout from before 1.18, so older versions still read them.
+    pub fn encode(&self) -> Vec<u8> {
+        match &self.egress {
+            None => postcard::to_stdvec(self),
+            Some(e) => postcard::to_stdvec(&ReceiptV4 {
+                usage: self.usage.clone(),
+                node_sig: self.node_sig,
+                billing: self.billing.clone(),
+                cluster_sig: self.cluster_sig,
+                gpu: self.gpu.clone(),
+                egress: e.clone(),
+            }),
+        }
+        .expect("receipt encodes")
     }
 
     /// Checks both signatures.
@@ -212,10 +343,16 @@ impl Receipt {
                 &self.node_sig,
                 &self.billing,
                 self.gpu.as_ref(),
+                self.egress.as_ref(),
             ),
             &self.cluster_sig,
         )
-        .map_err(|_| anyhow::anyhow!("control plane signature does not match"))
+        .map_err(|_| anyhow::anyhow!("control plane signature does not match"))?;
+        if let Some(e) = &self.egress {
+            e.net
+                .verify(&self.usage.cluster, &self.usage.node, &self.usage.task)?;
+        }
+        Ok(())
     }
 
     /// Stable identifier: the hash of the signed usage.
@@ -242,7 +379,7 @@ impl Receipt {
 
     /// Exact, copy-pasteable encoding used in exports.
     pub fn to_blob(&self) -> String {
-        let bytes = postcard::to_stdvec(self).expect("receipt encodes");
+        let bytes = self.encode();
         format!(
             "{BLOB_PREFIX}{}",
             data_encoding::BASE32_NOPAD
@@ -365,7 +502,19 @@ pub struct ReceiptRow {
     /// GPUs the run held (receipts from before GPUs have none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuRow>,
+    /// What the run's microVM network carried (1.18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressRow>,
     pub receipt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EgressRow {
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub billed_bytes: u64,
+    /// The egress part of `exact_cu`.
+    pub exact_cu: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -407,6 +556,12 @@ impl From<&Receipt> for ReceiptRow {
                 gflops: g.gflops,
                 vram_mib: g.vram_mib,
                 exact_cu: format_rate(g.exact_ucu),
+            }),
+            egress: r.egress.as_ref().map(|e| EgressRow {
+                tx_bytes: e.net.usage.tx_bytes,
+                rx_bytes: e.net.usage.rx_bytes,
+                billed_bytes: e.billed_bytes,
+                exact_cu: format_rate(e.exact_ucu),
             }),
             receipt: r.to_blob(),
         }

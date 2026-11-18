@@ -328,6 +328,24 @@ jobs:
           PUMASI_TEST_VM_DIR: ${{ env.VM_DIR }}
           PUMASI_TEST_VM_BACKEND: ${{ matrix.backend }}
         run: cargo test -p pumasi-cluster --test e2e microvm -- --nocapture
+      # 1.18: an agent running as root gives Firecracker a network through
+      # TAP devices, without QEMU. The allow list, UDP and egress test again,
+      # as root, and the TAP device's own test.
+      - name: Firecracker networks through TAP devices, as root
+        if: matrix.backend == 'firecracker'
+        env:
+          PUMASI_TEST_VM_DIR: ${{ env.VM_DIR }}
+          PUMASI_TEST_VM_BACKEND: ${{ matrix.backend }}
+        run: |
+          e2e=$(cargo test -p pumasi-cluster --test e2e --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "e2e" and .executable != null) | .executable' | tail -n1)
+          agent=$(cargo test -p pumasi-agent --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "pumasi_agent" and .profile.test and .executable != null) | .executable' | tail -n1)
+          sudo "$agent" microvm::tap --ignored --nocapture
+          sudo -E "$e2e" microvm_network_allow_lists_udp_and_egress --nocapture 2>&1 | tee tap-e2e.txt
+          # It ran, rather than skipped for want of a network.
+          ! grep -q "skipping" tap-e2e.txt
+          grep -q "test result: ok. 1 passed" tap-e2e.txt
       - name: Run the word count example's Python image in a microVM
         run: |
           cargo run -p pumasi-cli -- vm run --vm-dir "$VM_DIR" --vm-backend ${{ matrix.backend }} \

@@ -685,6 +685,7 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | Job { .. }
         | TaskFiles { .. }
         | Receipts { .. }
+        | ReceiptsFull { .. }
         | TaskDetails { .. }
         | TaskExecutors { .. }
         | NodePower
@@ -748,6 +749,8 @@ pub fn describe(op: &AdminOp) -> Option<(&'static str, String, String)> {
         | ApplyExt { .. }
         | ApplyMore { .. }
         | SubmitExt { .. }
+        | SubmitNet { .. }
+        | CheckJobNet { .. }
         | CheckJobExt { .. } => {
             return describe(&op.clone().joined());
         }

@@ -1868,10 +1868,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Cmd::Receipts { id, export, admin } => {
             let id: JobId = id.parse()?;
             let client = connect_admin(&home, &admin).await?;
-            let AdminResponse::Receipts(receipts) = client.call(AdminOp::Receipts { id }).await?
-            else {
-                bail!("unexpected response");
-            };
+            let receipts = client.receipts(id).await?;
             client.close().await;
             match export {
                 Some(path) => {
@@ -5320,6 +5317,29 @@ fn print_receipts(receipts: &[Receipt]) {
                 .map(|g| format_rate(g.exact_ucu))
                 .unwrap_or_else(|| "-".into())
         );
+    }
+    // What the guests sent and received, for runs with a network (1.18):
+    // the node's signed figure and what it was billed.
+    let net: Vec<_> = receipts
+        .iter()
+        .filter_map(|r| r.egress.as_ref().map(|e| (r.short_id(), e)))
+        .collect();
+    if !net.is_empty() {
+        println!();
+        println!(
+            "{:<13} {:>10} {:>10} {:>10} {:>12}",
+            "RECEIPT", "SENT", "RECEIVED", "NET", "NET CU"
+        );
+        for (id, e) in net {
+            println!(
+                "{:<13} {:>10} {:>10} {:>10} {:>12}",
+                id,
+                format_size(e.net.usage.tx_bytes),
+                format_size(e.net.usage.rx_bytes),
+                format_size(e.billed_bytes),
+                format_rate(e.exact_ucu)
+            );
+        }
     }
     if receipts.is_empty() {
         println!("(no receipts yet)");

@@ -32,6 +32,7 @@ pub mod text;
 pub mod ticket;
 pub mod ui;
 pub mod vmdisk;
+pub mod vmnet;
 pub mod webgpu;
 pub mod wire;
 
@@ -82,7 +83,7 @@ pub const CONFIDENTIAL_PROTOCOL: u32 = 14;
 /// does not know them), and each side sends a newer message only to a
 /// peer whose minor has it. The protocol version itself stays, so a
 /// cluster upgrades in any order and without `--force`.
-pub const PROTOCOL_MINOR: u32 = 9;
+pub const PROTOCOL_MINOR: u32 = 10;
 /// The first minor with sleep and wake (1.5): the agent says when its
 /// machine is about to sleep ([`msg::FromAgent::Sleeping`]) and how it
 /// sleeps and wakes ([`msg::FromAgent::Power`]), and sends magic packets
@@ -128,6 +129,13 @@ pub const METRICS_EXTRA_MINOR: u32 = 8;
 /// ([`msg::FromAgent::GpuSharing`]), and benchmarks and answers challenges
 /// for MIG slices.
 pub const GPU_SHARING_MINOR: u32 = 9;
+/// The first minor with the 1.18 file store and microVM networks: the
+/// agent takes a task's allow list and bandwidth cap
+/// ([`msg::TaskAssignment::net`]), forwards UDP, says what the task's
+/// network carried, signed ([`msg::ReportTail::net`]), and keeps its cache
+/// as the control plane says ([`msg::ToAgent::Cache`]). Older agents get
+/// no microVM tasks with an allow list or a cap.
+pub const NET_MINOR: u32 = 10;
 /// The protocol version as a literal, so it can be baked into
 /// [`BUILD_INFO`] with `concat!`.
 macro_rules! protocol_version {

@@ -250,6 +250,18 @@ pub struct GuestNet {
     pub prefix: u8,
     pub gateway: [u8; 4],
     pub dns: [u8; 4],
+    /// IPv6 too, when the host has it (1.18). A guest kernel without IPv6
+    /// goes on with IPv4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6: Option<GuestNet6>,
+}
+
+/// The guest's IPv6 address and default route (1.18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestNet6 {
+    pub address: [u8; 16],
+    pub prefix: u8,
+    pub gateway: [u8; 16],
 }
 
 impl RunSpec {

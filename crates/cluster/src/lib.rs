@@ -4,6 +4,7 @@ mod access;
 pub mod attest;
 pub mod audit;
 pub mod backup;
+mod cache;
 pub mod canary;
 mod check;
 pub mod confidential;

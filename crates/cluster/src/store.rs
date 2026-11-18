@@ -158,6 +158,8 @@ const SCIM_USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("scim_user
 const SCIM_GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("scim_groups");
 /// An event's message by key (1.15), by event number.
 const EVENT_TEXTS: TableDefinition<u64, &[u8]> = TableDefinition::new("event_texts");
+/// Key: job id. A microVM network's allow list and cap (1.18).
+const JOB_NET: TableDefinition<u128, &[u8]> = TableDefinition::new("job_net");
 /// Meta key of the SCIM tokens (their hashes).
 const SCIM_TOKENS_META: &str = "scim_tokens";
 
@@ -235,7 +237,8 @@ macro_rules! tables {
             MEMBER_WEBGPU_EXTRA,
             SCIM_USERS,
             SCIM_GROUPS,
-            EVENT_TEXTS
+            EVENT_TEXTS,
+            JOB_NET
         )
     };
 }
@@ -497,6 +500,7 @@ pub struct Snapshot {
     pub job_origin: Vec<(u128, JobOrigin)>,
     pub job_place: Vec<(u128, pumasi_proto::sched::Placement)>,
     pub job_gpu_ext: Vec<(u128, pumasi_proto::gpu::GpuExt)>,
+    pub job_net: Vec<(u128, pumasi_proto::vmnet::NetSpec)>,
     pub webgpu_extra: Vec<(String, crate::gpu::WebGpuExtraRecord)>,
     pub checkpoints: Vec<((u128, u32), crate::sched::CheckpointRecord)>,
     pub account_resources: Vec<(String, pumasi_proto::sched::ResourceQuota)>,
@@ -653,6 +657,7 @@ impl Store {
         tx.open_table(SCIM_USERS)?;
         tx.open_table(SCIM_GROUPS)?;
         tx.open_table(EVENT_TEXTS)?;
+        tx.open_table(JOB_NET)?;
         let schema = {
             let mut meta = tx.open_table(META)?;
             let stored = meta.get(SCHEMA_META)?.map(|v| v.value().to_vec());
@@ -992,7 +997,7 @@ impl Store {
     pub(crate) fn finish_credit_receipts(&self, receipts: &[Receipt]) -> Result<()> {
         let mut b = Batch::default();
         for r in receipts {
-            b.put(RECEIPTS, run_key(&r.usage.task), enc(r).as_slice());
+            b.put(RECEIPTS, run_key(&r.usage.task), r.encode().as_slice());
         }
         b.put(META, CREDIT_RECEIPTS_DONE_META, [1u8].as_slice());
         self.commit(b)
@@ -1161,6 +1166,10 @@ impl Store {
             let (k, v) = row?;
             snap.job_gpu_ext.push((k.value(), dec(v.value())?));
         }
+        for row in tx.open_table(JOB_NET)?.iter()? {
+            let (k, v) = row?;
+            snap.job_net.push((k.value(), dec(v.value())?));
+        }
         for row in tx.open_table(MEMBER_WEBGPU_EXTRA)?.iter()? {
             let (k, v) = row?;
             snap.webgpu_extra
@@ -1285,6 +1294,9 @@ impl Store {
         if !meta.gpu_ext.is_empty() {
             b.put(JOB_GPU_EXT, meta.id.0, enc(&meta.gpu_ext).as_slice());
         }
+        if !meta.net.is_empty() {
+            b.put(JOB_NET, meta.id.0, enc(&meta.net).as_slice());
+        }
         for (i, task) in tasks.iter().enumerate() {
             b.put(TASKS, (meta.id.0, i as u32), enc(task).as_slice());
             if !task.ext.is_empty() {
@@ -1310,6 +1322,7 @@ impl Store {
             b.del(JOB_ORIGIN, job);
             b.del(JOB_PLACE, job);
             b.del(JOB_GPU_EXT, job);
+            b.del(JOB_NET, job);
             for i in 0..tasks {
                 b.del(CHECKPOINTS, (job, i));
                 b.del(TASKS, (job, i));
@@ -1897,7 +1910,7 @@ impl Store {
             b.put(CARRY, (c.as_str(), p.as_str()), *v);
         }
         if let Some(r) = w.receipt {
-            b.put(RECEIPTS, run_key(&r.usage.task), enc(r).as_slice());
+            b.put(RECEIPTS, run_key(&r.usage.task), r.encode().as_slice());
         }
         self.commit(b)
     }
@@ -2447,6 +2460,7 @@ pub(crate) mod legacy {
                 origin: Default::default(),
                 place: Default::default(),
                 gpu_ext: Default::default(),
+                net: Default::default(),
             }
         }
     }
@@ -2540,6 +2554,7 @@ pub(crate) mod legacy {
                     job: pumasi_proto::job::JobSubmission {
                         placement: Default::default(),
                         gpu_ext: Default::default(),
+                        net: Default::default(),
                         name: j.name,
                         executor: j.executor,
                         module: j.module,
@@ -2651,6 +2666,7 @@ mod tests {
                 job: JobSubmission {
                     placement: Default::default(),
                     gpu_ext: Default::default(),
+                    net: Default::default(),
                     name: "report".into(),
                     executor: Executor::Wasm,
                     module: b"\0asm\x01\0\0\0".to_vec(),

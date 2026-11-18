@@ -461,12 +461,9 @@ async fn receipts(axum::extract::State(st): S, a: Api, Path(id): Path<String>) -
         Ok(i) => i,
         Err(r) => return r,
     };
-    match call(&st, &a, AdminOp::Receipts { id }).await {
-        Ok(AdminResponse::Receipts(r)) => {
-            Json(r.iter().map(ReceiptRow::from).collect::<Vec<_>>()).into_response()
-        }
-        Ok(_) => error(StatusCode::BAD_GATEWAY, "unexpected response"),
-        Err(r) => r,
+    match st.backend.receipts(a.0.secret, id).await {
+        Ok(r) => Json(r.iter().map(ReceiptRow::from).collect::<Vec<_>>()).into_response(),
+        Err(e) => fail(e),
     }
 }
 

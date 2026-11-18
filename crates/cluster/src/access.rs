@@ -26,7 +26,7 @@ fn op_name(op: &AdminOp) -> &'static str {
         TaskFiles { .. } => "read task outputs",
         Cancel { .. } => "cancel jobs",
         RemoveNode { .. } => "remove nodes",
-        Receipts { .. } => "read receipts",
+        Receipts { .. } | ReceiptsFull { .. } => "read receipts",
         Accounts => "read accounts",
         Ledger { .. } => "read the ledger",
         Deposit { .. } => "grant CU",
@@ -109,8 +109,8 @@ fn op_name(op: &AdminOp) -> &'static str {
         S3Commit { .. } => "upload to the store",
         S3KeyCreate { .. } | S3Keys | S3KeyRevoke { .. } => "manage S3 keys",
         S3Auth { .. } => "check S3 signatures",
-        SubmitPlaced { .. } | SubmitExt { .. } => "submit jobs",
-        CheckJobPlaced { .. } | CheckJobExt { .. } => "check jobs",
+        SubmitPlaced { .. } | SubmitExt { .. } | SubmitNet { .. } => "submit jobs",
+        CheckJobPlaced { .. } | CheckJobExt { .. } | CheckJobNet { .. } => "check jobs",
         SetScheduleExt { .. } => "change schedules",
         ApplyExt { .. } => "apply cluster files",
         Resources => "read quotas",
@@ -157,6 +157,7 @@ pub fn admit(st: &State, caller: &Caller, op: AdminOp) -> Result<AdminOp> {
             | NodePower
             | TaskFiles { .. }
             | Receipts { .. }
+            | ReceiptsFull { .. }
             | Accounts
             | Ledger { .. }
             | GetPolicy
@@ -250,6 +251,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         }
         Cancel { id }
         | Receipts { id }
+        | ReceiptsFull { id }
         | TaskFiles { id, .. }
         | Job { id, .. }
         | TaskDetails { id }
@@ -285,6 +287,7 @@ fn submitter(st: &State, caller: &Caller, account: &str, op: AdminOp) -> Result<
         }
         op @ (Cancel { .. }
         | Receipts { .. }
+        | ReceiptsFull { .. }
         | TaskFiles { .. }
         | Job { .. }
         | TaskDetails { .. }

@@ -1040,6 +1040,11 @@ impl ScheduleSpec {
             self.job.gpu_ext.is_empty(),
             "a scheduled job cannot ask for part of a GPU or for WebGPU features yet"
         );
+        // Nor for these: a scheduled run would get the whole internet.
+        ensure!(
+            self.job.net.is_empty(),
+            "a scheduled job cannot have a network allow list or bandwidth cap yet; use `network = true`, or submit it directly"
+        );
         Ok(())
     }
 }
@@ -2078,6 +2083,7 @@ pub fn kept_job() -> JobSubmission {
         gpu_capabilities: Vec::new(),
         placement: Default::default(),
         gpu_ext: Default::default(),
+        net: Default::default(),
     }
 }
 
@@ -2085,6 +2091,31 @@ pub fn kept_job() -> JobSubmission {
 mod tests {
     use super::*;
     use chrono::{FixedOffset, Utc};
+
+    #[test]
+    fn schedules_refuse_allow_lists() {
+        let dir = std::env::temp_dir();
+        let job = |net: &str| {
+            crate::job::JobFile::parse(&format!(
+                "executor = \"microvm\"\nimage = \"busybox\"\nnetwork = {net}"
+            ))
+            .unwrap()
+            .resolve(&dir)
+            .unwrap()
+        };
+        let spec = |job| ScheduleSpec {
+            name: "nightly".into(),
+            cron: "@daily".into(),
+            job,
+            overlap: false,
+            tz: None,
+        };
+        spec(job("true")).validate().unwrap();
+        // Its record would drop the list, and the runs would reach
+        // everything.
+        assert!(spec(job("[\"pypi.org:443\"]")).validate().is_err());
+        assert!(spec(job("{ mbps = 5 }")).validate().is_err());
+    }
 
     #[test]
     fn policy_patch_changes_only_what_it_names() {

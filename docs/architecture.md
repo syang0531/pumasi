@@ -964,9 +964,11 @@ Allowed means public unicast IPv4: not RFC 1918, CGNAT, loopback,
 link-local, multicast, broadcast, documentation, benchmarking or reserved
 ranges, not an address this host can bind (its own), and not port 25. DNS
 queries to the gateway are answered from the host's resolver (A records,
-filtered the same way). Other UDP, ICMP and IPv6 are dropped. Firecracker
-cards need TAP devices and root, so Firecracker nodes run network tasks on
-QEMU when it is installed, and report `microvm_network` accordingly; the
+filtered the same way). Since 1.18 UDP to allowed addresses, IPv6, per-job
+allow lists and caps go through the same gateway ("Phase 34"); ICMP is
+dropped. Firecracker cards need TAP devices and root, so Firecracker nodes
+run network tasks on QEMU when it is installed, on TAP devices when the
+agent runs as root (1.18), and report `microvm_network` accordingly; the
 scheduler sends network tasks only to nodes that report it.
 
 On macOS 11+ (the vz backend, which includes the 2013-2014 Intel Macs that
@@ -3771,6 +3773,116 @@ real PCs yet, and SignPath Foundation has not approved the project, so
 1.11: QEMU with WHPX is the Windows microVM backend, and binaries are
 unsigned (README "Smart App Control").
 
+## Phase 34: File store and microVM networks (1.18)
+
+Release 1.18 widens the microVM network (UDP, IPv6, per-job allow lists
+and bandwidth caps, egress on the receipt), gives Firecracker a network
+through TAP devices, takes private images from the file store after the
+first pull, and lets node labels set a node's cache size and each
+account's share of it. The agent protocol stays 14 and goes to minor 10
+(`NET_MINOR`); the stored layout stays 7 with one new table, `job_net`.
+
+### Allow lists and caps
+
+A job file's `network` is `true`, a list of rules or a table
+(`{ allow = [...], mbps = N }`), parsed into
+`pumasi_proto::vmnet::NetSpec`: up to 256 `NetRule`s, each a host name
+(`*.name` too), an address or a CIDR range with an optional port or port
+range, and a cap of 1 to 100000 Mbit/s. It travels outside the postcard
+`JobSubmission` like the other 1.x additions: in `JobExt` with
+`AdminOp::SubmitNet` / `CheckJobNet`, which a 1.17 control plane does not
+know and so refuses, rather than dropping the list and running the job
+with the whole internet. The control plane keeps it in `JobMeta::net`
+(table `job_net`) and sends it in `TaskAssignment::net` (minor 10) only
+for microVM runs; `Need::vm_net_rules` keeps such runs off agents below
+`NET_MINOR`. Docker cannot narrow its bridge, so the job file refuses a
+list with `executor = "docker"`, and `narrow_executor` makes an `image`
+job with one a microVM. A schedule's record has no room for the list, so
+`ScheduleSpec::validate` refuses it.
+
+In the agent, `microvm::net::Gateway::start(spec)` wraps the base policy
+(public addresses, not the host's own, not port 25) in a `Guard`: an
+address passes when the base policy allows it and the list names it, or
+DNS answered it for a listed name (`learn`, at most 4096 addresses, with
+the ports the name's rules allow). The gateway's DNS answers names off the
+list with NXDOMAIN. A cap is a token bucket per direction (`Meter`,
+burst a quarter second of the rate, 32 KiB at least): TCP copies wait for
+tokens, UDP datagrams over the budget are dropped.
+
+### UDP and IPv6
+
+smoltcp gains `proto-ipv6`. A UDP datagram from the guest to an address
+other than the gateway's is taken off before smoltcp sees it: allowed
+destinations get a host socket per flow (`open_udp`, 256 flows, closed
+after 120 s idle), and replies are built into frames (`udp_frame`) with
+the destination as their source; refused ones go to smoltcp, which
+answers port unreachable. When the host has IPv6 (`host_has_ipv6`, a UDP
+socket that can route to a public v6 address) the guest gets
+`GuestNet::v6` (`fd00:5055:4d41::15/64`, gateway `::2`); the guest init
+adds the address and default route with `SIOCSIFADDR` / `SIOCADDRT` on an
+`AF_INET6` socket, with DAD and router advertisements off. A v6 failure is
+logged and the task keeps IPv4. The gateway answers AAAA queries,
+listens for v6 SYNs like v4 ones, and `public_v6` allows 2000::/3 minus
+documentation, 6to4 and Teredo.
+
+### Egress
+
+`Meter` counts payload bytes the guest sent (`tx`) and received (`rx`)
+on TCP and UDP to the outside; DNS to the gateway is not counted. After
+the VM ends, `TaskIo::net_usage` holds the figure and the agent signs it
+with its node key (`SignedNet`, domain `pumasi/receipt/net/v1`, bound to
+the cluster and the task) in `ReportTail::net`. `settle_run` checks the
+signature, caps the bytes at the job's cap or
+`EGRESS_LINE_BYTES_PER_SEC` (10 Gbit/s) times the billed wall time (at
+least a second) times two directions, prices them with
+`egress_charge(bytes, rates.egress_gib)` (nothing when provider and
+consumer are the same account), adds that to the receipt's exact
+micro-CU and countersigns with `Receipt::countersign_full`. The receipt's
+`egress: Option<EgressBilling>` is `#[serde(skip)]` so
+`AdminResponse::Receipts` keeps its 1.17 layout; receipts with egress are
+stored and exported as version 4 (`ReceiptV4`, cluster domain
+`pumasi/receipt/cluster/v4`), which `AdminOp::ReceiptsFull` returns as
+encoded blobs (`AdminClient::receipts` falls back to the old op).
+`Receipt::verify` checks the node's signature on the egress part too.
+
+### Firecracker on TAP devices
+
+`microvm::tap` (Linux) creates `pmtap%d` through `/dev/net/tun`
+(`IFF_TAP | IFF_NO_PI | IFF_VNET_HDR`, persistent, IPv6 off), hands its
+name to Firecracker's `network-interfaces`, and bridges it to the gateway
+on two threads: an `AF_PACKET` socket bound to the device reads what the
+guest sent (skipping `PACKET_OUTGOING`) and writes what the gateway
+answers, framed as QEMU's stream netdev frames are. The guest init turns
+the card's offloads off (`SIOCETHTOOL`) so frames arrive whole and
+checksummed. `tap::available` needs root and a working `/dev/net/tun`;
+`net_vmm` picks QEMU when it is installed and TAP otherwise; devices left
+by an earlier agent are removed at start.
+
+### Images from the store
+
+`Files::pull_image` remembers the digest each `(reference, arch)` resolved
+to (`image_refs`) and tags each pulled image `imgc/<arch>/<digest>`
+besides the job's `img/<owner>/<digest>`. The next pull of the reference
+takes the cached collection when it is whole in the store
+(`reuse_image`): a digest reference without asking the registry, a tag
+reference within `IMAGE_REF_FRESH` (ten minutes) and after that once its
+manifest resolves to the same digest. `prune_images` keeps 32
+(`IMAGE_CACHE_MAX`) and drops those unused for a week. The `imgc/`
+prefix is not one of the control plane's reconciled prefixes, so jobs
+ending never drop it.
+
+### Node cache quotas
+
+`cache.rs` turns node labels into a `CachePolicy` (`cap` from
+`cache=SIZE`, `per_account` from `cache.account=SIZE`) with the roots
+queued tasks will mount (`queued_roots`: mounts and ready images, 4096 at
+most), and every five seconds sends `ToAgent::Cache` to connected agents
+of minor 10 whose policy changed. The agent's `NodeStore` records which
+account each cached collection was fetched for (`charge`, from
+`TaskAssignment::account`) and evicts in `eviction_order`: idle entries of
+accounts over their share first, then the least recently used, kept
+(queued) entries last, entries in use never.
+
 ## Not yet
 
 - Remote API: no ACME (certificates come from certbot, a proxy or a
@@ -3780,9 +3892,8 @@ unsigned (README "Smart App Control").
   (account quotas cover slots, GPUs, CU per day, and since 1.9 CPUs and
   memory).
 
-- File store: per-node quotas for caches beyond the size cap. Private images are pulled
-  from the registry again for each job (nodes that already loaded the
-  digest skip the download from the store).
+- File store: cache quotas are per node and per account (labels), not
+  per dataset; the image cache keeps 32 images for a week.
 - GPUs: Intel and Apple GPUs are used only through WebGPU; AMD GPUs are
   measured and challenged over WebGPU, so an agent without a WebGPU
   adapter for them (no Vulkan driver) still estimates them; passthrough is
@@ -3790,10 +3901,10 @@ unsigned (README "Smart App Control").
   under MPS (Linux, root agent, Volta or newer, root containers) and
   otherwise share memory on trust, and are Docker-only; vGPU is not
   handled.
-- MicroVM network: TCP and DNS only (no other UDP, ICMP or IPv6), no
-  per-job allow lists or bandwidth caps, egress is not billed, and
-  Firecracker without QEMU has no network (its cards need TAP devices;
-  install QEMU next to it).
+- MicroVM network: no ICMP; allow lists and caps are microVM-only (not
+  Docker) and not in schedules; IPv6 only where the host has it; egress is
+  the node's signed figure; Firecracker without QEMU has a network only
+  when the agent runs as root.
 - Cluster management: WASM tasks are stopped without warning when they
   move, keeping what they saved so far; a
   checkpoint is saved when a run moves, not periodically, so a machine
@@ -3824,7 +3935,7 @@ unsigned (README "Smart App Control").
   no minimum SEV-SNP TCB policy or RTMR0 pinning, leases lost on a
   restart or failover, and real SEV-SNP and TDX hosts checked by hand only
   (CI uses the test stand-in and recorded reports).
-- Roadmap: phases 20 to 33 are done and phases 34 to 36 are planned
+- Roadmap: phases 20 to 34 are done and phases 35 and 36 are planned
   ([roadmap.md](roadmap.md)); phases 18 and 19 (the hub and buying CU)
   are on hold.
 - Phase 17 leftovers: SCIM takes access away but never creates it

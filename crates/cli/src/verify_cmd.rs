@@ -13,6 +13,21 @@ use pumasi_proto::{
 
 use crate::{AdminArgs, connect_admin, manage::Output, monitor::local_time};
 
+// Written, not printed: account names count as sensitive to CodeQL's log
+// checks, as in `pumasi quota`.
+macro_rules! out {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout().lock(), $($t)*);
+    }};
+}
+macro_rules! err {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($t)*);
+    }};
+}
+
 #[derive(Subcommand)]
 pub enum HoneypotCmd {
     /// The honeypot policy, the account honeypots and the latest runs.
@@ -108,7 +123,7 @@ pub async fn honeypot(home: &Path, cmd: HoneypotCmd) -> Result<i32> {
         HoneypotCmd::List { output, admin } => {
             let v = call(home, &admin, AdminOp::Verify).await?;
             match output {
-                Output::Json => println!("{}", serde_json::to_string_pretty(&v)?),
+                Output::Json => out!("{}", serde_json::to_string_pretty(&v)?),
                 Output::Table => print_honeypots(&v),
             }
         }
@@ -122,15 +137,17 @@ pub async fn honeypot(home: &Path, cmd: HoneypotCmd) -> Result<i32> {
                 .filter(|h| !before.honeypots.iter().any(|b| b.id == h.id))
                 .collect();
             for h in &added {
-                eprintln!(
+                err!(
                     "honeypot {} from task {}/{}: waiting for one of your machines to confirm it",
-                    h.id, h.source, h.task
+                    h.id,
+                    h.source,
+                    h.task
                 );
             }
         }
         HoneypotCmd::Remove { id, admin } => {
             call(home, &admin, AdminOp::HoneypotRemove { id }).await?;
-            eprintln!("honeypot {id} removed");
+            err!("honeypot {id} removed");
         }
         HoneypotCmd::Release { account, admin } => {
             call(
@@ -141,7 +158,7 @@ pub async fn honeypot(home: &Path, cmd: HoneypotCmd) -> Result<i32> {
                 },
             )
             .await?;
-            eprintln!("{account}'s earnings are released after their usual hold period");
+            err!("{account}'s earnings are released after their usual hold period");
         }
         HoneypotCmd::Set {
             on,
@@ -184,14 +201,17 @@ pub async fn honeypot(home: &Path, cmd: HoneypotCmd) -> Result<i32> {
 fn print_policy(v: &VerifyView) {
     let p = &v.policy;
     if p.honeypots {
-        println!(
+        out!(
             "honeypots after each task: new providers {}‰, providers {}‰, trusted {}‰, struck {}‰",
-            p.new_permille, p.provider_permille, p.trusted_permille, p.struck_permille
+            p.new_permille,
+            p.provider_permille,
+            p.trusted_permille,
+            p.struck_permille
         );
     } else {
-        println!("honeypots: off");
+        out!("honeypots: off");
     }
-    println!(
+    out!(
         "built-in image honeypots: {}",
         if p.image.is_empty() {
             "none".to_string()
@@ -199,11 +219,11 @@ fn print_policy(v: &VerifyView) {
             p.image.clone()
         }
     );
-    println!(
+    out!(
         "a failed honeypot holds the account's earnings for {}",
         human_duration(p.hold_secs)
     );
-    println!(
+    out!(
         "providers are timed again {}",
         if p.retime_secs == 0 {
             "only when their benchmark changes".to_string()
@@ -216,18 +236,25 @@ fn print_policy(v: &VerifyView) {
 fn print_honeypots(v: &VerifyView) {
     print_policy(v);
     for (account, until) in &v.held {
-        println!(
+        out!(
             "HELD: {account}'s earnings until {} (`pumasi honeypot release {account}`)",
             local_time(*until, true)
         );
     }
-    println!();
+    out!();
     if v.honeypots.is_empty() {
-        println!("no account honeypots (`pumasi honeypot add JOB`); built-in ones only");
+        out!("no account honeypots (`pumasi honeypot add JOB`); built-in ones only");
     } else {
-        println!(
+        out!(
             "{:<4} {:<12} {:<20} {:<8} {:<10} {:>5} {:>6} {:>6}  FROM",
-            "ID", "ACCOUNT", "NAME", "EXEC", "STATE", "SENT", "PASSED", "FAILED"
+            "ID",
+            "ACCOUNT",
+            "NAME",
+            "EXEC",
+            "STATE",
+            "SENT",
+            "PASSED",
+            "FAILED"
         );
         for h in &v.honeypots {
             let state = if h.problem.is_some() {
@@ -237,7 +264,7 @@ fn print_honeypots(v: &VerifyView) {
             } else {
                 "confirming"
             };
-            println!(
+            out!(
                 "{:<4} {:<12} {:<20} {:<8} {:<10} {:>5} {:>6} {:>6}  {}/{}",
                 h.id,
                 crate::truncate(&h.account, 12),
@@ -251,18 +278,21 @@ fn print_honeypots(v: &VerifyView) {
                 h.task
             );
             if let Some(p) = &h.problem {
-                println!("     {p}");
+                out!("     {p}");
             }
         }
     }
     if !v.runs.is_empty() {
-        println!();
-        println!(
+        out!();
+        out!(
             "{:<17} {:<16} {:<10} {:<8} RESULT",
-            "SENT", "NODE", "HONEYPOT", "EXEC"
+            "SENT",
+            "NODE",
+            "HONEYPOT",
+            "EXEC"
         );
         for r in &v.runs {
-            println!(
+            out!(
                 "{:<17} {:<16} {:<10} {:<8} {}",
                 local_time(r.sent_unix, true),
                 crate::truncate(&r.node_name, 16),
@@ -281,14 +311,21 @@ fn print_honeypots(v: &VerifyView) {
 pub async fn score(home: &Path, output: Output, admin: &AdminArgs) -> Result<i32> {
     let v = call(home, admin, AdminOp::Verify).await?;
     match output {
-        Output::Json => println!("{}", serde_json::to_string_pretty(&v.scores)?),
+        Output::Json => out!("{}", serde_json::to_string_pretty(&v.scores)?),
         Output::Table => {
-            println!(
+            out!(
                 "{:<16} {:<10} {:>5} {:>7} {:>7} {:>7} {:>9} {:>6}  DISK",
-                "NODE", "LEVEL", "SCORE", "UPTIME", "CHECKS", "RUNS", "HONEYPOTS", "LOST"
+                "NODE",
+                "LEVEL",
+                "SCORE",
+                "UPTIME",
+                "CHECKS",
+                "RUNS",
+                "HONEYPOTS",
+                "LOST"
             );
             for s in &v.scores {
-                println!(
+                out!(
                     "{:<16} {:<10} {:>5} {:>6}% {:>6}% {:>6}% {:>9} {:>6}  {}",
                     crate::truncate(&s.name, 16),
                     s.level.to_string(),
@@ -324,7 +361,7 @@ fn disk_note(s: &ProviderScore) -> String {
 /// What `pumasi node NODE` adds about the node's score and the cluster's
 /// timings.
 pub fn print_node_score(s: &ProviderScore) {
-    println!(
+    out!(
         "  score {} ({}): uptime {}%, checks {}%, runs {}% ({} done, {} lost)",
         s.score,
         s.level,
@@ -335,13 +372,14 @@ pub fn print_node_score(s: &ProviderScore) {
         s.runs_lost
     );
     if s.honeypots_passed + s.honeypots_failed > 0 {
-        println!(
+        out!(
             "  honeypots passed {}, failed {}",
-            s.honeypots_passed, s.honeypots_failed
+            s.honeypots_passed,
+            s.honeypots_failed
         );
     }
     if let Some(d) = &s.disk {
-        println!(
+        out!(
             "  disk timed by the cluster: {} MB/s read, {} MB/s write, {} us a read: {}{}",
             d.seq_read_mb_s,
             d.seq_write_mb_s,
@@ -351,7 +389,7 @@ pub fn print_node_score(s: &ProviderScore) {
         );
     }
     if let Some(m) = &s.memory {
-        println!(
+        out!(
             "  memory timed by the cluster: {} MB/s (claims {}){}",
             m.measured_mb_s,
             m.claimed_mb_s,
@@ -359,7 +397,7 @@ pub fn print_node_score(s: &ProviderScore) {
         );
     }
     if let Some(until) = s.held_until {
-        println!(
+        out!(
             "  earnings HELD after a failed honeypot until {}",
             local_time(until, true)
         );

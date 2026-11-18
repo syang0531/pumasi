@@ -402,7 +402,7 @@ impl State {
             "account {account} has no earnings held by a honeypot"
         );
         self.save_held();
-        info!(%account, "held earnings released");
+        info!("earnings held after a failed honeypot released");
         Ok(())
     }
 
@@ -1023,7 +1023,8 @@ impl State {
                     ],
                 );
                 let msg = text.en();
-                warn!(node = %node, "{msg}");
+                // The account is in the event and the alert, not the log.
+                warn!(node = %name, "wrong answer to a honeypot task; the account's earnings are held");
                 self.event(
                     EventLevel::Critical,
                     "honeypot.failed",

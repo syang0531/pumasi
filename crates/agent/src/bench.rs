@@ -714,6 +714,10 @@ pub fn disk_challenge(dir: &Path, c: &DiskChallenge) -> Result<[u8; 32]> {
         DiskStep::Prepare { bytes } => {
             std::fs::create_dir_all(dir)?;
             let _ = std::fs::remove_file(&path);
+            anyhow::ensure!(
+                bytes <= pumasi_proto::verify::MAX_DISK_CHALLENGE_BYTES,
+                "disk challenge of {bytes} bytes is too large"
+            );
             let chunks = bytes / DISK_CHUNK as u64;
             anyhow::ensure!(chunks > 0, "empty disk challenge");
             let file = open_direct(&path)
@@ -742,6 +746,10 @@ pub fn disk_challenge(dir: &Path, c: &DiskChallenge) -> Result<[u8; 32]> {
             Ok(answer.finish())
         }
         DiskStep::Random { reads } => {
+            anyhow::ensure!(
+                reads <= pumasi_proto::verify::MAX_DISK_CHALLENGE_READS,
+                "disk challenge of {reads} reads is too large"
+            );
             struct Remove<'a>(&'a Path);
             impl Drop for Remove<'_> {
                 fn drop(&mut self) {
@@ -763,10 +771,17 @@ pub fn disk_challenge(dir: &Path, c: &DiskChallenge) -> Result<[u8; 32]> {
 
 /// Answers a memory challenge: the kernel's result in the first eight
 /// bytes. Blocking.
-pub fn memory_challenge(c: &MemoryChallenge) -> [u8; 32] {
+pub fn memory_challenge(c: &MemoryChallenge) -> Result<[u8; 32]> {
+    anyhow::ensure!(
+        c.bytes <= pumasi_proto::verify::MAX_MEMORY_CHALLENGE_BYTES
+            && c.passes <= pumasi_proto::verify::MAX_MEMORY_CHALLENGE_PASSES,
+        "memory challenge of {} bytes and {} passes is too large",
+        c.bytes,
+        c.passes
+    );
     let mut out = [0u8; 32];
     out[..8].copy_from_slice(&memory_kernel(c.seed, c.bytes, c.passes).to_le_bytes());
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

@@ -1538,9 +1538,14 @@ impl Agent {
                             crate::bench::memory_challenge(&ch)
                         })
                         .await;
+                        let result = match res {
+                            Ok(Ok(a)) => Ok(a),
+                            Ok(Err(e)) => Err(format!("{e:#}")),
+                            Err(e) => Err(format!("memory check panicked: {e}")),
+                        };
                         let _ = out_tx.send(FromAgent::ChallengeResult {
                             nonce: ch.nonce,
-                            result: res.map_err(|e| format!("memory check panicked: {e}")),
+                            result,
                         });
                     });
                 }

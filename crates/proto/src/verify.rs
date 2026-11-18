@@ -377,6 +377,16 @@ pub struct DiskChallenge {
     pub step: DiskStep,
 }
 
+/// The most a disk challenge may ask an agent to write; agents refuse
+/// more.
+pub const MAX_DISK_CHALLENGE_BYTES: u64 = 4 << 30;
+/// The most random reads one disk challenge step may ask for.
+pub const MAX_DISK_CHALLENGE_READS: u32 = 1 << 20;
+/// The most memory a memory challenge may ask an agent to touch.
+pub const MAX_MEMORY_CHALLENGE_BYTES: u64 = 1 << 30;
+/// The most passes a memory challenge may ask for.
+pub const MAX_MEMORY_CHALLENGE_PASSES: u32 = 4096;
+
 /// Run [`memory_kernel`] and send back its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryChallenge {

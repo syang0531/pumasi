@@ -363,7 +363,14 @@ async fn start_services(shared: &Arc<Shared>, store: Store) -> Result<Arc<Inner>
     state.power.wake_after = config.wake_after;
     state.set_probe_every(config.probe_every);
     state.set_replica_timing(config.replica_repair_after, config.scrub_every);
-    (state.verify.disk_bytes, state.verify.memory_bytes) = config.challenge_bytes;
+    state.verify.disk_bytes = config
+        .challenge_bytes
+        .0
+        .min(pumasi_proto::verify::MAX_DISK_CHALLENGE_BYTES);
+    state.verify.memory_bytes = config
+        .challenge_bytes
+        .1
+        .min(pumasi_proto::verify::MAX_MEMORY_CHALLENGE_BYTES);
     if config.insecure_test_tee {
         warn!(
             "--insecure-test-tee: confidential tasks may run without a TEE; nothing they hold is protected"

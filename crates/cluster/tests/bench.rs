@@ -171,13 +171,17 @@ async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
     let claimed = liar.perf().unwrap().profile.cpu.single;
     // Claims a disk sixteen times faster than it is (1.20).
     let disky = benched("disky", tempdir("d"), 1, 16).await;
-    let disk_direct = disky
+    let disk_takes = disky
         .perf()
         .unwrap()
         .profile
         .disk
         .as_ref()
         .is_some_and(|d| d.direct);
+    // macOS takes the bypass (F_NOCACHE) but can still serve data just
+    // written from its cache, so there the timing cannot tell the disks
+    // apart; the answers are still checked.
+    let disk_direct = disk_takes && !cfg!(target_os = "macos");
     let o = spawn_join(own, ticket);
     let h = spawn_join(honest, invite(&cluster, "alice"));
     let l = spawn_join(liar, invite(&cluster, "mallory"));
@@ -244,6 +248,13 @@ async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
         assert!(disk.seq_read_mb_s <= MAX_TIMED_DISK_MB_S, "{disk:?}");
         assert_eq!(s.disk_label, Some(disk.class));
         wait_for("the honest disk timed", || score("honest").disk.is_some()).await;
+    } else if disk_takes {
+        wait_for("the disks timed", || {
+            score("disky").disk.is_some() && score("honest").disk.is_some()
+        })
+        .await;
+        assert!(score("disky").disk.unwrap().correct);
+        assert!(score("honest").disk.unwrap().correct);
     }
     wait_for("the honest memory timed", || {
         score("honest").memory.is_some()

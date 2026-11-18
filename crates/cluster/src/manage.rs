@@ -224,7 +224,8 @@ impl State {
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         self.store.put_meta_record(JOB_CAPS_META, &rows)?;
         self.mgmt.job_caps = all;
-        info!(%account, caps = %caps.describe(), "caps per job set");
+        // (Who for is in the audit log.)
+        info!(caps = %caps.describe(), "caps per job set");
         Ok(())
     }
 

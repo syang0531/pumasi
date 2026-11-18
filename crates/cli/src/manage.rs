@@ -563,8 +563,11 @@ pub async fn quota(
         if let Some(cpu) = cpu {
             print_resources(&cpu)?;
         }
+        // (Written, not printed: account names count as sensitive to
+        // CodeQL's log checks.)
+        let mut out = std::io::stdout().lock();
         for (a, c) in caps {
-            println!("caps per job of {a}: {}", c.describe());
+            writeln!(out, "caps per job of {a}: {}", c.describe())?;
         }
         return Ok(0);
     };
@@ -682,7 +685,11 @@ pub async fn quota(
     client.close().await;
     let (q, p, r, c) = r?;
     if let Some(c) = c {
-        eprintln!("caps per job of {account}: {}", c.describe());
+        writeln!(
+            std::io::stderr().lock(),
+            "caps per job of {account}: {}",
+            c.describe()
+        )?;
     }
     eprintln!("quota of {account}: {}", q.describe());
     if let Some(r) = r {

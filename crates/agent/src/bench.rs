@@ -795,11 +795,18 @@ pub fn memory_challenge(c: &MemoryChallenge) -> Result<[u8; 32]> {
 // ---------------------------------------------------------------------------
 
 /// The CPU scores `inflate` times too high (for testing the checks that
-/// catch it).
+/// catch it), and at least `inflate` times the reference: a busy CI
+/// machine has measured its quick benchmark at a fifth of what the
+/// cluster timed a minute later, which made eight times that no lie.
 fn inflated(mut cpu: CpuPerf, inflate: u32) -> CpuPerf {
     if inflate > 1 {
-        cpu.single = cpu.single.saturating_mul(inflate);
-        cpu.multi = cpu.multi.saturating_mul(inflate);
+        let floor = |per_thread: u32, threads: u32| {
+            per_thread
+                .saturating_mul(inflate)
+                .max(1000u32.saturating_mul(inflate).saturating_mul(threads))
+        };
+        cpu.single = floor(cpu.single, 1);
+        cpu.multi = floor(cpu.multi, cpu.threads.max(1));
     }
     cpu
 }
@@ -1042,7 +1049,10 @@ mod tests {
         let x10 = inflated(p.cpu.clone(), 10);
         assert_eq!(
             (x10.single, x10.multi),
-            (p.cpu.single * 10, p.cpu.multi * 10)
+            (
+                (p.cpu.single * 10).max(10_000),
+                (p.cpu.multi * 10).max(10_000 * p.cpu.threads.max(1))
+            )
         );
         assert_eq!(inflated(p.cpu.clone(), 1), p.cpu);
     }

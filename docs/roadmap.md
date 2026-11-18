@@ -26,6 +26,19 @@ again starts with what the home cluster meets every day (upgrading the
 control plane by hand, the iMac's slow microVMs) and ends with what
 matters once outside providers are invited.
 
+Phases 37 to 45 (1.21 to 1.29) were planned on 2026-11-18, again with
+no open issues, from the same kinds of sources: what phases 29 to 36 left
+(schedules without allow lists, Docker without them, honeypots that
+follow a pattern, the HCS numbers and SignPath still outside), the "Not
+yet" list, and the research's recommendations that are still open (show
+providers what they earn against what their power costs, keep part of
+their earnings as a deposit, signed releases with update metadata in the
+spirit of TUF). The scope is the same seven areas; the order starts with
+what the home cluster meets every day (a task that fails once fails the
+job, a PC that loses power loses the work, nobody knows what a task
+really used or what the electricity cost) and again ends with what
+matters once outside providers are invited.
+
 Each phase is one pull request (or a few), ends in a minor release, and
 has a gate: what CI checks and what the owner checks by hand on real
 machines.
@@ -49,6 +62,15 @@ machines.
 | 34 | 1.18 | File store and microVM networks: node caches, images from the store, UDP and allow lists | done |
 | 35 | 1.19 | High availability and the remote API: reads from followers, limits that survive a failover, ACME | done |
 | 36 | 1.20 | Result checks: honeypot tasks, disk and memory challenges, re-benchmarks | done |
+| 37 | 1.21 | Cluster management: retries, reruns, suspended jobs, periodic checkpoints, what tasks really use | planned |
+| 38 | 1.22 | Monitoring: energy per task, electricity against earnings, pausing when hot, more alert channels | planned |
+| 39 | 1.23 | Dashboard: what is still CLI-only, and alerts pushed to the phone | planned |
+| 40 | 1.24 | MicroVMs and old Intel Macs: warm guests with networks, snapshots, memory given back, fans | planned |
+| 41 | 1.25 | GPUs: built-in GPU honeypots, what each task uses, GPU health | planned |
+| 42 | 1.26 | File store: datasets as folders on your machine, retention, sharing between accounts | planned |
+| 43 | 1.27 | Windows and Docker networks: allow lists for Docker, an agent without administrator, service logs | planned |
+| 44 | 1.28 | Operations and supply chain: leadership transfer, signed releases, upgrades across protocols | planned |
+| 45 | 1.29 | Providers: honeypots without a pattern, deposits, the confidential tier's leftovers | planned |
 | 18 | | Hub (Madang): provider discovery, latency probes, trust scores, cross-group CU ledger | on hold |
 | 19 | | Buying CU with won through the hub (Toss Payments) | on hold |
 
@@ -799,6 +821,316 @@ gets its receipts held, one that inflates its disk benchmark and gets
 caught, and placement that prefers the higher score. By hand: an invited
 provider's score in the dashboard after a day of work.
 
+## 37. Cluster management: retries, reruns, suspended jobs, periodic checkpoints, what tasks really use (1.21)
+
+Why: a task that exits non-zero, runs out of memory or times out fails
+its job at once (`max_attempts` covers lost nodes only), and the only
+way to run its failed tasks again is a new job; a checkpoint is saved
+when a run moves, so a PC that loses power or crashes loses everything
+since the last move; there is no way to hold a job without cancelling
+it; and nobody can see what a task really used, only what it asked for
+(CPU quotas count the CPUs asked for). Schedules still refuse allow
+lists (phase 34).
+
+- **Retries on failure:** `retries = N` in the job file, with
+  `retry_on` (`exit`, `oom`, `timeout`; exit codes such as `exit:75`)
+  and a delay that doubles from `retry_delay`; a retry prefers another
+  node. `pumasi job` and the dashboard show every attempt and why it
+  ended, and each attempt is billed as a run, as today.
+- **Reruns:** `pumasi job rerun JOB [--failed | --task N...]` runs the
+  given tasks again under the same job id (new attempts, same inputs),
+  so a job with three failed shards of a hundred does not start over.
+- **Suspended jobs:** `pumasi job suspend|resume JOB` (and the API):
+  queued tasks wait, running ones save a checkpoint where they can and go
+  back to the queue; a suspended job's tasks do not count against quotas.
+- **Periodic checkpoints:** `checkpoint_every = "15m"` asks Docker and
+  microVM tasks for a checkpoint on that period (the same signal and
+  `/checkpoint` directory as phase 25), and the agent stores each one, so
+  a machine that dies without notice loses at most the period. WASM tasks
+  get the request as a file they can look for (WASI has no signals).
+- **What tasks use:** each run's CPU time, peak memory, disk and network
+  bytes, from cgroups on Linux (Docker, and the VMM process of microVMs),
+  Job Objects on Windows and the engine for WASM, in `pumasi job`,
+  `describe job`, the API and the dashboard; `pumasi job` points out
+  tasks that asked for far more than they used.
+- **Schedules carry allow lists and bandwidth caps** in the schedule
+  extension record (`SetScheduleExt`), so they no longer refuse them.
+
+Gate: CI runs a task that fails twice and then succeeds with
+`retries = 2`, reruns only the failed tasks of a job, kills an agent
+(no goodbye) running a Docker task that checkpoints every 10 seconds and
+sees it resume elsewhere from the last checkpoint, checks the peak
+memory of a task that allocates a known amount within 10%, and runs a
+schedule with an allow list. By hand: a long job on the home cluster
+survives pulling a PC's power plug.
+
+## 38. Monitoring: energy per task, electricity against earnings, pausing when hot, more alert channels (1.22)
+
+Why: since 1.15 the cluster reads CPU package and GPU power on most
+machines but only charts it. The research asked to show providers what
+they would earn against what their electricity costs before they join;
+old iMacs and laptops run hot under load with nothing to stop them but
+the alert; Linux reports CPU power only to agents running as root; and
+alerts reach Slack, Discord or a JSON webhook only.
+
+- **Energy per run:** the agent integrates CPU package power (RAPL, the
+  SMC and IOReport, Windows where a monitor gives it) and GPU power over
+  each run, sharing the CPU's among the node's runs by their CPU time;
+  watt-hours in `pumasi job`, the dashboard and the receipts (shown, not
+  billed).
+- **Electricity against earnings:** an electricity price per node
+  (won per kWh, with optional cheaper hours) in `node set` and
+  `cluster.toml`, and a view per node and account of CU earned against
+  electricity spent per day. `pumasi bench --estimate [--price 120]`
+  prints, before joining, the CU per hour this machine would earn at the
+  cluster's prices and the power it would cost.
+- **Pausing when hot:** `node set --max-temperature 85` stops new tasks
+  while a CPU or GPU stays over the limit for a minute, and with
+  `--on-pause requeue` moves the running ones, like the other
+  availability rules.
+- **CPU power without root on Linux:** `service install` (run as root)
+  makes the RAPL energy counters readable to the agent's group with a
+  udev rule, documented for agents installed otherwise.
+- **More alert channels:** Telegram, ntfy and email (SMTP with STARTTLS)
+  next to Slack, Discord and JSON, with `webhook test` for each.
+- **Longer history:** `--keep-metrics 90d` keeps hourly averages past
+  the 7 days of today, for energy and score trends.
+
+Gate: CI integrates a recorded power trace into the expected watt-hours,
+sends a test alert to Telegram and ntfy stand-ins and a local SMTP
+server, keeps tasks off a node whose recorded temperature is over its
+limit, and checks the udev rule `service install --dry-run` writes. By
+hand: the owner sets the electricity price, sees the RTX 3080 PC's
+earnings against its power for a day, and gets an alert on the phone
+through ntfy or Telegram.
+
+## 39. Dashboard: what is still CLI-only, and alerts pushed to the phone (1.23)
+
+Why: honeypots and holds (1.20) are CLI-only, the `cluster.toml` editor
+takes no job files or `url_env` and never prunes, canary rollouts of
+your own binaries need the CLI, phases 37 and 38 add job actions and
+figures the browser should show, and alerts reach a phone only through a
+chat service.
+
+- **Result checks in the browser:** honeypots listed, added from a
+  finished job and removed, the verify policy edited, holds released;
+  each node's score over time.
+- **Job actions and figures:** retries in the submit form, rerun of
+  failed tasks, suspend and resume, and each task's use and energy
+  (phases 37 and 38).
+- **The `cluster.toml` editor** takes schedules' job files (uploaded with
+  the file) and `url_env`, and offers prune with a diff that lists what
+  would be removed.
+- **Your own binaries** uploaded for a rollout or a canary from the
+  Upgrade panel, like `upgrade rollout`.
+- **Alerts pushed to the phone:** the dashboard installs as a phone app
+  (a web app manifest and a service worker) and alerts arrive as Web Push
+  notices (VAPID keys kept by the control plane), also through the
+  tunnel, with no chat service needed.
+
+Gate: Playwright adds and removes a honeypot, releases a hold, reruns
+failed tasks, prunes from the editor after its diff, uploads a binary
+for a canary, and receives a test alert through a push subscription in
+Chromium. By hand: the owner's phone shows a push notice when a node
+goes offline.
+
+## 40. MicroVMs and old Intel Macs: warm guests with networks, snapshots, memory given back, fans (1.24)
+
+Why: warm guests (1.14) serve only tasks without a network or GPUs, and
+the first task of an image still boots cold; the warm pool takes up to a
+quarter of the machine's memory, which hurts an 8 GB iMac; microVMs pass
+no ICMP; and fans are not read anywhere, though a dead fan is what an
+old Mac usually dies of.
+
+- **Warm guests with networks:** every warm guest boots with a network
+  card on the user-space gateway, closed until a task takes the guest;
+  the task's allow list and caps then apply, so network tasks start warm
+  too, on every backend.
+- **Snapshots for first tasks:** a booted guest per kernel, CPU count and
+  memory size is saved (Firecracker snapshots, QEMU's saved state) and
+  restored instead of a cold boot. Virtualization.framework saves state
+  only from macOS 14, so old Intel Macs on Big Sur keep the warm pool.
+- **Memory given back:** a balloon device (Virtualization.framework's
+  since macOS 11, virtio-balloon in QEMU, Firecracker's) shrinks idle
+  warm guests, and the pool's size follows free memory rather than a
+  fixed share.
+- **ICMP:** echo requests through the gateway, with the same address
+  rules and allow lists as TCP and UDP, so tools that ping first work.
+- **Fans:** fan speeds from the SMC on Macs and from hwmon on Linux
+  (`applesmc` for old Macs running Linux, phase 21's guide), in `top`,
+  the dashboard and a new alert for a fan that stops while the machine is
+  hot.
+
+Gate: CI times a network task's start on a warm guest against a cold
+boot on Linux (KVM) and expects well under half, restores a Firecracker
+snapshot faster than a cold boot, sees a balloon return an idle guest's
+memory, pings an allowed public address and fails on a private one, and
+parses recorded SMC and hwmon fan readings. By hand: on the iMac, a
+second network task starts in seconds, the pool shrinks when memory is
+short, and its fan speed shows on the dashboard.
+
+## 41. GPUs: built-in GPU honeypots, what each task uses, GPU health (1.25)
+
+Why: built-in honeypots (1.20) use no GPU, so GPU results are checked
+only where an account added its own; the cluster sees how busy each GPU
+is but not which task used it or how much memory (parts of GPUs share
+memory on trust outside MPS); and a GPU that throws driver errors keeps
+getting tasks.
+
+- **Built-in GPU honeypots:** a WGSL compute shader with a seeded known
+  answer for WebGPU tasks and a CUDA image pinned by digest for Docker
+  GPU tasks, sent like the CPU ones and at the same rates.
+- **GPU use per task:** per-process utilization and memory from NVML,
+  DRM fdinfo (AMD and Intel on Linux) and Windows' per-process GPU
+  counters, so each run shows GPU time and peak memory, and a task on a
+  part of a GPU (`gpus = 0.5`) that went over its share is pointed out.
+- **GPU health:** Xid errors, ECC errors where the GPU has them, throttle
+  reasons and PCIe replays from NVML as events and alerts; a GPU with
+  repeated errors is cordoned (its tasks go to other GPUs) until an admin
+  clears it.
+- **WebGPU:** more optional features where the adapter has them
+  (timestamp queries, `float32-filterable`, compressed textures), and
+  `wasi:webgpu` components if Wasmtime runs them by then (checked at the
+  start of the phase).
+
+Gate: CI catches a provider that fakes WebGPU results with a built-in GPU
+honeypot on a software rasterizer, parses recorded NVML, fdinfo and
+Windows counters per process, and cordons a GPU on a stand-in's Xid
+errors. By hand: the RTX 3080's per-task memory in the job view; the
+iMac's AMD GPU passes a GPU honeypot.
+
+## 42. File store: datasets as folders on your machine, retention, sharing between accounts (1.26)
+
+Why: datasets are reached with `store put`/`get`, the dashboard or S3
+tools, never as a folder; every version is kept until removed by hand;
+an account cannot let another read its dataset; and cache quotas and the
+image cache are fixed (per node and account labels, 32 images for a
+week).
+
+- **Datasets as folders:** `pumasi ui` serves WebDAV at `/dav`
+  (read-write, signed in with tickets or S3 keys), which Windows
+  Explorer, macOS Finder and Linux file managers mount without extra
+  software; `pumasi store mount` prints the steps for the machine it runs
+  on.
+- **Retention:** per dataset `keep = { versions = 5, days = 90 }` in the
+  CLI, `cluster.toml` and the dashboard; jobs' output datasets go with
+  the job (`--keep-jobs`) unless pinned.
+- **Sharing:** `pumasi store share NAME ACCOUNT [--write]` lets another
+  account mount, download or write a dataset through every path (jobs,
+  S3, WebDAV); storage stays billed to the owner.
+- **Cache quotas per dataset**, and the image cache's size and age set
+  by the admin.
+
+Gate: CI runs a WebDAV client suite against `/dav`, mounts it with davfs2
+on Linux and the WebClient service on Windows, prunes versions by
+retention, and reads a shared dataset from the other account (refused
+without the grant). By hand: the owner maps the store as a drive on a
+Windows PC and opens a job's output in Finder on the iMac.
+
+## 43. Windows and Docker networks: allow lists for Docker, an agent without administrator, service logs (1.27)
+
+Why: Docker jobs get the whole internet or nothing, so the PCs whose
+Docker is the WSL distro Pumasi manages (phase 27) cannot run a job with
+an allow list; a Windows agent installs only as a LocalSystem service;
+the service logs on macOS and Windows grow without bound (months on an
+old iMac's small disk); and HCS and signing still wait on the outside.
+
+- **Allow lists, caps and billed egress for Docker** where Pumasi owns
+  the network setup: on Linux agents running as root and in Pumasi's WSL
+  distro, the container starts without a network and gets a TAP device in
+  its namespace on the same user-space gateway as microVMs (phase 34).
+  Docker Desktop and rootless Docker keep refusing lists.
+- **An agent without administrator on Windows:** `service install
+  --user` runs the agent at sign-in as that user (a scheduled task), for
+  WASM, WebGPU and microVMs where WHPX is already on.
+- **Service logs:** every service's log rotates at a size cap on every
+  OS, `pumasi service logs [ROLE] [-f]` shows it, and the Windows Event
+  Log records starts, stops, upgrades and rollbacks.
+- **HCS and signing, when the outside arrives:** the HCS backend if
+  `boot-times.ps1` numbers from real PCs show it clearly faster, and
+  signed binaries once SignPath approves (both as in phase 33).
+
+Gate: CI runs a Docker job with an allow list as root on Linux and in
+the WSL distro on a Windows runner (an allowed host answers, others and
+private addresses fail, egress on the receipt), installs a user agent on
+the Windows runner, and rotates a log at its cap. By hand: on the RTX
+3080 PC, a Docker job reaches only its allow list.
+
+## 44. Operations and supply chain: leadership transfer, signed releases, upgrades across protocols (1.28)
+
+Why: openraft 0.9 has no leadership transfer, so upgrades restart the
+leader to make it step down; openraft 0.10 is out and has one. A change
+of agent protocol still sends the control plane to be upgraded by hand.
+`upgrade latest` trusts whatever GitHub serves with a matching
+`SHA256SUMS` from the same release; the research asked for signed
+releases and TUF-style updates. Tickets made before a replica moved list
+its old address; chrono and chrono-tz are ignored as unmaintained in
+cargo-deny until the move to jiff; SCIM never creates accounts; and ACME
+has no DNS-01, so no wildcard certificates.
+
+- **openraft 0.10:** upgrades and `pumasi ha step-down` hand leadership
+  to an up-to-date follower instead of restarting the leader; the stored
+  log and state move over from 0.9 on first start, tested from a 1.27
+  cluster's state.
+- **Upgrades across a protocol change:** the control plane goes first,
+  replicas one at a time, accepting the old protocol until the rollout's
+  agents have moved.
+- **Signed releases:** the release workflow signs `SHA256SUMS` with a
+  project release key (Ed25519; the owner sets it once as a repository
+  secret, until then releases stay as today) into metadata with the
+  version and an expiry, so an old release cannot be served as the
+  newest and a stale mirror is noticed; a signed key list lets the key
+  be replaced. `upgrade latest`, `install.sh` and `install.ps1` check it
+  against the public key in the binary.
+- **Tickets that follow the cluster:** the CLI, dashboards and agents
+  update their stored replica list when the membership changes, so
+  tickets made before a move or a new replica keep working.
+- **jiff instead of chrono and chrono-tz**, dropping both cargo-deny and
+  cargo-audit exceptions.
+- **SCIM creates accounts and access** (phase 17 leftover), and **ACME
+  DNS-01** (Cloudflare's API and RFC 2136) for wildcard certificates.
+
+Gate: CI rolls a three-replica cluster with a leadership transfer and no
+failed job, upgrades across a stand-in protocol change, has `upgrade
+latest` refuse a release whose signature is wrong, old or expired from a
+local stand-in for GitHub, connects with a ticket made before a replica
+moved, passes cargo-deny without the chrono exceptions, and gets a
+wildcard certificate from Pebble over DNS-01. By hand: the owner sets the
+release key secret (one `gh` command) and upgrades the home cluster from
+the dashboard while the leader hands over.
+
+## 45. Providers: honeypots without a pattern, deposits, the confidential tier's leftovers (1.29)
+
+Why: a honeypot always comes right after a real task, which a watchful
+provider can notice, and built-in Docker and microVM honeypots use one
+image; the research's deposit (part of earnings kept as a bond instead
+of staking) is not there; and the confidential tier has no scratch disk,
+no network, no minimum firmware policy, and loses its leases when the
+control plane restarts. This matters once outside providers are
+invited, which is why it comes last.
+
+- **Honeypots without a pattern:** honeypots also go at random times
+  while a node is idle and between real tasks, with lengths drawn from
+  the node's recent real tasks; built-in ones pick from a few common base
+  images (pinned by digest) to match the real task's; account honeypots
+  may read pinned dataset versions from the store.
+- **Deposits:** a share of each provider's earnings (`--deposit 10%`, up
+  to a cap) is held as a bond, forfeited on a failed honeypot or a
+  proven mismatch, and released after a period without strikes or when
+  the provider leaves in good standing.
+- **The confidential tier:** an encrypted scratch disk (its key released
+  with the others), a minimum SEV-SNP TCB version and pinned TDX RTMR0,
+  leases kept across a restart or failover, and a network through allow
+  lists (the gateway sees addresses, the guest speaks TLS).
+- **Score counters** written as they change in compact records, like the
+  limits of 1.19, rather than every 5 minutes.
+
+Gate: CI catches a provider that cheats only on tasks that do not follow
+another task, holds and forfeits a deposit, runs the confidential stand-in
+with a scratch disk and a network allow list, refuses a recorded report
+below the TCB minimum, and keeps a confidential lease through a leader
+kill. By hand: an invited provider's deposit and score after a week.
+
 ## Not planned
 
 - Long-running services (Deployments, Services, ingress): Pumasi stays a
@@ -812,3 +1144,8 @@ provider's score in the dashboard after a day of work.
 - A paid third-party security audit and the 72-hour soak in the
   research's 1.0 gate: both need the owner's budget or machines (hosted
   runners stop at 6 hours), and are done when the owner asks.
+- NVIDIA vGPU (it needs NVIDIA's licensed server software) and
+  Windows-native executables (Windows machines run WASM, WebGPU, Linux
+  images in WSL Docker and microVMs).
+- SAML: OIDC covers the identity providers that offer SAML, and SAML's
+  XML signatures are a common source of sign-in bypasses.

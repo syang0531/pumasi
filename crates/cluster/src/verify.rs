@@ -88,6 +88,9 @@ const INFLATED: u64 = 2;
 const STRIKE_AFTER: u32 = 2;
 /// The smallest disk challenge (the node's free space allowing).
 const MIN_DISK_BYTES: u64 = 16 * DISK_CHUNK as u64;
+/// The fastest sequential speed the cluster records for a timed disk.
+pub const MAX_TIMED_DISK_MB_S: u32 = 20_000;
+
 /// The most a disk challenge writes ([`crate::ClusterConfig::challenge_bytes`]).
 pub const DISK_CHALLENGE_BYTES: u64 = 256 << 20;
 /// The most memory a memory challenge touches.
@@ -1424,8 +1427,12 @@ impl State {
     /// Records the cluster's timing of a node's disk.
     pub fn apply_disk_check(&mut self, d: &DiskDone, correct: bool) {
         let id = d.node.as_str();
+        // A step that took about one round trip leaves next to nothing once
+        // the round trip is taken off (a page cache that ignores the bypass,
+        // a round trip measured high); no disk reads or writes faster than
+        // this, so a timing above it says nothing more.
         let mb_s = |bytes: u64, t: Duration| -> u32 {
-            (bytes as f64 / 1e6 / t.as_secs_f64().max(1e-6)).min(u32::MAX as f64) as u32
+            (bytes as f64 / 1e6 / t.as_secs_f64().max(1e-6)).min(MAX_TIMED_DISK_MB_S as f64) as u32
         };
         let time = |i: usize| d.steps.get(i).map_or(CHALLENGE_TIMEOUT, |s| s.2);
         let write = mb_s(d.bytes, time(0));

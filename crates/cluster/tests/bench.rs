@@ -10,7 +10,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use pumasi_agent::{Agent, AgentConfig, AgentExit};
-use pumasi_cluster::{AdminClient, Cluster, ClusterConfig};
+use pumasi_cluster::{AdminClient, Cluster, ClusterConfig, verify::MAX_TIMED_DISK_MB_S};
 use pumasi_proto::{
     msg::{AdminOp, Invite},
     net::NetMode,
@@ -234,10 +234,14 @@ async fn benchmarks_are_signed_and_an_inflated_one_is_caught() {
         let s = score("disky");
         let disk = s.disk.as_ref().expect("disk timed");
         assert!(disk.correct && disk.attempts >= 2, "{disk:?}");
+        // Caught on speed or on latency: a page cache that ignores the
+        // bypass (macOS) can make the sequential read look fast.
         assert!(
-            disk.claimed_seq_read_mb_s > disk.seq_read_mb_s * 2,
+            disk.claimed_seq_read_mb_s > disk.seq_read_mb_s * 2
+                || disk.read_us > disk.claimed_p50_us * 2,
             "{disk:?}"
         );
+        assert!(disk.seq_read_mb_s <= MAX_TIMED_DISK_MB_S, "{disk:?}");
         assert_eq!(s.disk_label, Some(disk.class));
         wait_for("the honest disk timed", || score("honest").disk.is_some()).await;
     }

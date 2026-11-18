@@ -146,7 +146,10 @@ impl<K: std::hash::Hash + Eq + Clone> Buckets<K> {
         if got > 0 || want == 0 {
             (got, Duration::ZERO)
         } else {
-            (0, Duration::from_secs_f64((1.0 - *tokens).max(0.0) / self.per_sec))
+            (
+                0,
+                Duration::from_secs_f64((1.0 - *tokens).max(0.0) / self.per_sec),
+            )
         }
     }
 }

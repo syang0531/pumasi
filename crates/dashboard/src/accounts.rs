@@ -521,7 +521,15 @@ mod tests {
         let patch = &schemas["AccountPolicyPatch"];
         assert_eq!(patch["additionalProperties"], false);
         let fields = keys(&patch["properties"]);
-        assert_eq!(fields, keys(&view));
+        // With a 1.19 control plane the caps per job come along.
+        let with = with_caps(view.clone(), Some(&JobCaps::default()));
+        assert_eq!(fields, keys(&with));
+        let mut both = keys(&schemas["AccountPolicy"]["properties"]);
+        both.extend(keys(
+            &schemas["AccountPolicyView"]["allOf"][1]["properties"],
+        ));
+        both.sort();
+        assert_eq!(both, keys(&with));
         let list = [
             json!(["a"]),
             json!({"add": ["a"]}),
@@ -540,6 +548,11 @@ mod tests {
                 "network" => vec![json!("allow"), json!("deny")],
                 "selector" => vec![json!("zone=lab"), json!("")],
                 "max_timeout_ms" | "max_gpus_per_task" => vec![json!(3), Value::Null],
+                "max_job_cpus" | "max_job_memory_bytes" | "max_job_cu" => {
+                    let body = serde_json::to_vec(&json!({ f: 3 })).unwrap();
+                    assert!(!parse_caps_patch(&body).unwrap().is_empty(), "{f}");
+                    vec![json!(3), Value::Null]
+                }
                 "account" => vec![json!("ci")],
                 "usage" => vec![view["usage"].clone()],
                 "quota" => keys(&schemas["AccountQuota"]["properties"])
